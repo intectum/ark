@@ -229,7 +229,6 @@ Response:
 | `devices[].device_id` | Numeric ID, unique per user. |
 | `devices[].device_key` | Per-device Ed25519 signing key, authorized by the identity key. |
 | `devices[].label` | Human-readable device name. |
-| `policy` | Optional per-user policy overrides (Section 6.5.1). Includes `accept_registrations`, PoW difficulty overrides. |
 | `signature` | Ed25519 signature over the entire document (excluding this field). Proves the identity key holder authored this. |
 
 **The self-signature is the key security property** (for Mode A users). The server hosts this document but cannot tamper with it — any modification invalidates the signature. This means:
@@ -437,6 +436,7 @@ Everything else is up to applications. The protocol reserves the `.ark/` directo
 | `/ark/.ark/accounts` | Account creation endpoint (POST) |
 | `/ark/<user>/.ark/identity` | User identity document |
 | `/ark/<user>/.ark/inbox/` | Cross-server delivery landing zone |
+| `/ark/<user>/.ark/policy` | User spam policy overrides |
 | `/ark/<user>/.ark/contacts` | Contacts allowlist |
 | `/ark/<user>/.ark/stream` | Real-time event stream (WebSocket/SSE) |
 
@@ -903,39 +903,33 @@ The receiving server publishes `registration_difficulty` in its policy (see Sect
 
 #### 6.5.1 Per-user PoW overrides
 
-Individual users can override the server's default PoW settings in their identity document. This allows a newsletter account on a shared server to accept registrations while personal accounts on the same server do not.
+Individual users can override the server's default PoW settings via a separate policy file at `/ark/<user>/.ark/policy`. This allows a newsletter account on a shared server to accept registrations while personal accounts on the same server do not.
 
-The identity document includes an optional `policy` field:
+```
+GET https://example.com/ark/newsletter/.ark/policy
+```
 
 ```json
 {
-  "version": 1,
-  "address": "newsletter@example.com",
-  "identity_key": "...",
-  "encryption_key": "...",
-  "policy": {
-    "accept_registrations": true,
-    "default_difficulty": 20,
-    "first_contact_difficulty": 24,
-    "known_contact_difficulty": 0,
-    "registration_difficulty": 20
-  },
-  "devices": [ ... ],
-  "updated": "2026-04-14T12:00:00Z",
+  "accept_registrations": true,
+  "default_difficulty": 20,
+  "first_contact_difficulty": 24,
+  "known_contact_difficulty": 0,
+  "registration_difficulty": 20,
   "signature": "..."
 }
 ```
 
 **Rules:**
 
-- Per-user `policy` is optional. If absent, the server's policy applies.
+- Per-user policy is optional. If absent, the server's policy applies.
 - Per-user difficulty values can only be **equal to or higher** than the server's defaults — a user cannot lower PoW requirements below what the server enforces.
 - `accept_registrations` defaults to `false`. Only users who explicitly enable it will accept registration envelopes.
-- The `policy` field is included in the self-signature, so it cannot be tampered with by the server (Mode A users).
+- The policy file is signed by the user's identity key, so it cannot be tampered with by the server (Mode A users).
 
 **Resolution order** (when an envelope arrives for a user):
 
-1. Check user's identity document for `policy` overrides.
+1. Check user's policy file at `/ark/<user>/.ark/policy`.
 2. Fall back to server-wide policy from `/ark/.ark/policy`.
 3. Apply size-scaled difficulty on top (Section 6.4).
 
@@ -950,7 +944,7 @@ The identity document includes an optional `policy` field:
 
 #### 6.5.2 Sender discovery of registration support
 
-Before sending a registration envelope, the client checks the recipient's identity document for `"accept_registrations": true`. If the field is absent or `false`, the client should not send a registration envelope — the recipient's server will reject it with `403 Forbidden`.
+Before sending a registration envelope, the client fetches the recipient's policy file at `/ark/<user>/.ark/policy` and checks for `"accept_registrations": true`. If the file is absent or the field is `false`, the client should not send a registration envelope — the recipient's server will reject it with `403 Forbidden`.
 
 ### 6.6 Layer 3: Contacts allowlist
 
@@ -1180,7 +1174,7 @@ A server is a **single statically-linked binary** containing:
 
 ```
 ┌──────────────────────────────────────────────┐
-│              ark-server                       │
+│              ark-server                      │
 ├──────────────────────────────────────────────┤
 │  HTTPS Server                                │
 │  ├── File access (GET/HEAD/PUT/DELETE)       │
@@ -1305,8 +1299,8 @@ An Ark file is a binary file with two sections:
 
 ```
 ┌──────────────────────────────────┐
-│  Magic bytes: "ARK\x01" (4)     │
-│  Header length: uint32 BE (4)   │
+│  Magic bytes: "ARK\x01" (4)      │
+│  Header length: uint32 BE (4)    │
 ├──────────────────────────────────┤
 │  Header (protobuf, unencrypted)  │
 │  └── variable length             │
@@ -1452,7 +1446,7 @@ message OwnerMovedNotification {
 
 ### 8.5 Identity and policy documents
 
-Identity documents, server identity, and policy are JSON (human-readable, easy to debug with curl). See Section 2.4 and Section 5.4 for schemas.
+Identity documents, server identity, policy files, and contacts are JSON (human-readable, easy to debug with curl). See Section 2.4, Section 5.4, and Section 6.5.1 for schemas.
 
 ### 8.6 Serialization rules
 
@@ -1662,6 +1656,7 @@ All Ark paths are under `https://<domain>/ark/`.
 | Path | Method | Purpose |
 |---|---|---|
 | `/ark/<user>/.ark/identity` | GET | User identity document |
+| `/ark/<user>/.ark/policy` | GET | User spam policy (optional) |
 
 **User-level (authenticated — owner or co-owner):**
 
