@@ -71,7 +71,7 @@ Bob's Client                Bob's Server              Alice's Server            
     |                           |------- envelope -------->|                          |
     |                           |                          |  8. Verify signature      |
     |                           |                          |  9. Verify PoW            |
-    |                           |                          |  10. Store in .inbox/     |
+    |                           |                          |  10. Store in .ark/inbox/ |
     |                           |                          |                          |
     |                           |                          |  11. Alice fetches ------>|
     |                           |                          |  12. Decrypt with         |
@@ -87,8 +87,8 @@ The protocol defines no directory structure — apps do. Here are examples of ho
 
 **Mail app:**
 ```
-/ark/alice/mail/inbox/abc123          ← received message (moved from .inbox/)
-/ark/alice/mail/sent/def456           ��� sent message
+/ark/alice/mail/inbox/abc123          ← received message (moved from .ark/inbox/)
+/ark/alice/mail/sent/def456           ← sent message
 /ark/alice/mail/drafts/ghi789         ← draft
 /ark/alice/mail/archive/2026/jkl012   ← archived message
 ```
@@ -187,7 +187,7 @@ Security-conscious users choose Mode A — the server is purely a relay and stor
 Alice's public identity is published as a JSON document on her server:
 
 ```
-GET https://example.com/ark/alice/.identity
+GET https://example.com/ark/alice/.ark/identity
 ```
 
 Response:
@@ -244,7 +244,7 @@ Note: For Mode B users (server holds the private key), the server *could* sign a
 When Bob wants to contact Alice for the first time:
 
 1. Bob's client extracts the domain from `alice@example.com`.
-2. Bob's client makes an HTTPS GET to `https://example.com/ark/alice/.identity`.
+2. Bob's client makes an HTTPS GET to `https://example.com/ark/alice/.ark/identity`.
 3. Bob's client verifies the `signature` field against the `identity_key` in the document.
 4. **Trust On First Use (TOFU):** Bob's client stores Alice's `identity_key` locally. This is the first time Bob has seen this key, so he trusts it (like SSH's "The authenticity of host 'example.com' can't be established... Are you sure you want to continue?").
 5. On subsequent fetches, Bob's client compares the `identity_key` against the stored value. If it has changed without a proper key transition (see 2.8), the client raises an alert.
@@ -377,7 +377,7 @@ A single identity (one keypair) can have **multiple addresses** that all resolve
 **Alias identity document:**
 
 ```
-GET https://example.com/ark/old-alice/.identity
+GET https://example.com/ark/old-alice/.ark/identity
 ```
 
 ```json
@@ -426,19 +426,19 @@ See Section 8 for the full binary format.
 
 The protocol defines one path convention:
 
-- **`/ark/<user>/.inbox/`** — the landing zone for all cross-server deliveries. Remote servers POST files here. This is the only directory that accepts writes from other servers.
+- **`/ark/<user>/.ark/inbox/`** — the landing zone for all cross-server deliveries. Remote servers POST files here. This is the only directory that accepts writes from other servers.
 
-Everything else is up to applications. The protocol reserves paths starting with `.` under a user's root for system use:
+Everything else is up to applications. The protocol reserves the `.ark/` directory under each scope for system use:
 
 | Path | Purpose |
 |---|---|
-| `/ark/.identity` | Server identity document |
-| `/ark/.policy` | Server spam policy |
-| `/ark/.accounts` | Account creation endpoint (POST) |
-| `/ark/<user>/.identity` | User identity document |
-| `/ark/<user>/.inbox/` | Cross-server delivery landing zone |
-| `/ark/<user>/.contacts` | Contacts allowlist |
-| `/ark/<user>/.stream` | Real-time event stream (WebSocket/SSE) |
+| `/ark/.ark/identity` | Server identity document |
+| `/ark/.ark/policy` | Server spam policy |
+| `/ark/.ark/accounts` | Account creation endpoint (POST) |
+| `/ark/<user>/.ark/identity` | User identity document |
+| `/ark/<user>/.ark/inbox/` | Cross-server delivery landing zone |
+| `/ark/<user>/.ark/contacts` | Contacts allowlist |
+| `/ark/<user>/.ark/stream` | Real-time event stream (WebSocket/SSE) |
 
 All other paths under `/ark/<user>/` are free for apps and users to organize however they want.
 
@@ -469,7 +469,7 @@ Owner {
 
 **Single owner (default):** Notes, personal files. One owner entry (self, full).
 
-**Two owners (messaging):** Sender creates file with two owners — self (full) and recipient (read). A copy is delivered to the recipient's `.inbox/` via an envelope (Section 7). The recipient's app can move it to any path.
+**Two owners (messaging):** Sender creates file with two owners — self (full) and recipient (read). A copy is delivered to the recipient's `.ark/inbox/` via an envelope (Section 7). The recipient's app can move it to any path.
 
 **Multiple owners (collaboration):** Shared documents. All owners at `full` permission can read and modify. See Section 3.6 for sync.
 
@@ -728,7 +728,7 @@ Servers also authenticate themselves:
 
 1. Each server has its own Ed25519 keypair, published at:
    ```
-   GET https://example.com/ark/.identity
+   GET https://example.com/ark/.ark/identity
    ```
    ```json
    {
@@ -807,7 +807,7 @@ Every cross-server envelope includes a proof-of-work stamp computed using **Argo
 Each server publishes its spam policy:
 
 ```
-GET https://example.com/ark/.policy
+GET https://example.com/ark/.ark/policy
 ```
 
 ```json
@@ -936,7 +936,7 @@ The identity document includes an optional `policy` field:
 **Resolution order** (when an envelope arrives for a user):
 
 1. Check user's identity document for `policy` overrides.
-2. Fall back to server-wide policy from `/ark/.policy`.
+2. Fall back to server-wide policy from `/ark/.ark/policy`.
 3. Apply size-scaled difficulty on top (Section 6.4).
 
 **Use cases:**
@@ -962,7 +962,7 @@ This is automatic and transparent:
 - Alice adds Bob manually → Bob is allowlisted.
 - Alice removes Bob → Bob is de-listed, reverts to default PoW requirement.
 
-The allowlist is stored in `/ark/alice/.contacts` and is keyed by the sender's **identity public key**, not their address. This means:
+The allowlist is stored in `/ark/alice/.ark/contacts` and is keyed by the sender's **identity public key**, not their address. This means:
 - Bob can change servers and remain allowlisted as long as he keeps the same identity key.
 - Someone who registers bob@attacker.com with a different key is NOT allowlisted.
 
@@ -971,7 +971,7 @@ The allowlist is stored in `/ark/alice/.contacts` and is keyed by the sender's *
 Account creation also requires proof of work. This prevents mass creation of throwaway accounts to circumvent per-sender PoW.
 
 ```
-POST https://example.com/ark/.accounts
+POST https://example.com/ark/.ark/accounts
 Content-Type: application/json
 
 {
@@ -1029,7 +1029,7 @@ All communication happens over **HTTPS**. No custom protocols, no special ports.
 
 Transport has three modes:
 1. **Local access** — client reads/writes files on its own server by path.
-2. **Cross-server delivery** — sending files to other users' `.inbox/` via envelopes.
+2. **Cross-server delivery** — sending files to other users' `.ark/inbox/` via envelopes.
 3. **Cross-server sync** — keeping shared files in sync between co-owners' servers.
 
 ### 7.2 Local file access
@@ -1075,9 +1075,9 @@ Clients that need the full header (owner entries, wrapped keys) use GET and read
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/ark/alice/.contacts` | List contacts (allowlisted identity keys) |
-| `PUT` | `/ark/alice/.contacts` | Update contacts |
-| `GET` | `/ark/alice/.stream` | Real-time event stream (WebSocket/SSE) |
+| `GET` | `/ark/alice/.ark/contacts` | List contacts (allowlisted identity keys) |
+| `PUT` | `/ark/alice/.ark/contacts` | Update contacts |
+| `GET` | `/ark/alice/.ark/stream` | Real-time event stream (WebSocket/SSE) |
 
 ### 7.3 Cross-server delivery
 
@@ -1085,25 +1085,25 @@ When Bob sends a message (file) to Alice:
 
 **Step 1: Store locally.** Bob's client creates the file on Bob's server via PUT.
 
-**Step 2: Deliver via envelope.** Bob's server wraps the file in an envelope and delivers it to Alice's `.inbox/`:
+**Step 2: Deliver via envelope.** Bob's server wraps the file in an envelope and delivers it to Alice's `.ark/inbox/`:
 
 ```
-POST https://example.com/ark/alice/.inbox/
+POST https://example.com/ark/alice/.ark/inbox/
 Content-Type: application/x-ark-envelope
 Authorization: ArkServer sender.example.com <server-signature>
 
 <binary envelope>
 ```
 
-The envelope contains the Ark file plus Alice's owner entry (her wrapped file key), the PoW stamp, and the sender's signature. Alice's server extracts the file and writes it to `.inbox/` with a generated filename (the envelope's `message_id`).
+The envelope contains the Ark file plus Alice's owner entry (her wrapped file key), the PoW stamp, and the sender's signature. Alice's server extracts the file and writes it to `.ark/inbox/` with a generated filename (the envelope's `message_id`).
 
-The file header includes an `app` hint (e.g., `"mail"`, `"calendar"`) so client-side apps know which files to claim from `.inbox/`.
+The file header includes an `app` hint (e.g., `"mail"`, `"calendar"`) so client-side apps know which files to claim from `.ark/inbox/`.
 
 **Response codes:**
 
 | Code | Meaning |
 |---|---|
-| `202 Accepted` | File accepted, written to `.inbox/`. |
+| `202 Accepted` | File accepted, written to `.ark/inbox/`. |
 | `400 Bad Request` | Malformed envelope. |
 | `403 Forbidden` | Signature verification failed. |
 | `404 Not Found` | Recipient does not exist on this server. |
@@ -1121,7 +1121,7 @@ When a shared file is updated, co-owners' servers are notified.
 **Update notification:**
 
 ```
-POST https://example.com/ark/alice/.inbox/
+POST https://example.com/ark/alice/.ark/inbox/
 Content-Type: application/x-ark-envelope
 Authorization: ArkServer sender.example.com <server-signature>
 
@@ -1149,7 +1149,7 @@ The serving server verifies the requester's identity key is in the file's owner 
 
 **Owner moved notification:**
 
-When an owner migrates to a new server (Section 2.10), they send an `OWNER_MOVED` envelope to co-owners' `.inbox/` directories:
+When an owner migrates to a new server (Section 2.10), they send an `OWNER_MOVED` envelope to co-owners' `.ark/inbox/` directories:
 
 ```
 Envelope type: OWNER_MOVED
@@ -1161,17 +1161,17 @@ Co-owners' clients update the owner address and path in shared files. Identity k
 ### 7.5 Real-time events
 
 ```
-GET https://example.com/ark/alice/.stream
+GET https://example.com/ark/alice/.ark/stream
 Authorization: ArkUser <device_id>:<signature>
 ```
 
 WebSocket or SSE stream. Events:
 
 ```json
-{"event": "created", "path": "/ark/alice/.inbox/abc123", "from": "bob@example.com"}
+{"event": "created", "path": "/ark/alice/.ark/inbox/abc123", "from": "bob@example.com"}
 {"event": "modified", "path": "/ark/alice/notes/todo", "modified_by": "alice@example.com"}
 {"event": "deleted", "path": "/ark/alice/mail/trash/old-msg"}
-{"event": "sync", "path": "/ark/alice/.inbox/def456", "type": "OBJECT_UPDATED"}
+{"event": "sync", "path": "/ark/alice/.ark/inbox/def456", "type": "OBJECT_UPDATED"}
 ```
 
 ### 7.6 Server architecture
@@ -1179,37 +1179,37 @@ WebSocket or SSE stream. Events:
 A server is a **single statically-linked binary** containing:
 
 ```
-┌─────────────────────────────────────────┐
-│              ark-server                  │
-├─────────────────────────────────────────┤
-│  HTTPS Server                           │
-│  ├── File access (GET/HEAD/PUT/DELETE)  │
-│  ├── Envelope delivery (POST .inbox/)   │
-│  └── WebSocket/SSE (.stream)            │
-├─────────────────────────────────────────┤
-│  Filesystem Storage                     │
-│  ├── /ark/<user>/ (encrypted files)     │
-│  ├── /ark/<user>/.inbox/ (incoming)     │
-│  └── /ark/<user>/.contacts (allowlist)  │
-├─────────────────────────────────────────┤
-│  Outbound Relay                         │
-│  ├── Queue for outgoing envelopes       │
-│  ├── Retry logic (exponential backoff)  │
-│  └── Remote identity document cache     │
-├─────────────────────────────────────────┤
-│  Sync Engine                            │
-│  ├── Notify co-owners on file update    │
-│  ├── Fetch updates from co-owners       │
-│  └── Conflict resolution (last-write)   │
-├─────────────────────────────────────────┤
-│  TLS (ACME / Let's Encrypt)             │
-│  └── Auto-provision and renewal         │
-├─────────────────────────────────────────┤
-│  Admin CLI                              │
-│  ├── user add/remove/list               │
-│  ├── stats / diagnostics                │
-│  └── config reload                      │
-└─────────────────────────────────────────┘
+┌──────────────────────────────────────────────┐
+│              ark-server                       │
+├──────────────────────────────────────────────┤
+│  HTTPS Server                                │
+│  ├── File access (GET/HEAD/PUT/DELETE)       │
+│  ├── Envelope delivery (POST .ark/inbox/)    │
+│  └── WebSocket/SSE (.ark/stream)             │
+├──────────────────────────────────────────────┤
+│  Filesystem Storage                          │
+│  ├── /ark/<user>/ (encrypted files)          │
+│  ├── /ark/<user>/.ark/inbox/ (incoming)      │
+│  └── /ark/<user>/.ark/contacts (allowlist)   │
+├──────────────────────────────────────────────┤
+│  Outbound Relay                              │
+│  ├── Queue for outgoing envelopes            │
+│  ├── Retry logic (exponential backoff)       │
+│  └── Remote identity document cache          │
+├──────────────────────────────────────────────┤
+│  Sync Engine                                 │
+│  ├── Notify co-owners on file update         │
+│  ├── Fetch updates from co-owners            │
+│  └── Conflict resolution (last-write)        │
+├──────────────────────────────────────────────┤
+│  TLS (ACME / Let's Encrypt)                  │
+│  └── Auto-provision and renewal              │
+├──────────────────────────────────────────────┤
+│  Admin CLI                                   │
+│  ├── user add/remove/list                    │
+│  ├── stats / diagnostics                     │
+│  └── config reload                           │
+└──────────────────────────────────────────────┘
 ```
 
 **Configuration:**
@@ -1240,7 +1240,7 @@ storage = "./data"
 **Storage:**
 - Filesystem. Files are stored on disk exactly as they are — the server is essentially an authenticated file server. No database required for user data.
 - The server may use a lightweight index (e.g., SQLite) for caching directory listings and metadata queries, but the files themselves are the source of truth.
-- Contacts allowlists are stored as JSON files at `/ark/<user>/.contacts`.
+- Contacts allowlists are stored as JSON files at `/ark/<user>/.ark/contacts`.
 
 ### 7.7 Deployment: co-hosting with a website
 
@@ -1346,7 +1346,7 @@ message Header {
   uint32 modifier_device_id = 8;
   bytes signature = 9;                 // Ed25519 signature over fields 1-8 + body hash
 
-  // App hint (for .inbox/ routing by client apps)
+  // App hint (for .ark/inbox/ routing by client apps)
   string app = 10;                     // e.g., "mail", "calendar", "notes" — optional
 }
 
@@ -1383,7 +1383,7 @@ The history file is encrypted with the same file key as the parent file. Same ow
 
 ### 8.4 Envelope
 
-The envelope is the transport wrapper for cross-server delivery. It wraps a file (or a notification) for delivery to another server's `.inbox/`.
+The envelope is the transport wrapper for cross-server delivery. It wraps a file (or a notification) for delivery to another server's `.ark/inbox/`.
 
 ```protobuf
 enum EnvelopeType {
@@ -1572,7 +1572,7 @@ When a protocol user sends a message to a legacy email address, the server creat
 **Legacy email identity document:**
 
 ```
-GET https://gateway.example.com/ark/x-a7f3k2m9p4q8r2/.identity
+GET https://gateway.example.com/ark/x-a7f3k2m9p4q8r2/.ark/identity
 ```
 
 ```json
@@ -1612,7 +1612,7 @@ legacy_gateway = "gateway.ark.io"
 For protocol users who want to receive legacy email, a bridge service can forward incoming emails.
 
 1. Alice configures a forwarding rule in her email provider to a webhook handled by the bridge.
-2. The bridge receives the email, wraps the content in an Ark file, and delivers it to Alice's `.inbox/` via a standard envelope.
+2. The bridge receives the email, wraps the content in an Ark file, and delivers it to Alice's `.ark/inbox/` via a standard envelope.
 3. The file is marked as "received via email (unencrypted)" in Alice's client.
 
 **Security note:** Bridged messages are not encrypted in transit. The bridge sees plaintext during processing. These files should be clearly distinguished from native Ark files in the client UI.
@@ -1653,15 +1653,15 @@ All Ark paths are under `https://<domain>/ark/`.
 
 | Path | Method | Purpose |
 |---|---|---|
-| `/ark/.identity` | GET | Server identity document |
-| `/ark/.policy` | GET | Server spam policy |
-| `/ark/.accounts` | POST | Create account (requires PoW) |
+| `/ark/.ark/identity` | GET | Server identity document |
+| `/ark/.ark/policy` | GET | Server spam policy |
+| `/ark/.ark/accounts` | POST | Create account (requires PoW) |
 
 **User-level (public, no auth):**
 
 | Path | Method | Purpose |
 |---|---|---|
-| `/ark/<user>/.identity` | GET | User identity document |
+| `/ark/<user>/.ark/identity` | GET | User identity document |
 
 **User-level (authenticated — owner or co-owner):**
 
@@ -1672,11 +1672,11 @@ All Ark paths are under `https://<domain>/ark/`.
 | `/ark/<user>/<path>` | PUT | Create or update file |
 | `/ark/<user>/<path>` | DELETE | Delete file |
 | `/ark/<user>/<dir>/` | GET | List directory |
-| `/ark/<user>/.contacts` | GET/PUT | Manage contacts allowlist |
-| `/ark/<user>/.stream` | GET | Real-time event stream |
+| `/ark/<user>/.ark/contacts` | GET/PUT | Manage contacts allowlist |
+| `/ark/<user>/.ark/stream` | GET | Real-time event stream |
 
 **Cross-server delivery (server auth):**
 
 | Path | Method | Purpose |
 |---|---|---|
-| `/ark/<user>/.inbox/` | POST | Deliver envelope (file, notification, registration) |
+| `/ark/<user>/.ark/inbox/` | POST | Deliver envelope (file, notification, registration) |
