@@ -36,17 +36,17 @@ Ark is a federated, encrypted protocol for personal data. It replaces email, clo
 - **Cryptographic identity, not reputation-based.** Your identity is a keypair, not an IP address or domain reputation score. This eliminates the entire class of deliverability problems that plague self-hosted email.
 - **Encrypted by default.** All file content is end-to-end encrypted. Servers store ciphertext they cannot read.
 - **Files on disk.** Storage is the filesystem. No database for user data. Files are accessed by path over HTTPS. Any tool that can read files can interact with Ark data.
-- **One primitive.** Everything is a file with an unencrypted header and an encrypted body. Different ownership patterns produce different behaviors, not different concepts.
+- **One primitive.** Everything is a file with an unencrypted header and an encrypted body. Different membership patterns produce different behaviors, not different concepts.
 - **Simple to self-host.** A single binary, a single config file, a domain with an A record. That's it.
 - **Federated, not peer-to-peer.** Servers provide reliable offline storage and key hosting. Pure P2P systems (Bitmessage, Briar) struggle with reliability and adoption.
 - **Spam-resistant by construction.** Proof of work + unforgeable identity + contact allowlists make bulk spam economically infeasible without complex filtering infrastructure.
 - **Simple key model.** One keypair per identity, like a crypto wallet. Lose the key, lose the identity. Have the key, have all your data. No complex session state to manage.
 - **Flexible trust model.** Users choose where their private key lives — on their device (maximum security) or on their server (maximum convenience). Self-hosters get both.
-- **App-agnostic.** The protocol defines files, ownership, and transport. How files are organized into directories is up to applications. A mail app, a notes app, and a file manager all operate on the same files — just arranged differently.
+- **App-agnostic.** The protocol defines files, membership, and transport. How files are organized into directories is up to applications. A mail app, a notes app, and a file manager all operate on the same files — just arranged differently.
 
 ### How a message flows (end to end)
 
-A message is a file with two owners — sender (full) and recipient (read-only). Here is how it flows:
+A message is a file with two members — sender (owner) and recipient (read). Here is how it flows:
 
 ```
 Bob's Client                Bob's Server              Alice's Server             Alice's Client
@@ -112,7 +112,7 @@ The protocol defines no directory structure — apps do. Here are examples of ho
 /ark/alice/calendar/2026-05-01-birthday ← recurring event
 ```
 
-All of these are the same thing underneath: encrypted files with owners. The path and organization are conventions between the app and the user.
+All of these are the same thing underneath: encrypted files with members. The path and organization are conventions between the app and the user.
 
 ---
 
@@ -312,7 +312,7 @@ If Alice needs to change her identity key:
    - If only one direction is signed (e.g., old key is lost), clients warn the user and require manual acceptance.
 5. After the transition period, the old key and transition document are removed.
 
-When an identity key changes, Alice must re-wrap her file keys. Each file has a symmetric file key encrypted to her identity key (Section 4). Alice decrypts each file key with the old identity key and re-encrypts it with the new one. For shared files, other owners' entries are unaffected — they hold the file key wrapped to their own identity keys.
+When an identity key changes, Alice must re-wrap her file keys. Each file has a symmetric file key encrypted to her identity key (Section 4). Alice decrypts each file key with the old identity key and re-encrypts it with the new one. For shared files, other members' entries are unaffected — they hold the file key wrapped to their own identity keys.
 
 ### 2.9 Account recovery
 
@@ -367,7 +367,7 @@ If Alice's old server goes offline (provider shut down, lost access), the alias 
 
 **What doesn't migrate automatically:**
 - Other people's allowlists. Contacts who had Alice allowlisted on the old address may need to re-allowlist the new address. However, since allowlists are keyed by identity public key (not address), a smart server implementation can recognize that the same key is now at a new address and preserve the allowlist entry.
-- Shared file co-ownership. Other owners of shared files have Alice's old server address in the owner list. Alice notifies co-owners (via an `OWNER_MOVED` envelope) so they update the address. Since ownership is verified by identity key, the transition is seamless once addresses are updated.
+- Shared file co-membership. Other members of shared files have Alice's old server address in the member list. Alice notifies co-members (via a `MEMBER_MOVED` envelope) so they update the address. Since membership is verified by identity key, the transition is seamless once addresses are updated.
 
 ### 2.11 Aliases
 
@@ -416,7 +416,7 @@ Messages, notes, documents, photos — all the same thing underneath. Different 
 
 Every Ark file consists of two parts:
 
-1. **Header (unencrypted)** — metadata the server needs to index, serve, and enforce access control. Includes owner list, timestamps, signature, and wrapped file keys.
+1. **Header (unencrypted)** — metadata the server needs to index, serve, and enforce access control. Includes member list, timestamps, signature, and wrapped file keys.
 2. **Body (encrypted)** — the actual content, encrypted with the symmetric file key. Opaque to the server.
 
 See Section 8 for the full binary format.
@@ -442,36 +442,43 @@ Everything else is up to applications. The protocol reserves the `.ark/` directo
 
 All other paths under `/ark/<user>/` are free for apps and users to organize however they want.
 
-### 3.4 Ownership
+### 3.4 Membership
 
-Each file has one or more owners, listed in the header. Every owner holds the file's symmetric key, encrypted to their identity key. This means any owner can decrypt the content.
+Each file has one or more members, listed in the header. Every member holds the file's symmetric key, encrypted to their identity key. This means any member can decrypt the content.
 
-**Owner permissions:**
+**Member permissions:**
 
-| Permission | Can decrypt | Can modify | Can add/remove owners |
+| Permission | Can decrypt | Can modify | Can change members |
 |---|---|---|---|
-| `full` | Yes | Yes | Yes |
+| `owner` | Yes | Yes | Yes |
+| `write` | Yes | Yes | No |
 | `read` | Yes | No | No |
 
-Permission enforcement is server-side — other owners' servers reject updates from `read` owners. It is not cryptographically enforced (a `read` owner has the file key and *could* create a modified copy locally, but other owners' servers won't accept it).
+Permission enforcement is server-side. When a file is updated via PUT, the server:
 
-Each owner entry includes the **path** where that owner's copy of the file lives on their server. This allows co-owners to fetch updates from each other:
+1. Verifies the request signer is in the file's current member list.
+2. If the **body** changed, requires `write` or `owner` permission. Rejects `read` members with `403`.
+3. If the **member list** changed (members added, removed, or permissions modified), requires `owner` permission. Rejects `write` and `read` members with `403`.
+
+This is not cryptographically enforced — any member has the file key and *could* craft a modified file locally, but other members' servers won't accept it during sync because they check the modifier's permission level against the current member list.
+
+Each member entry includes the **path** where that member's copy of the file lives on their server. This allows co-members to fetch updates from each other:
 
 ```
-Owner {
+Member {
   address: "alice@example.com"
   path: "/ark/alice/docs/project-plan"
   identity_key: ...
-  permission: "full"
+  permission: "owner"
   wrapped_key: ...
 }
 ```
 
-**Single owner (default):** Notes, personal files. One owner entry (self, full).
+**Single member (default):** Notes, personal files. One member entry (self, owner).
 
-**Two owners (messaging):** Sender creates file with two owners — self (full) and recipient (read). A copy is delivered to the recipient's `.ark/inbox/` via an envelope (Section 7). The recipient's app can move it to any path.
+**Two members (messaging):** Sender creates file with two members — self (owner) and recipient (read). A copy is delivered to the recipient's `.ark/inbox/` via an envelope (Section 7). The recipient's app can move it to any path.
 
-**Multiple owners (collaboration):** Shared documents. All owners at `full` permission can read and modify. See Section 3.6 for sync.
+**Multiple members (collaboration):** Shared documents. All members at `write` or `owner` permission can read and modify. See Section 3.6 for sync.
 
 ### 3.5 Directory listings
 
@@ -509,43 +516,43 @@ Response (JSON):
 
 Entries include header metadata (from the unencrypted header) but not the encrypted body. Subdirectories are listed with a trailing `/`.
 
-### 3.6 Multi-owner sync
+### 3.6 Multi-member sync
 
-When a file has multiple owners with `full` permission, edits need to propagate.
+When a file has multiple members with `write` or `owner` permission, edits need to propagate.
 
 **Last-write-wins.** The `modified` timestamp is the tiebreaker. No merge, no conflict resolution in v1. When Alice updates a shared file:
 
 1. Alice edits the content, re-encrypts with the file key, bumps `modified`, signs with her device key.
 2. Alice's client writes the updated file to her server.
-3. Alice's server sends an `OBJECT_UPDATED` notification to each co-owner's server (lightweight envelope, no PoW — see Section 7.3).
-4. Co-owners' servers (or clients) fetch the updated file from Alice's server using the path in her owner entry.
-5. If a co-owner also made an edit concurrently, the higher `modified` timestamp wins. The losing edit is discarded (or preserved in the history chain if versioning is enabled).
+3. Alice's server sends an `OBJECT_UPDATED` notification to each co-member's server (lightweight envelope, no PoW — see Section 7.3).
+4. Co-members' servers (or clients) fetch the updated file from Alice's server using the path in her member entry.
+5. If a co-member also made an edit concurrently, the higher `modified` timestamp wins. The losing edit is discarded (or preserved in the history chain if versioning is enabled).
 
-**Fetching from another owner's server:**
+**Fetching from another member's server:**
 
 ```
 GET https://example.com/ark/alice/docs/project-plan
 Authorization: ArkUser <device_id>:<signature>
 ```
 
-The server verifies the requester is in the file's owner list (by checking identity key against the header) before serving the file.
+The server verifies the requester is in the file's member list (by checking identity key against the header) before serving the file.
 
-### 3.7 Adding and removing owners
+### 3.7 Adding and removing members
 
-**Adding an owner:**
+**Adding a member:**
 
-1. An existing owner (with `full` permission) decrypts the file key.
-2. Encrypts the file key to the new owner's identity key (fetched via key discovery, Section 2.5).
-3. Adds a new `Owner` entry to the file header.
-4. Signs the updated file and syncs to other owners.
+1. An existing member (with `owner` permission) decrypts the file key.
+2. Encrypts the file key to the new member's identity key (fetched via key discovery, Section 2.5).
+3. Adds a new `Member` entry to the file header.
+4. Signs the updated file and syncs to other members.
 
-**Removing an owner:**
+**Removing a member:**
 
-1. An existing owner (with `full` permission) removes the `Owner` entry.
-2. Remaining owners generate a **new file key** (the removed owner knew the old one).
+1. An existing member (with `owner` permission) removes the `Member` entry.
+2. Remaining members generate a **new file key** (the removed member knew the old one).
 3. Re-encrypt the body with the new key.
-4. Re-wrap the new key for each remaining owner.
-5. The removed owner still has their old copy (can't prevent this — they had the key). But new edits use the new key they don't have.
+4. Re-wrap the new key for each remaining member.
+5. The removed member still has their old copy (can't prevent this — they had the key). But new edits use the new key they don't have.
 
 ### 3.8 Versioning
 
@@ -572,7 +579,7 @@ A list of previous versions in reverse chronological order:
 
 See Section 8.3 for the wire format.
 
-**Storage:** History counts toward `max_account_size`. Owners can configure max history depth per-file. Pruning removes the oldest entries.
+**Storage:** History counts toward `max_account_size`. Members can configure max history depth per-file. Pruning removes the oldest entries.
 
 **When versioning is off (default):** No history file. Updates overwrite. Simpler, lighter.
 
@@ -584,11 +591,11 @@ See Section 8.3 for the wire format.
 
 ### 4.1 Concept
 
-Every file's body is encrypted with a **symmetric file key** (AES-256-GCM). The file key is then wrapped (encrypted) to each owner's identity key using ECIES. This two-layer approach means:
+Every file's body is encrypted with a **symmetric file key** (AES-256-GCM). The file key is then wrapped (encrypted) to each member's identity key using ECIES. This two-layer approach means:
 
-- Content is encrypted once, regardless of how many owners there are.
-- Adding an owner only requires wrapping the existing file key — no re-encryption of content.
-- Removing an owner requires generating a new file key and re-encrypting content (since the removed owner knew the old key).
+- Content is encrypted once, regardless of how members there are.
+- Adding a member only requires wrapping the existing file key — no re-encryption of content.
+- Removing a member requires generating a new file key and re-encrypting content (since the removed member knew the old key).
 
 ### 4.2 File key generation
 
@@ -600,7 +607,7 @@ When a file is created:
    nonce = random 12 bytes
    ciphertext, tag = AES-256-GCM(file_key, nonce, payload)
    ```
-3. For each owner, the client wraps the file key using **ECIES**:
+3. For each member, the client wraps the file key using **ECIES**:
    ```
    ephemeral_key = random X25519 keypair
    shared_secret = X25519(ephemeral_private, owner_encryption_key)
@@ -612,14 +619,14 @@ When a file is created:
    )
    wrapped_file_key = AES-256-GCM(wrapping_key, random_nonce, file_key)
    ```
-4. Each owner entry in the header stores the `ephemeral_public`, `nonce`, and `wrapped_file_key`.
+4. Each member entry in the header stores the `ephemeral_public`, `nonce`, and `wrapped_file_key`.
 
 ### 4.3 Decryption
 
 When Alice decrypts a file:
 
-1. Alice finds her owner entry in the header (matched by identity key).
-2. Alice computes the shared secret using her private key and the ephemeral public key in her owner entry:
+1. Alice finds her member entry in the header (matched by identity key).
+2. Alice computes the shared secret using her private key and the ephemeral public key in her member entry:
    ```
    shared_secret = X25519(alice_private, ephemeral_public)
    ```
@@ -631,10 +638,10 @@ When Alice decrypts a file:
 
 Direct ECIES encryption (as in v0.3) encrypts content directly to each recipient's public key. This works for one-to-one messages but breaks down for shared files:
 
-- **N owners would require N copies of the ciphertext** (each encrypted to a different key). A 100MB file shared with 5 people would require 500MB of storage.
-- **Adding an owner requires re-encrypting the entire content.** With a symmetric file key, adding an owner only wraps the 32-byte key — instant, regardless of content size.
+- **N members would require N copies of the ciphertext** (each encrypted to a different key). A 100MB file shared with 5 people would require 500MB of storage.
+- **Adding a member requires re-encrypting the entire content.** With a symmetric file key, adding a member only wraps the 32-byte key — instant, regardless of content size.
 
-The symmetric key approach encrypts content once and wraps the small key per-owner. Standard construction, used by Signal (group messages), PGP (session keys), and every major encrypted storage system.
+The symmetric key approach encrypts content once and wraps the small key per-member. Standard construction, used by Signal (group messages), PGP (session keys), and every major encrypted storage system.
 
 ### 4.5 Multi-device decryption
 
@@ -643,7 +650,7 @@ Since there's a single identity keypair per user, multi-device is straightforwar
 - **Mode B (server-managed key):** All devices get the private key from the server. Any device can unwrap any file key.
 - **Mode A (client-managed key):** All devices derive the same private key from the seed phrase. Same result.
 
-File keys are wrapped to the **identity key**, not per-device. One wrap per owner, regardless of how many devices that owner has.
+File keys are wrapped to the **identity key**, not per-device. One wrap per member, regardless of how many devices that member has.
 
 ### 4.6 Encryption algorithms
 
@@ -687,10 +694,10 @@ When Alice creates or modifies a file:
    ```
    signature = Ed25519_Sign(
      device_private_key,
-     modified || modified_by || owners_hash || body_hash
+     modified || modified_by || members_hash || body_hash
    )
    ```
-   Where `owners_hash` is the SHA-256 of the serialized owner entries and `body_hash` is the SHA-256 of the encrypted body.
+   Where `members_hash` is the SHA-256 of the serialized member entries and `body_hash` is the SHA-256 of the encrypted body.
 2. The signature and `modifier_device_id` are included in the header.
 3. Any server or client can verify by fetching the modifier's identity document and checking the device key.
 
@@ -1024,7 +1031,7 @@ All communication happens over **HTTPS**. No custom protocols, no special ports.
 Transport has three modes:
 1. **Local access** — client reads/writes files on its own server by path.
 2. **Cross-server delivery** — sending files to other users' `.ark/inbox/` via envelopes.
-3. **Cross-server sync** — keeping shared files in sync between co-owners' servers.
+3. **Cross-server sync** — keeping shared files in sync between co-members' servers.
 
 ### 7.2 Local file access
 
@@ -1058,12 +1065,12 @@ HTTP headers include file metadata extracted from the Ark header:
 ```
 X-Ark-Modified: 1712838400
 X-Ark-Modified-By: alice@example.com
-X-Ark-Owners: 2
+X-Ark-Members: 2
 X-Ark-Versioned: true
 Content-Length: 4096
 ```
 
-Clients that need the full header (owner entries, wrapped keys) use GET and read only the header portion.
+Clients that need the full header (member entries, wrapped keys) use GET and read only the header portion.
 
 **Special endpoints:**
 
@@ -1089,7 +1096,7 @@ Authorization: ArkServer sender.example.com <server-signature>
 <binary envelope>
 ```
 
-The envelope contains the Ark file plus Alice's owner entry (her wrapped file key), the PoW stamp, and the sender's signature. Alice's server extracts the file and writes it to `.ark/inbox/` with a generated filename (the envelope's `message_id`).
+The envelope contains the Ark file plus Alice's member entry (her wrapped file key), the PoW stamp, and the sender's signature. Alice's server extracts the file and writes it to `.ark/inbox/` with a generated filename (the envelope's `message_id`).
 
 The file header includes an `app` hint (e.g., `"mail"`, `"calendar"`) so client-side apps know which files to claim from `.ark/inbox/`.
 
@@ -1110,7 +1117,7 @@ The file header includes an `app` hint (e.g., `"mail"`, `"calendar"`) so client-
 
 ### 7.4 Cross-server sync (shared files)
 
-When a shared file is updated, co-owners' servers are notified.
+When a shared file is updated, co-members' servers are notified.
 
 **Update notification:**
 
@@ -1126,31 +1133,31 @@ The notification envelope contains:
 - `path` — the updated file's path on the modifier's server.
 - `modified` — new timestamp.
 - `modified_by` — who made the change.
-- Signature from the modifier (proves ownership).
+- Signature from the modifier (proves membership).
 
-**No PoW required** for sync notifications between co-owners. The co-ownership relationship is already established — the receiving server verifies the modifier is in the file's owner list.
+**No PoW required** for sync notifications between co-members. The co-membership relationship is already established — the receiving server verifies the modifier is in the file's member list.
 
 **Fetching the updated file:**
 
-After receiving a notification, the co-owner's server (or client) fetches the updated file:
+After receiving a notification, the co-member's server (or client) fetches the updated file:
 
 ```
 GET https://bob-server.com/ark/bob/docs/project-plan
 Authorization: ArkUser <device_id>:<signature>
 ```
 
-The serving server verifies the requester's identity key is in the file's owner list before responding.
+The serving server verifies the requester's identity key is in the file's member list before responding.
 
-**Owner moved notification:**
+**Member moved notification:**
 
-When an owner migrates to a new server (Section 2.10), they send an `OWNER_MOVED` envelope to co-owners' `.ark/inbox/` directories:
+When a member migrates to a new server (Section 2.10), they send a `MEMBER_MOVED` envelope to co-members' `.ark/inbox/` directories:
 
 ```
-Envelope type: OWNER_MOVED
+Envelope type: MEMBER_MOVED
 Payload: { old_address, new_address, identity_key, signature }
 ```
 
-Co-owners' clients update the owner address and path in shared files. Identity key stays the same, so trust is preserved.
+Co-members' clients update the member address and path in shared files. Identity key stays the same, so trust is preserved.
 
 ### 7.5 Real-time events
 
@@ -1192,8 +1199,8 @@ A server is a **single statically-linked binary** containing:
 │  └── Remote identity document cache          │
 ├──────────────────────────────────────────────┤
 │  Sync Engine                                 │
-│  ├── Notify co-owners on file update         │
-│  ├── Fetch updates from co-owners            │
+│  ├── Notify co-members on file update         │
+│  ├── Fetch updates from co-members            │
 │  └── Conflict resolution (last-write)        │
 ├──────────────────────────────────────────────┤
 │  TLS (ACME / Let's Encrypt)                  │
@@ -1325,8 +1332,8 @@ message Header {
   uint64 created = 1;                   // Unix milliseconds
   uint64 modified = 2;                  // Unix milliseconds
 
-  // Ownership
-  repeated Owner owners = 3;
+  // Membership
+  repeated Member members = 3;
 
   // Encryption
   string algorithm = 4;                 // "aes-256-gcm" or "chacha20-poly1305"
@@ -1344,16 +1351,16 @@ message Header {
   string app = 10;                     // e.g., "mail", "calendar", "notes" — optional
 }
 
-message Owner {
+message Member {
   string address = 1;                   // "alice@example.com"
-  string path = 2;                     // "/ark/alice/notes/todo" — where this owner's copy lives
-  bytes identity_key = 3;              // Owner's Ed25519 public key (for verification)
-  string permission = 4;               // "full" or "read"
+  string path = 2;                     // "/ark/alice/notes/todo" — where this member's copy lives
+  bytes identity_key = 3;              // Member's Ed25519 public key (for verification)
+  string permission = 4;               // "owner", "write", or "read"
 
-  // File key wrapped for this owner (ECIES)
+  // File key wrapped for this member (ECIES)
   bytes ephemeral_key = 5;            // X25519 ephemeral public key (32 bytes)
   bytes key_nonce = 6;                // AES-256-GCM nonce for key wrapping (12 bytes)
-  bytes wrapped_file_key = 7;         // File key encrypted to this owner (32 bytes + 16 byte tag)
+  bytes wrapped_file_key = 7;         // File key encrypted to this member (32 bytes + 16 byte tag)
 }
 ```
 
@@ -1373,7 +1380,7 @@ message HistoryEntry {
 }
 ```
 
-The history file is encrypted with the same file key as the parent file. Same ownership, same access control.
+The history file is encrypted with the same file key as the parent file. Same membership, same access control.
 
 ### 8.4 Envelope
 
@@ -1384,8 +1391,8 @@ enum EnvelopeType {
   DELIVER = 0;                         // Deliver a file to a recipient
   REGISTER = 1;                        // Registration request (Section 6.5)
   UNREGISTER = 2;                      // Unregistration request (Section 6.5)
-  OBJECT_UPDATED = 3;                  // Notify co-owner of file update
-  OWNER_MOVED = 4;                     // Notify co-owners of address change
+  OBJECT_UPDATED = 3;                  // Notify co-member of file update
+  MEMBER_MOVED = 4;                     // Notify co-members of address change
 }
 
 message Envelope {
@@ -1415,7 +1422,7 @@ message Envelope {
   // Payload — depends on envelope type:
   // DELIVER: raw Ark file bytes (header + encrypted body)
   // OBJECT_UPDATED: FileUpdateNotification
-  // OWNER_MOVED: OwnerMovedNotification
+  // MEMBER_MOVED: MemberMovedNotification
   // REGISTER/UNREGISTER: empty
   bytes payload = 11;
 }
@@ -1433,10 +1440,10 @@ message FileUpdateNotification {
   string path = 1;                    // Path on the modifier's server
   uint64 modified = 2;
   string modified_by = 3;
-  bytes signature = 4;               // Modifier's signature (proves ownership)
+  bytes signature = 4;               // Modifier's signature (proves membership)
 }
 
-message OwnerMovedNotification {
+message MemberMovedNotification {
   string old_address = 1;
   string new_address = 2;
   bytes identity_key = 3;
@@ -1473,10 +1480,10 @@ Identity documents, server identity, policy files, and contacts are JSON (human-
 
 | Risk | Details |
 |---|---|
-| **Metadata** | File paths, sizes, timestamps, owner addresses, and cross-server delivery patterns are visible to the server and network observers. Path names may reveal content intent (e.g., `/notes/tax-2025`). |
+| **Metadata** | File paths, sizes, timestamps, member addresses, and cross-server delivery patterns are visible to the server and network observers. Path names may reveal content intent (e.g., `/notes/tax-2025`). |
 | **Forward secrecy** | If the identity private key is compromised, all file keys can be unwrapped, and all past and future data can be decrypted. This is a deliberate tradeoff for simplicity and recoverability. See Section 10.1 for the forward secrecy extension. |
 | **Mode B server trust** | If the server holds the private key (Mode B), the server can read all data. Self-hosters mitigate this by controlling the server. |
-| **Removed owner's existing copy** | When an owner is removed from a shared file, they retain any copy they already downloaded. Re-keying prevents access to future edits, not past content. |
+| **Removed member's existing copy** | When a member is removed from a shared file, they retain any copy they already downloaded. Re-keying prevents access to future edits, not past content. |
 | **Path metadata** | File paths are unencrypted (the server needs them for routing). Path names like `/mail/inbox/` or `/notes/secret-project` are visible to the server. For maximum privacy, use opaque paths. |
 
 ### 9.3 Compromise scenarios
@@ -1499,7 +1506,7 @@ Identity documents, server identity, policy files, and contacts are JSON (human-
 
 **Scenario: Shared file key is compromised**
 - Only the specific file is affected, not Alice's other data.
-- Mitigation: re-key the file (generate new file key, re-encrypt body, re-wrap for all owners).
+- Mitigation: re-key the file (generate new file key, re-encrypt body, re-wrap for all members).
 
 **Scenario: Server-to-server traffic is intercepted (TLS broken)**
 - Attacker sees encrypted envelopes in transit. They can see metadata (routing info is plaintext).
@@ -1658,7 +1665,7 @@ All Ark paths are under `https://<domain>/ark/`.
 | `/ark/<user>/.ark/identity` | GET | User identity document |
 | `/ark/<user>/.ark/policy` | GET | User spam policy (optional) |
 
-**User-level (authenticated — owner or co-owner):**
+**User-level (authenticated — member):**
 
 | Path | Method | Purpose |
 |---|---|---|
