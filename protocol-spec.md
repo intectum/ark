@@ -478,14 +478,14 @@ Member {
 
 **Two members (messaging):** Sender creates file with two members — self (owner) and recipient (read). A copy is delivered to the recipient's `.ark/inbox/` via an envelope (Section 7). The recipient's app can move it to any path.
 
-**Multiple members (collaboration):** Shared documents. All members at `write` or `owner` permission can read and modify. See Section 3.6 for sync.
+**Multiple members (collaboration):** Shared documents. All members at `write` or `owner` permission can read and modify. See Section 3.7 for sync.
 
 ### 3.5 Directory listings
 
-A GET request to a directory path (trailing `/`) returns a listing of entries with their headers:
+A GET request to a directory path returns a listing of entries with their headers. The server knows whether a path is a file or a directory — no trailing slash needed:
 
 ```
-GET https://example.com/ark/alice/notes/
+GET https://example.com/ark/alice/notes
 Authorization: ArkUser <device_id>:<signature>
 ```
 
@@ -507,16 +507,65 @@ Response (JSON):
       "modified_by": "alice@example.com"
     },
     {
-      "name": "work/",
+      "name": "work",
       "type": "directory"
     }
   ]
 }
 ```
 
-Entries include header metadata (from the unencrypted header) but not the encrypted body. Subdirectories are listed with a trailing `/`.
+Entries include header metadata (from the unencrypted header) but not the encrypted body. Subdirectories are listed with `"type": "directory"`.
 
-### 3.6 Multi-member sync
+### 3.6 Directory membership
+
+A directory can have its own member list, stored at `.ark/members` within the directory:
+
+```
+/ark/alice/projects/.ark/members
+```
+
+```json
+{
+  "members": [
+    {
+      "address": "alice@example.com",
+      "identity_key": "...",
+      "permission": "owner"
+    },
+    {
+      "address": "bob@other.com",
+      "identity_key": "...",
+      "permission": "write"
+    }
+  ],
+  "signature": "..."
+}
+```
+
+When a file is created in a directory with a members file, the client wraps the file key for each directory member. The server enforces this — it rejects any PUT where the file's member list does not include all directory members at their directory-level permission or higher.
+
+**Inheritance rules:**
+
+- Directory members cascade to all subdirectories and files below.
+- A subdirectory's `.ark/members` can **add** new members or **elevate** permissions (e.g., `read` → `write`), but cannot reduce or remove members inherited from a parent directory.
+- The server resolves the effective member list by walking up from the file's directory to the user root, accumulating members. The highest permission for each identity key wins.
+- Only members with `owner` permission on a directory can modify that directory's `.ark/members` file.
+
+**Example:**
+
+```
+/ark/alice/projects/.ark/members          → alice (owner), bob (read)
+/ark/alice/projects/secret/.ark/members   → carol (write), bob (write)
+```
+
+Effective members for files in `/ark/alice/projects/secret/`:
+- alice: `owner` (inherited from parent)
+- bob: `write` (elevated from parent's `read` by subdirectory)
+- carol: `write` (added by subdirectory)
+
+**No directory members (default):** If no `.ark/members` file exists in a directory or any parent, files have only the members specified in their own headers. This is the normal case for personal files.
+
+### 3.7 Multi-member sync
 
 When a file has multiple members with `write` or `owner` permission, edits need to propagate.
 
@@ -537,7 +586,7 @@ Authorization: ArkUser <device_id>:<signature>
 
 The server verifies the requester is in the file's member list (by checking identity key against the header) before serving the file.
 
-### 3.7 Adding and removing members
+### 3.8 Adding and removing members
 
 **Adding a member:**
 
@@ -554,7 +603,7 @@ The server verifies the requester is in the file's member list (by checking iden
 4. Re-wrap the new key for each remaining member.
 5. The removed member still has their old copy (can't prevent this — they had the key). But new edits use the new key they don't have.
 
-### 3.8 Versioning
+### 3.9 Versioning
 
 Versioning is optional, per-file. When enabled, the file always represents the **current version**. History is stored in a separate **history file**, referenced from the main file's header.
 
@@ -1052,7 +1101,7 @@ The server verifies the signature against the device key registered in Alice's i
 | `HEAD` | `/ark/alice/path/to/file` | Fetch header/metadata only |
 | `PUT` | `/ark/alice/path/to/file` | Create or update a file |
 | `DELETE` | `/ark/alice/path/to/file` | Delete a file |
-| `GET` | `/ark/alice/path/to/dir/` | List directory contents |
+| `GET` | `/ark/alice/path/to/dir` | List directory contents |
 
 **GET response:**
 
@@ -1673,7 +1722,7 @@ All Ark paths are under `https://<domain>/ark/`.
 | `/ark/<user>/<path>` | HEAD | Fetch header/metadata only |
 | `/ark/<user>/<path>` | PUT | Create or update file |
 | `/ark/<user>/<path>` | DELETE | Delete file |
-| `/ark/<user>/<dir>/` | GET | List directory |
+| `/ark/<user>/<dir>` | GET | List directory |
 | `/ark/<user>/.ark/contacts` | GET/PUT | Manage contacts allowlist |
 | `/ark/<user>/.ark/stream` | GET | Real-time event stream |
 
