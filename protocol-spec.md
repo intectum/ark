@@ -40,7 +40,7 @@ Ark is a federated, encrypted protocol for personal data. It replaces email, clo
 - **Simple to self-host.** A single binary, a single config file, a domain with an A record. That's it.
 - **Federated, not peer-to-peer.** Servers provide reliable offline storage and key hosting. Pure P2P systems (Bitmessage, Briar) struggle with reliability and adoption.
 - **Spam-resistant by construction.** Proof of work + unforgeable identity + contact allowlists make bulk spam economically infeasible without complex filtering infrastructure.
-- **Simple key model.** One keypair per identity, like a crypto wallet. Lose the key, lose the identity. Have the key, have all your data. No complex session state to manage.
+- **Simple key model.** One keypair per identity, like a crypto wallet. Lose the key, lose the identity. Have the key, have all your data. Ratcheted sequences (Section 10.1) optionally add session state for forward secrecy — users who opt in accept the tradeoff that those sequences are tied to one device and not recoverable from the seed phrase alone.
 - **Flexible trust model.** Users choose where their private key lives — on their device (maximum security) or on their server (maximum convenience). Self-hosters get both.
 - **App-agnostic.** The protocol defines files, membership, and transport. How files are organized into directories is up to applications. A mail app, a notes app, and a file manager all operate on the same files — just arranged differently.
 
@@ -212,6 +212,14 @@ Response:
       "registered": "2026-04-01T00:00:00Z"
     }
   ],
+  "prekeys": {
+    "signed_prekey": "base64url-encoded-x25519-public-key",
+    "signed_prekey_signature": "base64url-encoded-ed25519-signature",
+    "one_time_prekeys": [
+      "base64url-encoded-x25519-public-key",
+      "base64url-encoded-x25519-public-key"
+    ]
+  },
   "updated": "2026-04-11T12:00:00Z",
   "signature": "base64url-encoded-ed25519-signature-over-everything-above"
 }
@@ -229,6 +237,10 @@ Response:
 | `devices[].device_id` | Numeric ID, unique per user. |
 | `devices[].device_key` | Per-device Ed25519 signing key, authorized by the identity key. |
 | `devices[].label` | Human-readable device name. |
+| `prekeys` | Prekey bundle for forward secrecy sessions (Section 10.1). Optional — only present if the user supports ratcheted sequences. |
+| `prekeys.signed_prekey` | X25519 public key, rotated periodically (e.g., weekly). Signed by the identity key. |
+| `prekeys.signed_prekey_signature` | Ed25519 signature over the signed prekey, proving the identity key holder published it. |
+| `prekeys.one_time_prekeys` | List of single-use X25519 public keys. Consumed on first use. Server removes each key after it is fetched. |
 | `signature` | Ed25519 signature over the entire document (excluding this field). Proves the identity key holder authored this. |
 
 **The self-signature is the key security property** (for Mode A users). The server hosts this document but cannot tamper with it — any modification invalidates the signature. This means:
@@ -646,9 +658,20 @@ Every file's body is encrypted with a **symmetric file key** (AES-256-GCM). The 
 - Adding a member only requires wrapping the existing file key — no re-encryption of content.
 - Removing a member requires generating a new file key and re-encrypting content (since the removed member knew the old key).
 
-### 4.2 File key generation
+### 4.2 Key derivation modes
 
-When a file is created:
+Ark supports two key derivation modes, specified in the file header's `key_derivation` field:
+
+| Mode | Value | Forward secrecy | Recoverable | Use case |
+|---|---|---|---|---|
+| **Static** | `ecies` (default) | No | Yes — identity key unwraps all file keys | Notes, documents, shared files, single messages |
+| **Ratcheted** | `ratchet` | Yes — old keys are destroyed | No — lost ratchet state = lost history | Ongoing file sequences requiring forward secrecy |
+
+Static mode is the default and is described in this section. Ratcheted mode is described in Section 10.1.
+
+### 4.3 File key generation (static mode)
+
+When a file is created in static mode:
 
 1. The client generates a random 256-bit **file key**.
 2. The client encrypts the file body with the file key:
@@ -670,7 +693,7 @@ When a file is created:
    ```
 4. Each member entry in the header stores the `ephemeral_public`, `nonce`, and `wrapped_file_key`.
 
-### 4.3 Decryption
+### 4.4 Decryption (static mode)
 
 When Alice decrypts a file:
 
@@ -683,7 +706,7 @@ When Alice decrypts a file:
 4. Alice decrypts the wrapped file key.
 5. Alice decrypts the file body with the file key.
 
-### 4.4 Why a symmetric file key?
+### 4.5 Why a symmetric file key?
 
 Direct ECIES encryption (as in v0.3) encrypts content directly to each recipient's public key. This works for one-to-one messages but breaks down for shared files:
 
@@ -692,7 +715,7 @@ Direct ECIES encryption (as in v0.3) encrypts content directly to each recipient
 
 The symmetric key approach encrypts content once and wraps the small key per-member. Standard construction, used by Signal (group messages), PGP (session keys), and every major encrypted storage system.
 
-### 4.5 Multi-device decryption
+### 4.6 Multi-device decryption
 
 Since there's a single identity keypair per user, multi-device is straightforward:
 
@@ -701,7 +724,7 @@ Since there's a single identity keypair per user, multi-device is straightforwar
 
 File keys are wrapped to the **identity key**, not per-device. One wrap per member, regardless of how many devices that member has.
 
-### 4.6 Encryption algorithms
+### 4.7 Encryption algorithms
 
 | Operation | Algorithm | Parameters |
 |---|---|---|
@@ -715,7 +738,7 @@ File keys are wrapped to the **identity key**, not per-device. One wrap per memb
 
 Clients MUST support AES-256-GCM. ChaCha20-Poly1305 is recommended as an alternative (faster on devices without AES hardware acceleration). The algorithm used is indicated in the file header.
 
-### 4.7 Why not PGP?
+### 4.8 Why not PGP?
 
 PGP/GPG uses a similar model (session keys wrapped with public keys) but has well-known usability problems:
 - Key management is manual and error-prone (keyrings, keyservers, web of trust).
@@ -1398,6 +1421,12 @@ message Header {
 
   // App hint (for .ark/inbox/ routing by client apps)
   string app = 10;                     // e.g., "mail", "calendar", "notes" — optional
+
+  // Forward secrecy (reserved for ratcheted sequences — see Section 10.1)
+  string key_derivation = 11;          // "ecies" (default) or "ratchet"
+  bytes sequence_id = 12;              // Identifies the ratchet session (if key_derivation = "ratchet")
+  uint64 message_index = 13;           // Position in the ratchet chain
+  bytes ratchet_key = 14;              // Sender's current DH ratchet public key (X25519, 32 bytes)
 }
 
 message Member {
@@ -1523,14 +1552,15 @@ Identity documents, server identity, policy files, and contacts are JSON (human-
 | **Author authentication** | Files and envelopes are signed by the author's device key. Forgery requires the private key. |
 | **Integrity** | Any modification to a file invalidates the signature. Any modification to the ciphertext invalidates the AEAD tag. |
 | **Spam resistance** | Bulk cross-server delivery requires proportional computational resources (PoW). |
-| **Data persistence** | All files can be decrypted with the single identity key (which unwraps file keys). No session state to lose. |
+| **Data persistence (static mode)** | All static-mode files can be decrypted with the single identity key (which unwraps file keys). No session state to lose. |
+| **Forward secrecy (ratcheted mode)** | Ratcheted sequences (Section 10.1) use the Double Ratchet — old keys are destroyed after use. Compromising the identity key does not expose past ratcheted messages. |
 
 ### 9.2 What is NOT protected
 
 | Risk | Details |
 |---|---|
 | **Metadata** | File paths, sizes, timestamps, member addresses, and cross-server delivery patterns are visible to the server and network observers. Path names may reveal content intent (e.g., `/notes/tax-2025`). |
-| **Forward secrecy** | If the identity private key is compromised, all file keys can be unwrapped, and all past and future data can be decrypted. This is a deliberate tradeoff for simplicity and recoverability. See Section 10.1 for the forward secrecy extension. |
+| **Forward secrecy (static mode)** | In static mode (default), if the identity private key is compromised, all file keys can be unwrapped, and all past and future data can be decrypted. This is a deliberate tradeoff for simplicity and recoverability. Ratcheted sequences (Section 10.1) provide forward secrecy for sequences that opt in. |
 | **Mode B server trust** | If the server holds the private key (Mode B), the server can read all data. Self-hosters mitigate this by controlling the server. |
 | **Removed member's existing copy** | When a member is removed from a shared file, they retain any copy they already downloaded. Re-keying prevents access to future edits, not past content. |
 | **Path metadata** | File paths are unencrypted (the server needs them for routing). Path names like `/mail/inbox/` or `/notes/secret-project` are visible to the server. For maximum privacy, use opaque paths. |
@@ -1580,15 +1610,146 @@ Identity documents, server identity, policy files, and contacts are JSON (human-
 
 These are planned features not included in the core v1 protocol. They can be layered on top without breaking compatibility.
 
-### 10.1 Forward Secrecy (optional mode)
+### 10.1 Forward Secrecy — Ratcheted Sequences
 
-A future version could add an optional **forward secrecy mode** for message conversations between two users who both opt in. This would use the Signal protocol's Double Ratchet:
+An optional **ratcheted key derivation mode** for file sequences between two parties. Uses the Double Ratchet algorithm (as used in Signal) to provide forward secrecy: compromising the identity key does not expose past messages, and compromising a single message key does not expose other messages.
 
-- Each message would use a unique ephemeral key, and old keys would be destroyed.
-- Compromising the identity key would not expose past messages.
-- The tradeoff: messages encrypted with destroyed keys become unrecoverable.
+This is opt-in. The default static mode (Section 4.2) remains unchanged. Both modes coexist — apps choose which to use based on the use case.
 
-This would be negotiated per-conversation and coexist with the default file key mode.
+#### 10.1.1 Concept
+
+A **ratcheted sequence** is an ordered collection of files between exactly two parties, where each file's key is derived from a ratchet chain rather than generated randomly and wrapped via ECIES. The sequence lives in a directory:
+
+```
+/ark/alice/mail/conversations/bob-abc123/
+  .ark/members              ← exactly 2 members
+  .ark/ratchet              ← ratchet session state (encrypted to self only, single device)
+  0001                      ← file, key derived from ratchet
+  0002                      ← file, key derived from ratchet
+  ...
+```
+
+Each file in the sequence is still a standard Ark file (same binary format, same transport, same envelope delivery). The only difference is how the file key is derived — from the ratchet chain instead of random + ECIES.
+
+#### 10.1.2 Prekey bundles
+
+To establish a ratchet session without requiring both parties to be online simultaneously, the protocol uses **X3DH** (Extended Triple Diffie-Hellman) key agreement. This requires prekeys published in the identity document (Section 2.4):
+
+| Field | Purpose |
+|---|---|
+| `prekeys.signed_prekey` | X25519 public key, rotated periodically (e.g., weekly). Signed by the identity key to prove authenticity. |
+| `prekeys.signed_prekey_signature` | Ed25519 signature over the signed prekey. |
+| `prekeys.one_time_prekeys` | List of single-use X25519 public keys. The server removes each key after it is fetched by a sender. Provides one-time forward secrecy for session initiation. |
+
+Users who do not publish prekeys do not support ratcheted sequences. Senders fall back to static mode.
+
+**Prekey replenishment:** Clients should monitor their one-time prekey count and upload new keys when the supply runs low. If no one-time prekeys are available, X3DH proceeds without one (reduced forward secrecy for the initial message only).
+
+#### 10.1.3 Session establishment (X3DH)
+
+When Alice initiates a ratcheted sequence with Bob:
+
+1. Alice fetches Bob's identity document and extracts:
+   - Bob's identity key (`IK_B`) — the X25519 encryption key
+   - Bob's signed prekey (`SPK_B`)
+   - One of Bob's one-time prekeys (`OPK_B`), if available
+2. Alice verifies `signed_prekey_signature` against Bob's identity key.
+3. Alice generates an ephemeral X25519 keypair (`EK_A`).
+4. Alice computes four DH values:
+   ```
+   DH1 = X25519(IK_A_private, SPK_B)       # Alice's identity × Bob's signed prekey
+   DH2 = X25519(EK_A_private, IK_B)        # Alice's ephemeral × Bob's identity
+   DH3 = X25519(EK_A_private, SPK_B)       # Alice's ephemeral × Bob's signed prekey
+   DH4 = X25519(EK_A_private, OPK_B)       # Alice's ephemeral × Bob's one-time prekey (if available)
+   ```
+5. Alice derives the initial root key:
+   ```
+   root_key = HKDF-SHA256(
+     ikm: DH1 || DH2 || DH3 || DH4,
+     salt: 0 (32 zero bytes),
+     info: "ark-ratchet-init",
+     length: 32
+   )
+   ```
+6. Alice stores the ratchet state locally and sends the first file in the sequence with her ephemeral public key (`EK_A`) and the one-time prekey identifier in the file header, so Bob can compute the same root key.
+
+#### 10.1.4 Double Ratchet operation
+
+After session establishment, the Double Ratchet proceeds as follows:
+
+**Symmetric ratchet (per-message):** Each file in a sending chain advances a chain key:
+
+```
+chain_key[n+1] = HMAC-SHA256(chain_key[n], 0x02)
+message_key[n] = HMAC-SHA256(chain_key[n], 0x01)
+```
+
+The `message_key` is used as the file key for that file. It is used once and discarded.
+
+**DH ratchet (per-turn):** When the sending direction changes (Alice sends, then Bob sends), a new DH ratchet step occurs:
+
+1. The new sender generates a fresh X25519 ephemeral keypair.
+2. The new sender computes a DH shared secret with the other party's latest ratchet key.
+3. The root key advances:
+   ```
+   dh_output = X25519(new_private, other_ratchet_public)
+   root_key[n+1], chain_key = HKDF-SHA256(
+     ikm: dh_output,
+     salt: root_key[n],
+     info: "ark-ratchet-step",
+     length: 64
+   )
+   ```
+4. The sender's new ratchet public key is included in the file header's `ratchet_key` field.
+
+**File header fields for ratcheted files:**
+
+| Field | Purpose |
+|---|---|
+| `key_derivation` | `"ratchet"` |
+| `sequence_id` | Identifies the ratchet session (random 16 bytes, set at session creation) |
+| `message_index` | Monotonic counter — position in the ratchet chain |
+| `ratchet_key` | Sender's current DH ratchet public key (X25519, 32 bytes) |
+
+The `members` list still exists in the header but `wrapped_file_key` fields are empty — the file key is derived from the ratchet, not wrapped via ECIES.
+
+#### 10.1.5 Ratchet state storage
+
+Ratchet state is stored locally at `.ark/ratchets/<sequence_id>`, encrypted to self only. It contains:
+
+- Current root key
+- Sending and receiving chain keys
+- Current DH ratchet keypair
+- Other party's current DH ratchet public key
+- Message counters
+- Skipped message keys (for out-of-order delivery, capped and pruned)
+
+**Single device only.** Ratchet state is not synced across devices. This is a deliberate choice — ratchet security depends on state never being duplicated. Users who opt into ratcheted sequences accept that those sequences are tied to one device.
+
+**If ratchet state is lost** (device lost, storage failure), all messages in the sequence become unrecoverable. This is the fundamental tradeoff of forward secrecy. Users who need recoverability should use static mode.
+
+#### 10.1.6 Out-of-order delivery
+
+Files may arrive out of order (network delays, server queuing). The ratchet handles this:
+
+1. The recipient checks the `message_index` against their current chain position.
+2. If the index is ahead, the recipient advances the chain and stores skipped message keys (up to a configurable limit, default: 256).
+3. If the index matches a stored skipped key, the recipient uses it and deletes it.
+4. If the index is behind and the key was already deleted, the file is undecryptable.
+
+#### 10.1.7 Group ratchet (future)
+
+The Double Ratchet is fundamentally a 2-party protocol. Group forward secrecy (3+ members) can be layered on top using **sender keys**: each member maintains their own sending chain and distributes the sender key to the group via pairwise ratcheted channels. This is not specified in v1.
+
+#### 10.1.8 Upgrade path
+
+Nothing in the v1 static mode blocks adding ratcheted sequences later:
+
+- The protobuf schema reserves fields `key_derivation`, `sequence_id`, `message_index`, and `ratchet_key` in the Header message.
+- The identity document schema reserves the `prekeys` object.
+- Ratcheted files are standard Ark files — same format, same transport, same envelopes.
+- Old clients that don't understand `key_derivation = "ratchet"` simply cannot decrypt those files (they lack the ratchet state regardless).
+- Proto3 silently ignores unknown fields, so old clients won't break on new headers.
 
 ### 10.2 Legacy Email Interop
 
@@ -1694,6 +1855,9 @@ V1 uses last-write-wins for shared files. A future extension could support real-
 | Alt. body encryption | ChaCha20-Poly1305 | 256-bit | ciphertext + 128-bit tag |
 | Proof of work | Argon2id | variable | 256-bit |
 | Seed phrase | BIP-39 | 256-bit entropy | 24 words |
+| Ratchet session init | X3DH (X25519) | 256-bit | 256-bit root key |
+| Ratchet chain advance | HMAC-SHA256 | 256-bit | 256-bit chain/message key |
+| Ratchet DH step | X25519 + HKDF-SHA256 | 256-bit | 512-bit (root key + chain key) |
 
 ## Appendix B: URL Structure Summary
 
