@@ -34,7 +34,7 @@ Ark is a federated, encrypted protocol for personal data. It replaces email, clo
 ### Design principles
 
 - **Cryptographic identity, not reputation-based.** Your identity is a keypair, not an IP address or domain reputation score. This eliminates the entire class of deliverability problems that plague self-hosted email.
-- **Encrypted by default.** All file content is end-to-end encrypted. Servers store ciphertext they cannot read.
+- **Encrypted by default.** File content is end-to-end encrypted unless explicitly opted out. Servers store ciphertext they cannot read. Unencrypted files are supported for public content — the header still provides authentication and integrity via signatures.
 - **Files on disk.** Storage is the filesystem. No database for user data. Files are accessed by path over HTTPS. Any tool that can read files can interact with Ark data.
 - **One primitive.** Everything is a file with an unencrypted header and an encrypted body. Different membership patterns produce different behaviors, not different concepts.
 - **Simple to self-host.** A single binary, a single config file, a domain with an A record. That's it.
@@ -492,6 +492,24 @@ Member {
 
 **Multiple members (collaboration):** Shared documents. All members at `write` or `owner` permission can read and modify. See Section 3.7 for sync.
 
+**Wildcard member (`*`):** A special member entry with `address = "*"` represents public access. The wildcard member has no `identity_key`, no `path`, and no `wrapped_file_key`. It is only valid on unencrypted files (`algorithm = "none"` — see Section 4.2).
+
+| Wildcard permission | Meaning |
+|---|---|
+| `read` | Anyone can GET the file without authentication. |
+| `write` | Any authenticated Ark user can read and modify the file. |
+| `owner` | Any authenticated Ark user can read, modify, and change the file's members. |
+
+The server skips authentication on GET requests when a `*` member with `read` (or higher) permission is present. For `write` and `owner`, the server still requires a valid `ArkUser` authorization header — "public write" means any authenticated Ark user, not unauthenticated HTTP requests.
+
+Wildcard members can also appear in directory membership files (`.ark/members`). A wildcard member in a directory's member list cascades to all files and subdirectories below, following the same inheritance rules as named members (Section 3.6).
+
+**Use cases for wildcard members:**
+
+- `*` (read): Public website, blog, published documents, open-source project files.
+- `*` (write): Anonymous drop box, public wiki, open submission folder.
+- `*` (owner): Fully open collaborative space (uncommon but not prohibited — the protocol defines mechanism, not policy).
+
 ### 3.5 Directory listings
 
 A GET request to a directory path returns a listing of entries with their headers. The server knows whether a path is a file or a directory — no trailing slash needed:
@@ -658,18 +676,34 @@ Every file's body is encrypted with a **symmetric file key** (AES-256-GCM). The 
 - Adding a member only requires wrapping the existing file key — no re-encryption of content.
 - Removing a member requires generating a new file key and re-encrypting content (since the removed member knew the old key).
 
-### 4.2 Key derivation modes
+### 4.2 Encryption modes
 
-Ark supports two key derivation modes, specified in the file header's `key_derivation` field:
+The file header's `algorithm` field specifies whether and how the body is encrypted:
+
+| Algorithm | Body | Wrapped keys | Use case |
+|---|---|---|---|
+| `aes-256-gcm` (default) | Encrypted | Yes — ECIES-wrapped per member | Private files, messages, shared documents |
+| `chacha20-poly1305` | Encrypted | Yes — ECIES-wrapped per member | Same, for devices without AES hardware acceleration |
+| `none` | Unencrypted (raw bytes) | No — `wrapped_file_key` fields are empty | Public content, websites, published documents |
+
+When `algorithm = "none"`:
+- The body is stored as raw bytes (no nonce, no AEAD tag).
+- Member entries have empty `ephemeral_key`, `key_nonce`, and `wrapped_file_key` fields.
+- The file signature still covers the body hash, providing integrity and authenticity (Section 5.2). This is the **only** integrity guarantee for unencrypted files — there is no AEAD tag to catch tampering.
+- Wildcard members (`*`) are only valid on files with `algorithm = "none"`.
+
+### 4.3 Key derivation modes
+
+Ark supports two key derivation modes for encrypted files, specified in the file header's `key_derivation` field:
 
 | Mode | Value | Forward secrecy | Recoverable | Use case |
 |---|---|---|---|---|
 | **Static** | `ecies` (default) | No | Yes — identity key unwraps all file keys | Notes, documents, shared files, single messages |
 | **Ratcheted** | `ratchet` | Yes — old keys are destroyed | No — lost ratchet state = lost history | Ongoing file sequences requiring forward secrecy |
 
-Static mode is the default and is described in this section. Ratcheted mode is described in Section 10.1.
+Static mode is the default and is described in this section. Ratcheted mode is described in Section 10.1. Neither applies when `algorithm = "none"` (unencrypted files have no file key to derive).
 
-### 4.3 File key generation (static mode)
+### 4.4 File key generation (static mode)
 
 When a file is created in static mode:
 
@@ -693,7 +727,7 @@ When a file is created in static mode:
    ```
 4. Each member entry in the header stores the `ephemeral_public`, `nonce`, and `wrapped_file_key`.
 
-### 4.4 Decryption (static mode)
+### 4.5 Decryption (static mode)
 
 When Alice decrypts a file:
 
@@ -706,7 +740,7 @@ When Alice decrypts a file:
 4. Alice decrypts the wrapped file key.
 5. Alice decrypts the file body with the file key.
 
-### 4.5 Why a symmetric file key?
+### 4.6 Why a symmetric file key?
 
 Direct ECIES encryption (as in v0.3) encrypts content directly to each recipient's public key. This works for one-to-one messages but breaks down for shared files:
 
@@ -715,7 +749,7 @@ Direct ECIES encryption (as in v0.3) encrypts content directly to each recipient
 
 The symmetric key approach encrypts content once and wraps the small key per-member. Standard construction, used by Signal (group messages), PGP (session keys), and every major encrypted storage system.
 
-### 4.6 Multi-device decryption
+### 4.7 Multi-device decryption
 
 Since there's a single identity keypair per user, multi-device is straightforward:
 
@@ -724,7 +758,7 @@ Since there's a single identity keypair per user, multi-device is straightforwar
 
 File keys are wrapped to the **identity key**, not per-device. One wrap per member, regardless of how many devices that member has.
 
-### 4.7 Encryption algorithms
+### 4.8 Encryption algorithms
 
 | Operation | Algorithm | Parameters |
 |---|---|---|
@@ -734,11 +768,12 @@ File keys are wrapped to the **identity key**, not per-device. One wrap per memb
 | File key wrapping | AES-256-GCM | 96-bit nonce, 128-bit tag |
 | File body encryption | AES-256-GCM | 96-bit nonce, 128-bit tag |
 | Alternative body encryption | ChaCha20-Poly1305 | 96-bit nonce, 128-bit tag |
+| Unencrypted body | None | Raw bytes, no nonce or tag |
 | Proof of work | Argon2id | configurable |
 
-Clients MUST support AES-256-GCM. ChaCha20-Poly1305 is recommended as an alternative (faster on devices without AES hardware acceleration). The algorithm used is indicated in the file header.
+Clients MUST support AES-256-GCM and `none` (unencrypted). ChaCha20-Poly1305 is recommended as an alternative (faster on devices without AES hardware acceleration). The algorithm used is indicated in the file header.
 
-### 4.8 Why not PGP?
+### 4.9 Why not PGP?
 
 PGP/GPG uses a similar model (session keys wrapped with public keys) but has well-known usability problems:
 - Key management is manual and error-prone (keyrings, keyservers, web of trust).
@@ -1384,9 +1419,12 @@ An Ark file is a binary file with two sections:
 │  Header (protobuf, unencrypted)  │
 │  └── variable length             │
 ├──────────────────────────────────┤
-│  Body (encrypted)                │
-│  ├── nonce (12 bytes)            │
-│  └── ciphertext + tag (rest)     │
+│  Body                            │
+│  ├── If encrypted:               │
+│  │   ├── nonce (12 bytes)        │
+│  │   └── ciphertext + tag (rest) │
+│  └── If algorithm = "none":      │
+│      └── raw bytes (rest)        │
 └──────────────────────────────────┘
 ```
 
@@ -1408,7 +1446,7 @@ message Header {
   repeated Member members = 3;
 
   // Encryption
-  string algorithm = 4;                 // "aes-256-gcm" or "chacha20-poly1305"
+  string algorithm = 4;                 // "aes-256-gcm", "chacha20-poly1305", or "none"
 
   // Versioning (optional)
   bool versioned = 5;
@@ -1564,6 +1602,8 @@ Identity documents, server identity, policy files, and contacts are JSON (human-
 | **Mode B server trust** | If the server holds the private key (Mode B), the server can read all data. Self-hosters mitigate this by controlling the server. |
 | **Removed member's existing copy** | When a member is removed from a shared file, they retain any copy they already downloaded. Re-keying prevents access to future edits, not past content. |
 | **Path metadata** | File paths are unencrypted (the server needs them for routing). Path names like `/mail/inbox/` or `/notes/secret-project` are visible to the server. For maximum privacy, use opaque paths. |
+| **Unencrypted files** | Files with `algorithm = "none"` have no confidentiality protection. The body is readable by the server, network observers (if TLS is broken), and anyone with read access. Integrity and authenticity are still provided by the file signature. |
+| **Public files** | Files with a wildcard member (`*`) are accessible without authentication. Combined with `algorithm = "none"`, the content is fully public. The signature ensures readers can verify the content is authentic and unmodified. |
 
 ### 9.3 Compromise scenarios
 
@@ -1853,6 +1893,7 @@ V1 uses last-write-wins for shared files. A future extension could support real-
 | File key wrapping | AES-256-GCM | 256-bit | ciphertext + 128-bit tag |
 | File body encryption | AES-256-GCM | 256-bit | ciphertext + 128-bit tag |
 | Alt. body encryption | ChaCha20-Poly1305 | 256-bit | ciphertext + 128-bit tag |
+| No encryption | None | — | raw bytes |
 | Proof of work | Argon2id | variable | 256-bit |
 | Seed phrase | BIP-39 | 256-bit entropy | 24 words |
 | Ratchet session init | X3DH (X25519) | 256-bit | 256-bit root key |
@@ -1877,6 +1918,12 @@ All Ark paths are under `https://<domain>/ark/`.
 |---|---|---|
 | `/ark/<user>/.ark/identity` | GET | User identity document |
 | `/ark/<user>/.ark/policy` | GET | User spam policy (optional) |
+
+**User-level (public files — wildcard `*` read member):**
+
+| Path | Method | Purpose |
+|---|---|---|
+| `/ark/<user>/<path>` | GET | Fetch file (no auth required if `*` read member present) |
 
 **User-level (authenticated — member):**
 
