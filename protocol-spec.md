@@ -40,79 +40,10 @@ Ark is a federated, encrypted protocol for personal data. It replaces email, clo
 - **Simple to self-host.** A single binary, a single config file, a domain with an A record. That's it.
 - **Federated, not peer-to-peer.** Servers provide reliable offline storage and key hosting. Pure P2P systems (Bitmessage, Briar) struggle with reliability and adoption.
 - **Spam-resistant by construction.** Proof of work + unforgeable identity + contact allowlists make bulk spam economically infeasible without complex filtering infrastructure.
-- **Simple key model.** One keypair per identity, like a crypto wallet. Lose the key, lose the identity. Have the key, have all your data. Ratcheted sequences (Section 10.1) optionally add session state for forward secrecy — users who opt in accept the tradeoff that those sequences are tied to one device and not recoverable from the seed phrase alone.
+- **Simple key model.** One keypair per identity, like a crypto wallet. Lose the key, lose the identity. Have the key, have all your data.
 - **Flexible trust model.** Users choose where their private key lives — on their device (maximum security) or on their server (maximum convenience). Self-hosters get both.
 - **App-agnostic.** The protocol defines files, membership, and transport. How files are organized into directories is up to applications. A mail app, a notes app, and a file manager all operate on the same files — just arranged differently.
 
-### How a message flows (end to end)
-
-A message is a file with two members — sender (owner) and recipient (read). Here is how it flows:
-
-```
-Bob's Client                Bob's Server              Alice's Server             Alice's Client
-    |                           |                          |                          |
-    |  1. Fetch Alice's         |                          |                          |
-    |     identity doc -------->|------- HTTPS GET ------->|                          |
-    |  2. Receive public key    |<------ JSON response ----|                          |
-    |                           |                          |                          |
-    |  3. Generate file key,    |                          |                          |
-    |     encrypt content,      |                          |                          |
-    |     wrap key for self     |                          |                          |
-    |     and Alice             |                          |                          |
-    |                           |                          |                          |
-    |  4. Compute proof of work |                          |                          |
-    |     (Argon2id, ~0.5s)     |                          |                          |
-    |                           |                          |                          |
-    |  5. Sign envelope         |                          |                          |
-    |                           |                          |                          |
-    |  6. Store file on ------->|                          |                          |
-    |     home server           |                          |                          |
-    |                           |  7. Relay via HTTPS POST |                          |
-    |                           |------- envelope -------->|                          |
-    |                           |                          |  8. Verify signature      |
-    |                           |                          |  9. Verify PoW            |
-    |                           |                          |  10. Store in .ark/inbox/ |
-    |                           |                          |                          |
-    |                           |                          |  11. Alice fetches ------>|
-    |                           |                          |  12. Decrypt with         |
-    |                           |                          |      private key          |
-    |                           |                          |                          |
-    |                           |                          |  13. Mail app moves file  |
-    |                           |                          |      to mail/inbox/       |
-```
-
-### Example use cases
-
-The protocol defines no directory structure — apps do. Here are examples of how different apps might organize files:
-
-**Mail app:**
-```
-/ark/alice/mail/inbox/abc123          ← received message (moved from .ark/inbox/)
-/ark/alice/mail/sent/def456           ← sent message
-/ark/alice/mail/drafts/ghi789         ← draft
-/ark/alice/mail/archive/2026/jkl012   ← archived message
-```
-
-**Notes app:**
-```
-/ark/alice/notes/personal/todo.md     ← personal note
-/ark/alice/notes/work/meeting-notes   ← work note (could be shared with coworkers)
-```
-
-**File storage:**
-```
-/ark/alice/files/photos/vacation.jpg  ← personal photo
-/ark/alice/files/documents/tax-2025   ← tax document
-/ark/alice/files/shared/project-plan  ← shared with collaborators
-```
-
-**Calendar app:**
-```
-/ark/alice/calendar/2026-04-28-standup  ← calendar event
-/ark/alice/calendar/2026-05-01-birthday ← recurring event
-```
-
-All of these are the same thing underneath: encrypted files with members. The path and organization are conventions between the app and the user.
 
 ---
 
@@ -220,26 +151,6 @@ Response:
       "registered": "2026-04-01T00:00:00Z"
     }
   ],
-  "prekeys": {
-    "signed_prekey": {
-      "algorithm": "x25519",
-      "public_key": "base64url-encoded"
-    },
-    "signed_prekey_signature": {
-      "algorithm": "ed25519",
-      "signature": "base64url-encoded"
-    },
-    "one_time_prekeys": [
-      {
-        "algorithm": "x25519",
-        "public_key": "base64url-encoded"
-      },
-      {
-        "algorithm": "x25519",
-        "public_key": "base64url-encoded"
-      }
-    ]
-  },
   "updated": "2026-04-11T12:00:00Z",
   "signature": {
     "algorithm": "ed25519",
@@ -259,10 +170,6 @@ Response:
 | `devices[].device_id` | Numeric ID, unique per user. |
 | `devices[].device_key` | Per-device signing key, authorized by the identity key. Contains `algorithm` and `public_key`. |
 | `devices[].label` | Human-readable device name. |
-| `prekeys` | Prekey bundle for forward secrecy sessions (Section 10.1). Optional — only present if the user supports ratcheted sequences. |
-| `prekeys.signed_prekey` | Key exchange public key, rotated periodically (e.g., weekly). Signed by the identity key. Contains `algorithm` and `public_key`. |
-| `prekeys.signed_prekey_signature` | Signature over the signed prekey, proving the identity key holder published it. Contains `algorithm` and `signature`. |
-| `prekeys.one_time_prekeys` | List of single-use key exchange public keys. Consumed on first use. Server removes each key after it is fetched. Each contains `algorithm` and `public_key`. |
 | `signature` | Signature over the entire document (excluding this field). Proves the identity key holder authored this. Contains `algorithm` and `signature`. |
 
 **The self-signature is the key security property** (for Mode A users). The server hosts this document but cannot tamper with it — any modification invalidates the signature. This means:
@@ -426,7 +333,7 @@ When someone encounters an alias document, they follow the `redirect` to fetch t
 **Use cases:**
 - **Name changes.** Alice changes her username from `old-alice` to `alice`. The old address becomes an alias. Existing contacts are seamlessly redirected.
 - **Vanity aliases.** Alice has `alice@example.com` as primary but also wants `a@example.com`.
-- **Generated aliases.** Machine-generated aliases for special purposes like legacy email interop (see Section 10.2).
+- **Generated aliases.** Machine-generated aliases for special purposes.
 
 **Cross-server aliases** are not supported in v1. An alias must be on the same server as the primary address. Cross-server migration is handled by key transitions (Section 2.8).
 
@@ -512,25 +419,8 @@ Member {
 
 **Two members (messaging):** Sender creates file with two members — self (owner) and recipient (read). A copy is delivered to the recipient's `.ark/inbox/` via an envelope (Section 7). The recipient's app can move it to any path.
 
-**Multiple members (collaboration):** Shared documents. All members at `write` or `owner` permission can read and modify. See Section 3.7 for sync.
+**Multiple members (collaboration):** Shared documents. All members at `write` or `owner` permission can read and modify. See Section 3.6 for sync.
 
-**Wildcard member (`*`):** A special member entry with `address = "*"` represents public access. The wildcard member has no `identity_key` and no `wrapped_file_key`. It is only valid on unencrypted files (`algorithm = "none"` — see Section 4.2).
-
-| Wildcard permission | Meaning |
-|---|---|
-| `read` | Anyone can GET the file without authentication. |
-| `write` | Any authenticated Ark user can read and modify the file. |
-| `owner` | Any authenticated Ark user can read, modify, and change the file's members. |
-
-The server skips authentication on GET requests when a `*` member with `read` (or higher) permission is present. For `write` and `owner`, the server still requires a valid `ArkUser` authorization header — "public write" means any authenticated Ark user, not unauthenticated HTTP requests.
-
-Wildcard members can also appear in directory membership files (`.ark/members`). A wildcard member in a directory's member list cascades to all files and subdirectories below, following the same inheritance rules as named members (Section 3.6).
-
-**Use cases for wildcard members:**
-
-- `*` (read): Public website, blog, published documents, open-source project files.
-- `*` (write): Anonymous drop box, public wiki, open submission folder.
-- `*` (owner): Fully open collaborative space (uncommon but not prohibited — the protocol defines mechanism, not policy).
 
 ### 3.5 Directory listings
 
@@ -568,56 +458,8 @@ Response (JSON):
 
 Entries include header metadata (from the unencrypted header) but not the encrypted body. Subdirectories are listed with `"type": "directory"`.
 
-### 3.6 Directory membership
 
-A directory can have its own member list, stored at `.ark/members` within the directory:
-
-```
-/ark/alice/projects/.ark/members
-```
-
-```json
-{
-  "members": [
-    {
-      "address": "alice@example.com",
-      "identity_key": { "algorithm": "ed25519", "public_key": "..." },
-      "permission": "owner"
-    },
-    {
-      "address": "bob@other.com",
-      "identity_key": { "algorithm": "ed25519", "public_key": "..." },
-      "permission": "write"
-    }
-  ],
-  "signature": { "algorithm": "ed25519", "signature": "..." }
-}
-```
-
-When a file is created in a directory with a members file, the client wraps the file key for each directory member. The server enforces this — it rejects any PUT where the file's member list does not include all directory members at their directory-level permission or higher.
-
-**Inheritance rules:**
-
-- Directory members cascade to all subdirectories and files below.
-- A subdirectory's `.ark/members` can **add** new members or **elevate** permissions (e.g., `read` → `write`), but cannot reduce or remove members inherited from a parent directory.
-- The server resolves the effective member list by walking up from the file's directory to the user root, accumulating members. The highest permission for each identity key wins.
-- Only members with `owner` permission on a directory can modify that directory's `.ark/members` file.
-
-**Example:**
-
-```
-/ark/alice/projects/.ark/members          → alice (owner), bob (read)
-/ark/alice/projects/secret/.ark/members   → carol (write), bob (write)
-```
-
-Effective members for files in `/ark/alice/projects/secret/`:
-- alice: `owner` (inherited from parent)
-- bob: `write` (elevated from parent's `read` by subdirectory)
-- carol: `write` (added by subdirectory)
-
-**No directory members (default):** If no `.ark/members` file exists in a directory or any parent, files have only the members specified in their own headers. This is the normal case for personal files.
-
-### 3.7 Multi-member sync
+### 3.6 Multi-member sync
 
 When a file has multiple members with `write` or `owner` permission, edits need to propagate.
 
@@ -627,11 +469,11 @@ When a file has multiple members with `write` or `owner` permission, edits need 
 2. Alice's client writes the updated file to her server.
 3. Alice's server delivers the updated file to each co-member's `.ark/inbox/` via an envelope (no PoW required — co-membership is already established).
 4. The receiving server matches the file by `file_id` in the header. If a local file with that `file_id` already exists, it compares `modified` timestamps and keeps the newer version (updating the local copy in place).
-5. If a co-member also made an edit concurrently, the higher `modified` timestamp wins. The losing edit is discarded (or preserved in the history chain if versioning is enabled).
+5. If a co-member also made an edit concurrently, the higher `modified` timestamp wins. The losing edit is discarded.
 
 **No fetch step required.** Unlike a notification-based approach, the full file is pushed directly. This eliminates the need for co-members to know each other's file paths and removes any path resolution or polling mechanism.
 
-### 3.8 Adding and removing members
+### 3.7 Adding and removing members
 
 **Adding a member:**
 
@@ -647,37 +489,6 @@ When a file has multiple members with `write` or `owner` permission, edits need 
 3. Re-encrypt the body with the new key.
 4. Re-wrap the new key for each remaining member.
 5. The removed member still has their old copy (can't prevent this — they had the key). But new edits use the new key they don't have.
-
-### 3.9 Versioning
-
-Versioning is optional, per-file. When enabled, the file always represents the **current version**. History is stored in a separate **history file**, referenced from the main file's header.
-
-**How it works:**
-
-1. File header has `versioned = true` and `history_path` pointing to the history file (e.g., `notes/todo.history`).
-2. When the file is updated, the current body is prepended to the history file (newest first).
-3. The file body is replaced with the new content.
-4. The history file is itself an Ark file — same format, same encryption (using the same file key as the parent), same ownership.
-
-**History file contents (decrypted):**
-
-A list of previous versions in reverse chronological order:
-
-```
-[
-  { modified, modified_by, body (previous version) },
-  { modified, modified_by, body (version before that) },
-  ...
-]
-```
-
-See Section 8.3 for the wire format.
-
-**Storage:** History counts toward `max_account_size`. Members can configure max history depth per-file. Pruning removes the oldest entries.
-
-**When versioning is off (default):** No history file. Updates overwrite. Simpler, lighter.
-
-**When versioning is on:** Full edit history. Clients that don't care about history never need to fetch the history file — the main file always has the current version.
 
 ---
 
@@ -705,20 +516,8 @@ When `algorithm = "none"`:
 - The body is stored as raw bytes (no nonce, no AEAD tag).
 - Member entries have empty `ephemeral_key`, `key_nonce`, and `wrapped_file_key` fields.
 - The file signature still covers the body hash, providing integrity and authenticity (Section 5.2). This is the **only** integrity guarantee for unencrypted files — there is no AEAD tag to catch tampering.
-- Wildcard members (`*`) are only valid on files with `algorithm = "none"`.
 
-### 4.3 Key derivation modes
-
-Ark supports two key derivation modes for encrypted files, specified in the file header's `key_derivation` field:
-
-| Mode | Value | Forward secrecy | Recoverable | Use case |
-|---|---|---|---|---|
-| **Static** | `ecies` (default) | No | Yes — identity key unwraps all file keys | Notes, documents, shared files, single messages |
-| **Ratcheted** | `ratchet` | Yes — old keys are destroyed | No — lost ratchet state = lost history | Ongoing file sequences requiring forward secrecy |
-
-Static mode is the default and is described in this section. Ratcheted mode is described in Section 10.1. Neither applies when `algorithm = "none"` (unencrypted files have no file key to derive).
-
-### 4.4 File key generation (static mode)
+### 4.3 File key generation
 
 When a file is created in static mode:
 
@@ -743,7 +542,7 @@ When a file is created in static mode:
    ```
 4. Each member entry in the header stores the `ephemeral_public`, `nonce`, and `wrapped_file_key`.
 
-### 4.5 Decryption (static mode)
+### 4.4 Decryption
 
 When Alice decrypts a file:
 
@@ -756,7 +555,7 @@ When Alice decrypts a file:
 4. Alice decrypts the wrapped file key.
 5. Alice decrypts the file body with the file key.
 
-### 4.6 Why a symmetric file key?
+### 4.5 Why a symmetric file key?
 
 Direct ECIES encryption (as in v0.3) encrypts content directly to each recipient's public key. This works for one-to-one messages but breaks down for shared files:
 
@@ -765,7 +564,7 @@ Direct ECIES encryption (as in v0.3) encrypts content directly to each recipient
 
 The symmetric key approach encrypts content once and wraps the small key per-member. Standard construction, used by Signal (group messages), PGP (session keys), and every major encrypted storage system.
 
-### 4.7 Multi-device decryption
+### 4.6 Multi-device decryption
 
 Since there's a single identity keypair per user, multi-device is straightforward:
 
@@ -774,7 +573,7 @@ Since there's a single identity keypair per user, multi-device is straightforwar
 
 File keys are wrapped to the **identity key**, not per-device. One wrap per member, regardless of how many devices that member has.
 
-### 4.8 Encryption algorithms
+### 4.7 Encryption algorithms
 
 | Operation | Algorithm | Parameters |
 |---|---|---|
@@ -789,7 +588,7 @@ File keys are wrapped to the **identity key**, not per-device. One wrap per memb
 
 Clients MUST support AES-256-GCM and `none` (unencrypted). ChaCha20-Poly1305 is recommended as an alternative (faster on devices without AES hardware acceleration). The algorithm used is indicated in the file header.
 
-### 4.9 Why not PGP?
+### 4.8 Why not PGP?
 
 PGP/GPG uses a similar model (session keys wrapped with public keys) but has well-known usability problems:
 - Key management is manual and error-prone (keyrings, keyservers, web of trust).
@@ -1131,18 +930,7 @@ allow_remote_registration = false  # Only admin can create accounts (default: tr
 
 When disabled, the endpoint returns `403 Forbidden`. Local account creation (via the admin CLI) always works regardless of this setting.
 
-### 6.8 Layer 5: Social trust signals (optional)
-
-**Introduction field:**
-- The envelope can include an optional plaintext `introduction` field (max 280 characters) visible to the receiving server (but not E2E encrypted).
-- Use case: "Hi, I'm Bob from Acme Corp, we met at the conference."
-
-**Cross-signing vouches:**
-- Alice can sign a statement: "I vouch for `bob@example.com` (identity key: `...`)".
-- Bob can attach this vouch to his envelopes to Alice's contacts.
-- Carol's server, upon seeing a vouch from Alice (whom Carol trusts), reduces PoW requirements for Bob.
-
-### 6.9 Why this eliminates IP reputation
+### 6.8 Why this eliminates IP reputation
 
 | Email problem | How Ark solves it |
 |---|---|
@@ -1197,7 +985,6 @@ HTTP headers include file metadata extracted from the Ark header:
 X-Ark-Modified: 1712838400
 X-Ark-Modified-By: alice@example.com
 X-Ark-Members: 2
-X-Ark-Versioned: true
 Content-Length: 4096
 ```
 
@@ -1230,7 +1017,7 @@ Authorization: ArkServer sender.example.com <server-signature>
 
 The envelope contains the Ark file plus Alice's member entry (her wrapped file key), the PoW stamp, and the sender's signature. Alice's server extracts the file and writes it to `.ark/inbox/` with a generated filename (the envelope's `message_id`).
 
-The file header includes an `app` hint (e.g., `"mail"`, `"calendar"`) so client-side apps know which files to claim from `.ark/inbox/`.
+Client-side apps inspect incoming files in `.ark/inbox/` and claim them based on content or directory conventions.
 
 **Response codes:**
 
@@ -1479,28 +1266,14 @@ message Header {
   // Encryption
   string algorithm = 5;                 // "aes-256-gcm", "chacha20-poly1305", or "none"
 
-  // Versioning (optional)
-  bool versioned = 6;
-  string history_path = 7;             // Path to history file (if versioned)
-
   // Author of last modification
-  string modified_by = 8;              // "alice@example.com"
-  uint32 modifier_device_id = 9;
-  string signature_algorithm = 10;     // "ed25519"
-  bytes signature = 11;                // Signature over fields 1-9 + body hash
-
-  // App hint (for .ark/inbox/ routing by client apps)
-  string app = 12;                     // e.g., "mail", "calendar", "notes" — optional
-
-  // Forward secrecy (reserved for ratcheted sequences — see Section 10.1)
-  string key_derivation = 13;          // "ecies" (default) or "ratchet"
-  bytes sequence_id = 14;              // Identifies the ratchet session (if key_derivation = "ratchet")
-  uint64 message_index = 15;           // Position in the ratchet chain
-  string ratchet_key_algorithm = 16;   // "x25519"
-  bytes ratchet_key = 17;              // Sender's current DH ratchet public key
+  string modified_by = 6;              // "alice@example.com"
+  uint32 modifier_device_id = 7;
+  string signature_algorithm = 8;      // "ed25519"
+  bytes signature = 9;                 // Signature over fields 1-7 + body hash
 
   // Key conversion (for ECIES wrapping)
-  string encryption_algorithm = 18;    // "x25519" — target algorithm for deriving encryption key from identity key
+  string encryption_algorithm = 10;    // "x25519" — target algorithm for deriving encryption key from identity key
 }
 
 message Member {
@@ -1517,25 +1290,7 @@ message Member {
 }
 ```
 
-### 8.3 History file
-
-The history file uses the same Ark file format (magic + header + encrypted body). Its decrypted body contains a list of previous versions:
-
-```protobuf
-message HistoryPayload {
-  repeated HistoryEntry entries = 1;   // Newest first (reverse chronological)
-}
-
-message HistoryEntry {
-  uint64 modified = 1;                // When this version was current
-  string modified_by = 2;             // Who created this version
-  bytes body = 3;                     // Previous file body (decrypted content of previous version)
-}
-```
-
-The history file is encrypted with the same file key as the parent file. Same membership, same access control.
-
-### 8.4 Envelope
+### 8.3 Envelope
 
 The envelope is the transport wrapper for cross-server delivery. It wraps a file (or a notification) for delivery to another server's `.ark/inbox/`.
 
@@ -1566,19 +1321,16 @@ message Envelope {
   // Spam resistance (required for DELIVER, REGISTER; absent for others)
   ProofOfWork proof_of_work = 8;
 
-  // Optional plaintext introduction (for first-contact filtering)
-  string introduction = 9;            // Max 280 chars, optional
-
-  // Sender authentication (signature over fields 1-9)
-  string signature_algorithm = 10;    // "ed25519"
-  bytes envelope_signature = 11;      // 64 bytes
+  // Sender authentication (signature over fields 1-8)
+  string signature_algorithm = 9;     // "ed25519"
+  bytes envelope_signature = 10;      // 64 bytes
 
   // Payload — depends on envelope type:
   // DELIVER: raw Ark file bytes (header + encrypted body)
   // SYNC: raw Ark file bytes (header + encrypted body)
   // MEMBER_MOVED: MemberMovedNotification
   // REGISTER/UNREGISTER: empty
-  bytes payload = 12;
+  bytes payload = 11;
 }
 
 message ProofOfWork {
@@ -1600,11 +1352,11 @@ message MemberMovedNotification {
 }
 ```
 
-### 8.5 Identity and policy documents
+### 8.4 Identity and policy documents
 
 Identity documents, server identity, policy files, and contacts are JSON (human-readable, easy to debug with curl). See Section 2.4, Section 5.4, and Section 6.5.1 for schemas.
 
-### 8.6 Serialization rules
+### 8.5 Serialization rules
 
 - **File headers, envelopes:** Protocol Buffers (binary). Compact, efficient, schema-evolvable.
 - **Identity documents, policy, server identity, contacts:** JSON. Human-readable.
@@ -1624,19 +1376,17 @@ Identity documents, server identity, policy files, and contacts are JSON (human-
 | **Integrity** | Any modification to a file invalidates the signature. Any modification to the ciphertext invalidates the AEAD tag. |
 | **Spam resistance** | Bulk cross-server delivery requires proportional computational resources (PoW). |
 | **Data persistence (static mode)** | All static-mode files can be decrypted with the single identity key (which unwraps file keys). No session state to lose. |
-| **Forward secrecy (ratcheted mode)** | Ratcheted sequences (Section 10.1) use the Double Ratchet — old keys are destroyed after use. Compromising the identity key does not expose past ratcheted messages. |
 
 ### 9.2 What is NOT protected
 
 | Risk | Details |
 |---|---|
 | **Metadata** | File paths, sizes, timestamps, member addresses, and cross-server delivery patterns are visible to the server and network observers. Path names may reveal content intent (e.g., `/notes/tax-2025`). |
-| **Forward secrecy (static mode)** | In static mode (default), if the identity private key is compromised, all file keys can be unwrapped, and all past and future data can be decrypted. This is a deliberate tradeoff for simplicity and recoverability. Ratcheted sequences (Section 10.1) provide forward secrecy for sequences that opt in. |
+| **Forward secrecy** | If the identity private key is compromised, all file keys can be unwrapped, and all past and future data can be decrypted. This is a deliberate tradeoff for simplicity and recoverability. |
 | **Mode B server trust** | If the server holds the private key (Mode B), the server can read all data. Self-hosters mitigate this by controlling the server. |
 | **Removed member's existing copy** | When a member is removed from a shared file, they retain any copy they already downloaded. Re-keying prevents access to future edits, not past content. |
 | **Path metadata** | File paths are unencrypted (the server needs them for routing). Path names like `/mail/inbox/` or `/notes/secret-project` are visible to the server. For maximum privacy, use opaque paths. |
 | **Unencrypted files** | Files with `algorithm = "none"` have no confidentiality protection. The body is readable by the server, network observers (if TLS is broken), and anyone with read access. Integrity and authenticity are still provided by the file signature. |
-| **Public files** | Files with a wildcard member (`*`) are accessible without authentication. Combined with `algorithm = "none"`, the content is fully public. The signature ensures readers can verify the content is authentic and unmodified. |
 
 ### 9.3 Compromise scenarios
 
@@ -1816,12 +1566,11 @@ The Double Ratchet is fundamentally a 2-party protocol. Group forward secrecy (3
 
 #### 10.1.8 Upgrade path
 
-Nothing in the v1 static mode blocks adding ratcheted sequences later:
+Nothing in the core protocol blocks adding ratcheted sequences later:
 
-- The protobuf schema reserves fields `key_derivation`, `sequence_id`, `message_index`, and `ratchet_key` in the Header message.
-- The identity document schema reserves the `prekeys` object.
-- Ratcheted files are standard Ark files — same format, same transport, same envelopes.
-- Old clients that don't understand `key_derivation = "ratchet"` simply cannot decrypt those files (they lack the ratchet state regardless).
+- Ratcheted files are standard Ark files — same format, same transport, same envelopes. The Header protobuf is extended with `key_derivation`, `sequence_id`, `message_index`, and `ratchet_key` fields.
+- The identity document is extended with a `prekeys` object.
+- Old clients that don't understand ratcheted files simply cannot decrypt them (they lack the ratchet state regardless).
 - Proto3 silently ignores unknown fields, so old clients won't break on new headers.
 
 ### 10.2 Legacy Email Interop
@@ -1906,11 +1655,78 @@ For protocol users who want to receive legacy email, a bridge service can forwar
 
 **Security note:** Bridged messages are not encrypted in transit. The bridge sees plaintext during processing. These files should be clearly distinguished from native Ark files in the client UI.
 
-### 10.3 Metadata Privacy
+### 10.3 Wildcard Members (Public Files)
+
+A special member entry with `address = "*"` represents public access. The wildcard member has no `identity_key` and no `wrapped_file_key`. It is only valid on unencrypted files (`algorithm = "none"`).
+
+| Wildcard permission | Meaning |
+|---|---|
+| `read` | Anyone can GET the file without authentication. |
+| `write` | Any authenticated Ark user can read and modify the file. |
+| `owner` | Any authenticated Ark user can read, modify, and change the file's members. |
+
+The server skips authentication on GET requests when a `*` member with `read` (or higher) permission is present. For `write` and `owner`, the server still requires a valid `ArkUser` authorization header — "public write" means any authenticated Ark user, not unauthenticated HTTP requests.
+
+**Use cases:**
+
+- `*` (read): Public website, blog, published documents, open-source project files.
+- `*` (write): Anonymous drop box, public wiki, open submission folder.
+- `*` (owner): Fully open collaborative space (uncommon but not prohibited).
+
+### 10.4 Directory Membership
+
+A directory can have its own member list, stored at `.ark/members` within the directory:
+
+```
+/ark/alice/projects/.ark/members
+```
+
+```json
+{
+  "members": [
+    {
+      "address": "alice@example.com",
+      "identity_key": { "algorithm": "ed25519", "public_key": "..." },
+      "permission": "owner"
+    },
+    {
+      "address": "bob@other.com",
+      "identity_key": { "algorithm": "ed25519", "public_key": "..." },
+      "permission": "write"
+    }
+  ],
+  "signature": { "algorithm": "ed25519", "signature": "..." }
+}
+```
+
+When a file is created in a directory with a members file, the client wraps the file key for each directory member. The server enforces this — it rejects any PUT where the file's member list does not include all directory members at their directory-level permission or higher.
+
+**Inheritance rules:**
+
+- Directory members cascade to all subdirectories and files below.
+- A subdirectory's `.ark/members` can **add** new members or **elevate** permissions (e.g., `read` → `write`), but cannot reduce or remove members inherited from a parent directory.
+- The server resolves the effective member list by walking up from the file's directory to the user root, accumulating members. The highest permission for each identity key wins.
+- Only members with `owner` permission on a directory can modify that directory's `.ark/members` file.
+
+**Example:**
+
+```
+/ark/alice/projects/.ark/members          → alice (owner), bob (read)
+/ark/alice/projects/secret/.ark/members   → carol (write), bob (write)
+```
+
+Effective members for files in `/ark/alice/projects/secret/`:
+- alice: `owner` (inherited from parent)
+- bob: `write` (elevated from parent's `read` by subdirectory)
+- carol: `write` (added by subdirectory)
+
+Wildcard members (Section 10.3) can also appear in directory membership files, cascading to all files and subdirectories below.
+
+### 10.5 Metadata Privacy
 
 A future version could add onion routing or mixnet support to hide metadata (sender/recipient/timing) from servers and network observers. The protocol's layered design (file vs. envelope) makes this possible without changing the core file format.
 
-### 10.4 Collaborative Editing (CRDTs)
+### 10.6 Collaborative Editing (CRDTs)
 
 V1 uses last-write-wins for shared files. A future extension could support real-time collaborative editing via CRDTs (Conflict-free Replicated Data Types):
 
@@ -1934,9 +1750,6 @@ V1 uses last-write-wins for shared files. A future extension could support real-
 | No encryption | None | — | raw bytes |
 | Proof of work | Argon2id | variable | 256-bit |
 | Seed phrase | BIP-39 | 256-bit entropy | 24 words |
-| Ratchet session init | X3DH (X25519) | 256-bit | 256-bit root key |
-| Ratchet chain advance | HMAC-SHA256 | 256-bit | 256-bit chain/message key |
-| Ratchet DH step | X25519 + HKDF-SHA256 | 256-bit | 512-bit (root key + chain key) |
 
 ## Appendix B: URL Structure Summary
 
@@ -1957,12 +1770,6 @@ All Ark paths are under `https://<domain>/ark/`.
 | `/ark/<user>/.ark/identity` | GET | User identity document |
 | `/ark/<user>/.ark/policy` | GET | User spam policy (optional) |
 
-**User-level (public files — wildcard `*` read member):**
-
-| Path | Method | Purpose |
-|---|---|---|
-| `/ark/<user>/<path>` | GET | Fetch file (no auth required if `*` read member present) |
-
 **User-level (authenticated — member):**
 
 | Path | Method | Purpose |
@@ -1972,6 +1779,7 @@ All Ark paths are under `https://<domain>/ark/`.
 | `/ark/<user>/<path>` | PUT | Create or update file |
 | `/ark/<user>/<path>` | DELETE | Delete file |
 | `/ark/<user>/<dir>` | GET | List directory |
+| `/ark/<user>/.ark/files/<file_id>` | GET/HEAD | Fetch/check shared file by ID (sync recovery) |
 | `/ark/<user>/.ark/contacts` | GET/PUT | Manage contacts allowlist |
 | `/ark/<user>/.ark/stream` | GET | Real-time event stream |
 
@@ -1980,3 +1788,77 @@ All Ark paths are under `https://<domain>/ark/`.
 | Path | Method | Purpose |
 |---|---|---|
 | `/ark/<user>/.ark/inbox/` | POST | Deliver envelope (file, notification, registration) |
+
+---
+
+## Appendix C: Example Usage
+
+### Message flow (end to end)
+
+A message is a file with two members — sender (owner) and recipient (read):
+
+```
+Bob's Client                Bob's Server              Alice's Server             Alice's Client
+    |                           |                          |                          |
+    |  1. Fetch Alice's         |                          |                          |
+    |     identity doc -------->|------- HTTPS GET ------->|                          |
+    |  2. Receive public key    |<------ JSON response ----|                          |
+    |                           |                          |                          |
+    |  3. Generate file key,    |                          |                          |
+    |     encrypt content,      |                          |                          |
+    |     wrap key for self     |                          |                          |
+    |     and Alice             |                          |                          |
+    |                           |                          |                          |
+    |  4. Compute proof of work |                          |                          |
+    |     (Argon2id, ~0.5s)     |                          |                          |
+    |                           |                          |                          |
+    |  5. Sign envelope         |                          |                          |
+    |                           |                          |                          |
+    |  6. Store file on ------->|                          |                          |
+    |     home server           |                          |                          |
+    |                           |  7. Relay via HTTPS POST |                          |
+    |                           |------- envelope -------->|                          |
+    |                           |                          |  8. Verify signature      |
+    |                           |                          |  9. Verify PoW            |
+    |                           |                          |  10. Store in .ark/inbox/ |
+    |                           |                          |                          |
+    |                           |                          |  11. Alice fetches ------>|
+    |                           |                          |  12. Decrypt with         |
+    |                           |                          |      private key          |
+    |                           |                          |                          |
+    |                           |                          |  13. App moves file       |
+    |                           |                          |      to desired path      |
+```
+
+### Example use cases
+
+The protocol defines no directory structure — apps do. Examples of how different apps might organize files:
+
+**Mail app:**
+```
+/ark/alice/mail/inbox/abc123          ← received message (moved from .ark/inbox/)
+/ark/alice/mail/sent/def456           ← sent message
+/ark/alice/mail/drafts/ghi789         ← draft
+/ark/alice/mail/archive/2026/jkl012   ← archived message
+```
+
+**Notes app:**
+```
+/ark/alice/notes/personal/todo.md     ← personal note
+/ark/alice/notes/work/meeting-notes   ← work note (shared with coworkers)
+```
+
+**File storage:**
+```
+/ark/alice/files/photos/vacation.jpg  ← personal photo
+/ark/alice/files/documents/tax-2025   ← tax document
+/ark/alice/files/shared/project-plan  ← shared with collaborators
+```
+
+**Calendar app:**
+```
+/ark/alice/calendar/2026-04-28-standup  ← calendar event
+/ark/alice/calendar/2026-05-01-birthday ← recurring event
+```
+
+All of these are the same thing underneath: encrypted files with members. The path and organization are conventions between the app and the user.
