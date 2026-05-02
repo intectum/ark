@@ -196,32 +196,55 @@ Response:
 {
   "version": 1,
   "address": "alice@example.com",
-  "identity_key": "base64url-encoded-ed25519-public-key",
-  "encryption_key": "base64url-encoded-x25519-public-key",
+  "identity_key": {
+    "algorithm": "ed25519",
+    "public_key": "base64url-encoded"
+  },
   "devices": [
     {
       "device_id": 1,
-      "device_key": "base64url-encoded-ed25519-public-key",
+      "device_key": {
+        "algorithm": "ed25519",
+        "public_key": "base64url-encoded"
+      },
       "label": "Alice's Laptop",
       "registered": "2026-03-15T00:00:00Z"
     },
     {
       "device_id": 2,
-      "device_key": "base64url-encoded-ed25519-public-key",
+      "device_key": {
+        "algorithm": "ed25519",
+        "public_key": "base64url-encoded"
+      },
       "label": "Alice's Phone",
       "registered": "2026-04-01T00:00:00Z"
     }
   ],
   "prekeys": {
-    "signed_prekey": "base64url-encoded-x25519-public-key",
-    "signed_prekey_signature": "base64url-encoded-ed25519-signature",
+    "signed_prekey": {
+      "algorithm": "x25519",
+      "public_key": "base64url-encoded"
+    },
+    "signed_prekey_signature": {
+      "algorithm": "ed25519",
+      "signature": "base64url-encoded"
+    },
     "one_time_prekeys": [
-      "base64url-encoded-x25519-public-key",
-      "base64url-encoded-x25519-public-key"
+      {
+        "algorithm": "x25519",
+        "public_key": "base64url-encoded"
+      },
+      {
+        "algorithm": "x25519",
+        "public_key": "base64url-encoded"
+      }
     ]
   },
   "updated": "2026-04-11T12:00:00Z",
-  "signature": "base64url-encoded-ed25519-signature-over-everything-above"
+  "signature": {
+    "algorithm": "ed25519",
+    "signature": "base64url-encoded-over-everything-above"
+  }
 }
 ```
 
@@ -231,17 +254,16 @@ Response:
 |---|---|
 | `version` | Protocol version. Currently `1`. |
 | `address` | The user's full address. |
-| `identity_key` | Ed25519 public key. The root of trust for this user. Used for signing. |
-| `encryption_key` | X25519 public key (derived from the identity key). Used for encryption. Published explicitly so senders don't need to perform the Ed25519→X25519 conversion themselves. |
+| `identity_key` | The root of trust for this user. Used for signing. Senders derive the encryption key from this using the conversion specified in the key wrapping step (Section 4.4). Contains `algorithm` and `public_key`. |
 | `devices[]` | List of authorized devices. |
 | `devices[].device_id` | Numeric ID, unique per user. |
-| `devices[].device_key` | Per-device Ed25519 signing key, authorized by the identity key. |
+| `devices[].device_key` | Per-device signing key, authorized by the identity key. Contains `algorithm` and `public_key`. |
 | `devices[].label` | Human-readable device name. |
 | `prekeys` | Prekey bundle for forward secrecy sessions (Section 10.1). Optional — only present if the user supports ratcheted sequences. |
-| `prekeys.signed_prekey` | X25519 public key, rotated periodically (e.g., weekly). Signed by the identity key. |
-| `prekeys.signed_prekey_signature` | Ed25519 signature over the signed prekey, proving the identity key holder published it. |
-| `prekeys.one_time_prekeys` | List of single-use X25519 public keys. Consumed on first use. Server removes each key after it is fetched. |
-| `signature` | Ed25519 signature over the entire document (excluding this field). Proves the identity key holder authored this. |
+| `prekeys.signed_prekey` | Key exchange public key, rotated periodically (e.g., weekly). Signed by the identity key. Contains `algorithm` and `public_key`. |
+| `prekeys.signed_prekey_signature` | Signature over the signed prekey, proving the identity key holder published it. Contains `algorithm` and `signature`. |
+| `prekeys.one_time_prekeys` | List of single-use key exchange public keys. Consumed on first use. Server removes each key after it is fetched. Each contains `algorithm` and `public_key`. |
+| `signature` | Signature over the entire document (excluding this field). Proves the identity key holder authored this. Contains `algorithm` and `signature`. |
 
 **The self-signature is the key security property** (for Mode A users). The server hosts this document but cannot tamper with it — any modification invalidates the signature. This means:
 - A compromised server cannot swap in a different public key to intercept data.
@@ -480,9 +502,12 @@ Each member entry includes the **path** where that member's copy of the file liv
 Member {
   address: "alice@example.com"
   path: "/ark/alice/docs/project-plan"
+  identity_key_algorithm: "ed25519"
   identity_key: ...
   permission: "owner"
-  wrapped_key: ...
+  ephemeral_key_algorithm: "x25519"
+  ephemeral_key: ...
+  wrapped_file_key: ...
 }
 ```
 
@@ -559,16 +584,16 @@ A directory can have its own member list, stored at `.ark/members` within the di
   "members": [
     {
       "address": "alice@example.com",
-      "identity_key": "...",
+      "identity_key": { "algorithm": "ed25519", "public_key": "..." },
       "permission": "owner"
     },
     {
       "address": "bob@other.com",
-      "identity_key": "...",
+      "identity_key": { "algorithm": "ed25519", "public_key": "..." },
       "permission": "write"
     }
   ],
-  "signature": "..."
+  "signature": { "algorithm": "ed25519", "signature": "..." }
 }
 ```
 
@@ -716,10 +741,11 @@ When a file is created in static mode:
 3. For each member, the client wraps the file key using **ECIES**:
    ```
    ephemeral_key = random X25519 keypair
-   shared_secret = X25519(ephemeral_private, owner_encryption_key)
+   owner_x25519_key = convert(owner_identity_key, target: "x25519")
+   shared_secret = X25519(ephemeral_private, owner_x25519_key)
    wrapping_key = HKDF-SHA256(
      ikm: shared_secret,
-     salt: ephemeral_public || owner_encryption_key,
+     salt: ephemeral_public || owner_x25519_key,
      info: "file-key-wrap",
      length: 32
    )
@@ -847,9 +873,15 @@ Servers also authenticate themselves:
    ```json
    {
      "domain": "example.com",
-     "server_key": "base64url-encoded-ed25519-public-key",
+     "server_key": {
+       "algorithm": "ed25519",
+       "public_key": "base64url-encoded"
+     },
      "updated": "2026-04-11T00:00:00Z",
-     "signature": "base64url-self-signature"
+     "signature": {
+       "algorithm": "ed25519",
+       "signature": "base64url-encoded"
+     }
    }
    ```
 2. When server A sends an envelope to server B, it includes an `Authorization` header:
@@ -1084,8 +1116,10 @@ Content-Type: application/json
 
 {
   "address": "alice",
-  "identity_key": "base64url-encoded-ed25519-public-key",
-  "encryption_key": "base64url-encoded-x25519-public-key",
+  "identity_key": {
+    "algorithm": "ed25519",
+    "public_key": "base64url-encoded"
+  },
   "proof_of_work": {
     "algorithm": "argon2id",
     "nonce": "base64url-encoded-nonce",
@@ -1455,28 +1489,35 @@ message Header {
   // Author of last modification
   string modified_by = 7;              // "alice@example.com"
   uint32 modifier_device_id = 8;
-  bytes signature = 9;                 // Ed25519 signature over fields 1-8 + body hash
+  string signature_algorithm = 9;      // "ed25519"
+  bytes signature = 10;                // Signature over fields 1-8 + body hash
 
   // App hint (for .ark/inbox/ routing by client apps)
-  string app = 10;                     // e.g., "mail", "calendar", "notes" — optional
+  string app = 11;                     // e.g., "mail", "calendar", "notes" — optional
 
   // Forward secrecy (reserved for ratcheted sequences — see Section 10.1)
-  string key_derivation = 11;          // "ecies" (default) or "ratchet"
-  bytes sequence_id = 12;              // Identifies the ratchet session (if key_derivation = "ratchet")
-  uint64 message_index = 13;           // Position in the ratchet chain
-  bytes ratchet_key = 14;              // Sender's current DH ratchet public key (X25519, 32 bytes)
+  string key_derivation = 12;          // "ecies" (default) or "ratchet"
+  bytes sequence_id = 13;              // Identifies the ratchet session (if key_derivation = "ratchet")
+  uint64 message_index = 14;           // Position in the ratchet chain
+  string ratchet_key_algorithm = 15;   // "x25519"
+  bytes ratchet_key = 16;              // Sender's current DH ratchet public key
+
+  // Key conversion (for ECIES wrapping)
+  string encryption_algorithm = 17;    // "x25519" — target algorithm for deriving encryption key from identity key
 }
 
 message Member {
   string address = 1;                   // "alice@example.com"
   string path = 2;                     // "/ark/alice/notes/todo" — where this member's copy lives
-  bytes identity_key = 3;              // Member's Ed25519 public key (for verification)
-  string permission = 4;               // "owner", "write", or "read"
+  string identity_key_algorithm = 3;   // "ed25519"
+  bytes identity_key = 4;              // Member's public key (for verification)
+  string permission = 5;               // "owner", "write", or "read"
 
   // File key wrapped for this member (ECIES)
-  bytes ephemeral_key = 5;            // X25519 ephemeral public key (32 bytes)
-  bytes key_nonce = 6;                // AES-256-GCM nonce for key wrapping (12 bytes)
-  bytes wrapped_file_key = 7;         // File key encrypted to this member (32 bytes + 16 byte tag)
+  string ephemeral_key_algorithm = 6;  // "x25519"
+  bytes ephemeral_key = 7;            // Ephemeral public key (32 bytes)
+  bytes key_nonce = 8;                // AES-256-GCM nonce for key wrapping (12 bytes)
+  bytes wrapped_file_key = 9;         // File key encrypted to this member (32 bytes + 16 byte tag)
 }
 ```
 
@@ -1532,15 +1573,16 @@ message Envelope {
   // Optional plaintext introduction (for first-contact filtering)
   string introduction = 9;            // Max 280 chars, optional
 
-  // Sender authentication (Ed25519 signature over fields 1-9)
-  bytes envelope_signature = 10;      // 64 bytes
+  // Sender authentication (signature over fields 1-9)
+  string signature_algorithm = 10;    // "ed25519"
+  bytes envelope_signature = 11;      // 64 bytes
 
   // Payload — depends on envelope type:
   // DELIVER: raw Ark file bytes (header + encrypted body)
   // OBJECT_UPDATED: FileUpdateNotification
   // MEMBER_MOVED: MemberMovedNotification
   // REGISTER/UNREGISTER: empty
-  bytes payload = 11;
+  bytes payload = 12;
 }
 
 message ProofOfWork {
@@ -1556,14 +1598,17 @@ message FileUpdateNotification {
   string path = 1;                    // Path on the modifier's server
   uint64 modified = 2;
   string modified_by = 3;
-  bytes signature = 4;               // Modifier's signature (proves membership)
+  string signature_algorithm = 4;    // "ed25519"
+  bytes signature = 5;               // Modifier's signature (proves membership)
 }
 
 message MemberMovedNotification {
   string old_address = 1;
   string new_address = 2;
-  bytes identity_key = 3;
-  bytes signature = 4;               // Signed by the identity key
+  string identity_key_algorithm = 3; // "ed25519"
+  bytes identity_key = 4;
+  string signature_algorithm = 5;    // "ed25519"
+  bytes signature = 6;               // Signed by the identity key
 }
 ```
 
@@ -1638,7 +1683,7 @@ Identity documents, server identity, policy files, and contacts are JSON (human-
 | Assumption | Consequence if violated |
 |---|---|
 | Ed25519 is secure | All identity and authentication breaks. |
-| X25519 is secure | All encryption key exchange breaks. |
+| X25519 is secure | All encryption and key exchange breaks. |
 | AES-256-GCM / ChaCha20-Poly1305 is secure | Data confidentiality breaks. |
 | Argon2id is memory-hard | PoW can be computed cheaply by attackers with specialized hardware. |
 | User's seed phrase / private key is stored securely | Attacker can decrypt all data and impersonate user. |
@@ -1690,7 +1735,7 @@ Users who do not publish prekeys do not support ratcheted sequences. Senders fal
 When Alice initiates a ratcheted sequence with Bob:
 
 1. Alice fetches Bob's identity document and extracts:
-   - Bob's identity key (`IK_B`) — the X25519 encryption key
+   - Bob's identity key (`IK_B`) — converted using the `encryption_algorithm` (e.g., `"x25519"`)
    - Bob's signed prekey (`SPK_B`)
    - One of Bob's one-time prekeys (`OPK_B`), if available
 2. Alice verifies `signed_prekey_signature` against Bob's identity key.
@@ -1832,11 +1877,16 @@ GET https://gateway.example.com/ark/x-a7f3k2m9p4q8r2/.ark/identity
   "type": "legacy_email",
   "address": "x-a7f3k2m9p4q8r2@gateway.example.com",
   "legacy_email": "carol@gmail.com",
-  "identity_key": "base64url-encoded-ed25519-public-key",
-  "encryption_key": "base64url-encoded-x25519-public-key",
+  "identity_key": {
+    "algorithm": "ed25519",
+    "public_key": "base64url-encoded"
+  },
   "notify": true,
   "updated": "2026-04-14T12:00:00Z",
-  "signature": "base64url-encoded-signature"
+  "signature": {
+    "algorithm": "ed25519",
+    "signature": "base64url-encoded"
+  }
 }
 ```
 
