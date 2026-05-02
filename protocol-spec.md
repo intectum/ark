@@ -496,12 +496,9 @@ Permission enforcement is server-side. When a file is updated via PUT, the serve
 
 This is not cryptographically enforced — any member has the file key and *could* craft a modified file locally, but other members' servers won't accept it during sync because they check the modifier's permission level against the current member list.
 
-Each member entry includes the **path** where that member's copy of the file lives on their server. This allows co-members to fetch updates from each other:
-
 ```
 Member {
   address: "alice@example.com"
-  path: "/ark/alice/docs/project-plan"
   identity_key_algorithm: "ed25519"
   identity_key: ...
   permission: "owner"
@@ -517,7 +514,7 @@ Member {
 
 **Multiple members (collaboration):** Shared documents. All members at `write` or `owner` permission can read and modify. See Section 3.7 for sync.
 
-**Wildcard member (`*`):** A special member entry with `address = "*"` represents public access. The wildcard member has no `identity_key`, no `path`, and no `wrapped_file_key`. It is only valid on unencrypted files (`algorithm = "none"` — see Section 4.2).
+**Wildcard member (`*`):** A special member entry with `address = "*"` represents public access. The wildcard member has no `identity_key` and no `wrapped_file_key`. It is only valid on unencrypted files (`algorithm = "none"` — see Section 4.2).
 
 | Wildcard permission | Meaning |
 |---|---|
@@ -628,18 +625,11 @@ When a file has multiple members with `write` or `owner` permission, edits need 
 
 1. Alice edits the content, re-encrypts with the file key, bumps `modified`, signs with her device key.
 2. Alice's client writes the updated file to her server.
-3. Alice's server sends an `OBJECT_UPDATED` notification to each co-member's server (lightweight envelope, no PoW — see Section 7.3).
-4. Co-members' servers (or clients) fetch the updated file from Alice's server using the path in her member entry.
+3. Alice's server delivers the updated file to each co-member's `.ark/inbox/` via an envelope (no PoW required — co-membership is already established).
+4. The receiving server matches the file by `file_id` in the header. If a local file with that `file_id` already exists, it compares `modified` timestamps and keeps the newer version (updating the local copy in place).
 5. If a co-member also made an edit concurrently, the higher `modified` timestamp wins. The losing edit is discarded (or preserved in the history chain if versioning is enabled).
 
-**Fetching from another member's server:**
-
-```
-GET https://example.com/ark/alice/docs/project-plan
-Authorization: ArkUser <device_id>:<signature>
-```
-
-The server verifies the requester is in the file's member list (by checking identity key against the header) before serving the file.
+**No fetch step required.** Unlike a notification-based approach, the full file is pushed directly. This eliminates the need for co-members to know each other's file paths and removes any path resolution or polling mechanism.
 
 ### 3.8 Adding and removing members
 
@@ -1219,6 +1209,7 @@ Clients that need the full header (member entries, wrapped keys) use GET and rea
 |---|---|---|
 | `GET` | `/ark/alice/.ark/contacts` | List contacts (allowlisted identity keys) |
 | `PUT` | `/ark/alice/.ark/contacts` | Update contacts |
+| `GET/HEAD` | `/ark/alice/.ark/files/<file_id>` | Fetch/check shared file by ID (sync recovery) |
 | `GET` | `/ark/alice/.ark/stream` | Real-time event stream (WebSocket/SSE) |
 
 ### 7.3 Cross-server delivery
@@ -1258,36 +1249,26 @@ The file header includes an `app` hint (e.g., `"mail"`, `"calendar"`) so client-
 
 ### 7.4 Cross-server sync (shared files)
 
-When a shared file is updated, co-members' servers are notified.
-
-**Update notification:**
+When a shared file is updated, the updated file is pushed to co-members using the same delivery mechanism as new files:
 
 ```
 POST https://example.com/ark/alice/.ark/inbox/
 Content-Type: application/x-ark-envelope
 Authorization: ArkServer sender.example.com <server-signature>
 
-<binary envelope with type OBJECT_UPDATED>
+<binary envelope with type SYNC>
 ```
 
-The notification envelope contains:
-- `path` — the updated file's path on the modifier's server.
-- `modified` — new timestamp.
-- `modified_by` — who made the change.
-- Signature from the modifier (proves membership).
+The envelope payload is the full updated Ark file (header + encrypted body). The receiving server:
 
-**No PoW required** for sync notifications between co-members. The co-membership relationship is already established — the receiving server verifies the modifier is in the file's member list.
+1. Extracts the `file_id` from the header.
+2. Checks if a local file with that `file_id` exists.
+3. If yes: compares `modified` timestamps. If the incoming file is newer, updates the local copy in place (at whatever path the local file currently lives). If older, discards.
+4. If no: writes to `.ark/inbox/` as a new file (shouldn't normally happen for SYNC envelopes — indicates the receiver deleted their copy).
 
-**Fetching the updated file:**
+**No PoW required** for sync between co-members. The co-membership relationship is already established — the receiving server verifies the sender is in the file's member list.
 
-After receiving a notification, the co-member's server (or client) fetches the updated file:
-
-```
-GET https://bob-server.com/ark/bob/docs/project-plan
-Authorization: ArkUser <device_id>:<signature>
-```
-
-The serving server verifies the requester's identity key is in the file's member list before responding.
+**No path knowledge required.** The sender doesn't need to know where the receiver stores their copy. The receiver's server resolves `file_id` → local path internally.
 
 **Member moved notification:**
 
@@ -1298,7 +1279,20 @@ Envelope type: MEMBER_MOVED
 Payload: { old_address, new_address, identity_key, signature }
 ```
 
-Co-members' clients update the member address and path in shared files. Identity key stays the same, so trust is preserved.
+Co-members' clients update the member address in shared files. Identity key stays the same, so trust is preserved.
+
+**Sync recovery (pull fallback):**
+
+If a server misses SYNC pushes (e.g., downtime exceeding the retry window), members can pull the latest version of a shared file directly from a co-member's server:
+
+```
+GET https://example.com/ark/alice/.ark/files/<file_id>
+Authorization: ArkUser <device_id>:<signature>
+```
+
+The server resolves `file_id` to the local path, verifies the requester's identity key is in the file's member list, and returns the full file (header + body). Returns `404` if the file_id is unknown or `403` if the requester is not a member.
+
+**Recovery flow:** On startup (or periodically), a client can check each shared file by sending a HEAD request to co-members' `.ark/files/<file_id>` endpoint. If the remote `modified` timestamp is newer than the local copy, the client fetches the full file via GET.
 
 ### 7.5 Real-time events
 
@@ -1313,7 +1307,7 @@ WebSocket or SSE stream. Events:
 {"event": "created", "path": "/ark/alice/.ark/inbox/abc123", "from": "bob@example.com"}
 {"event": "modified", "path": "/ark/alice/notes/todo", "modified_by": "alice@example.com"}
 {"event": "deleted", "path": "/ark/alice/mail/trash/old-msg"}
-{"event": "sync", "path": "/ark/alice/.ark/inbox/def456", "type": "OBJECT_UPDATED"}
+{"event": "sync", "path": "/ark/alice/docs/project-plan", "file_id": "def456"}
 ```
 
 ### 7.6 Server architecture
@@ -1340,8 +1334,8 @@ A server is a **single statically-linked binary** containing:
 │  └── Remote identity document cache          │
 ├──────────────────────────────────────────────┤
 │  Sync Engine                                 │
-│  ├── Notify co-members on file update         │
-│  ├── Fetch updates from co-members            │
+│  ├── Push updates to co-members               │
+│  ├── Receive updates (match by file_id)       │
 │  └── Conflict resolution (last-write)        │
 ├──────────────────────────────────────────────┤
 │  TLS (ACME / Let's Encrypt)                  │
@@ -1381,7 +1375,7 @@ storage = "./data"
 
 **Storage:**
 - Filesystem. Files are stored on disk exactly as they are — the server is essentially an authenticated file server. No database required for user data.
-- The server may use a lightweight index (e.g., SQLite) for caching directory listings and metadata queries, but the files themselves are the source of truth.
+- The server maintains a lightweight index (e.g., SQLite) mapping `file_id` → local path (required for sync) and caching directory listings and metadata queries. The files themselves are the source of truth.
 - Contacts allowlists are stored as JSON files at `/ark/<user>/.ark/contacts`.
 
 ### 7.7 Deployment: co-hosting with a website
@@ -1472,52 +1466,54 @@ The header is serialized using Protocol Buffers.
 syntax = "proto3";
 
 message Header {
+  // File identity
+  bytes file_id = 1;                    // 16 bytes, random UUID, immutable after creation
+
   // Timestamps
-  uint64 created = 1;                   // Unix milliseconds
-  uint64 modified = 2;                  // Unix milliseconds
+  uint64 created = 2;                   // Unix milliseconds
+  uint64 modified = 3;                  // Unix milliseconds
 
   // Membership
-  repeated Member members = 3;
+  repeated Member members = 4;
 
   // Encryption
-  string algorithm = 4;                 // "aes-256-gcm", "chacha20-poly1305", or "none"
+  string algorithm = 5;                 // "aes-256-gcm", "chacha20-poly1305", or "none"
 
   // Versioning (optional)
-  bool versioned = 5;
-  string history_path = 6;             // Path to history file (if versioned)
+  bool versioned = 6;
+  string history_path = 7;             // Path to history file (if versioned)
 
   // Author of last modification
-  string modified_by = 7;              // "alice@example.com"
-  uint32 modifier_device_id = 8;
-  string signature_algorithm = 9;      // "ed25519"
-  bytes signature = 10;                // Signature over fields 1-8 + body hash
+  string modified_by = 8;              // "alice@example.com"
+  uint32 modifier_device_id = 9;
+  string signature_algorithm = 10;     // "ed25519"
+  bytes signature = 11;                // Signature over fields 1-9 + body hash
 
   // App hint (for .ark/inbox/ routing by client apps)
-  string app = 11;                     // e.g., "mail", "calendar", "notes" — optional
+  string app = 12;                     // e.g., "mail", "calendar", "notes" — optional
 
   // Forward secrecy (reserved for ratcheted sequences — see Section 10.1)
-  string key_derivation = 12;          // "ecies" (default) or "ratchet"
-  bytes sequence_id = 13;              // Identifies the ratchet session (if key_derivation = "ratchet")
-  uint64 message_index = 14;           // Position in the ratchet chain
-  string ratchet_key_algorithm = 15;   // "x25519"
-  bytes ratchet_key = 16;              // Sender's current DH ratchet public key
+  string key_derivation = 13;          // "ecies" (default) or "ratchet"
+  bytes sequence_id = 14;              // Identifies the ratchet session (if key_derivation = "ratchet")
+  uint64 message_index = 15;           // Position in the ratchet chain
+  string ratchet_key_algorithm = 16;   // "x25519"
+  bytes ratchet_key = 17;              // Sender's current DH ratchet public key
 
   // Key conversion (for ECIES wrapping)
-  string encryption_algorithm = 17;    // "x25519" — target algorithm for deriving encryption key from identity key
+  string encryption_algorithm = 18;    // "x25519" — target algorithm for deriving encryption key from identity key
 }
 
 message Member {
   string address = 1;                   // "alice@example.com"
-  string path = 2;                     // "/ark/alice/notes/todo" — where this member's copy lives
-  string identity_key_algorithm = 3;   // "ed25519"
-  bytes identity_key = 4;              // Member's public key (for verification)
-  string permission = 5;               // "owner", "write", or "read"
+  string identity_key_algorithm = 2;   // "ed25519"
+  bytes identity_key = 3;              // Member's public key (for verification)
+  string permission = 4;               // "owner", "write", or "read"
 
   // File key wrapped for this member (ECIES)
-  string ephemeral_key_algorithm = 6;  // "x25519"
-  bytes ephemeral_key = 7;            // Ephemeral public key (32 bytes)
-  bytes key_nonce = 8;                // AES-256-GCM nonce for key wrapping (12 bytes)
-  bytes wrapped_file_key = 9;         // File key encrypted to this member (32 bytes + 16 byte tag)
+  string ephemeral_key_algorithm = 5;  // "x25519"
+  bytes ephemeral_key = 6;            // Ephemeral public key (32 bytes)
+  bytes key_nonce = 7;                // AES-256-GCM nonce for key wrapping (12 bytes)
+  bytes wrapped_file_key = 8;         // File key encrypted to this member (32 bytes + 16 byte tag)
 }
 ```
 
@@ -1548,7 +1544,7 @@ enum EnvelopeType {
   DELIVER = 0;                         // Deliver a file to a recipient
   REGISTER = 1;                        // Registration request (Section 6.5)
   UNREGISTER = 2;                      // Unregistration request (Section 6.5)
-  OBJECT_UPDATED = 3;                  // Notify co-member of file update
+  SYNC = 3;                            // Push updated file to co-member
   MEMBER_MOVED = 4;                     // Notify co-members of address change
 }
 
@@ -1579,7 +1575,7 @@ message Envelope {
 
   // Payload — depends on envelope type:
   // DELIVER: raw Ark file bytes (header + encrypted body)
-  // OBJECT_UPDATED: FileUpdateNotification
+  // SYNC: raw Ark file bytes (header + encrypted body)
   // MEMBER_MOVED: MemberMovedNotification
   // REGISTER/UNREGISTER: empty
   bytes payload = 12;
@@ -1592,14 +1588,6 @@ message ProofOfWork {
   uint32 memory_cost = 4;            // Argon2 memory parameter (KB)
   uint32 time_cost = 5;              // Argon2 time parameter
   uint64 timestamp = 6;              // When PoW was computed (must be recent)
-}
-
-message FileUpdateNotification {
-  string path = 1;                    // Path on the modifier's server
-  uint64 modified = 2;
-  string modified_by = 3;
-  string signature_algorithm = 4;    // "ed25519"
-  bytes signature = 5;               // Modifier's signature (proves membership)
 }
 
 message MemberMovedNotification {
