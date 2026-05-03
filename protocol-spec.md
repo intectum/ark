@@ -10,7 +10,7 @@
 3. [System 2: Files](#3-system-2-files--the-core-primitive)
 4. [System 3: Encryption](#4-system-3-encryption--nobody-else-can-read-this)
 5. [System 4: Authentication](#5-system-4-authentication--this-really-came-from-alice)
-6. [System 5: Spam Resistance](#6-system-5-spam-resistance--sending-costs-effort)
+6. [System 5: Delivery Control](#6-system-5-delivery-control--who-can-reach-you)
 7. [System 6: Transport](#7-system-6-transport--how-data-moves)
 8. [File Format](#8-file-format)
 9. [Threat Model](#9-threat-model)
@@ -28,7 +28,7 @@ Ark is a federated, encrypted protocol for personal data. It replaces email, clo
 | **Files** | The core data primitive. Everything — messages, documents, notes — is an encrypted file on disk. |
 | **Encryption** | Nobody else can read your data. Symmetric file keys wrapped with public-key encryption. |
 | **Authentication** | Proof that data really came from the claimed author. |
-| **Spam Resistance** | Cross-server delivery costs computational effort. No reputation systems needed. |
+| **Delivery Control** | Only contacts can reach your inbox by default. No reputation systems needed. |
 | **Transport** | How files move between servers. Plain HTTPS, trivially self-hostable. |
 
 ### Design principles
@@ -39,7 +39,7 @@ Ark is a federated, encrypted protocol for personal data. It replaces email, clo
 - **One primitive.** Everything is a file with an unencrypted header and an encrypted body. Different membership patterns produce different behaviors, not different concepts.
 - **Simple to self-host.** A single binary, a single config file, a domain with an A record. That's it.
 - **Federated, not peer-to-peer.** Servers provide reliable offline storage and key hosting. Pure P2P systems (Bitmessage, Briar) struggle with reliability and adoption.
-- **Spam-resistant by construction.** Proof of work + unforgeable identity + contact allowlists make bulk spam economically infeasible without complex filtering infrastructure.
+- **Spam-resistant by construction.** Only contacts can deliver to your inbox by default. Unforgeable identity means no one can impersonate a contact.
 - **Simple key model.** One keypair per identity, like a crypto wallet. Lose the key, lose the identity. Have the key, have all your data.
 - **Flexible trust model.** Users choose where their private key lives — on their device (maximum security) or on their server (maximum convenience). Self-hosters get both.
 - **App-agnostic.** The protocol defines files, membership, and transport. How files are organized into directories is up to applications. A mail app, a notes app, and a file manager all operate on the same files — just arranged differently.
@@ -160,7 +160,7 @@ Note: For Mode B users (server holds the private key), the server *could* sign a
 When Bob wants to contact Alice for the first time:
 
 1. Bob's client extracts the domain from `alice@example.com`.
-2. Bob's client makes an HTTPS GET to `https://example.com/ark/alice/.ark/identity`.
+2. Bob's client makes an HTTPS GET to `https://example.com/ark/alice/.ark/identity.json`.
 3. Bob's client verifies the `signature` field against the `identity_key` in the document.
 4. **Trust On First Use (TOFU):** Bob's client stores Alice's `identity_key` locally. This is the first time Bob has seen this key, so he trusts it (like SSH's "The authenticity of host 'example.com' can't be established... Are you sure you want to continue?").
 5. On subsequent fetches, Bob's client compares the `identity_key` against the stored value. If it has changed without a proper key transition (see 2.8), the client raises an alert.
@@ -328,13 +328,12 @@ Everything else is up to applications. The protocol reserves the `.ark/` directo
 
 | Path | Purpose |
 |---|---|
-| `/ark/.ark/policy` | Server spam policy |
 | `/ark/.ark/accounts` | Account creation endpoint (POST) |
-| `/ark/<user>/.ark/identity` | User identity document |
+| `/ark/<user>/.ark/identity` | HTML contact card / `.json` for identity document |
 | `/ark/<user>/.ark/inbox/` | Cross-server delivery landing zone |
 | `/ark/<user>/.ark/files/<file_id>` | File lookup by ID (sync recovery) |
-| `/ark/<user>/.ark/policy` | User spam policy overrides |
-| `/ark/<user>/.ark/contacts` | Contacts allowlist |
+| `/ark/<user>/.ark/contacts.json` | Contacts allowlist |
+| `/ark/<user>/.ark/contact-invites/` | Contact invite tokens (HTML) / POST to create |
 | `/ark/<user>/.ark/stream` | Real-time event stream (WebSocket/SSE) |
 
 All other paths under `/ark/<user>/` are free for apps and users to organize however they want.
@@ -423,7 +422,7 @@ When a file has multiple members with `write` or `owner` permission, edits need 
 
 1. Alice edits the content, re-encrypts with the file key, bumps `modified`, signs with her identity key.
 2. Alice's client writes the updated file to her server.
-3. Alice's server delivers the updated file to each co-member's `.ark/inbox/` via an envelope (no PoW required — co-membership is already established).
+3. Alice's server delivers the updated file to each co-member's `.ark/inbox/` via an envelope (co-membership is already established).
 4. The receiving server matches the file by `file_id` in the header. If a local file with that `file_id` already exists, it compares `modified` timestamps and keeps the newer version (updating the local copy in place).
 5. If a co-member also made an edit concurrently, the higher `modified` timestamp wins. The losing edit is discarded.
 
@@ -540,7 +539,6 @@ File keys are wrapped to the **identity key**, not per-device. One wrap per memb
 | File body encryption | AES-256-GCM | 96-bit nonce, 128-bit tag |
 | Alternative body encryption | ChaCha20-Poly1305 | 96-bit nonce, 128-bit tag |
 | Unencrypted body | None | Raw bytes, no nonce or tag |
-| Proof of work | Argon2id | configurable |
 
 Clients MUST support AES-256-GCM and `none` (unencrypted). ChaCha20-Poly1305 is recommended as an alternative (faster on devices without AES hardware acceleration). The algorithm used is indicated in the file header.
 
@@ -589,7 +587,7 @@ When files are delivered cross-server via an envelope:
    signature = Ed25519_Sign(
      identity_private_key,
      version || sender || recipient || timestamp || message_id ||
-     envelope_type || proof_of_work
+     envelope_type
    )
    ```
 3. The signature is included in the envelope's `envelope_signature` field.
@@ -612,215 +610,108 @@ The Ed25519 signature provides **non-repudiation**: Alice can prove to a third p
 
 ---
 
-## 6. System 5: Spam Resistance — "Sending costs effort"
-
-Spam resistance applies to **cross-server delivery** — when an envelope is sent from one server to another. Local operations (creating files on your own server, editing your own data) never require proof of work.
+## 6. System 5: Delivery Control — "Who can reach you"
 
 ### 6.1 Concept
 
-Email spam is possible because sending is free and identity is forgeable. This protocol eliminates both: identity is cryptographically unforgeable, and every cross-server envelope requires proof of computational work.
+Email spam is possible because anyone can send to anyone. This protocol inverts that: by default, only your contacts can deliver to your inbox. Accounts that want to receive from anyone (e.g., `info@business.com`) opt into a public inbox.
 
-### 6.2 Layer 1: Proof of Work
+Identity is cryptographically unforgeable, so the contacts allowlist is a reliable delivery gate — no one can impersonate a contact.
 
-Every cross-server envelope includes a proof-of-work stamp computed using **Argon2id**.
+### 6.2 Public vs. private inboxes
 
-**Why Argon2id?**
-- It's **memory-hard**: requires a configurable amount of RAM per computation.
-- Spammers use GPUs and ASICs, which have massive parallel compute but limited per-core memory. Memory-hardness neutralizes this advantage — each parallel computation needs its own chunk of RAM.
-- It's the winner of the Password Hashing Competition and is well-understood.
-- Simple hashcash (SHA-256) is vulnerable to GPU/ASIC acceleration. An attacker with a GPU farm could compute PoW stamps orders of magnitude faster than legitimate users.
-
-**How the puzzle works:**
-
-1. The sender constructs the envelope data (excluding the PoW fields).
-2. The sender serializes it into a byte string: `challenge = sender || recipient || timestamp || message_id`.
-3. The sender picks a random starting nonce (16 bytes).
-4. The sender repeatedly computes:
-   ```
-   result = Argon2id(
-     password: challenge || nonce,
-     salt: recipient_domain,
-     time_cost: 1,
-     memory_cost: 65536,    // 64 MB
-     parallelism: 1,
-     output_length: 32
-   )
-   ```
-   incrementing the nonce each time, until the first `difficulty` bits of `result` are zero.
-5. The winning nonce and difficulty are included in the envelope.
-
-**Verification** (by the receiving server):
-1. Reconstruct the challenge from the envelope fields.
-2. Run Argon2id once with the provided nonce.
-3. Check that the first `difficulty` bits are zero.
-4. Check that the timestamp in the PoW is recent (within 1 hour).
-5. Total verification time: < 1 second (single computation vs. sender's many attempts).
-
-**Default difficulty:**
-- At the default difficulty (20 leading zero bits), a sender computes ~1 million Argon2id evaluations on average. With 64MB memory per evaluation, this takes approximately **0.5–2 seconds** on a modern machine.
-- This is imperceptible for a human sending a message. For a spammer sending 1 million messages, it would take ~12–24 CPU-days.
-
-### 6.3 Variable difficulty
-
-Each server publishes its spam policy:
-
-```
-GET https://example.com/ark/.ark/policy
-```
+The identity document includes a `public` flag:
 
 ```json
 {
-  "pow": {
-    "algorithm": "argon2id",
-    "default_difficulty": 20,
-    "first_contact_difficulty": 22,
-    "known_contact_difficulty": 0,
-    "registration_difficulty": 22,
-    "account_creation_difficulty": 24,
-    "memory_cost": 65536,
-    "time_cost": 1
-  }
+  "version": 1,
+  "address": "alice@example.com",
+  "identity_key": { "algorithm": "ed25519", "public_key": "..." },
+  "public": false,
+  "updated": "...",
+  "signature": { "algorithm": "ed25519", "signature": "..." }
 }
 ```
 
-| Scenario | Difficulty | Approximate time |
-|---|---|---|
-| Known contact (in allowlist) | 0 (none) | Instant |
-| Default (unknown sender) | 20 bits | ~0.5–2 seconds |
-| First contact (no prior exchange) | 22 bits | ~2–8 seconds |
-| Registration (subscribing to a sender) | 22 bits | ~2–8 seconds |
-| Under load / attack | 24+ bits | ~10–30+ seconds |
+| `public` | Behavior |
+|---|---|
+| `false` (default) | Only senders in the contacts allowlist can deliver to `.ark/inbox/`. Unknown senders are rejected with `403`. |
+| `true` | Any sender can deliver. The server may apply its own rate limiting or abuse prevention (not specified by the protocol). |
 
-Servers can dynamically increase difficulty when under load.
+### 6.3 Contacts allowlist
 
-### 6.4 Size-scaled difficulty
-
-PoW difficulty increases with envelope size. This prevents storage-filling attacks where an attacker sends many large files to exhaust a recipient's storage.
-
-The effective difficulty is:
-
-```
-effective_difficulty = base_difficulty + min(floor(log2(envelope_size_kb)), size_difficulty_cap)
-```
-
-Where `base_difficulty` is the applicable difficulty from Section 6.3 and `size_difficulty_cap` limits how much the size penalty can add (default: 4 bits).
-
-| Envelope size | Extra bits | Total (base 20) | Approx. time |
-|---|---|---|---|
-| 1 KB (short text) | 0 | 20 | ~1 second |
-| 100 KB (long message) | 2 | 22 | ~4 seconds |
-| 1 MB (small attachment) | 4 (capped) | 24 | ~15 seconds |
-| 25 MB (large attachment) | 4 (capped) | 24 | ~15 seconds |
-
-The cap prevents legitimate large attachments from being impractical to send. The server publishes its cap in the policy:
-
-```json
-{
-  "pow": {
-    "size_difficulty_cap": 4
-  }
-}
-```
-
-Combined with `max_account_size` (server config, default 1GB) and `max_file_size` (server config, default 25MB for deliveries), this creates layered storage protection:
-- `max_file_size` rejects oversized deliveries outright.
-- Size-scaled PoW makes large deliveries more expensive to send in bulk.
-- `max_account_size` is the hard ceiling — once full, the server returns `507 Insufficient Storage`.
-
-### 6.5 Layer 2: Registration
-
-Some users — newsletters, services, notification systems — need to send to many recipients without paying per-delivery PoW. The **registration** mechanism solves this: the *recipient* initiates contact by sending a lightweight registration envelope to the sender, paying PoW once. After registration, the sender can deliver to that recipient at `known_contact_difficulty` (typically 0).
-
-**How it works:**
-
-1. Alice wants to receive updates from `newsletter@example.com`.
-2. Alice's client fetches the identity document for `newsletter@example.com` and checks that `accept_registrations` is `true` (see Section 6.5.2).
-3. Alice's client sends a `REGISTER` envelope to `newsletter@example.com`:
-   - The envelope has `type: REGISTER` and no file payload.
-   - Alice computes PoW at the `registration_difficulty` published by `newsletter@example.com`'s server.
-   - The envelope is signed by Alice's identity key (proving Alice authorized this registration).
-4. The newsletter's server verifies the PoW and signature, then adds Alice's identity key to the newsletter's contacts allowlist.
-5. The newsletter can now deliver to Alice at `known_contact_difficulty` (typically 0).
-
-**Unregistration:**
-
-Alice can send an `UNREGISTER` envelope (same format, `type: UNREGISTER`, no PoW required — only the signature is needed to prove identity). The sender's server removes Alice from the allowlist.
-
-Alice's client also removes the sender from her own allowlist, so future deliveries from the sender revert to default PoW requirements on her server.
-
-**Why the recipient pays PoW (not the sender):**
-
-- Legitimate bulk senders would be crushed by per-delivery PoW at scale. A newsletter with 100,000 subscribers sending weekly would need ~100,000 PoW computations per send — impractical.
-- The subscriber pays once (~2–8 seconds). The sender benefits permanently (or until unregistration).
-- Spam is impossible: no one registers to receive spam.
-- Unlike traditional email subscription bombing, an attacker cannot register *someone else* — the registration envelope is signed by the registrant's identity key.
-
-**Registration difficulty:**
-
-The receiving server publishes `registration_difficulty` in its policy (see Section 6.3). Default: same as `first_contact_difficulty` (22 bits).
-
-#### 6.5.1 Per-user PoW overrides
-
-Individual users can override the server's default PoW settings via a separate policy file at `/ark/<user>/.ark/policy`. This allows a newsletter account on a shared server to accept registrations while personal accounts on the same server do not.
-
-```
-GET https://example.com/ark/newsletter/.ark/policy
-```
-
-```json
-{
-  "accept_registrations": true,
-  "default_difficulty": 20,
-  "first_contact_difficulty": 24,
-  "known_contact_difficulty": 0,
-  "registration_difficulty": 20,
-  "signature": "..."
-}
-```
-
-**Rules:**
-
-- Per-user policy is optional. If absent, the server's policy applies.
-- Per-user difficulty values can only be **equal to or higher** than the server's defaults — a user cannot lower PoW requirements below what the server enforces.
-- `accept_registrations` defaults to `false`. Only users who explicitly enable it will accept registration envelopes.
-- The policy file is signed by the user's identity key, so it cannot be tampered with by the server (Mode A users).
-
-**Resolution order** (when an envelope arrives for a user):
-
-1. Check user's policy file at `/ark/<user>/.ark/policy`.
-2. Fall back to server-wide policy from `/ark/.ark/policy`.
-3. Apply size-scaled difficulty on top (Section 6.4).
-
-**Use cases:**
-
-| User type | `accept_registrations` | `first_contact_difficulty` | Notes |
-|---|---|---|---|
-| Personal account | `false` (default) | Server default (22) | Normal behavior. |
-| Newsletter / service | `true` | Higher (24+) | Accepts registrations, discourages cold contact. |
-| Public figure | `false` | Higher (26+) | No registrations, very high bar for cold contact. |
-| Private account | `false` | Higher (28+) | Effectively unreachable unless allowlisted. |
-
-#### 6.5.2 Sender discovery of registration support
-
-Before sending a registration envelope, the client fetches the recipient's policy file at `/ark/<user>/.ark/policy` and checks for `"accept_registrations": true`. If the file is absent or the field is `false`, the client should not send a registration envelope — the recipient's server will reject it with `403 Forbidden`.
-
-### 6.6 Layer 3: Contacts allowlist
-
-Once Alice replies to Bob, Bob's identity key is added to Alice's contacts allowlist on her server. Future deliveries from Bob require zero (or minimal) proof of work.
-
-This is automatic and transparent:
-- Alice replies to Bob → Bob is allowlisted.
-- Alice registers with Bob (Section 6.5) → mutual allowlisting.
-- Alice adds Bob manually → Bob is allowlisted.
-- Alice removes Bob → Bob is de-listed, reverts to default PoW requirement.
-
-The allowlist is stored in `/ark/alice/.ark/contacts` and is keyed by the sender's **identity public key**, not their address. This means:
+The allowlist is stored at `/ark/<user>/.ark/contacts.json` and is keyed by **identity public key**, not address. This means:
 - Bob can change servers and remain allowlisted as long as he keeps the same identity key.
-- Someone who registers bob@attacker.com with a different key is NOT allowlisted.
+- Someone who registers `bob@attacker.com` with a different key is NOT allowlisted.
 
-### 6.7 Layer 4: Account creation PoW
+**How contacts are added:**
+- Alice adds Bob manually (out-of-band exchange of addresses).
+- Alice replies to Bob → Bob is automatically allowlisted.
+- Bob redeems a contact invite created by Alice (see Section 6.4).
+- Alice removes Bob → future deliveries from Bob are rejected.
 
-Account creation also requires proof of work. This prevents mass creation of throwaway accounts to circumvent per-sender PoW.
+**Delivery flow:**
+
+When an envelope arrives for a user with `public: false`:
+1. The server verifies the `envelope_signature` against the sender's identity key.
+2. The server checks if the sender's identity key is in the recipient's contacts allowlist.
+3. If not in contacts → reject with `403 Forbidden`.
+4. If in contacts → accept delivery.
+
+For users with `public: true`, step 2–3 are skipped.
+
+### 6.4 Contact invites
+
+Contact invites allow adding someone to your contacts via a shareable link or QR code.
+
+**Creating an invite:**
+
+```
+POST /ark/alice/.ark/contact-invites
+Authorization: ArkUser <signature>
+Content-Type: application/json
+
+{
+  "max_uses": 1,
+  "expires": "2026-05-10T00:00:00Z"
+}
+```
+
+Response:
+
+```json
+{
+  "token": "base64url-encoded-random-token"
+}
+```
+
+Both `max_uses` and `expires` are optional. If omitted, the invite is single-use with no expiry.
+
+**Redeeming an invite:**
+
+```
+POST /ark/alice/.ark/contact-invites/<token>
+Content-Type: application/json
+
+{
+  "identity_key": {
+    "algorithm": "ed25519",
+    "public_key": "base64url-encoded"
+  },
+  "address": "bob@other-server.com"
+}
+```
+
+The server validates the token (not expired, uses remaining), then adds Bob's identity key to Alice's contacts allowlist. Returns `200 OK` on success, `404` if token is invalid/expired.
+
+**Sharing invites:**
+
+Invites are shared as regular HTTPS URLs: `https://example.com/ark/alice/.ark/contact-invites/<token>`
+
+- **QR code**: Encode the URL. Recipient scans, their client POSTs to redeem.
+- **Web fallback**: A GET to the invite URL (without `.json`) serves an HTML page with a confirm button for users without a native client.
+
+### 6.5 Account creation
 
 ```
 POST https://example.com/ark/.ark/accounts
@@ -831,21 +722,11 @@ Content-Type: application/json
   "identity_key": {
     "algorithm": "ed25519",
     "public_key": "base64url-encoded"
-  },
-  "proof_of_work": {
-    "algorithm": "argon2id",
-    "nonce": "base64url-encoded-nonce",
-    "difficulty": 24,
-    "memory_cost": 65536,
-    "time_cost": 1,
-    "timestamp": 1712838400
   }
 }
 ```
 
-The PoW challenge for account creation is: `challenge = "account-creation" || address || identity_key || timestamp`.
-
-Servers can disable remote account creation entirely:
+Servers can disable remote account creation:
 
 ```toml
 allow_remote_registration = false  # Only admin can create accounts (default: true)
@@ -853,12 +734,12 @@ allow_remote_registration = false  # Only admin can create accounts (default: tr
 
 When disabled, the endpoint returns `403 Forbidden`. Local account creation (via the admin CLI) always works regardless of this setting.
 
-### 6.8 Why this eliminates IP reputation
+### 6.6 Why this eliminates IP reputation
 
 | Email problem | How Ark solves it |
 |---|---|
-| Unknown IP → spam folder | Identity is cryptographic, not IP-based. A brand-new server delivers just as well as an established one. |
-| IP blocklists | No blocklists needed. PoW + signatures prevent abuse. |
+| Unknown IP → spam folder | Identity is cryptographic, not IP-based. |
+| IP blocklists | Not needed. Contacts allowlist prevents unwanted delivery. |
 | Shared IP risk (cloud hosting) | IP doesn't matter. Your cryptographic identity is unique. |
 | SPF/DKIM/DMARC complexity | None of these exist. Authentication is per-file signatures. |
 
@@ -917,8 +798,13 @@ Clients that need the full header (member entries, wrapped keys) use GET and rea
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/ark/alice/.ark/contacts` | List contacts (allowlisted identity keys) |
-| `PUT` | `/ark/alice/.ark/contacts` | Update contacts |
+| `GET` | `/ark/alice/.ark/identity.json` | Identity document (JSON) |
+| `GET` | `/ark/alice/.ark/identity` | Contact card (HTML) |
+| `GET` | `/ark/alice/.ark/contacts.json` | List contacts (allowlisted identity keys) |
+| `PUT` | `/ark/alice/.ark/contacts.json` | Update contacts |
+| `POST` | `/ark/alice/.ark/contact-invites` | Create contact invite |
+| `POST` | `/ark/alice/.ark/contact-invites/<token>` | Redeem contact invite |
+| `GET` | `/ark/alice/.ark/contact-invites/<token>` | Invite page (HTML) |
 | `GET/HEAD` | `/ark/alice/.ark/files/<file_id>` | Fetch/check shared file by ID (sync recovery) |
 | `GET` | `/ark/alice/.ark/stream` | Real-time event stream (WebSocket/SSE) |
 
@@ -937,7 +823,7 @@ Content-Type: application/x-ark-envelope
 <binary envelope>
 ```
 
-The envelope is self-authenticating — it contains the sender's signature and PoW stamp. No HTTP-level authentication is required. The receiving server verifies the `envelope_signature` against the sender's identity key. Alice's server extracts the file and writes it to `.ark/inbox/` with a generated filename (the envelope's `message_id`).
+The envelope is self-authenticating — it contains the sender's signature. No HTTP-level authentication is required. The receiving server verifies the `envelope_signature` against the sender's identity key, then checks the contacts allowlist (Section 6.3). The file is written to `.ark/inbox/` with a generated filename (the envelope's `message_id`).
 
 Client-side apps inspect incoming files in `.ark/inbox/` and claim them based on content or directory conventions.
 
@@ -949,7 +835,6 @@ Client-side apps inspect incoming files in `.ark/inbox/` and claim them based on
 | `400 Bad Request` | Malformed envelope. |
 | `403 Forbidden` | Signature verification failed. |
 | `404 Not Found` | Recipient does not exist on this server. |
-| `422 Unprocessable` | PoW verification failed or difficulty too low. |
 | `429 Too Many Requests` | Rate limited. Includes `Retry-After` header. |
 | `507 Insufficient Storage` | Recipient's storage is full. |
 
@@ -974,7 +859,7 @@ The envelope payload is the full updated Ark file (header + encrypted body). The
 3. If yes: compares `modified` timestamps. If the incoming file is newer, updates the local copy in place (at whatever path the local file currently lives). If older, discards.
 4. If no: writes to `.ark/inbox/` as a new file (shouldn't normally happen for SYNC envelopes — indicates the receiver deleted their copy).
 
-**No PoW required** for sync between co-members. The co-membership relationship is already established — the receiving server verifies the sender is in the file's member list.
+Sync envelopes bypass the contacts allowlist check — the receiving server verifies the sender is in the file's member list instead.
 
 **No path knowledge required.** The sender doesn't need to know where the receiver stores their copy. The receiver's server resolves `file_id` → local path internally.
 
@@ -1034,7 +919,7 @@ A server is a **single statically-linked binary** containing:
 │  Filesystem Storage                          │
 │  ├── /ark/<user>/ (encrypted files)          │
 │  ├── /ark/<user>/.ark/inbox/ (incoming)      │
-│  └── /ark/<user>/.ark/contacts (allowlist)   │
+│  └── /ark/<user>/.ark/contacts.json (allowlist)│
 ├──────────────────────────────────────────────┤
 │  Outbound Relay                              │
 │  ├── Queue for outgoing envelopes            │
@@ -1077,14 +962,14 @@ storage = "./data"
 2. Point a domain to the server's IP (A/AAAA record).
 3. Create the config file (2 lines minimum).
 4. Start the server. It auto-provisions a TLS certificate via Let's Encrypt.
-5. Add users locally: `ark-server user add alice` (bypasses PoW for local admin).
-6. Or users self-register via the accounts endpoint (requires account creation PoW).
+5. Add users locally: `ark-server user add alice`.
+6. Or users self-register via the accounts endpoint.
 7. Alice's client registers her public key (Mode A) or the server generates one for her (Mode B).
 
 **Storage:**
 - Filesystem. Files are stored on disk exactly as they are — the server is essentially an authenticated file server. No database required for user data.
 - The server maintains a lightweight index (e.g., SQLite) mapping `file_id` → local path (required for sync) and caching directory listings and metadata queries. The files themselves are the source of truth.
-- Contacts allowlists are stored as JSON files at `/ark/<user>/.ark/contacts`.
+- Contacts allowlists are stored as JSON files at `/ark/<user>/.ark/contacts.json`.
 
 ### 7.7 Deployment: co-hosting with a website
 
@@ -1130,7 +1015,7 @@ tls = false  # reverse proxy handles TLS
 | DNS records | A, MX, PTR, SPF, DKIM, DMARC | A (or AAAA) only |
 | TLS certificates | Manual or separate ACME setup | Built-in ACME or use reverse proxy |
 | IP reputation | Critical. New IPs go to spam for months. | Not a concept. |
-| Spam filtering | SpamAssassin, Bayesian filters, blocklists | Built-in: PoW + signatures |
+| Spam filtering | SpamAssassin, Bayesian filters, blocklists | Built-in: contacts allowlist |
 | Deliverability | Gmail/Outlook may silently drop your mail | Guaranteed — cryptographic identity |
 | Software | Postfix + Dovecot + OpenDKIM + Rspamd + ... | Single binary |
 | Config files | Dozens across multiple services | One file |
@@ -1217,10 +1102,8 @@ The envelope is the transport wrapper for cross-server delivery. It wraps a file
 ```protobuf
 enum EnvelopeType {
   DELIVER = 0;                         // Deliver a file to a recipient
-  REGISTER = 1;                        // Registration request (Section 6.5)
-  UNREGISTER = 2;                      // Unregistration request (Section 6.5)
-  SYNC = 3;                            // Push updated file to co-member
-  MEMBER_MOVED = 4;                     // Notify co-members of address change
+  SYNC = 1;                            // Push updated file to co-member
+  MEMBER_MOVED = 2;                    // Notify co-members of address change
 }
 
 message Envelope {
@@ -1235,28 +1118,15 @@ message Envelope {
   // Envelope type
   EnvelopeType type = 6;              // Default: DELIVER
 
-  // Spam resistance (required for DELIVER, REGISTER; absent for others)
-  ProofOfWork proof_of_work = 7;
-
-  // Sender authentication (signature over fields 1-7)
-  string signature_algorithm = 8;     // "ed25519"
-  bytes envelope_signature = 9;       // 64 bytes
+  // Sender authentication (signature over fields 1-6)
+  string signature_algorithm = 7;     // "ed25519"
+  bytes envelope_signature = 8;       // 64 bytes
 
   // Payload — depends on envelope type:
   // DELIVER: raw Ark file bytes (header + encrypted body)
   // SYNC: raw Ark file bytes (header + encrypted body)
   // MEMBER_MOVED: MemberMovedNotification
-  // REGISTER/UNREGISTER: empty
-  bytes payload = 10;
-}
-
-message ProofOfWork {
-  string algorithm = 1;               // "argon2id"
-  bytes nonce = 2;                    // 16 bytes
-  uint32 difficulty = 3;              // Number of leading zero bits required
-  uint32 memory_cost = 4;            // Argon2 memory parameter (KB)
-  uint32 time_cost = 5;              // Argon2 time parameter
-  uint64 timestamp = 6;              // When PoW was computed (must be recent)
+  bytes payload = 9;
 }
 
 message MemberMovedNotification {
@@ -1269,14 +1139,14 @@ message MemberMovedNotification {
 }
 ```
 
-### 8.4 Identity and policy documents
+### 8.4 Identity and contacts documents
 
-Identity documents, policy files, and contacts are JSON (human-readable, easy to debug with curl). See Section 2.4 and Section 6.5.1 for schemas.
+Identity documents and contacts are JSON (human-readable, easy to debug with curl). See Section 2.4 for the identity document schema.
 
 ### 8.5 Serialization rules
 
 - **File headers, envelopes:** Protocol Buffers (binary). Compact, efficient, schema-evolvable.
-- **Identity documents, policy, server identity, contacts:** JSON. Human-readable.
+- **Identity documents, contacts:** JSON. Human-readable.
 - **Signatures:** computed over the canonical protobuf serialization (deterministic encoding) plus the SHA-256 hash of the encrypted body.
 - **All binary values in JSON:** base64url encoding (RFC 4648, no padding).
 
@@ -1291,7 +1161,7 @@ Identity documents, policy files, and contacts are JSON (human-readable, easy to
 | **Data confidentiality** | Only holders of the file key can read file content. Servers see only ciphertext (Mode A). |
 | **Author authentication** | Files and envelopes are signed by the author's identity key. Forgery requires the private key. |
 | **Integrity** | Any modification to a file invalidates the signature. Any modification to the ciphertext invalidates the AEAD tag. |
-| **Spam resistance** | Bulk cross-server delivery requires proportional computational resources (PoW). |
+| **Spam resistance** | Only contacts can deliver to private inboxes. Public inboxes are opt-in. |
 | **Data persistence (static mode)** | All static-mode files can be decrypted with the single identity key (which unwraps file keys). No session state to lose. |
 
 ### 9.2 What is NOT protected
@@ -1340,7 +1210,6 @@ Identity documents, policy files, and contacts are JSON (human-readable, easy to
 | Ed25519 is secure | All identity and authentication breaks. |
 | X25519 is secure | All encryption and key exchange breaks. |
 | AES-256-GCM / ChaCha20-Poly1305 is secure | Data confidentiality breaks. |
-| Argon2id is memory-hard | PoW can be computed cheaply by attackers with specialized hardware. |
 | User's seed phrase / private key is stored securely | Attacker can decrypt all data and impersonate user. |
 | TOFU on first contact is not intercepted | MITM on first key fetch allows interception until detected. |
 
@@ -1507,7 +1376,7 @@ When a protocol user sends a message to a legacy email address, the server creat
    → "x-a7f3k2m9p4q8r2"
    ```
 3. Bob's server checks whether this alias already exists on the **gateway server**.
-4. If not, it requests account creation on the gateway (with account creation PoW):
+4. If not, it requests account creation on the gateway:
    - The gateway creates a Mode B account (server-generated keypair).
    - The gateway publishes a legacy email identity document for the alias.
 5. Bob's server encrypts the message to the new account's public key and delivers it.
@@ -1665,7 +1534,6 @@ V1 uses last-write-wins for shared files. A future extension could support real-
 | File body encryption | AES-256-GCM | 256-bit | ciphertext + 128-bit tag |
 | Alt. body encryption | ChaCha20-Poly1305 | 256-bit | ciphertext + 128-bit tag |
 | No encryption | None | — | raw bytes |
-| Proof of work | Argon2id | variable | 256-bit |
 | Seed phrase | BIP-39 | 256-bit entropy | 24 words |
 
 ## Appendix B: URL Structure Summary
@@ -1676,15 +1544,15 @@ All Ark paths are under `https://<domain>/ark/`.
 
 | Path | Method | Purpose |
 |---|---|---|
-| `/ark/.ark/policy` | GET | Server spam policy |
-| `/ark/.ark/accounts` | POST | Create account (requires PoW) |
+| `/ark/.ark/accounts` | POST | Create account |
 
 **User-level (public, no auth):**
 
 | Path | Method | Purpose |
 |---|---|---|
-| `/ark/<user>/.ark/identity` | GET | User identity document |
-| `/ark/<user>/.ark/policy` | GET | User spam policy (optional) |
+| `/ark/<user>/.ark/identity.json` | GET | Identity document (JSON) |
+| `/ark/<user>/.ark/identity` | GET | Contact card (HTML) |
+| `/ark/<user>/.ark/contact-invites/<token>` | GET/POST | View/redeem invite (HTML/JSON) |
 
 **User-level (authenticated — member):**
 
@@ -1696,7 +1564,7 @@ All Ark paths are under `https://<domain>/ark/`.
 | `/ark/<user>/<path>` | DELETE | Delete file |
 | `/ark/<user>/<dir>` | GET | List directory |
 | `/ark/<user>/.ark/files/<file_id>` | GET/HEAD | Fetch/check shared file by ID (sync recovery) |
-| `/ark/<user>/.ark/contacts` | GET/PUT | Manage contacts allowlist |
+| `/ark/<user>/.ark/contacts.json` | GET/PUT | Manage contacts allowlist |
 | `/ark/<user>/.ark/stream` | GET | Real-time event stream |
 
 **Cross-server delivery (server auth):**
@@ -1725,24 +1593,21 @@ Bob's Client                Bob's Server              Alice's Server            
     |     wrap key for self     |                          |                          |
     |     and Alice             |                          |                          |
     |                           |                          |                          |
-    |  4. Compute proof of work |                          |                          |
-    |     (Argon2id, ~0.5s)     |                          |                          |
+    |  4. Sign envelope         |                          |                          |
     |                           |                          |                          |
-    |  5. Sign envelope         |                          |                          |
-    |                           |                          |                          |
-    |  6. Store file on ------->|                          |                          |
+    |  5. Store file on ------->|                          |                          |
     |     home server           |                          |                          |
-    |                           |  7. Relay via HTTPS POST |                          |
+    |                           |  6. Relay via HTTPS POST |                          |
     |                           |------- envelope -------->|                          |
-    |                           |                          |  8. Verify signature      |
-    |                           |                          |  9. Verify PoW            |
-    |                           |                          |  10. Store in .ark/inbox/ |
+    |                           |                          |  7. Verify signature      |
+    |                           |                          |  8. Check contacts/public |
+    |                           |                          |  9. Store in .ark/inbox/  |
     |                           |                          |                          |
-    |                           |                          |  11. Alice fetches ------>|
-    |                           |                          |  12. Decrypt with         |
+    |                           |                          |  10. Alice fetches ------>|
+    |                           |                          |  11. Decrypt with         |
     |                           |                          |      private key          |
     |                           |                          |                          |
-    |                           |                          |  13. App moves file       |
+    |                           |                          |  12. App moves file       |
     |                           |                          |      to desired path      |
 ```
 
