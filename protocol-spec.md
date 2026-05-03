@@ -131,26 +131,6 @@ Response:
     "algorithm": "ed25519",
     "public_key": "base64url-encoded"
   },
-  "devices": [
-    {
-      "device_id": 1,
-      "device_key": {
-        "algorithm": "ed25519",
-        "public_key": "base64url-encoded"
-      },
-      "label": "Alice's Laptop",
-      "registered": "2026-03-15T00:00:00Z"
-    },
-    {
-      "device_id": 2,
-      "device_key": {
-        "algorithm": "ed25519",
-        "public_key": "base64url-encoded"
-      },
-      "label": "Alice's Phone",
-      "registered": "2026-04-01T00:00:00Z"
-    }
-  ],
   "updated": "2026-04-11T12:00:00Z",
   "signature": {
     "algorithm": "ed25519",
@@ -165,11 +145,7 @@ Response:
 |---|---|
 | `version` | Protocol version. Currently `1`. |
 | `address` | The user's full address. |
-| `identity_key` | The root of trust for this user. Used for signing. Senders derive the encryption key from this using the conversion specified in the key wrapping step (Section 4.4). Contains `algorithm` and `public_key`. |
-| `devices[]` | List of authorized devices. |
-| `devices[].device_id` | Numeric ID, unique per user. |
-| `devices[].device_key` | Per-device signing key, authorized by the identity key. Contains `algorithm` and `public_key`. |
-| `devices[].label` | Human-readable device name. |
+| `identity_key` | The root of trust for this user. Used for signing and encryption (via key conversion). Contains `algorithm` and `public_key`. |
 | `signature` | Signature over the entire document (excluding this field). Proves the identity key holder authored this. Contains `algorithm` and `signature`. |
 
 **The self-signature is the key security property** (for Mode A users). The server hosts this document but cannot tamper with it — any modification invalidates the signature. This means:
@@ -203,34 +179,14 @@ Alice uses a laptop and a phone. Multi-device works differently depending on the
 
 **Mode B (server-managed key):**
 - Simple. Each device authenticates with the server (password, token, etc.) and receives the private key.
-- All devices can decrypt all files (they all have the same identity private key).
-- Each device also has its own **device signing key** (Ed25519) for authenticating requests and signing outgoing data.
+- All devices can decrypt all files and sign operations (they all have the same identity keypair).
 
 **Mode A (client-managed key):**
 - Alice sets up her first device with the seed phrase.
 - To add a second device, Alice enters the seed phrase on the new device (or transfers the private key via QR code / secure channel).
-- Each device also generates its own **device signing key**.
-- The identity key signs each device key (proving "I, Alice, authorize this device").
+- All devices derive the same identity keypair.
 
-**Device signing keys** are useful in both modes:
-- They identify which device authored an operation.
-- A device can be individually revoked without changing the identity key.
-- Request authentication is per-device (the server knows which device is making each request).
-
-**Device removal:**
-- Alice signs a revocation statement with her identity key, removing the device from her identity document.
-- Other users' clients see the device is gone on the next identity document fetch.
-
-### 2.7 Key rotation
-
-**Identity key:**
-- Rarely changed. Only needed if the key is compromised or the user wants to start fresh.
-- See section 2.8 for the transition process.
-
-**Device signing keys:**
-- Can be rotated independently. The new device key is signed by the identity key and published in the identity document.
-
-### 2.8 Identity key transition
+### 2.7 Identity key transition
 
 If Alice needs to change her identity key:
 
@@ -255,7 +211,7 @@ If Alice needs to change her identity key:
 
 When an identity key changes, Alice must re-wrap her file keys. Each file has a symmetric file key encrypted to her identity key (Section 4). Alice decrypts each file key with the old identity key and re-encrypts it with the new one. For shared files, other members' entries are unaffected — they hold the file key wrapped to their own identity keys.
 
-### 2.9 Account recovery
+### 2.8 Account recovery
 
 **Mode B (server-managed key):**
 - The server holds the private key. Recovery is a standard password reset / admin intervention.
@@ -265,7 +221,7 @@ When an identity key changes, Alice must re-wrap her file keys. Each file has a 
 **Mode A (client-managed key):**
 - Alice enters her 24-word seed phrase on a new device.
 - The client derives the identity keypair from the seed.
-- The client registers the new device with Alice's server (the server recognizes the identity public key).
+- The client authenticates with Alice's server using the identity key.
 - Files stored on the server (encrypted) can be decrypted because Alice has the same private key, which unwraps the file keys.
 
 **What is lost if the seed phrase is lost (Mode A):**
@@ -277,7 +233,7 @@ When an identity key changes, Alice must re-wrap her file keys. Each file has a 
 - The server just needs a domain name pointing to it (A/AAAA record). That's it.
 - No MX records, no SPF, no DKIM, no DMARC. Identity is cryptographic, not DNS-based.
 
-### 2.10 Server migration
+### 2.9 Server migration
 
 Alice can move from one server to another while keeping the same identity keypair.
 
@@ -310,7 +266,7 @@ If Alice's old server goes offline (provider shut down, lost access), the alias 
 - Other people's allowlists. Contacts who had Alice allowlisted on the old address may need to re-allowlist the new address. However, since allowlists are keyed by identity public key (not address), a smart server implementation can recognize that the same key is now at a new address and preserve the allowlist entry.
 - Shared file co-membership. Other members of shared files have Alice's old server address in the member list. Alice notifies co-members (via a `MEMBER_MOVED` envelope) so they update the address. Since membership is verified by identity key, the transition is seamless once addresses are updated.
 
-### 2.11 Aliases
+### 2.10 Aliases
 
 A single identity (one keypair) can have **multiple addresses** that all resolve to the same account. One address is the **primary** and has a full identity document. All others are **aliases** that redirect to the primary.
 
@@ -335,7 +291,7 @@ When someone encounters an alias document, they follow the `redirect` to fetch t
 - **Vanity aliases.** Alice has `alice@example.com` as primary but also wants `a@example.com`.
 - **Generated aliases.** Machine-generated aliases for special purposes.
 
-**Cross-server aliases** are not supported in v1. An alias must be on the same server as the primary address. Cross-server migration is handled by key transitions (Section 2.8).
+**Cross-server aliases** are not supported in v1. An alias must be on the same server as the primary address. Cross-server migration is handled by key transitions (Section 2.7).
 
 ---
 
@@ -372,11 +328,11 @@ Everything else is up to applications. The protocol reserves the `.ark/` directo
 
 | Path | Purpose |
 |---|---|
-| `/ark/.ark/identity` | Server identity document |
 | `/ark/.ark/policy` | Server spam policy |
 | `/ark/.ark/accounts` | Account creation endpoint (POST) |
 | `/ark/<user>/.ark/identity` | User identity document |
 | `/ark/<user>/.ark/inbox/` | Cross-server delivery landing zone |
+| `/ark/<user>/.ark/files/<file_id>` | File lookup by ID (sync recovery) |
 | `/ark/<user>/.ark/policy` | User spam policy overrides |
 | `/ark/<user>/.ark/contacts` | Contacts allowlist |
 | `/ark/<user>/.ark/stream` | Real-time event stream (WebSocket/SSE) |
@@ -428,7 +384,7 @@ A GET request to a directory path returns a listing of entries with their header
 
 ```
 GET https://example.com/ark/alice/notes
-Authorization: ArkUser <device_id>:<signature>
+Authorization: ArkUser <signature>
 ```
 
 Response (JSON):
@@ -465,7 +421,7 @@ When a file has multiple members with `write` or `owner` permission, edits need 
 
 **Last-write-wins.** The `modified` timestamp is the tiebreaker. No merge, no conflict resolution in v1. When Alice updates a shared file:
 
-1. Alice edits the content, re-encrypts with the file key, bumps `modified`, signs with her device key.
+1. Alice edits the content, re-encrypts with the file key, bumps `modified`, signs with her identity key.
 2. Alice's client writes the updated file to her server.
 3. Alice's server delivers the updated file to each co-member's `.ark/inbox/` via an envelope (no PoW required — co-membership is already established).
 4. The receiving server matches the file by `file_id` in the header. If a local file with that `file_id` already exists, it compares `modified` timestamps and keeps the newer version (updating the local copy in place).
@@ -606,7 +562,7 @@ This protocol uses the same fundamental cryptographic approach but with:
 
 ### 5.1 Concept
 
-Every file modification is digitally signed by the author's device key. When files are delivered cross-server, the envelope is signed so the receiving server can verify authenticity without decrypting the content. Identity forgery is mathematically impossible without the sender's private key.
+Every file modification is digitally signed by the author's identity key. When files are delivered cross-server, the envelope is signed so the receiving server can verify authenticity without decrypting the content. Identity forgery is mathematically impossible without the private key.
 
 ### 5.2 File signature
 
@@ -615,13 +571,13 @@ When Alice creates or modifies a file:
 1. Alice computes an Ed25519 signature over the file's header fields:
    ```
    signature = Ed25519_Sign(
-     device_private_key,
+     identity_private_key,
      modified || modified_by || members_hash || body_hash
    )
    ```
    Where `members_hash` is the SHA-256 of the serialized member entries and `body_hash` is the SHA-256 of the encrypted body.
-2. The signature and `modifier_device_id` are included in the header.
-3. Any server or client can verify by fetching the modifier's identity document and checking the device key.
+2. The signature is included in the header.
+3. Any server or client can verify by fetching the modifier's identity document and checking the identity key.
 
 ### 5.3 Envelope signature
 
@@ -631,7 +587,7 @@ When files are delivered cross-server via an envelope:
 2. The sender computes an Ed25519 signature over the serialized envelope contents (excluding the signature field itself):
    ```
    signature = Ed25519_Sign(
-     device_private_key,
+     identity_private_key,
      version || sender || recipient || timestamp || message_id ||
      envelope_type || proof_of_work
    )
@@ -643,47 +599,14 @@ When files are delivered cross-server via an envelope:
 1. Alice's server receives the envelope.
 2. It extracts the sender address (`bob@sender.example.com`).
 3. It fetches (or uses a cached copy of) Bob's identity document from `sender.example.com`.
-4. It finds the device matching `sender_device_id` in Bob's identity document.
-5. It verifies the `envelope_signature` against the device's public key.
-6. If verification fails: the delivery is rejected with a `403 Invalid Signature` response.
+4. It verifies the `envelope_signature` against Bob's identity key.
+5. If verification fails: the delivery is rejected with a `403 Invalid Signature` response.
 
 **Cache policy for identity documents:**
 - Servers cache fetched identity documents for a configurable period (default: 1 hour).
-- If a signature fails to verify, the server re-fetches the identity document (the device key may have been added recently) and retries verification once.
+- If a signature fails to verify, the server re-fetches the identity document (the key may have changed via transition) and retries verification once.
 
-### 5.4 Server-level authentication
-
-Servers also authenticate themselves:
-
-1. Each server has its own Ed25519 keypair, published at:
-   ```
-   GET https://example.com/ark/.ark/identity
-   ```
-   ```json
-   {
-     "domain": "example.com",
-     "server_key": {
-       "algorithm": "ed25519",
-       "public_key": "base64url-encoded"
-     },
-     "updated": "2026-04-11T00:00:00Z",
-     "signature": {
-       "algorithm": "ed25519",
-       "signature": "base64url-encoded"
-     }
-   }
-   ```
-2. When server A sends an envelope to server B, it includes an `Authorization` header:
-   ```
-   Authorization: ArkServer sender.example.com <signature-over-request-body>
-   ```
-3. Server B verifies this against server A's published server key.
-
-This is defense-in-depth. Even without it, the per-file signature from the author's device key provides authentication. Server-level auth adds:
-- Protection against rogue servers forwarding envelopes they didn't originate.
-- Rate limiting and abuse tracking at the server level.
-
-### 5.5 Non-repudiation
+### 5.4 Non-repudiation
 
 The Ed25519 signature provides **non-repudiation**: Alice can prove to a third party that Bob authored a specific file. This is a deliberate design choice — you *want* proof of who sent what (contracts, agreements, records).
 
@@ -815,7 +738,7 @@ Some users — newsletters, services, notification systems — need to send to m
 3. Alice's client sends a `REGISTER` envelope to `newsletter@example.com`:
    - The envelope has `type: REGISTER` and no file payload.
    - Alice computes PoW at the `registration_difficulty` published by `newsletter@example.com`'s server.
-   - The envelope is signed by Alice's device key (proving Alice authorized this registration).
+   - The envelope is signed by Alice's identity key (proving Alice authorized this registration).
 4. The newsletter's server verifies the PoW and signature, then adds Alice's identity key to the newsletter's contacts allowlist.
 5. The newsletter can now deliver to Alice at `known_contact_difficulty` (typically 0).
 
@@ -956,12 +879,12 @@ Transport has three modes:
 
 Alice's client communicates with her home server over HTTPS.
 
-**Authentication:** Every request is signed with the device's Ed25519 key:
+**Authentication:** Every request is signed with the identity key:
 ```
-Authorization: ArkUser <device_id>:<signature-over-method-path-timestamp-body>
+Authorization: ArkUser <signature-over-method-path-timestamp-body>
 X-Ark-Timestamp: 1712838400
 ```
-The server verifies the signature against the device key registered in Alice's identity document. Requests with timestamps older than 5 minutes are rejected (replay protection).
+The server verifies the signature against the identity key in Alice's identity document. Requests with timestamps older than 5 minutes are rejected (replay protection).
 
 **File operations:**
 
@@ -1010,12 +933,11 @@ When Bob sends a message (file) to Alice:
 ```
 POST https://example.com/ark/alice/.ark/inbox/
 Content-Type: application/x-ark-envelope
-Authorization: ArkServer sender.example.com <server-signature>
 
 <binary envelope>
 ```
 
-The envelope contains the Ark file plus Alice's member entry (her wrapped file key), the PoW stamp, and the sender's signature. Alice's server extracts the file and writes it to `.ark/inbox/` with a generated filename (the envelope's `message_id`).
+The envelope is self-authenticating — it contains the sender's signature and PoW stamp. No HTTP-level authentication is required. The receiving server verifies the `envelope_signature` against the sender's identity key. Alice's server extracts the file and writes it to `.ark/inbox/` with a generated filename (the envelope's `message_id`).
 
 Client-side apps inspect incoming files in `.ark/inbox/` and claim them based on content or directory conventions.
 
@@ -1041,7 +963,6 @@ When a shared file is updated, the updated file is pushed to co-members using th
 ```
 POST https://example.com/ark/alice/.ark/inbox/
 Content-Type: application/x-ark-envelope
-Authorization: ArkServer sender.example.com <server-signature>
 
 <binary envelope with type SYNC>
 ```
@@ -1059,7 +980,7 @@ The envelope payload is the full updated Ark file (header + encrypted body). The
 
 **Member moved notification:**
 
-When a member migrates to a new server (Section 2.10), they send a `MEMBER_MOVED` envelope to co-members' `.ark/inbox/` directories:
+When a member migrates to a new server (Section 2.9), they send a `MEMBER_MOVED` envelope to co-members' `.ark/inbox/` directories:
 
 ```
 Envelope type: MEMBER_MOVED
@@ -1074,7 +995,7 @@ If a server misses SYNC pushes (e.g., downtime exceeding the retry window), memb
 
 ```
 GET https://example.com/ark/alice/.ark/files/<file_id>
-Authorization: ArkUser <device_id>:<signature>
+Authorization: ArkUser <signature>
 ```
 
 The server resolves `file_id` to the local path, verifies the requester's identity key is in the file's member list, and returns the full file (header + body). Returns `404` if the file_id is unknown or `403` if the requester is not a member.
@@ -1085,7 +1006,7 @@ The server resolves `file_id` to the local path, verifies the requester's identi
 
 ```
 GET https://example.com/ark/alice/.ark/stream
-Authorization: ArkUser <device_id>:<signature>
+Authorization: ArkUser <signature>
 ```
 
 WebSocket or SSE stream. Events:
@@ -1268,12 +1189,11 @@ message Header {
 
   // Author of last modification
   string modified_by = 6;              // "alice@example.com"
-  uint32 modifier_device_id = 7;
-  string signature_algorithm = 8;      // "ed25519"
-  bytes signature = 9;                 // Signature over fields 1-7 + body hash
+  string signature_algorithm = 7;      // "ed25519"
+  bytes signature = 8;                 // Signature over fields 1-6 + body hash
 
   // Key conversion (for ECIES wrapping)
-  string encryption_algorithm = 10;    // "x25519" — target algorithm for deriving encryption key from identity key
+  string encryption_algorithm = 9;     // "x25519" — target algorithm for deriving encryption key from identity key
 }
 
 message Member {
@@ -1312,25 +1232,22 @@ message Envelope {
   uint64 timestamp = 4;               // Unix milliseconds
   bytes message_id = 5;               // 16 bytes, random UUID
 
-  // Sender device
-  uint32 sender_device_id = 6;
-
   // Envelope type
-  EnvelopeType type = 7;              // Default: DELIVER
+  EnvelopeType type = 6;              // Default: DELIVER
 
   // Spam resistance (required for DELIVER, REGISTER; absent for others)
-  ProofOfWork proof_of_work = 8;
+  ProofOfWork proof_of_work = 7;
 
-  // Sender authentication (signature over fields 1-8)
-  string signature_algorithm = 9;     // "ed25519"
-  bytes envelope_signature = 10;      // 64 bytes
+  // Sender authentication (signature over fields 1-7)
+  string signature_algorithm = 8;     // "ed25519"
+  bytes envelope_signature = 9;       // 64 bytes
 
   // Payload — depends on envelope type:
   // DELIVER: raw Ark file bytes (header + encrypted body)
   // SYNC: raw Ark file bytes (header + encrypted body)
   // MEMBER_MOVED: MemberMovedNotification
   // REGISTER/UNREGISTER: empty
-  bytes payload = 11;
+  bytes payload = 10;
 }
 
 message ProofOfWork {
@@ -1354,7 +1271,7 @@ message MemberMovedNotification {
 
 ### 8.4 Identity and policy documents
 
-Identity documents, server identity, policy files, and contacts are JSON (human-readable, easy to debug with curl). See Section 2.4, Section 5.4, and Section 6.5.1 for schemas.
+Identity documents, policy files, and contacts are JSON (human-readable, easy to debug with curl). See Section 2.4 and Section 6.5.1 for schemas.
 
 ### 8.5 Serialization rules
 
@@ -1372,7 +1289,7 @@ Identity documents, server identity, policy files, and contacts are JSON (human-
 | Property | Guarantee |
 |---|---|
 | **Data confidentiality** | Only holders of the file key can read file content. Servers see only ciphertext (Mode A). |
-| **Author authentication** | Files and envelopes are signed by the author's device key. Forgery requires the private key. |
+| **Author authentication** | Files and envelopes are signed by the author's identity key. Forgery requires the private key. |
 | **Integrity** | Any modification to a file invalidates the signature. Any modification to the ciphertext invalidates the AEAD tag. |
 | **Spam resistance** | Bulk cross-server delivery requires proportional computational resources (PoW). |
 | **Data persistence (static mode)** | All static-mode files can be decrypted with the single identity key (which unwraps file keys). No session state to lose. |
@@ -1404,7 +1321,7 @@ Identity documents, server identity, policy files, and contacts are JSON (human-
 
 **Scenario: Alice's identity key is compromised (either mode)**
 - Worst case. Attacker can impersonate Alice and decrypt all data.
-- Mitigation: Alice performs a key transition (Section 2.8). After transition, new files use the new key and are safe.
+- Mitigation: Alice performs a key transition (Section 2.7). After transition, new files use the new key and are safe.
 
 **Scenario: Shared file key is compromised**
 - Only the specific file is affected, not Alice's other data.
@@ -1633,7 +1550,7 @@ When Carol decides she wants a real address:
 1. Carol chooses a username (e.g., `carol`).
 2. The gateway creates a new identity document at `carol@gateway.example.com` (same keypair).
 3. The hash alias redirects to the new address.
-4. Carol can migrate to her own server later using a key transition (Section 2.8).
+4. Carol can migrate to her own server later using a key transition (Section 2.7).
 
 **The gateway server:**
 
@@ -1759,7 +1676,6 @@ All Ark paths are under `https://<domain>/ark/`.
 
 | Path | Method | Purpose |
 |---|---|---|
-| `/ark/.ark/identity` | GET | Server identity document |
 | `/ark/.ark/policy` | GET | Server spam policy |
 | `/ark/.ark/accounts` | POST | Create account (requires PoW) |
 
