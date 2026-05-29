@@ -15,10 +15,10 @@
 8. [File Format](#8-file-format)
 9. [Threat Model](#9-threat-model)
 10. [Extensions](#10-extensions)
-- [Appendix A: Cryptographic Algorithms](#appendix-a-cryptographic-algorithms)
+- [Appendix A: Configuration](#appendix-a-configuration)
 - [Appendix B: Endpoints](#appendix-b-endpoints)
 - [Appendix C: Types](#appendix-c-types)
-- [Appendix D: Configuration](#appendix-d-configuration)
+- [Appendix D: Cryptographic Algorithms](#appendix-d-cryptographic-algorithms)
 - [Appendix E: Example Usage](#appendix-e-example-usage)
 
 ---
@@ -1459,18 +1459,33 @@ V1 uses last-write-wins for shared files. A future extension could support real-
 
 ---
 
-## Appendix A: Cryptographic Algorithms
+## Appendix A: Configuration
 
-| Purpose | Algorithm | Key Size | Output Size |
+### A.1 Server Configuration (`ark.toml`)
+
+```toml
+domain = "example.com"
+listen = "0.0.0.0:443"
+tls = true
+acme_email = "admin@example.com"
+max_account_size = "1GB"
+max_file_size = "100MB"
+max_delivery_size = "25MB"
+allow_remote_registration = true
+legacy_gateway = ""
+```
+
+| Field | Type | Required | Description |
 |---|---|---|---|
-| Identity / signing | Ed25519 | 256-bit | 512-bit signature |
-| Encryption key exchange | X25519 | 256-bit | 256-bit shared secret |
-| Key derivation | HKDF-SHA256 | variable | variable |
-| File key wrapping | AES-256-GCM | 256-bit | ciphertext + 128-bit tag |
-| File body encryption | AES-256-GCM | 256-bit | ciphertext + 128-bit tag |
-| Alt. body encryption | ChaCha20-Poly1305 | 256-bit | ciphertext + 128-bit tag |
-| No encryption | None | — | raw bytes |
-| Seed phrase | BIP-39 | 256-bit entropy | 24 words |
+| `domain` | string | Yes | Server's public hostname. |
+| `listen` | string | No | Bind address and port. Default `0.0.0.0:443`. |
+| `tls` | boolean | No | Enable built-in TLS. Disable if behind a reverse proxy. Default `true`. |
+| `acme_email` | string | No | Email for Let's Encrypt certificate provisioning. |
+| `max_account_size` | string | No | Maximum storage per account. Default `1GB`. |
+| `max_file_size` | string | No | Maximum single file size. Default `100MB`. |
+| `max_delivery_size` | string | No | Maximum envelope payload size. Default `25MB`. |
+| `allow_remote_registration` | boolean | No | Allow account creation via PUT `/ark/<user>/.ark/identity.json`. Default `true`. |
+| `legacy_gateway` | string | No | Gateway server address for legacy email interop (Section 10.2). Default empty. |
 
 ## Appendix B: Endpoints
 
@@ -1717,25 +1732,18 @@ All other fields follow the standard identity document schema (C.1).
 
 ---
 
-## Appendix D: Configuration
+## Appendix D: Cryptographic Algorithms
 
-### D.1 Server Configuration (`ark.toml`)
-
-```toml
-# Required
-domain = "example.com"            # Server's public hostname
-storage = "./data"                # Path to file storage directory
-
-# Optional (all have sensible defaults)
-listen = "0.0.0.0:443"           # Bind address and port
-tls = true                       # Enable built-in TLS (disable if behind reverse proxy)
-acme_email = "admin@example.com" # Email for Let's Encrypt certificate provisioning
-max_account_size = "1GB"         # Maximum storage per account
-max_file_size = "100MB"          # Maximum single file size
-max_delivery_size = "25MB"       # Maximum envelope payload size
-allow_remote_registration = true # Allow account creation via PUT /ark/<user>/.ark/identity.json
-legacy_gateway = ""              # Gateway server address for legacy email interop (Section 10.2)
-```
+| Purpose | Algorithm | Key Size | Output Size |
+|---|---|---|---|
+| Identity / signing | Ed25519 | 256-bit | 512-bit signature |
+| Encryption key exchange | X25519 | 256-bit | 256-bit shared secret |
+| Key derivation | HKDF-SHA256 | variable | variable |
+| File key wrapping | AES-256-GCM | 256-bit | ciphertext + 128-bit tag |
+| File body encryption | AES-256-GCM | 256-bit | ciphertext + 128-bit tag |
+| Alt. body encryption | ChaCha20-Poly1305 | 256-bit | ciphertext + 128-bit tag |
+| No encryption | None | — | raw bytes |
+| Seed phrase | BIP-39 | 256-bit entropy | 24 words |
 
 ---
 
