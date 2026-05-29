@@ -71,6 +71,14 @@ bob@ark.myserver.org
 
 This format is deliberately identical to email. Users already understand it, and it requires no new mental model.
 
+**Addressing by local path.** Anywhere a user is addressed, you can instead address a **local path** to a file in the same account:
+
+```
+/.ark/groups/team.json
+```
+
+The path is **local** — resolved within the account that is resolving it, never reaching into another user's account — and the file it points to **must be an identity document or a group document** (Sections C.1, C.7). Cross-account sharing still works because groups are replicated to every member's account at the same path (Section 3.9), so the local path resolves for each member. A `user@domain` address remains the way to reach a remote user.
+
 ### 2.3 Keypair generation
 
 Each user has a single **identity keypair**. This keypair is used for both signing (Ed25519) and encryption (converted to X25519 for Diffie-Hellman operations — this is a standard, well-defined mathematical conversion).
@@ -390,6 +398,63 @@ When a file has multiple members with `write` or `owner` permission, edits need 
 4. Re-wrap the new key for each remaining member.
 5. The removed member still has their old copy (can't prevent this — they had the key). But new edits use the new key they don't have.
 
+### 3.8 Wildcard members (public files)
+
+A special member entry with `address = "*"` represents public access. The wildcard member has no `identity_key` and no `wrapped_file_key`. It is only valid on unencrypted files (`algorithm = "none"`).
+
+| Wildcard permission | Meaning |
+|---|---|
+| `read` | Anyone can GET the file without authentication. |
+| `write` | Any authenticated Ark user can read and modify the file. |
+| `owner` | Any authenticated Ark user can read, modify, and change the file's members. |
+
+The server skips authentication on GET requests when a `*` member with `read` (or higher) permission is present. For `write` and `owner`, the server still requires a valid `ArkUser` authorization header — "public write" means any authenticated Ark user, not unauthenticated HTTP requests.
+
+**Use cases:**
+
+- `*` (read): Public website, blog, published documents, open-source project files.
+- `*` (write): Anonymous drop box, public wiki, open submission folder.
+- `*` (owner): Fully open collaborative space (uncommon but not prohibited).
+
+### 3.9 Groups
+
+A **group** is a reusable, named set of members. Instead of wrapping a file key to every member individually, a file is shared with the group once, and group members decrypt through the group's key.
+
+A group is two files, **replicated to every member's account** and synced like any shared file (Section 7.4), so each member holds a copy at the same local path:
+
+- **Group document** (`/ark/<user>/.ark/groups/<name>.json`) — like an identity document, but identifying a **member list** instead of a single address. Self-signed by an `owner` member. Holds the group's current **public key** and the members, each with a permission (`owner`, `write`, or `read`) within the group. See Section C.7.
+- **Group key file** (`/ark/<user>/.ark/groups/<name>.key`) — the group's **private key**, wrapped to each member's identity key. Members-only read. Omitted for allowlist-only groups (no keypair).
+
+**Addressing.** A group is addressed by the **local path** to its document, e.g. `/.ark/groups/team.json` (Section 2.2), used anywhere a user address is used — including the `address` field of a file `Member` entry. The path is local and contains no owner; because the group is replicated to every member at the same path, the address resolves for each member, and ownership can transfer without changing it.
+
+**Sharing a file with a group.**
+
+1. Take the group's current public key from the group document.
+2. Wrap the file key to it via ECIES (Section 4.3).
+3. Add a `Member` entry to the file: `address` = the group's local path, `key` = group public key, `permission` = the group's permission on this file.
+
+**Decrypting a file shared with a group.**
+
+1. Read your replicated copy of the group key file (`.key`) and unwrap the group private key with your own identity key.
+2. Use it to unwrap the file key from the file's group member entry (Section 4.4).
+3. Decrypt the body.
+
+**Effective permission.** A user's permission on a file shared with a group is the **lower** of: the group's permission on the file, and the user's permission within the group (the group document). The server enforces writes by reading the (public) group document.
+
+**Ownership transfer.** Ownership is just the `owner` permission in the group document. The current owner grants `owner` to another member (and optionally drops their own). Nothing about the address changes.
+
+**Adding a member.** Add them to the group document and re-wrap the private key to them in the `.key` file. Both sync to members. Files already shared with the group are unaffected — instant.
+
+**Removing a member.** The removed member knew the group private key, so the group is **re-keyed**: generate a new group keypair, re-wrap the new private key to the remaining members in the `.key` file, and re-wrap the file key of every file shared with the group to the new group public key. Cost scales with the number of files shared with the group.
+
+**Default group for a directory (client hint).** A reserved marker file `<dir>/.ark/group` containing a group's local path:
+
+```
+/ark/alice/projects/.ark/group   →   /.ark/groups/team.json
+```
+
+When a client creates a file in that directory, it shares with that group by default. This is a **hint only** — the server does not enforce it, and files in the directory may use any membership.
+
 ---
 
 ## 4. System 3: Encryption — "Nobody else can read this"
@@ -585,9 +650,11 @@ The identity document includes a `public` flag:
 
 ### 6.3 Contacts allowlist
 
-The allowlist is stored at `/ark/<user>/.ark/contacts.json` as a list of full identity documents (`Identity[]`, Section C.1). Matching is by **identity key**, not address. This means:
-- Bob can change servers and remain allowlisted as long as he keeps the same identity key.
-- Someone who registers `bob@attacker.com` with a different key is NOT allowlisted.
+A user's contacts are a **group** (Section 3.9) — the built-in contacts group, whose document is at `/ark/<user>/.ark/contacts.json` (a `Group`, Section C.7). Its members are the user's contacts. Delivery control reduces to group membership: a sender may deliver iff its identity key is a member of the recipient's contacts group. Matching is by **identity key**, not address. This means:
+- Bob can change servers and remain a contact as long as he keeps the same identity key.
+- Someone who registers `bob@attacker.com` with a different key is NOT a contact.
+
+The contacts group is an allowlist by default (no group keypair, so no `.key` file). If the user gives it a keypair, it doubles as a "share with all my contacts" group.
 
 **How contacts are added:**
 - Alice adds Bob manually (out-of-band exchange of addresses).
@@ -736,8 +803,8 @@ Clients that need the full header (member entries, wrapped keys) use GET and rea
 |---|---|---|
 | `GET` | `/ark/alice/.ark/identity.json` | Identity document (JSON) |
 | `GET` | `/ark/alice/.ark/identity.html` | Contact card (HTML) |
-| `GET` | `/ark/alice/.ark/contacts.json` | List contacts (allowlisted identities) |
-| `PUT` | `/ark/alice/.ark/contacts.json` | Update contacts |
+| `GET` | `/ark/alice/.ark/contacts.json` | Contacts group document (members = contacts) |
+| `PUT` | `/ark/alice/.ark/contacts.json` | Update contacts group |
 | `PUT` | `/ark/alice/.ark/invitations/<token>.json` | Create invitation |
 | `POST` | `/ark/alice/.ark/invitations/<token>` | Redeem invitation |
 | `GET` | `/ark/alice/.ark/invitations/<token>.html` | Invitation page (HTML) |
@@ -1377,78 +1444,11 @@ For protocol users who want to receive legacy email, a bridge service can forwar
 
 **Security note:** Bridged messages are not encrypted in transit. The bridge sees plaintext during processing. These files should be clearly distinguished from native Ark files in the client UI.
 
-### 10.3 Wildcard Members (Public Files)
-
-A special member entry with `address = "*"` represents public access. The wildcard member has no `identity_key` and no `wrapped_file_key`. It is only valid on unencrypted files (`algorithm = "none"`).
-
-| Wildcard permission | Meaning |
-|---|---|
-| `read` | Anyone can GET the file without authentication. |
-| `write` | Any authenticated Ark user can read and modify the file. |
-| `owner` | Any authenticated Ark user can read, modify, and change the file's members. |
-
-The server skips authentication on GET requests when a `*` member with `read` (or higher) permission is present. For `write` and `owner`, the server still requires a valid `ArkUser` authorization header — "public write" means any authenticated Ark user, not unauthenticated HTTP requests.
-
-**Use cases:**
-
-- `*` (read): Public website, blog, published documents, open-source project files.
-- `*` (write): Anonymous drop box, public wiki, open submission folder.
-- `*` (owner): Fully open collaborative space (uncommon but not prohibited).
-
-### 10.4 Directory Membership
-
-A directory can have its own member list, stored at `.ark/members` within the directory:
-
-```
-/ark/alice/projects/.ark/members
-```
-
-```json
-{
-  "members": [
-    {
-      "address": "alice@example.com",
-      "key": { "algorithm": "ed25519", "public_key": "..." },
-      "permission": "owner"
-    },
-    {
-      "address": "bob@other.com",
-      "key": { "algorithm": "ed25519", "public_key": "..." },
-      "permission": "write"
-    }
-  ],
-  "signature": { "algorithm": "ed25519", "signature": "..." }
-}
-```
-
-When a file is created in a directory with a members file, the client wraps the file key for each directory member. The server enforces this — it rejects any PUT where the file's member list does not include all directory members at their directory-level permission or higher.
-
-**Inheritance rules:**
-
-- Directory members cascade to all subdirectories and files below.
-- A subdirectory's `.ark/members` can **add** new members or **elevate** permissions (e.g., `read` → `write`), but cannot reduce or remove members inherited from a parent directory.
-- The server resolves the effective member list by walking up from the file's directory to the user root, accumulating members. The highest permission for each identity key wins.
-- Only members with `owner` permission on a directory can modify that directory's `.ark/members` file.
-
-**Example:**
-
-```
-/ark/alice/projects/.ark/members          → alice (owner), bob (read)
-/ark/alice/projects/secret/.ark/members   → carol (write), bob (write)
-```
-
-Effective members for files in `/ark/alice/projects/secret/`:
-- alice: `owner` (inherited from parent)
-- bob: `write` (elevated from parent's `read` by subdirectory)
-- carol: `write` (added by subdirectory)
-
-Wildcard members (Section 10.3) can also appear in directory membership files, cascading to all files and subdirectories below.
-
-### 10.5 Metadata Privacy
+### 10.3 Metadata Privacy
 
 A future version could add onion routing or mixnet support to hide metadata (sender/recipient/timing) from servers and network observers. The protocol's layered design (file vs. envelope) makes this possible without changing the core file format.
 
-### 10.6 Collaborative Editing (CRDTs)
+### 10.4 Collaborative Editing (CRDTs)
 
 V1 uses last-write-wins for shared files. A future extension could support real-time collaborative editing via CRDTs (Conflict-free Replicated Data Types):
 
@@ -1503,7 +1503,10 @@ Most endpoints are standard file resource requests which require an `ArkUser` Au
 
 The `/ark/<user>/.ark/` directory is a special directory that is limited to specific Ark files. These files are of the format specified instead of the standard `File` format:
 
-- `/ark/<user>/.ark/contacts.json`: `Identity[]`. Only users listed in this file can deliver files to `<user>`.
+- `/ark/<user>/.ark/contacts.json`: `Group` (Section C.7) — the user's contacts group. Only its members can deliver files to `<user>`.
+- `/ark/<user>/.ark/contacts.key`: contacts group private key, wrapped per member. Members-only. Present only if the contacts group has a keypair.
+- `/ark/<user>/.ark/groups/<name>.json`: `Group` (Section C.7).
+- `/ark/<user>/.ark/groups/<name>.key`: group private key, wrapped per member. Members-only.
 - `/ark/<user>/.ark/identity.html`: Contact HTML page, auto-generated, HEAD/GET only, no authentication required. This should contain a link to add the user to your contacts.
 - `/ark/<user>/.ark/identity.json`: `Identity`, no authentication required for PUT if creating new file. The creation of this file creates a new user.
 - `/ark/<user>/.ark/inbox/<message_id>`: `Envelope`, users listed in `/ark/<user>/.ark/contacts.json` allowed for PUT if creating new file.
@@ -1655,19 +1658,27 @@ All other fields follow the standard identity document schema (C.1).
 | `modified` | string | No | ISO 8601 last modification time. Absent for directories. |
 | `modified_by` | string | No | Address of last modifier. Absent for directories. |
 
-### C.7 DirectoryMembers (Section 10.4)
+### C.7 Group (Section 3.9)
+
+Like an identity document, but identifies a set of members instead of a single address. This is the public group document; the matching private key lives in the members-only `.key` file. Addressed by its local path (Section 2.2).
 
 ```json
 {
+  "version": 1,
   "members": Member[],
+  "key": Key,
+  "updated": "2026-04-11T12:00:00Z",
   "signature": Signature
 }
 ```
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `members` | array | Yes | List of directory members. |
-| `signature` | object | Yes | Signature over the members list by an owner. |
+| `version` | integer | Yes | Protocol version. |
+| `members` | array | Yes | Group members (`Member[]`), each with a permission within the group. |
+| `key` | Key | No | Current group public key. Present when the group is used for sharing; absent for allowlist-only groups (e.g. a contacts group with no shared files). |
+| `updated` | string | Yes | ISO 8601 timestamp of last update. |
+| `signature` | Signature | Yes | An `owner` member's signature over all fields above. |
 
 ### C.8 Event
 
