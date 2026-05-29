@@ -39,9 +39,9 @@ Ark is a federated, encrypted protocol for synchronizing personal and shared dat
 ### Design principles
 
 - **Cryptographic identity, not reputation-based.** Your identity is a keypair, not an IP address or domain reputation score. This eliminates the entire class of deliverability problems that plague self-hosted email.
-- **Encrypted by default.** File content is end-to-end encrypted unless explicitly opted out. Servers store ciphertext they cannot read. Unencrypted files are supported for public content — the header still provides authentication and integrity via signatures.
+- **Encrypted by default.** File content is end-to-end encrypted unless explicitly opted out. Servers store ciphertext they cannot read. Unencrypted files are supported for public content — the metadata still provides authentication and integrity via signatures.
 - **Files on disk.** Storage is the filesystem. No database for user data. Files are accessed by path over HTTPS. Any tool that can read files can interact with Ark data.
-- **One primitive.** Everything is a file with an unencrypted header and an encrypted body. Different membership patterns produce different behaviors, not different concepts.
+- **One primitive.** Everything is a file: a body plus a small signed metadata record. Different membership patterns produce different behaviors, not different concepts.
 - **Simple to self-host.** A single binary, a single config file, a domain with an A record. That's it.
 - **Federated, not peer-to-peer.** Servers provide reliable offline storage and key hosting. Pure P2P systems (Bitmessage, Briar) struggle with reliability and adoption.
 - **Spam-resistant by construction.** Only contacts can deliver to your inbox by default. Unforgeable identity means no one can impersonate a contact.
@@ -67,17 +67,24 @@ bob@ark.myserver.org
 ```
 
 - `user` — the local part, unique within the server. Lowercase alphanumeric, dots, hyphens, underscores. Max 64 characters.
-- `domain` — the server's hostname. Must resolve to an IP address via DNS A/AAAA record.
+- `domain` — the server's hostname.
 
 This format is deliberately identical to email. Users already understand it, and it requires no new mental model.
 
-**Addressing by local path.** Anywhere a user is addressed, you can instead address a **local path** to a file in the same account:
+Addresses can also use IP addresses:
 
 ```
-/.ark/groups/team.json
+alice@127.0.0.1
 ```
 
-The path is **local** — resolved within the account that is resolving it, never reaching into another user's account — and the file it points to **must be an identity document or a group document** (Sections C.1, C.7). Cross-account sharing still works because groups are replicated to every member's account at the same path (Section 3.9), so the local path resolves for each member. A `user@domain` address remains the way to reach a remote user.
+Addresses can also include paths to specific files:
+
+```
+alice@example.com/.ark/groups/contacts.json
+/.ark/groups/contacts.json
+```
+
+Paths must point to an `Identity` or `Group` file.
 
 ### 2.3 Keypair generation
 
@@ -127,11 +134,9 @@ Security-conscious users choose Mode A — the server is purely a relay and stor
 
 ### 2.4 Identity document
 
-Alice's public identity is published as a JSON document on her server:
+Alice's public `Identity` is published as a JSON document on her server:
 
-```
-GET https://example.com/ark/alice/.ark/identity.json
-```
+`https://example.com/ark/alice/.ark/identity.json`
 
 See Section C.1 for format.
 
@@ -239,7 +244,7 @@ If Alice's old server goes offline (provider shut down, lost access), the alias 
 
 **What doesn't migrate automatically:**
 - Other people's allowlists. Contacts who had Alice allowlisted on the old address may need to re-allowlist the new address. However, since allowlists are keyed by identity public key (not address), a smart server implementation can recognize that the same key is now at a new address and preserve the allowlist entry.
-- Shared file co-membership. Other members of shared files have Alice's old server address in the member list. Alice notifies co-members (via a `MEMBER_MOVED` envelope) so they update the address. Since membership is verified by identity key, the transition is seamless once addresses are updated.
+- Shared file co-membership. Other members of shared files have Alice's old server address in the member list. Alice notifies co-members by sending them her new identity document (Section 7.4) so they update the address. Since membership is verified by identity key, the transition is seamless once addresses are updated.
 
 ### 2.10 Aliases
 
@@ -274,28 +279,28 @@ When someone encounters an alias document, they follow the `redirect` to fetch t
 
 ### 3.1 Concept
 
-Everything in Ark is a **file** — encrypted data stored on the server's filesystem, accessed by path over HTTPS. Each file has an unencrypted **header** (metadata, ownership, wrapped keys) and an encrypted **body** (the actual content). The URL is the path:
+Everything in Ark is a **file** — data stored on the server's filesystem, accessed by path over HTTPS. A file is its **body** (the content — ciphertext, or raw bytes for public files) plus a small signed **metadata** record (ownership, members, wrapped keys) kept alongside the body rather than inside it (Section 8). The URL is the path:
 
 ```
-GET  https://example.com/ark/alice/notes/todo     → full file (header + body)
-HEAD https://example.com/ark/alice/notes/todo     → header only
+GET  https://example.com/ark/alice/notes/todo     → body + metadata
+HEAD https://example.com/ark/alice/notes/todo     → metadata only
 GET  https://example.com/ark/alice/notes/         → directory listing
 ```
 
-Messages, notes, documents, photos — all the same thing underneath. Different apps organize them into different directories, but the protocol doesn't care. It just stores and serves encrypted files.
+Messages, notes, documents, photos — all the same thing underneath. Different apps organize them into different directories, but the protocol doesn't care. It just stores and serves files.
 
 ### 3.2 File structure
 
-Every Ark file consists of two parts:
+Every Ark file consists of two parts, stored separately:
 
-1. **Header (unencrypted)** — metadata the server needs to index, serve, and enforce access control. Includes member list, timestamps, signature, and wrapped file keys.
-2. **Body (encrypted)** — the actual content, encrypted with the symmetric file key. Opaque to the server.
+1. **Metadata** — a small signed blob the server needs to index, serve, and enforce access control: member list, permissions, timestamps, algorithm, wrapped file keys, signature. Stored out-of-band (a `user.ark` xattr at rest, an `X-Ark-Metadata` header in transit), never inside the body.
+2. **Body** — the content. Ciphertext for encrypted files (`nonce ‖ ciphertext + tag`), raw bytes for `algorithm = "none"`. Opaque to the server.
 
-See Section 8 for the full binary format.
+See Section 8 for the full format.
 
 ### 3.4 Membership
 
-Each file has one or more members, listed in the header. Every member holds the file's symmetric key, encrypted to their identity key. This means any member can decrypt the content.
+Each file has one or more members, listed in the metadata. Every member holds the file's symmetric key, encrypted to their identity key. This means any member can decrypt the content.
 
 **Member permissions:**
 
@@ -327,7 +332,7 @@ Member {
 
 **Single member (default):** Notes, personal files. One member entry (self, owner).
 
-**Two members (messaging):** Sender creates file with two members — self (owner) and recipient (read). A copy is delivered to the recipient's `.ark/inbox/` via an envelope (Section 7). The recipient's app can move it to any path.
+**Two members (messaging):** Sender creates file with two members — self (owner) and recipient (read). A copy is delivered to the recipient's `.ark/inbox/` (Section 7). The recipient's app can move it to any path.
 
 **Multiple members (collaboration):** Shared documents. All members at `write` or `owner` permission can read and modify. See Section 3.6 for sync.
 
@@ -365,7 +370,7 @@ Response (JSON):
 }
 ```
 
-Entries include header metadata (from the unencrypted header) but not the encrypted body. Subdirectories are listed with `"type": "directory"`.
+Entries include metadata (members, timestamps) but not the body. Subdirectories are listed with `"type": "directory"`.
 
 ### 3.6 Multi-member sync
 
@@ -375,8 +380,8 @@ When a file has multiple members with `write` or `owner` permission, edits need 
 
 1. Alice edits the content, re-encrypts with the file key, bumps `modified`, signs with her identity key.
 2. Alice's client writes the updated file to her server.
-3. Alice's server delivers the updated file to each co-member's `.ark/inbox/` via an envelope (co-membership is already established).
-4. The receiving server matches the file by `file_id` in the header. If a local file with that `file_id` already exists, it compares `modified` timestamps and keeps the newer version (updating the local copy in place).
+3. Alice's server delivers the updated file to each co-member's `.ark/inbox/` (co-membership is already established).
+4. The receiving server matches the file by `file_id` in the metadata. If a local file with that `file_id` already exists, it compares `modified` timestamps and keeps the newer version (updating the local copy in place).
 5. If a co-member also made an edit concurrently, the higher `modified` timestamp wins. The losing edit is discarded.
 
 **No fetch step required.** Unlike a notification-based approach, the full file is pushed directly. This eliminates the need for co-members to know each other's file paths and removes any path resolution or polling mechanism.
@@ -387,7 +392,7 @@ When a file has multiple members with `write` or `owner` permission, edits need 
 
 1. An existing member (with `owner` permission) decrypts the file key.
 2. Encrypts the file key to the new member's identity key (fetched via key discovery, Section 2.5).
-3. Adds a new `Member` entry to the file header.
+3. Adds a new `Member` entry to the file's metadata.
 4. Signs the updated file and syncs to other members.
 
 **Removing a member:**
@@ -469,7 +474,7 @@ Every file's body is encrypted with a **symmetric file key** (AES-256-GCM). The 
 
 ### 4.2 Encryption modes
 
-The file header's `algorithm` field specifies whether and how the body is encrypted:
+The file metadata's `algorithm` field specifies whether and how the body is encrypted:
 
 | Algorithm | Body | Wrapped keys | Use case |
 |---|---|---|---|
@@ -505,13 +510,13 @@ When a file is created in static mode:
    )
    wrapped_file_key = AES-256-GCM(wrapping_key, random_nonce, file_key)
    ```
-4. Each member entry in the header stores the `ephemeral_public`, `nonce`, and `wrapped_file_key`.
+4. Each member entry in the metadata stores the `ephemeral_public`, `nonce`, and `wrapped_file_key`.
 
 ### 4.4 Decryption
 
 When Alice decrypts a file:
 
-1. Alice finds her member entry in the header (matched by identity key).
+1. Alice finds her member entry in the metadata (matched by identity key).
 2. Alice computes the shared secret using her private key and the ephemeral public key in her member entry:
    ```
    shared_secret = X25519(alice_private, ephemeral_public)
@@ -550,7 +555,7 @@ File keys are wrapped to the **identity key**, not per-device. One wrap per memb
 | Alternative body encryption | ChaCha20-Poly1305 | 96-bit nonce, 128-bit tag |
 | Unencrypted body | None | Raw bytes, no nonce or tag |
 
-Clients MUST support AES-256-GCM and `none` (unencrypted). ChaCha20-Poly1305 is recommended as an alternative (faster on devices without AES hardware acceleration). The algorithm used is indicated in the file header.
+Clients MUST support AES-256-GCM and `none` (unencrypted). ChaCha20-Poly1305 is recommended as an alternative (faster on devices without AES hardware acceleration). The algorithm used is indicated in the file metadata.
 
 ### 4.8 Why not PGP?
 
@@ -570,45 +575,30 @@ This protocol uses the same fundamental cryptographic approach but with:
 
 ### 5.1 Concept
 
-Every file modification is digitally signed by the author's identity key. When files are delivered cross-server, the envelope is signed so the receiving server can verify authenticity without decrypting the content. Identity forgery is mathematically impossible without the private key.
+Every file modification is digitally signed by the author's identity key, and identity and group documents are self-signed. When data is delivered cross-server, the receiving server verifies these signatures directly — there is no separate transport signature — so it authenticates the author without decrypting the content. Identity forgery is mathematically impossible without the private key.
 
 ### 5.2 File signature
 
 When Alice creates or modifies a file:
 
-1. Alice computes an Ed25519 signature over the file's header fields:
+1. Alice computes an Ed25519 signature over the canonical serialization of the metadata fields (`file_id`, timestamps, members, algorithm, `modified_by` — Section 8.2) plus the SHA-256 hash of the body:
    ```
    signature = Ed25519_Sign(
      identity_private_key,
-     modified || modified_by || members_hash || body_hash
+     metadata_fields || SHA-256(body)
    )
    ```
-   Where `members_hash` is the SHA-256 of the serialized member entries and `body_hash` is the SHA-256 of the encrypted body.
-2. The signature is included in the header.
+2. The signature is stored in the metadata's `signature` field.
 3. Any server or client can verify by fetching the modifier's identity document and checking the identity key.
 
-### 5.3 Envelope signature
+### 5.3 Cross-server verification
 
-When files are delivered cross-server via an envelope:
+Files are POSTed to a recipient's `.ark/inbox/` directly (Section 7.3) — there is no transport wrapper and no separate transport signature. The receiving server authenticates the payload by its own signature:
 
-1. The sender constructs the envelope (see Section 8.4 for full format).
-2. The sender computes an Ed25519 signature over the serialized envelope contents (excluding the signature field itself):
-   ```
-   signature = Ed25519_Sign(
-     identity_private_key,
-     version || sender || recipient || timestamp || message_id ||
-     envelope_type
-   )
-   ```
-3. The signature is included in the envelope's `envelope_signature` field.
+- **File:** verify the metadata signature (Section 5.2) against the identity key of `modified_by`. The verified `modified_by` is the sender, used for the contacts/membership gate (Section 7.3).
+- **Identity document:** verify the document's self-signature against the key it contains.
 
-**Verification by the receiving server:**
-
-1. Alice's server receives the envelope.
-2. It extracts the sender address (`bob@sender.example.com`).
-3. It fetches (or uses a cached copy of) Bob's identity document from `sender.example.com`.
-4. It verifies the `envelope_signature` against Bob's identity key.
-5. If verification fails: the delivery is rejected with a `403 Invalid Signature` response.
+If verification fails, the delivery is rejected with `403 Forbidden`.
 
 **Cache policy for identity documents:**
 - Servers cache fetched identity documents for a configurable period (default: 1 hour).
@@ -624,9 +614,9 @@ The Ed25519 signature provides **non-repudiation**: Alice can prove to a third p
 
 ### 6.1 Concept
 
-Email spam is possible because anyone can send to anyone. This protocol inverts that: by default, only your contacts can deliver to your inbox. Accounts that want to receive from anyone (e.g., `info@business.com`) opt into a public inbox.
+Spam is possible because anyone can send to anyone. This protocol inverts that: by default, only your contacts can deliver to your inbox. Accounts that want to receive from anyone (e.g., `info@business.com`) opt into a public inbox.
 
-Identity is cryptographically unforgeable, so the contacts allowlist is a reliable delivery gate — no one can impersonate a contact.
+By default, the `/akr/<user>/.ark/inbox/` directory has the permission `group:contacts = "write"`. To opt into a public inbox, change the permission to `* = "write"`.
 
 ### 6.2 Public vs. private inboxes
 
@@ -664,8 +654,8 @@ The contacts group is an allowlist by default (no group keypair, so no `.key` fi
 
 **Delivery flow:**
 
-When an envelope arrives for a user with `public: false`:
-1. The server verifies the `envelope_signature` against the sender's identity key.
+When a file arrives for a user with `public: false`:
+1. The server verifies the file's signature and takes `modified_by` as the sender (Section 5.3).
 2. The server checks if the sender's identity key is in the recipient's contacts allowlist.
 3. If not in contacts → reject with `403 Forbidden`.
 4. If in contacts → accept delivery.
@@ -756,7 +746,7 @@ All communication happens over **HTTPS**. No custom protocols, no special ports.
 
 Transport has three modes:
 1. **Local access** — client reads/writes files on its own server by path.
-2. **Cross-server delivery** — sending files to other users' `.ark/inbox/` via envelopes.
+2. **Cross-server delivery** — POSTing files to other users' `.ark/inbox/`.
 3. **Cross-server sync** — keeping shared files in sync between co-members' servers.
 
 ### 7.2 Local file access
@@ -774,28 +764,19 @@ The server verifies the signature against the identity key in Alice's identity d
 
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/ark/alice/path/to/file` | Fetch file (header + encrypted body) |
-| `HEAD` | `/ark/alice/path/to/file` | Fetch header/metadata only |
+| `GET` | `/ark/alice/path/to/file` | Fetch body + `X-Ark-Metadata` |
+| `HEAD` | `/ark/alice/path/to/file` | Fetch `X-Ark-Metadata` only |
 | `PUT` | `/ark/alice/path/to/file` | Create or update a file |
 | `DELETE` | `/ark/alice/path/to/file` | Delete a file |
 | `GET` | `/ark/alice/path/to/dir` | List directory contents |
 
 **GET response:**
 
-The raw Ark file — binary header followed by encrypted body. The `Content-Type` is `application/x-ark`.
+The raw body as the entity body (`Content-Type: application/x-ark`), with the metadata blob in the `X-Ark-Metadata` header (Section 8.3). The body is the file content itself — ciphertext for encrypted files, raw bytes for `algorithm = "none"` — so non-Ark clients can use it directly and ignore the header.
 
 **HEAD response:**
 
-HTTP headers include file metadata extracted from the Ark header:
-
-```
-X-Ark-Modified: 1712838400
-X-Ark-Modified-By: alice@example.com
-X-Ark-Members: 2
-Content-Length: 4096
-```
-
-Clients that need the full header (member entries, wrapped keys) use GET and read only the header portion.
+`X-Ark-Metadata` (the full signed blob — member entries, wrapped keys, everything) plus `Content-Length`, with no body. The metadata blob is the authoritative source; servers may add convenience headers (e.g. `X-Ark-Modified`) but those are non-signed and derived.
 
 **Special endpoints:**
 
@@ -813,73 +794,58 @@ Clients that need the full header (member entries, wrapped keys) use GET and rea
 
 ### 7.3 Cross-server delivery
 
-When Bob sends a message (file) to Alice:
+When Bob sends a file to Alice — whether a brand-new file or an update to one she already has:
 
-**Step 1: Store locally.** Bob's client creates the file on Bob's server via PUT.
+**Step 1: Store locally.** Bob's client creates or updates the file on Bob's server via PUT.
 
-**Step 2: Deliver via envelope.** Bob's server wraps the file in an envelope and delivers it to Alice's `.ark/inbox/`:
+**Step 2: Deliver.** Bob's server POSTs the file directly to Alice's `.ark/inbox/` — the body as the entity body, the metadata in `X-Ark-Metadata`:
 
 ```
 POST https://example.com/ark/alice/.ark/inbox/
-Content-Type: application/x-ark-envelope
+Content-Type: application/x-ark
+X-Ark-Metadata: <base64 metadata blob>
 
-<binary envelope>
+<raw body>
 ```
 
-The envelope is self-authenticating — it contains the sender's signature. No HTTP-level authentication is required. The receiving server verifies the `envelope_signature` against the sender's identity key, then checks the contacts allowlist (Section 6.3). The file is written to `.ark/inbox/` with a generated filename (the envelope's `message_id`).
+There is no transport wrapper — the metadata is self-authenticating, so no HTTP-level authentication is required. A request with no `X-Ark-Metadata` and a JSON body is an identity document (a move notification — Section 7.4); otherwise it is a file. For a file, the server verifies the metadata signature and takes `modified_by` as the sender (Section 5.3), then resolves it by `file_id` (the server indexes `file_id` → path, Section 7.6):
 
-Client-side apps inspect incoming files in `.ark/inbox/` and claim them based on content or directory conventions.
+1. **`file_id` already exists in Alice's account** (an update) — the server checks the sender is a member of the **existing local** file (not the incoming one, which a spoofer could pad). If so, and the incoming `modified` is newer, the local copy is updated in place at its current path; if older, discarded. The contacts allowlist is **not** consulted.
+2. **`file_id` is new** (a new delivery) — the server checks the contacts allowlist (Section 6.3). If the sender is a contact, the file is written to `.ark/inbox/` keyed by `file_id`; otherwise rejected.
+
+In both cases the server also rejects the file unless the **receiving account is itself a member of it** (directly, or through a group it belongs to). A server only accepts files its owner actually belongs to — so a redirected or misaddressed file, even from a contact, is dropped rather than littering the inbox with an undecryptable blob.
+
+Client-side apps inspect new files in `.ark/inbox/` and claim them based on content or directory conventions. Once a file is claimed (moved to a path), later updates resolve by `file_id` and land in place — no second inbox copy, no `message_id` needed.
 
 **Response codes:**
 
 | Code | Meaning |
 |---|---|
-| `202 Accepted` | File accepted, written to `.ark/inbox/`. |
-| `400 Bad Request` | Malformed envelope. |
-| `403 Forbidden` | Signature verification failed. |
+| `202 Accepted` | Accepted — written to `.ark/inbox/`, or applied in place. |
+| `400 Bad Request` | Malformed file or document. |
+| `403 Forbidden` | Signature, contacts, or membership check failed (incl. receiving account not a member of the file). |
 | `404 Not Found` | Recipient does not exist on this server. |
 | `429 Too Many Requests` | Rate limited. Includes `Retry-After` header. |
 | `507 Insufficient Storage` | Recipient's storage is full. |
 
 **Delivery retries:**
-- If delivery fails (server down, network error), the sending server retries with exponential backoff (1 min, 5 min, 30 min, 2 hours, 8 hours) for up to 72 hours, then returns a bounce notification to the sender.
+- If delivery fails (server down, network error), the sending server retries with exponential backoff (1 min, 5 min, 30 min, 2 hours, 8 hours) for up to 72 hours, then returns a bounce notification to the sender. Retries are idempotent — re-delivering the same `file_id` + `modified` is a no-op (newest-wins).
 
-### 7.4 Cross-server sync (shared files)
+### 7.4 Cross-server sync
 
-When a shared file is updated, the updated file is pushed to co-members using the same delivery mechanism as new files:
-
-```
-POST https://example.com/ark/alice/.ark/inbox/
-Content-Type: application/x-ark-envelope
-
-<binary envelope with type SYNC>
-```
-
-The envelope payload is the full updated Ark file (header + encrypted body). The receiving server:
-
-1. Extracts the `file_id` from the header.
-2. Checks if a local file with that `file_id` exists.
-3. If yes: compares `modified` timestamps. If the incoming file is newer, updates the local copy in place (at whatever path the local file currently lives). If older, discards.
-4. If no: writes to `.ark/inbox/` as a new file (shouldn't normally happen for SYNC envelopes — indicates the receiver deleted their copy).
-
-Sync envelopes bypass the contacts allowlist check — the receiving server verifies the sender is in the file's member list instead.
+Updating a shared file uses the same delivery path as a new file (Section 7.3): the updated file is pushed to each co-member's `.ark/inbox/`, and because its `file_id` already exists in their account, each server applies it in place (newest-`modified`-wins, sender checked against the existing local file's member list). There is no separate sync message type.
 
 **No path knowledge required.** The sender doesn't need to know where the receiver stores their copy. The receiver's server resolves `file_id` → local path internally.
 
 **Member moved notification:**
 
-When a member migrates to a new server (Section 2.9), they send a `MEMBER_MOVED` envelope to co-members' `.ark/inbox/` directories:
+When a member migrates to a new server (Section 2.9), they announce it by POSTing their **new identity document** (Section C.1) to co-members' `.ark/inbox/` as a JSON body with no `X-Ark-Metadata` header — that absence is what distinguishes it from a file, so no marker is needed.
 
-```
-Envelope type: MEMBER_MOVED
-Payload: { old_address, new_address, identity_key, signature }
-```
-
-Co-members' clients update the member address in shared files. Identity key stays the same, so trust is preserved.
+Each co-member verifies the document's signature and matches its `key` against the one they have pinned (TOFU). The key is unchanged, so it is the same member at a new address, and the client updates that member's address in shared files. Trust is preserved because the identity key never changed.
 
 **Sync recovery (pull fallback):**
 
-If a server misses SYNC pushes (e.g., downtime exceeding the retry window), members can pull the latest version of a shared file directly from a co-member's server. The requester doesn't know the co-member's local path, so it first resolves the `file_id`:
+If a server misses pushed updates (e.g., downtime exceeding the retry window), members can pull the latest version of a shared file directly from a co-member's server. The requester doesn't know the co-member's local path, so it first resolves the `file_id`:
 
 ```
 GET https://example.com/ark/alice/.ark/paths/<file_id>
@@ -916,7 +882,7 @@ A server is a **single statically-linked binary** containing:
 ├──────────────────────────────────────────────┤
 │  HTTPS Server                                │
 │  ├── File access (GET/HEAD/PUT/DELETE)       │
-│  ├── Envelope delivery (POST .ark/inbox/)    │
+│  ├── Inbox delivery (POST .ark/inbox/)       │
 │  └── WebSocket/SSE (.ark/stream)             │
 ├──────────────────────────────────────────────┤
 │  Filesystem Storage                          │
@@ -925,7 +891,7 @@ A server is a **single statically-linked binary** containing:
 │  └── /ark/<user>/.ark/contacts.json (allowlist)│
 ├──────────────────────────────────────────────┤
 │  Outbound Relay                              │
-│  ├── Queue for outgoing envelopes            │
+│  ├── Queue for outgoing deliveries           │
 │  ├── Retry logic (exponential backoff)       │
 │  └── Remote identity document cache          │
 ├──────────────────────────────────────────────┤
@@ -970,8 +936,8 @@ storage = "./data"
 7. Alice's client registers her public key (Mode A) or the server generates one for her (Mode B).
 
 **Storage:**
-- Filesystem. Files are stored on disk exactly as they are — the server is essentially an authenticated file server. No database required for user data.
-- The server maintains a lightweight index (e.g., SQLite) mapping `file_id` → local path (required for sync) and caching directory listings and metadata queries. The files themselves are the source of truth.
+- Filesystem (one that supports extended attributes). The body is stored on disk as the file's bytes; the signed metadata blob lives in the file's `user.ark` xattr (Section 8.3). The server is essentially an authenticated file server. No database required for user data.
+- The server maintains a lightweight index (e.g., SQLite) mapping `file_id` → local path (required for sync) and caching directory listings and metadata queries. The files (body + xattr) are the source of truth.
 - Contacts allowlists are stored as JSON files at `/ark/<user>/.ark/contacts.json`.
 
 ### 7.7 Deployment: co-hosting with a website
@@ -1031,63 +997,45 @@ tls = false  # reverse proxy handles TLS
 
 ## 8. File Format
 
-### 8.1 Binary layout
+### 8.1 File and metadata
 
-An Ark file is a binary file with two sections:
+An Ark file is split into two parts that live and travel separately:
 
-```
-┌──────────────────────────────────┐
-│  Magic bytes: "ARK\x01" (4)      │
-│  Header length: uint32 BE (4)    │
-├──────────────────────────────────┤
-│  Header (protobuf, unencrypted)  │
-│  └── variable length             │
-├──────────────────────────────────┤
-│  Body                            │
-│  ├── If encrypted:               │
-│  │   ├── nonce (12 bytes)        │
-│  │   └── ciphertext + tag (rest) │
-│  └── If algorithm = "none":      │
-│      └── raw bytes (rest)        │
-└──────────────────────────────────┘
-```
+- **Body** — the file content itself, stored as the file's bytes on disk:
+  - `algorithm = "none"`: the raw file bytes (a public `.html` is stored and served verbatim).
+  - encrypted (`aes-256-gcm` / `chacha20-poly1305`): `nonce (12 bytes) ‖ ciphertext + tag`.
+- **Metadata** — a signed Protocol Buffers blob (Section 8.2) holding everything else: `file_id`, members + wrapped keys, permissions, timestamps, algorithm, signature. It is **not** part of the body; it is stored and carried out-of-band (Section 8.3).
 
-The first 8 bytes are fixed: 4-byte magic (`ARK\x01`, where `\x01` is the format version) and 4-byte big-endian header length. The header follows immediately, then the encrypted body fills the rest of the file.
+Because the body is just the file content, a decrypted file (or a public unencrypted file) is a normal, directly usable file — no prefix to strip. The metadata accompanies it out-of-band.
 
-### 8.2 Header
+### 8.2 Metadata
 
-The header is serialized using Protocol Buffers.
+The metadata is a single Protocol Buffers blob. It is signed and stored/transmitted **verbatim** — never decomposed into separate attributes or headers (decomposition would reintroduce a canonicalization problem for the signature).
 
 ```protobuf
 syntax = "proto3";
 
-message Header {
-  // File identity
-  bytes file_id = 1;                    // 16 bytes, random UUID, immutable after creation
+message Metadata {
+  uint32 version = 1;                   // Format version (1)
+  bytes file_id = 2;                    // 16 bytes, random UUID, immutable after creation
 
-  // Timestamps
-  uint64 created = 2;                   // Unix milliseconds
-  uint64 modified = 3;                  // Unix milliseconds
+  uint64 created = 3;                   // Unix milliseconds
+  uint64 modified = 4;                  // Unix milliseconds
 
-  // Membership
-  repeated Member members = 4;
+  repeated Member members = 5;
 
-  // Encryption
-  string algorithm = 5;                 // "aes-256-gcm", "chacha20-poly1305", or "none"
+  string algorithm = 6;                 // "aes-256-gcm", "chacha20-poly1305", or "none"
+  string encryption_algorithm = 7;      // "x25519" — target for deriving the ECIES wrapping key
 
-  // Author of last modification
-  string modified_by = 6;              // "alice@example.com"
-  string signature_algorithm = 7;      // "ed25519"
-  bytes signature = 8;                 // Signature over fields 1-6 + body hash
-
-  // Key conversion (for ECIES wrapping)
-  string encryption_algorithm = 9;     // "x25519" — target algorithm for deriving encryption key from identity key
+  string modified_by = 8;              // "alice@example.com"
+  string signature_algorithm = 9;      // "ed25519"
+  bytes signature = 10;                // Ed25519 over fields 1-9 + SHA-256(body)
 }
 
 message Member {
-  string address = 1;                   // "alice@example.com"
+  string address = 1;                   // "alice@example.com" or a local group path (Section 3.9)
   string identity_key_algorithm = 2;   // "ed25519"
-  bytes identity_key = 3;              // Member's public key (for verification)
+  bytes identity_key = 3;              // Member's (or group's) public key
   string permission = 4;               // "owner", "write", or "read"
 
   // File key wrapped for this member (ECIES)
@@ -1098,49 +1046,21 @@ message Member {
 }
 ```
 
-### 8.3 Envelope
+The signature covers fields 1–9 of the canonical (deterministic) protobuf serialization plus `SHA-256(body)`, so the metadata and body are cryptographically bound even though they are stored apart — a body cannot be swapped under a signed metadata blob.
 
-The envelope is the transport wrapper for cross-server delivery. It wraps a file (or a notification) for delivery to another server's `.ark/inbox/`.
+### 8.3 Metadata storage and transport
 
-```protobuf
-enum EnvelopeType {
-  DELIVER = 0;                         // Deliver a file to a recipient
-  SYNC = 1;                            // Push updated file to co-member
-  MEMBER_MOVED = 2;                    // Notify co-members of address change
-}
+**At rest.** The metadata blob is stored in a single extended attribute, `user.ark`, on the body file. Ark requires a filesystem that supports extended attributes; those without them are unsupported. Updates are atomic: write the new body to a temporary file in the same directory, set its `user.ark` xattr, `fsync`, then `rename` over the target. The rename swaps body and metadata together, so neither a concurrent reader nor a crash ever sees a body that disagrees with its metadata.
 
-message Envelope {
-  uint32 version = 1;                  // Protocol version (1)
+**In transit.** Over HTTP the metadata travels as one header, base64-encoded:
 
-  // Routing
-  string sender = 2;                   // "bob@sender.example.com"
-  string recipient = 3;               // "alice@example.com"
-  uint64 timestamp = 4;               // Unix milliseconds
-  bytes message_id = 5;               // 16 bytes, random UUID
-
-  // Envelope type
-  EnvelopeType type = 6;              // Default: DELIVER
-
-  // Sender authentication (signature over fields 1-6)
-  string signature_algorithm = 7;     // "ed25519"
-  bytes envelope_signature = 8;       // 64 bytes
-
-  // Payload — depends on envelope type:
-  // DELIVER: raw Ark file bytes (header + encrypted body)
-  // SYNC: raw Ark file bytes (header + encrypted body)
-  // MEMBER_MOVED: MemberMovedNotification
-  bytes payload = 9;
-}
-
-message MemberMovedNotification {
-  string old_address = 1;
-  string new_address = 2;
-  string identity_key_algorithm = 3; // "ed25519"
-  bytes identity_key = 4;
-  string signature_algorithm = 5;    // "ed25519"
-  bytes signature = 6;               // Signed by the identity key
-}
 ```
+X-Ark-Metadata: <base64 of the metadata blob>
+```
+
+`GET` returns the body as the HTTP entity body plus `X-Ark-Metadata`; `HEAD` returns `X-Ark-Metadata` with no body; `PUT` and inbox `POST` send both. Because the entity body is always the raw file, there is no separate "raw" form — a non-Ark client (e.g. a browser fetching a public file) simply ignores the `X-Ark-Metadata` header.
+
+**Size budget.** The blob must fit a single xattr value; the binding constraint is ext4's ~4 KB per-inode limit. A blob is ~120 B fixed plus ~150–200 B per member entry, so a file with a handful of members — or a single group member (Section 3.9) — sits far under it. Past ~25 direct members, use a group. The same budget keeps `X-Ark-Metadata` within proxies' HTTP header-size limits.
 
 ### 8.4 Identity and contacts documents
 
@@ -1148,9 +1068,9 @@ Identity documents and contacts are JSON (human-readable, easy to debug with cur
 
 ### 8.5 Serialization rules
 
-- **File headers, envelopes:** Protocol Buffers (binary). Compact, efficient, schema-evolvable.
+- **Metadata:** Protocol Buffers (binary), stored verbatim in the `user.ark` xattr and the `X-Ark-Metadata` header.
 - **Identity documents, contacts:** JSON. Human-readable.
-- **Signatures:** computed over the canonical protobuf serialization (deterministic encoding) plus the SHA-256 hash of the encrypted body.
+- **Signatures:** computed over the canonical protobuf serialization of metadata fields 1–9 (deterministic encoding) plus `SHA-256(body)`.
 - **All binary values in JSON:** base64url encoding (RFC 4648, no padding).
 
 ---
@@ -1162,7 +1082,7 @@ Identity documents and contacts are JSON (human-readable, easy to debug with cur
 | Property | Guarantee |
 |---|---|
 | **Data confidentiality** | Only holders of the file key can read file content. Servers see only ciphertext (Mode A). |
-| **Author authentication** | Files and envelopes are signed by the author's identity key. Forgery requires the private key. |
+| **Author authentication** | Files, identity, and group documents are signed by the author's identity key. Forgery requires the private key. |
 | **Integrity** | Any modification to a file invalidates the signature. Any modification to the ciphertext invalidates the AEAD tag. |
 | **Spam resistance** | Only contacts can deliver to private inboxes. Public inboxes are opt-in. |
 | **Data persistence (static mode)** | All static-mode files can be decrypted with the single identity key (which unwraps file keys). No session state to lose. |
@@ -1201,9 +1121,9 @@ Identity documents and contacts are JSON (human-readable, easy to debug with cur
 - Mitigation: re-key the file (generate new file key, re-encrypt body, re-wrap for all members).
 
 **Scenario: Server-to-server traffic is intercepted (TLS broken)**
-- Attacker sees encrypted envelopes in transit. They can see metadata (routing info is plaintext).
+- Attacker sees files in transit. They can see metadata (the metadata blob is plaintext).
 - Attacker **cannot** read file content (E2E encrypted independent of TLS).
-- Attacker **cannot** forge envelopes (signatures are verified).
+- Attacker **cannot** forge files (signatures are verified).
 - TLS is defense-in-depth for metadata, not the primary security layer.
 
 ### 9.4 Trust assumptions
@@ -1241,7 +1161,7 @@ A **ratcheted sequence** is an ordered collection of files between exactly two p
   ...
 ```
 
-Each file in the sequence is still a standard Ark file (same binary format, same transport, same envelope delivery). The only difference is how the file key is derived — from the ratchet chain instead of random + ECIES.
+Each file in the sequence is still a standard Ark file (same binary format, same transport, same inbox delivery). The only difference is how the file key is derived — from the ratchet chain instead of random + ECIES.
 
 #### 10.1.2 Prekey bundles
 
@@ -1283,7 +1203,7 @@ When Alice initiates a ratcheted sequence with Bob:
      length: 32
    )
    ```
-6. Alice stores the ratchet state locally and sends the first file in the sequence with her ephemeral public key (`EK_A`) and the one-time prekey identifier in the file header, so Bob can compute the same root key.
+6. Alice stores the ratchet state locally and sends the first file in the sequence with her ephemeral public key (`EK_A`) and the one-time prekey identifier in the file metadata, so Bob can compute the same root key.
 
 #### 10.1.4 Double Ratchet operation
 
@@ -1312,9 +1232,9 @@ The `message_key` is used as the file key for that file. It is used once and dis
      length: 64
    )
    ```
-4. The sender's new ratchet public key is included in the file header's `ratchet_key` field.
+4. The sender's new ratchet public key is included in the file metadata's `ratchet_key` field.
 
-**File header fields for ratcheted files:**
+**Metadata fields for ratcheted files:**
 
 | Field | Purpose |
 |---|---|
@@ -1323,7 +1243,7 @@ The `message_key` is used as the file key for that file. It is used once and dis
 | `message_index` | Monotonic counter — position in the ratchet chain |
 | `ratchet_key` | Sender's current DH ratchet public key (X25519, 32 bytes) |
 
-The `members` list still exists in the header but `wrapped_file_key` fields are empty — the file key is derived from the ratchet, not wrapped via ECIES.
+The `members` list still exists in the metadata but `wrapped_file_key` fields are empty — the file key is derived from the ratchet, not wrapped via ECIES.
 
 #### 10.1.5 Ratchet state storage
 
@@ -1357,7 +1277,7 @@ The Double Ratchet is fundamentally a 2-party protocol. Group forward secrecy (3
 
 Nothing in the core protocol blocks adding ratcheted sequences later:
 
-- Ratcheted files are standard Ark files — same format, same transport, same envelopes. The Header protobuf is extended with `key_derivation`, `sequence_id`, `message_index`, and `ratchet_key` fields.
+- Ratcheted files are standard Ark files — same format, same transport, same inbox delivery. The Metadata protobuf is extended with `key_derivation`, `sequence_id`, `message_index`, and `ratchet_key` fields.
 - The identity document is extended with a `prekeys` object.
 - Old clients that don't understand ratcheted files simply cannot decrypt them (they lack the ratchet state regardless).
 - Proto3 silently ignores unknown fields, so old clients won't break on new headers.
@@ -1439,14 +1359,14 @@ legacy_gateway = "gateway.ark.io"
 For protocol users who want to receive legacy email, a bridge service can forward incoming emails.
 
 1. Alice configures a forwarding rule in her email provider to a webhook handled by the bridge.
-2. The bridge receives the email, wraps the content in an Ark file, and delivers it to Alice's `.ark/inbox/` via a standard envelope.
+2. The bridge receives the email, wraps the content in an Ark file, and delivers it to Alice's `.ark/inbox/` like any file.
 3. The file is marked as "received via email (unencrypted)" in Alice's client.
 
 **Security note:** Bridged messages are not encrypted in transit. The bridge sees plaintext during processing. These files should be clearly distinguished from native Ark files in the client UI.
 
 ### 10.3 Metadata Privacy
 
-A future version could add onion routing or mixnet support to hide metadata (sender/recipient/timing) from servers and network observers. The protocol's layered design (file vs. envelope) makes this possible without changing the core file format.
+A future version could add onion routing or mixnet support to hide metadata (sender/recipient/timing) from servers and network observers. The protocol's separation of routing (the inbox path) from content makes this possible without changing the core file format.
 
 ### 10.4 Collaborative Editing (CRDTs)
 
@@ -1483,7 +1403,7 @@ legacy_gateway = ""
 | `acme_email` | string | No | Email for Let's Encrypt certificate provisioning. |
 | `max_account_size` | string | No | Maximum storage per account. Default `1GB`. |
 | `max_file_size` | string | No | Maximum single file size. Default `100MB`. |
-| `max_delivery_size` | string | No | Maximum envelope payload size. Default `25MB`. |
+| `max_delivery_size` | string | No | Maximum size of a file delivered to an inbox. Default `25MB`. |
 | `allow_remote_registration` | boolean | No | Allow account creation via PUT `/ark/<user>/.ark/identity.json`. Default `true`. |
 | `legacy_gateway` | string | No | Gateway server address for legacy email interop (Section 10.2). Default empty. |
 
@@ -1491,12 +1411,12 @@ legacy_gateway = ""
 
 All Ark endpoints are under `https://<domain>/ark/<user>/`.
 
-Most endpoints are standard file resource requests which require an `ArkUser` Authentication header:
+Most endpoints are standard file resource requests:
 
 | Endpoint | Body | Response | Purpose |
 |---|---|---|---|
 | `GET    /ark/<user>/<dir_path>` | - | `DirectoryEntry[]` | List directory entries |
-| `HEAD   /ark/<user>/<file_path>` | - | - | Fetch file header/metadata |
+| `HEAD   /ark/<user>/<file_path>` | - | - | Fetch metadata (`X-Ark-Metadata`) |
 | `GET    /ark/<user>/<file_path>` | - | `File` | Fetch file |
 | `PUT    /ark/<user>/<file_path>` | `File` | - | Create or update file |
 | `DELETE /ark/<user>/<file_path>` | - | - | Delete file |
@@ -1509,7 +1429,7 @@ The `/ark/<user>/.ark/` directory is a special directory that is limited to spec
 - `/ark/<user>/.ark/groups/<name>.key`: group private key, wrapped per member. Members-only.
 - `/ark/<user>/.ark/identity.html`: Contact HTML page, auto-generated, HEAD/GET only, no authentication required. This should contain a link to add the user to your contacts.
 - `/ark/<user>/.ark/identity.json`: `Identity`, no authentication required for PUT if creating new file. The creation of this file creates a new user.
-- `/ark/<user>/.ark/inbox/<message_id>`: `Envelope`, users listed in `/ark/<user>/.ark/contacts.json` allowed for PUT if creating new file.
+- `/ark/<user>/.ark/inbox/<file_id>`: `File` (or an `Identity` document for a move notification). New files are keyed by `file_id`; senders in `/ark/<user>/.ark/contacts.json` allowed for new files, existing-file members for updates (Section 7.3).
 - `/ark/<user>/.ark/invitations/<token>.html`: Invitation HTML page, auto-generated, no authentication required. This should contain a link to redeem the invitation i.e. add yourself to their contacts (HEAD/GET only, no authentication required)
 - `/ark/<user>/.ark/invitations/<token>.json`: `Invitation`
 - `/ark/<user>/.ark/paths/<file_id>`: File path e.g. `/ark/<user>/my_dir/my_file.txt`, auto-generated, HEAD/GET only, users listed in `/ark/<user>/.ark/contacts.json` allowed.
@@ -1518,7 +1438,7 @@ The following are special requests that do not fit the standard file resource mo
 
 | Endpoint | Body | Response | Purpose |
 |---|---|---|---|
-| `POST   /ark/<user>/.ark/invitations/<token>` | `Identity` | `Identity` | Redeem invitation. The body is the identity of the redeemer, the response is the identity of `<user>`. |
+| `POST   /ark/<user>/.ark/invitations/<token>` | `Identity` | `Identity` | Redeem an invitation. The body is the identity of the redeemer, the response is the identity of `<user>`. |
 | `GET    /ark/<user>/.ark/stream` | - | `Event` stream | Subscribe to a real-time event stream |
 
 ---
@@ -1776,12 +1696,12 @@ Bob's Client                Bob's Server              Alice's Server            
     |     wrap key for self     |                          |                          |
     |     and Alice             |                          |                          |
     |                           |                          |                          |
-    |  4. Sign envelope         |                          |                          |
+    |  4. Sign file             |                          |                          |
     |                           |                          |                          |
     |  5. Store file on ------->|                          |                          |
     |     home server           |                          |                          |
     |                           |  6. Relay via HTTPS POST |                          |
-    |                           |------- envelope -------->|                          |
+    |                           |--------- file ---------->|                          |
     |                           |                          |  7. Verify signature      |
     |                           |                          |  8. Check contacts/public |
     |                           |                          |  9. Store in .ark/inbox/  |
