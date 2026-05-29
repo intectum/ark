@@ -6,7 +6,7 @@
 ## Table of Contents
 
 1. [Overview](#1-overview)
-2. [System 1: Identity](#2-system-1-identity--who-are-you)
+2. [System 1: Identity](#2-system-1-identity)
 3. [System 2: Files](#3-system-2-files--the-core-primitive)
 4. [System 3: Encryption](#4-system-3-encryption--nobody-else-can-read-this)
 5. [System 4: Authentication](#5-system-4-authentication--this-really-came-from-alice)
@@ -51,11 +51,11 @@ Ark is a federated, encrypted protocol for synchronizing personal and shared dat
 
 ---
 
-## 2. System 1: Identity — "Who are you?"
+## 2. System 1: Identity
 
 ### 2.1 Concept
 
-Every user has a cryptographic keypair — like a crypto wallet. The public key *is* your identity. It's mapped to a human-readable address like `alice@example.com`, where `example.com` is the server that hosts Alice's account.
+Every account has a cryptographic keypair — like a crypto wallet. The public key *is* the identity. It's mapped to a human-readable address like `alice@example.com`, where `example.com` is the server that hosts Alice's account.
 
 ### 2.2 Address format
 
@@ -71,24 +71,11 @@ bob@ark.myserver.org
 
 This format is deliberately identical to email. Users already understand it, and it requires no new mental model.
 
-Addresses can also use IP addresses:
-
-```
-alice@127.0.0.1
-```
-
-Addresses can also include paths to specific files:
-
-```
-alice@example.com/.ark/groups/contacts.json
-/.ark/groups/contacts.json
-```
-
-Paths must point to an `Identity` or `Group` file.
+Addresses can also use IP addresses (`alice@127.0.0.1`) and include paths to specific files (`alice@example.com/.ark/groups/contacts.json` or `/.ark/groups/contacts.json`). Paths must point to an `Identity` or `Group` file.
 
 ### 2.3 Keypair generation
 
-Each user has a single **identity keypair**. This keypair is used for both signing (Ed25519) and encryption (converted to X25519 for Diffie-Hellman operations — this is a standard, well-defined mathematical conversion).
+Each account has a single **identity keypair**. This keypair is used for both signing and encryption [TODO: ?] (converted to X25519 for Diffie-Hellman operations — this is a standard, well-defined mathematical conversion).
 
 There are two modes of key generation, chosen at account creation:
 
@@ -106,24 +93,26 @@ There are two modes of key generation, chosen at account creation:
 4. Alice writes down the seed phrase and stores it securely offline.
 5. The server **never has the private key**. If Alice loses her seed phrase and all devices, the key is gone.
 
-**Mode B: Server-generated key (maximum convenience)**
+**Mode B: Server-hosted key (maximum convenience)**
 
-1. The server generates the Ed25519 identity keypair.
-2. The server stores the private key (encrypted at rest).
-3. The server provides the private key to Alice's client when she logs in (over TLS + an additional authentication step, e.g., password or registration token).
-4. This means the server *can* decrypt Alice's data. Alice trusts her server.
+1. Alice's client generates the Ed25519 identity keypair locally — the server never sees the private key.
+2. The client stores it as an ordinary file at `/ark/<user>/.ark/identity.key` whose members are credential members — passwords and/or passkeys (Sections 2.11, 3.10) — so only a holder of one of those credentials can decrypt it, and the server gates access to it. The client creates this file exactly as it creates any other (encrypt body, wrap the file key to each member, sign, PUT); the server stores ciphertext it cannot read.
+3. To log in on any device, Alice's client requests `identity.key` and decrypts it with her password or passkey, recovering the private key. The server verifies the credential before returning the file (Section 2.11), so the encrypted key is never freely downloadable. There is no seed phrase to manage, and multi-device works by entering the same credential on each device.
+4. By default the server holds no credential of its own, so it **cannot** read the key. Alice may optionally add a **server recovery member** so an admin can reset her password — this re-enables the server to decrypt her data, the classic "your provider can read your mail" trade-off.
 5. Alice can export her seed phrase at any time and switch to Mode A.
+
+The only difference from Mode A is *where the key lives and how it is recovered*: in Mode B the encrypted key is hosted on the server and unlocked by a password/passkey; in Mode A nothing is hosted and the key is recovered from a seed phrase. In neither mode does the server see the private key (absent a server recovery member).
 
 **Why offer both modes?**
 
-Most people will choose Mode B — it's how email works today (your email provider can read your email). It means:
+Most people will choose Mode B — login with a password or passkey, like every web service. It means:
 - No seed phrase to lose.
-- Seamless multi-device (server provides the key to each device).
-- If you forget your password, the server admin can reset it (for self-hosters, you *are* the admin).
+- Seamless multi-device (each device decrypts the same `identity.key`).
+- Optionally, if Alice adds a server recovery member, a forgotten password can be reset by the admin (for self-hosters, you *are* the admin) — at the cost of letting the server read her data.
 
-Security-conscious users choose Mode A — the server is purely a relay and storage node that cannot read data.
+Security-conscious users choose Mode A — the encrypted key is never hosted on the server at all, so there is nothing for a compromised server to brute-force. Recovery is by seed phrase only.
 
-**Self-hosters get the best of both worlds:** They control the server, so Mode B gives them convenience without trusting a third party. The private key is on infrastructure they own.
+**Self-hosters get the best of both worlds:** They control the server, so Mode B gives them convenience without trusting a third party. The private key — and any recovery member — is on infrastructure they own.
 
 **Why Ed25519?**
 - Fast signing and verification (important for per-file signatures).
@@ -145,7 +134,7 @@ See Section C.1 for format.
 - A MITM attacker who compromises the TLS connection cannot forge the identity document.
 - The document is self-authenticating: anyone can verify it using only the public key it contains.
 
-Note: For Mode B users (server holds the private key), the server *could* sign a different identity document. The user is already trusting the server with their private key, so this doesn't change the trust model.
+Note: A Mode B user with a server recovery member (Section 2.11) lets the server hold a credential to the private key, so the server *could* sign a different identity document — but the user already accepted that the server can read their data, so this doesn't change their trust model. A Mode B user without a server recovery member keeps the full self-signature guarantee, like Mode A.
 
 ### 2.5 Key discovery
 
@@ -161,8 +150,8 @@ When Bob wants to contact Alice for the first time:
 
 Alice uses a laptop and a phone. Multi-device works differently depending on the key mode:
 
-**Mode B (server-managed key):**
-- Simple. Each device authenticates with the server (password, token, etc.) and receives the private key.
+**Mode B (server-hosted key):**
+- Each device fetches `identity.key` and decrypts it with Alice's password or passkey (Section 2.11) to recover the private key.
 - All devices can decrypt all files and sign operations (they all have the same identity keypair).
 
 **Mode A (client-managed key):**
@@ -197,10 +186,10 @@ When an identity key changes, Alice must re-wrap her file keys. Each file has a 
 
 ### 2.8 Account recovery
 
-**Mode B (server-managed key):**
-- The server holds the private key. Recovery is a standard password reset / admin intervention.
-- Files are stored on the server and remain accessible.
-- This is the simplest recovery story — works like email.
+**Mode B (server-hosted key):**
+- With a remembered credential (password or passkey), Alice fetches and decrypts `identity.key` on a new device — files on the server remain accessible.
+- With a **server recovery member**, a forgotten password can be reset by the admin — the simplest recovery story, like email. This is what lets the server decrypt the key.
+- Without a server recovery member, losing **all** credentials means the identity key file can no longer be opened. Alice falls back to her exported seed phrase (Section 2.3, step 5); if she has none, the account is lost, as in Mode A.
 
 **Mode A (client-managed key):**
 - Alice enters her 24-word seed phrase on a new device.
@@ -219,7 +208,7 @@ Alice can move from one server to another while keeping the same identity keypai
 
 **When the old server is still online:**
 
-1. Alice creates an account on the new server with her existing identity key (Mode A: enters seed phrase; Mode B: transfers the private key).
+1. Alice creates an account on the new server with her existing identity key (Mode A: enters seed phrase; Mode B: uploads her encrypted `identity.key` to the new server).
 2. Alice copies her files from the old server to the new server. No re-encryption needed — all file keys are encrypted to the same identity key regardless of which server stores them.
 3. Alice copies her contacts file to the new server.
 4. On the old server, Alice's identity document is replaced with an alias redirect:
@@ -273,6 +262,29 @@ When someone encounters an alias document, they follow the `redirect` to fetch t
 
 **Cross-server aliases** are not supported in v1. An alias must be on the same server as the primary address. Cross-server migration is handled by key transitions (Section 2.7).
 
+### 2.11 Identity key file (Mode B)
+
+A Mode B account stores its identity private key in a file at `/ark/<user>/.ark/identity.key`. This is an **ordinary Ark file** (Section 8), not a special format: its **body** is the identity private key (encrypted with a file key, like any file), and its **members** are **credential members** — passwords and/or passkeys (Section 3.10) — with `read` permission, plus the identity itself as `owner`.
+
+Because access is governed by the file's members, the server **verifies a credential before returning the body** (Section 3.10) — exactly as it would for any credential-gated file. The private key is never handed to an unauthenticated requester, and attempts are rate-limited. This gives Mode B its convenience — password/passkey login, seamless multi-device, no seed phrase — while keeping the server unable to decrypt (the credential's decryption key never reaches it, Section 3.10).
+
+**Login flow:**
+
+1. The client requests `identity.key`, presenting a password or passkey proof (Section 7.2). The server verifies it against a credential member and returns the file; a failed or unauthenticated request gets `403` — no ciphertext leaks.
+2. The client derives its wrapping key from the credential, unwraps the file key from its member entry, and decrypts the body to recover the private key (Section 3.10).
+3. The client derives the public key and verifies it equals the `key` in `identity.json`. This catches substitution of the file.
+4. The client signs subsequent `ArkUser` requests (Section 7.2) with the private key. Possession of a credential *is* possession of the account.
+
+**Adding / removing a credential.** Both are ordinary `owner`-level edits to the file, made with the recovered identity key:
+- *Add:* unwrap the file key (via any credential, or the `owner` entry), then add a credential member that wraps it. The body is not re-encrypted.
+- *Remove:* drop the member. This is **soft revocation only** — the holder may have cached the key, and the identity key is unchanged — so true revocation is an identity key transition (Section 2.7). Parallels Section 3.7.
+
+The file is self-signed by the identity key like any file (Section 5.2), so a malicious server cannot tamper with the member list — e.g. it cannot strip a strong passkey member to force a weaker password path (a downgrade attack).
+
+**Server recovery (optional).** Adding a credential member the server controls lets an admin reset access — and lets the server decrypt the private key (classic Mode B). Explicit per-account opt-in, not the default.
+
+The key is generated by the client and uploaded encrypted, so the server never sees the private key (absent a server recovery member). The difference from Mode A is only that Mode A keeps nothing on the server and recovers from a seed phrase.
+
 ---
 
 ## 3. System 2: Files ��� "The core primitive"
@@ -300,7 +312,7 @@ See Section 8 for the full format.
 
 ### 3.4 Membership
 
-Each file has one or more members, listed in the metadata. Every member holds the file's symmetric key, encrypted to their identity key. This means any member can decrypt the content.
+Each file has one or more members, listed in the metadata. Every member holds the file's symmetric key, wrapped to their key. This means any member can decrypt the content. Members are usually **identity members** (identified by an identity key); a file may also have **credential members** — passwords or passkeys the server verifies before serving (Section 3.10) — and a **wildcard member** for public access (Section 3.8).
 
 **Member permissions:**
 
@@ -460,13 +472,46 @@ A group is two files, **replicated to every member's account** and synced like a
 
 When a client creates a file in that directory, it shares with that group by default. This is a **hint only** — the server does not enforce it, and files in the directory may use any membership.
 
+### 3.10 Credential members (password / passkey)
+
+Most members are **identity members**, identified by an identity key (the default). A **credential member** is instead identified by a secret — a **password** or a **passkey**. Two things make it useful:
+
+- The file can be shared with someone who is **not an Ark identity** — a link plus a password, or a passkey — with no key discovery.
+- The server can **verify the credential before returning the file**, so gated content is never handed to an unauthenticated requester (and attempts are rate-limited).
+
+A credential member is set by `credential_type` in its member entry (Section 8.2): `"password"` or `"passkey"` (vs. `"identity"`). It is **read-only** in v1 (see *Writes*). Each carries two independent pieces:
+
+**1. Gate material** — what the server checks to authorize a request:
+- *Passkey:* the credential's WebAuthn public key. On access the server runs a challenge-response (`401` + challenge → client returns a signed assertion → server verifies, Section 7.2). Nothing here is offline-attackable — the authenticator private key never leaves the device.
+- *Password:* a `verifier`. The client sends an `auth_secret` over TLS; the server compares it to the verifier and rate-limits. A *compromised* server holding the verifier can brute-force the password offline, so passwords are the weaker option — prefer passkeys.
+
+**2. Wrapped file key** — the file key wrapped to a `wrap_key` derived from the same credential and stored in `wrapped_file_key` (with `key_nonce`; the `ephemeral_key` ECIES fields are empty — wrapping is direct AES-256-GCM under `wrap_key`, not ECIES):
+- *Passkey:* `wrap_key = HKDF-SHA256(WebAuthn-PRF(prf_salt))`.
+- *Password:* `wrap_key = HKDF-SHA256(Argon2id(password, salt), info: "wrap")`.
+
+**The gate key and the wrap key are domain-separated.** For passwords, `auth_secret = HKDF-SHA256(Argon2id(password, salt), info: "auth")` while `wrap_key` uses `info: "wrap"` — so the server learns `auth_secret` but can never derive `wrap_key`. The server gates access **without being able to decrypt**; end-to-end encryption is preserved.
+
+**Access flow (GET):**
+
+1. The server sees the file has credential members and challenges accordingly (Section 7.2).
+2. The client proves a credential. The server verifies it against a member with `read` (or higher) and returns the file; otherwise `403`.
+3. The client derives `wrap_key`, unwraps the file key from that member entry, and decrypts the body.
+
+**Metadata exposure.** A password member's `verifier` and `salt` are brute-force material, so for a file with password members the server MUST require the same authorization for `HEAD` and directory listings as for `GET` — it must not reveal those fields to an unauthenticated requester. Passkey gate material (a public key) is safe to expose.
+
+**Writes.** Modifying a file requires an Ed25519 signature by an identity key (Section 5.2); a credential member has none. So credential members are **read-only** in v1 — a credential-shared file is still authored and modified by its identity `owner`/`write` members. (Credential-based authorship would need a signing extension; out of scope for v1.)
+
+**Browser fallback.** As with invitations (Section 6.4), a server may serve an HTML page that prompts for the password (or invokes the passkey) and fetches the file, so recipients without a native client can open a credential-shared file.
+
+The identity key file (Section 2.11) is the canonical use of credential members: its body is the identity private key, its members are the passwords/passkeys that can unlock it.
+
 ---
 
 ## 4. System 3: Encryption — "Nobody else can read this"
 
 ### 4.1 Concept
 
-Every file's body is encrypted with a **symmetric file key** (AES-256-GCM). The file key is then wrapped (encrypted) to each member's identity key using ECIES. This two-layer approach means:
+Every file's body is encrypted with a **symmetric file key** (AES-256-GCM). The file key is then wrapped (encrypted) to each member — to an identity key via ECIES, or to a credential-derived key for credential members (Section 3.10). This two-layer approach means:
 
 - Content is encrypted once, regardless of how members there are.
 - Adding a member only requires wrapping the existing file key — no re-encryption of content.
@@ -538,7 +583,7 @@ The symmetric key approach encrypts content once and wraps the small key per-mem
 
 Since there's a single identity keypair per user, multi-device is straightforward:
 
-- **Mode B (server-managed key):** All devices get the private key from the server. Any device can unwrap any file key.
+- **Mode B (server-hosted key):** All devices decrypt the same `identity.key` with Alice's password or passkey (Section 2.11) to obtain the private key. Any device can unwrap any file key.
 - **Mode A (client-managed key):** All devices derive the same private key from the seed phrase. Same result.
 
 File keys are wrapped to the **identity key**, not per-device. One wrap per member, regardless of how many devices that member has.
@@ -760,6 +805,12 @@ X-Ark-Timestamp: 1712838400
 ```
 The server verifies the signature against the identity key in Alice's identity document. Requests with timestamps older than 5 minutes are rejected (replay protection).
 
+**Credential authentication.** Requests for files with credential members (Section 3.10) authorize with a credential instead of an identity signature:
+- `Authorization: ArkPasskey <assertion>` — a WebAuthn assertion over a server challenge. The server issues the challenge with `401 Unauthorized` and `WWW-Authenticate: ArkPasskey challenge=<nonce>`; the client retries with the signed assertion.
+- `Authorization: ArkPassword <auth_secret>` — the password-derived auth secret (Section 3.10), sent over TLS and rate-limited.
+
+The server verifies the proof against the file's credential members before serving. For a file with password members, the server applies the same check to `HEAD` and directory listings (Section 3.10).
+
 **File operations:**
 
 | Method | Path | Purpose |
@@ -783,6 +834,7 @@ The raw body as the entity body (`Content-Type: application/x-ark`), with the me
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/ark/alice/.ark/identity.json` | Identity document (JSON) |
+| `GET` | `/ark/alice/.ark/identity.key` | Identity private key, Mode B — credential-gated (Sections 2.11, 3.10) |
 | `GET` | `/ark/alice/.ark/identity.html` | Contact card (HTML) |
 | `GET` | `/ark/alice/.ark/contacts.json` | Contacts group document (members = contacts) |
 | `PUT` | `/ark/alice/.ark/contacts.json` | Update contacts group |
@@ -933,7 +985,7 @@ storage = "./data"
 4. Start the server. It auto-provisions a TLS certificate via Let's Encrypt.
 5. Add users locally: `ark-server user add alice`.
 6. Or users self-register by PUTting their identity document to `/ark/<user>/.ark/identity.json`.
-7. Alice's client registers her public key (Mode A) or the server generates one for her (Mode B).
+7. Alice's client generates her keypair and registers her public key (`identity.json`); a Mode B client also uploads the encrypted `identity.key` (Section 2.11).
 
 **Storage:**
 - Filesystem (one that supports extended attributes). The body is stored on disk as the file's bytes; the signed metadata blob lives in the file's `user.ark` xattr (Section 8.3). The server is essentially an authenticated file server. No database required for user data.
@@ -1038,11 +1090,25 @@ message Member {
   bytes identity_key = 3;              // Member's (or group's) public key
   string permission = 4;               // "owner", "write", or "read"
 
-  // File key wrapped for this member (ECIES)
-  string ephemeral_key_algorithm = 5;  // "x25519"
-  bytes ephemeral_key = 6;            // Ephemeral public key (32 bytes)
+  // File key wrapped for this member.
+  // Identity members: ECIES (ephemeral_key set). Credential members: direct
+  // AES-256-GCM under wrap_key (ephemeral_key empty), see Section 3.10.
+  string ephemeral_key_algorithm = 5;  // "x25519" (identity members)
+  bytes ephemeral_key = 6;            // Ephemeral public key (32 bytes); empty for credential members
   bytes key_nonce = 7;                // AES-256-GCM nonce for key wrapping (12 bytes)
-  bytes wrapped_file_key = 8;         // File key encrypted to this member (32 bytes + 16 byte tag)
+  bytes wrapped_file_key = 8;         // File key wrapped to this member (32 bytes + 16 byte tag)
+
+  // Credential members (Section 3.10). credential_type defaults to "identity".
+  string credential_type = 9;          // "identity" (default), "password", or "passkey"
+  // Password credential
+  string kdf = 10;                     // "argon2id"
+  string kdf_params = 11;              // e.g. "m=1048576,t=3,p=4"
+  bytes kdf_salt = 12;                // Argon2id salt (shared by auth_secret and wrap_key derivation)
+  bytes verifier = 13;                // server-checked gate value (e.g. SHA-256 of auth_secret)
+  // Passkey credential
+  bytes webauthn_credential_id = 14;  // selects the authenticator
+  bytes webauthn_public_key = 15;     // gate: verifies WebAuthn assertions
+  bytes prf_salt = 16;                // input to the WebAuthn PRF (derives wrap_key)
 }
 ```
 
@@ -1081,7 +1147,7 @@ Identity documents and contacts are JSON (human-readable, easy to debug with cur
 
 | Property | Guarantee |
 |---|---|
-| **Data confidentiality** | Only holders of the file key can read file content. Servers see only ciphertext (Mode A). |
+| **Data confidentiality** | Only holders of the file key can read file content. Servers see only ciphertext (Mode A, and Mode B without a server recovery member). |
 | **Author authentication** | Files, identity, and group documents are signed by the author's identity key. Forgery requires the private key. |
 | **Integrity** | Any modification to a file invalidates the signature. Any modification to the ciphertext invalidates the AEAD tag. |
 | **Spam resistance** | Only contacts can deliver to private inboxes. Public inboxes are opt-in. |
@@ -1093,7 +1159,8 @@ Identity documents and contacts are JSON (human-readable, easy to debug with cur
 |---|---|
 | **Metadata** | File paths, sizes, timestamps, member addresses, and cross-server delivery patterns are visible to the server and network observers. Path names may reveal content intent (e.g., `/notes/tax-2025`). |
 | **Forward secrecy** | If the identity private key is compromised, all file keys can be unwrapped, and all past and future data can be decrypted. This is a deliberate tradeoff for simplicity and recoverability. |
-| **Mode B server trust** | If the server holds the private key (Mode B), the server can read all data. Self-hosters mitigate this by controlling the server. |
+| **Mode B server trust** | The key is client-generated and uploaded encrypted, so a Mode B server can read data only if it holds a credential — a **server recovery member** (Section 2.11). Without one it stores ciphertext it cannot read. Self-hosters mitigate either way by controlling the server. |
+| **Password member brute force** | `identity.key` (and any password-gated file) is served only after the server verifies the credential, so it is not freely downloadable — online attempts are rate-limited. A *compromised* server holding the `verifier` can still brute-force a password member offline (Sections 2.11, 3.10). Passkey members are hardware-bound and resist even that. |
 | **Removed member's existing copy** | When a member is removed from a shared file, they retain any copy they already downloaded. Re-keying prevents access to future edits, not past content. |
 | **Path metadata** | File paths are unencrypted (the server needs them for routing). Path names like `/mail/inbox/` or `/notes/secret-project` are visible to the server. For maximum privacy, use opaque paths. |
 | **Unencrypted files** | Files with `algorithm = "none"` have no confidentiality protection. The body is readable by the server, network observers (if TLS is broken), and anyone with read access. Integrity and authenticity are still provided by the file signature. |
@@ -1106,11 +1173,10 @@ Identity documents and contacts are JSON (human-readable, easy to debug with cur
 - Attacker **cannot** forge files from Alice (doesn't have her signing key).
 - Attacker could serve a fake identity document with a different public key. Mitigations: (1) existing contacts have Alice's key pinned via TOFU, (2) verified contacts will see a safety number change warning.
 
-**Scenario: Alice's server is compromised (Mode B — server-managed key)**
-- Attacker gets Alice's private key from the server.
-- Attacker **can** read all files (past and future, until the key is rotated).
-- Attacker **can** forge files from Alice.
-- This is the tradeoff of Mode B. Mitigation: use Mode A for high-security needs.
+**Scenario: Alice's server is compromised (Mode B — server-hosted key)**
+- *With a server recovery member*: the attacker gets Alice's private key, **can** read all files (past and future, until the key is rotated), and **can** forge files from Alice. This is the tradeoff of opting into server recovery.
+- *Without a server recovery member*: the attacker holds the `identity.key` file and its metadata (a password member's `verifier` and `salt`), so they can brute-force a password member offline; passkey members are not attackable this way. Until a password is cracked, the attacker **cannot** read files or forge as Alice.
+- Mitigation: omit the server recovery member, use passkey members, and choose a strong passphrase — or use Mode A for high-security needs.
 
 **Scenario: Alice's identity key is compromised (either mode)**
 - Worst case. Attacker can impersonate Alice and decrypt all data.
@@ -1300,7 +1366,7 @@ When a protocol user sends a message to a legacy email address, the server creat
    ```
 3. Bob's server checks whether this alias already exists on the **gateway server**.
 4. If not, it requests account creation on the gateway:
-   - The gateway creates a Mode B account (server-generated keypair).
+   - The gateway generates a keypair on the alias's behalf and holds it — the legacy recipient has no client of their own, so the gateway can display their messages. This is the legacy-interop trust trade-off (the gateway can read these messages).
    - The gateway publishes a legacy email identity document for the alias.
 5. Bob's server encrypts the message to the new account's public key and delivers it.
 6. The gateway sends a notification email to `carol@gmail.com`:
@@ -1429,6 +1495,7 @@ The `/ark/<user>/.ark/` directory is a special directory that is limited to spec
 - `/ark/<user>/.ark/groups/<name>.key`: group private key, wrapped per member. Members-only.
 - `/ark/<user>/.ark/identity.html`: Contact HTML page, auto-generated, HEAD/GET only, no authentication required. This should contain a link to add the user to your contacts.
 - `/ark/<user>/.ark/identity.json`: `Identity`, no authentication required for PUT if creating new file. The creation of this file creates a new user.
+- `/ark/<user>/.ark/identity.key`: `File` (Section 8, C.12) whose body is the Mode B identity private key, with credential members (Sections 2.11, 3.10). GET/HEAD require a valid credential proof (Section 7.2); PUT requires the identity (owner) key.
 - `/ark/<user>/.ark/inbox/<file_id>`: `File` (or an `Identity` document for a move notification). New files are keyed by `file_id`; senders in `/ark/<user>/.ark/contacts.json` allowed for new files, existing-file members for updates (Section 7.3).
 - `/ark/<user>/.ark/invitations/<token>.html`: Invitation HTML page, auto-generated, no authentication required. This should contain a link to redeem the invitation i.e. add yourself to their contacts (HEAD/GET only, no authentication required)
 - `/ark/<user>/.ark/invitations/<token>.json`: `Invitation`
@@ -1661,6 +1728,16 @@ Like an identity document, but identifies a set of members instead of a single a
 | `key` | object | Yes | Member's identity key. |
 | `permission` | string | Yes | `"owner"`, `"write"`, or `"read"`. |
 
+### C.12 Identity key file (`identity.key`, Section 2.11)
+
+Not a distinct document type — an ordinary Ark **File** (Section 8) served at `/ark/<user>/.ark/identity.key`:
+
+- **Body:** the identity private key, encrypted with the file key (like any file body).
+- **Members:** one or more **credential members** (Section 3.10, `credential_type` `"password"` / `"passkey"`) with `read` permission — the credentials that can unlock the key — plus the identity itself as an `owner` identity member (used to add/remove credentials). An optional server-controlled credential member enables admin recovery (Section 2.11).
+- **Metadata / signature:** standard file metadata (Section 8.2), self-signed by the identity key. The signature binds the member list, so a malicious server cannot strip a credential member to force a downgrade.
+
+The server verifies a credential before returning the body (Section 3.10), so the encrypted key is never served to an unauthenticated requester. There is no bespoke schema: a credential member's fields (`kdf`, `kdf_salt`, `verifier`, `webauthn_public_key`, `prf_salt`, `wrapped_file_key`, …) live in the `Member` message (Section 8.2).
+
 ---
 
 ## Appendix D: Cryptographic Algorithms
@@ -1675,6 +1752,8 @@ Like an identity document, but identifies a set of members instead of a single a
 | Alt. body encryption | ChaCha20-Poly1305 | 256-bit | ciphertext + 128-bit tag |
 | No encryption | None | — | raw bytes |
 | Seed phrase | BIP-39 | 256-bit entropy | 24 words |
+| Password member KDF (Section 3.10) | Argon2id | — | 256-bit wrapping key |
+| Passkey member secret (Section 3.10) | WebAuthn PRF (`hmac-secret`) | — | 256-bit |
 
 ---
 
