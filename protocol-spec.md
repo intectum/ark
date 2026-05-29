@@ -15,12 +15,17 @@
 8. [File Format](#8-file-format)
 9. [Threat Model](#9-threat-model)
 10. [Extensions](#10-extensions)
+- [Appendix A: Cryptographic Algorithms](#appendix-a-cryptographic-algorithms)
+- [Appendix B: Endpoints](#appendix-b-endpoints)
+- [Appendix C: Types](#appendix-c-types)
+- [Appendix D: Configuration](#appendix-d-configuration)
+- [Appendix E: Example Usage](#appendix-e-example-usage)
 
 ---
 
 ## 1. Overview
 
-Ark is a federated, encrypted protocol for personal data. It replaces email, cloud storage, and note-taking with a single system built on cryptographic identity and end-to-end encryption. It has six core systems:
+Ark is a federated, encrypted protocol for synchronizing personal and shared data. It is built on cryptographic identity and end-to-end encryption with six core systems:
 
 | System | Purpose |
 |---|---|
@@ -44,7 +49,6 @@ Ark is a federated, encrypted protocol for personal data. It replaces email, clo
 - **Flexible trust model.** Users choose where their private key lives — on their device (maximum security) or on their server (maximum convenience). Self-hosters get both.
 - **App-agnostic.** The protocol defines files, membership, and transport. How files are organized into directories is up to applications. A mail app, a notes app, and a file manager all operate on the same files — just arranged differently.
 
-
 ---
 
 ## 2. System 1: Identity — "Who are you?"
@@ -59,7 +63,7 @@ Addresses use the familiar `user@domain` format:
 
 ```
 alice@example.com
-bob@mail.myserver.org
+bob@ark.myserver.org
 ```
 
 - `user` — the local part, unique within the server. Lowercase alphanumeric, dots, hyphens, underscores. Max 64 characters.
@@ -118,35 +122,10 @@ Security-conscious users choose Mode A — the server is purely a relay and stor
 Alice's public identity is published as a JSON document on her server:
 
 ```
-GET https://example.com/ark/alice/.ark/identity
+GET https://example.com/ark/alice/.ark/identity.json
 ```
 
-Response:
-
-```json
-{
-  "version": 1,
-  "address": "alice@example.com",
-  "identity_key": {
-    "algorithm": "ed25519",
-    "public_key": "base64url-encoded"
-  },
-  "updated": "2026-04-11T12:00:00Z",
-  "signature": {
-    "algorithm": "ed25519",
-    "signature": "base64url-encoded-over-everything-above"
-  }
-}
-```
-
-**Field details:**
-
-| Field | Purpose |
-|---|---|
-| `version` | Protocol version. Currently `1`. |
-| `address` | The user's full address. |
-| `identity_key` | The root of trust for this user. Used for signing and encryption (via key conversion). Contains `algorithm` and `public_key`. |
-| `signature` | Signature over the entire document (excluding this field). Proves the identity key holder authored this. Contains `algorithm` and `signature`. |
+See Section C.1 for format.
 
 **The self-signature is the key security property** (for Mode A users). The server hosts this document but cannot tamper with it — any modification invalidates the signature. This means:
 - A compromised server cannot swap in a different public key to intercept data.
@@ -161,17 +140,9 @@ When Bob wants to contact Alice for the first time:
 
 1. Bob's client extracts the domain from `alice@example.com`.
 2. Bob's client makes an HTTPS GET to `https://example.com/ark/alice/.ark/identity.json`.
-3. Bob's client verifies the `signature` field against the `identity_key` in the document.
-4. **Trust On First Use (TOFU):** Bob's client stores Alice's `identity_key` locally. This is the first time Bob has seen this key, so he trusts it (like SSH's "The authenticity of host 'example.com' can't be established... Are you sure you want to continue?").
-5. On subsequent fetches, Bob's client compares the `identity_key` against the stored value. If it has changed without a proper key transition (see 2.8), the client raises an alert.
-
-**Optional: Out-of-band verification.**
-Alice and Bob can verify each other's keys by comparing a **safety number** — a fingerprint derived from both their identity keys. This can be done by:
-- Comparing a numeric code displayed in both clients.
-- Scanning a QR code in person.
-- Reading the number aloud over a phone call.
-
-Once verified, the client marks the contact as "verified." Any key change after verification triggers a prominent warning.
+3. Bob's client verifies the `signature` field against the `key` in the document.
+4. **Trust On First Use (TOFU):** Bob's client stores Alice's `key` locally. This is the first time Bob has seen this key, so he trusts it (like SSH's "The authenticity of host 'example.com' can't be established... Are you sure you want to continue?").
+5. On subsequent fetches, Bob's client compares the `key` against the stored value. If it has changed without a proper key transition (see 2.8), the client raises an alert.
 
 ### 2.6 Multi-device support
 
@@ -228,10 +199,6 @@ When an identity key changes, Alice must re-wrap her file keys. Each file has a 
 - The identity key is gone. Alice must create a new account with a new keypair.
 - All files encrypted to the old key are unrecoverable.
 - Contacts will see a new key and need to re-verify.
-
-**No DNS complexity:**
-- The server just needs a domain name pointing to it (A/AAAA record). That's it.
-- No MX records, no SPF, no DKIM, no DMARC. Identity is cryptographic, not DNS-based.
 
 ### 2.9 Server migration
 
@@ -318,26 +285,6 @@ Every Ark file consists of two parts:
 
 See Section 8 for the full binary format.
 
-### 3.3 Path conventions
-
-The protocol defines one path convention:
-
-- **`/ark/<user>/.ark/inbox/`** — the landing zone for all cross-server deliveries. Remote servers POST files here. This is the only directory that accepts writes from other servers.
-
-Everything else is up to applications. The protocol reserves the `.ark/` directory under each scope for system use:
-
-| Path | Purpose |
-|---|---|
-| `/ark/.ark/accounts` | Account creation endpoint (POST) |
-| `/ark/<user>/.ark/identity` | HTML contact card / `.json` for identity document |
-| `/ark/<user>/.ark/inbox/` | Cross-server delivery landing zone |
-| `/ark/<user>/.ark/files/<file_id>` | File lookup by ID (sync recovery) |
-| `/ark/<user>/.ark/contacts.json` | Contacts allowlist |
-| `/ark/<user>/.ark/contact-invites/` | Contact invite tokens (HTML) / POST to create |
-| `/ark/<user>/.ark/stream` | Real-time event stream (WebSocket/SSE) |
-
-All other paths under `/ark/<user>/` are free for apps and users to organize however they want.
-
 ### 3.4 Membership
 
 Each file has one or more members, listed in the header. Every member holds the file's symmetric key, encrypted to their identity key. This means any member can decrypt the content.
@@ -376,7 +323,6 @@ Member {
 
 **Multiple members (collaboration):** Shared documents. All members at `write` or `owner` permission can read and modify. See Section 3.6 for sync.
 
-
 ### 3.5 Directory listings
 
 A GET request to a directory path returns a listing of entries with their headers. The server knows whether a path is a file or a directory — no trailing slash needed:
@@ -412,7 +358,6 @@ Response (JSON):
 ```
 
 Entries include header metadata (from the unencrypted header) but not the encrypted body. Subdirectories are listed with `"type": "directory"`.
-
 
 ### 3.6 Multi-member sync
 
@@ -626,7 +571,7 @@ The identity document includes a `public` flag:
 {
   "version": 1,
   "address": "alice@example.com",
-  "identity_key": { "algorithm": "ed25519", "public_key": "..." },
+  "key": { "algorithm": "ed25519", "public_key": "..." },
   "public": false,
   "updated": "...",
   "signature": { "algorithm": "ed25519", "signature": "..." }
@@ -640,14 +585,14 @@ The identity document includes a `public` flag:
 
 ### 6.3 Contacts allowlist
 
-The allowlist is stored at `/ark/<user>/.ark/contacts.json` and is keyed by **identity public key**, not address. This means:
+The allowlist is stored at `/ark/<user>/.ark/contacts.json` as a list of full identity documents (`Identity[]`, Section C.1). Matching is by **identity key**, not address. This means:
 - Bob can change servers and remain allowlisted as long as he keeps the same identity key.
 - Someone who registers `bob@attacker.com` with a different key is NOT allowlisted.
 
 **How contacts are added:**
 - Alice adds Bob manually (out-of-band exchange of addresses).
 - Alice replies to Bob → Bob is automatically allowlisted.
-- Bob redeems a contact invite created by Alice (see Section 6.4).
+- Bob redeems an invitation created by Alice (see Section 6.4).
 - Alice removes Bob → future deliveries from Bob are rejected.
 
 **Delivery flow:**
@@ -660,14 +605,16 @@ When an envelope arrives for a user with `public: false`:
 
 For users with `public: true`, step 2–3 are skipped.
 
-### 6.4 Contact invites
+### 6.4 Invitations
 
-Contact invites allow adding someone to your contacts via a shareable link or QR code.
+Invitations allow adding someone to your contacts via a shareable link or QR code.
 
-**Creating an invite:**
+**Creating an invitation:**
+
+The client generates a random token and PUTs an invitation file (Section C.5) at that token:
 
 ```
-POST /ark/alice/.ark/contact-invites
+PUT /ark/alice/.ark/invitations/<token>.json
 Authorization: ArkUser <signature>
 Content-Type: application/json
 
@@ -677,52 +624,41 @@ Content-Type: application/json
 }
 ```
 
-Response:
+Both `max_uses` and `expires` are optional. If omitted, the invitation is single-use with no expiry.
 
-```json
-{
-  "token": "base64url-encoded-random-token"
-}
-```
-
-Both `max_uses` and `expires` are optional. If omitted, the invite is single-use with no expiry.
-
-**Redeeming an invite:**
+**Redeeming an invitation:**
 
 ```
-POST /ark/alice/.ark/contact-invites/<token>
+POST /ark/alice/.ark/invitations/<token>
 Content-Type: application/json
 
-{
-  "identity_key": {
-    "algorithm": "ed25519",
-    "public_key": "base64url-encoded"
-  },
-  "address": "bob@other-server.com"
-}
+<the redeemer's identity document — see Section C.1>
 ```
 
-The server validates the token (not expired, uses remaining), then adds Bob's identity key to Alice's contacts allowlist. Returns `200 OK` on success, `404` if token is invalid/expired.
+The body is the redeemer's identity document. The server validates the token (not expired, uses remaining), adds the redeemer's key to Alice's contacts allowlist, and returns Alice's identity document so the redeemer can add Alice in turn. Returns `404` if the token is invalid/expired.
 
-**Sharing invites:**
+**Sharing invitations:**
 
-Invites are shared as regular HTTPS URLs: `https://example.com/ark/alice/.ark/contact-invites/<token>`
+Invitations are shared as regular HTTPS URLs: `https://example.com/ark/alice/.ark/invitations/<token>`
 
 - **QR code**: Encode the URL. Recipient scans, their client POSTs to redeem.
-- **Web fallback**: A GET to the invite URL (without `.json`) serves an HTML page with a confirm button for users without a native client.
+- **Web fallback**: A GET to `invitations/<token>.html` serves an HTML page with a confirm button for users without a native client.
 
 ### 6.5 Account creation
 
+An account is created by PUTting an identity document to its address. No authentication is required when the file does not yet exist — the document is self-signed (Section C.1), so the server verifies the signature against the `key` it contains:
+
 ```
-POST https://example.com/ark/.ark/accounts
+PUT https://example.com/ark/alice/.ark/identity.json
 Content-Type: application/json
 
 {
-  "address": "alice",
-  "identity_key": {
-    "algorithm": "ed25519",
-    "public_key": "base64url-encoded"
-  }
+  "version": 1,
+  "address": "alice@example.com",
+  "public": false,
+  "key": { "algorithm": "ed25519", "public_key": "base64url-encoded" },
+  "updated": "2026-04-11T12:00:00Z",
+  "signature": { "algorithm": "ed25519", "signature": "base64url-encoded" }
 }
 ```
 
@@ -799,13 +735,13 @@ Clients that need the full header (member entries, wrapped keys) use GET and rea
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/ark/alice/.ark/identity.json` | Identity document (JSON) |
-| `GET` | `/ark/alice/.ark/identity` | Contact card (HTML) |
-| `GET` | `/ark/alice/.ark/contacts.json` | List contacts (allowlisted identity keys) |
+| `GET` | `/ark/alice/.ark/identity.html` | Contact card (HTML) |
+| `GET` | `/ark/alice/.ark/contacts.json` | List contacts (allowlisted identities) |
 | `PUT` | `/ark/alice/.ark/contacts.json` | Update contacts |
-| `POST` | `/ark/alice/.ark/contact-invites` | Create contact invite |
-| `POST` | `/ark/alice/.ark/contact-invites/<token>` | Redeem contact invite |
-| `GET` | `/ark/alice/.ark/contact-invites/<token>` | Invite page (HTML) |
-| `GET/HEAD` | `/ark/alice/.ark/files/<file_id>` | Fetch/check shared file by ID (sync recovery) |
+| `PUT` | `/ark/alice/.ark/invitations/<token>.json` | Create invitation |
+| `POST` | `/ark/alice/.ark/invitations/<token>` | Redeem invitation |
+| `GET` | `/ark/alice/.ark/invitations/<token>.html` | Invitation page (HTML) |
+| `GET/HEAD` | `/ark/alice/.ark/paths/<file_id>` | Resolve file ID to path (sync recovery) |
 | `GET` | `/ark/alice/.ark/stream` | Real-time event stream (WebSocket/SSE) |
 
 ### 7.3 Cross-server delivery
@@ -876,16 +812,16 @@ Co-members' clients update the member address in shared files. Identity key stay
 
 **Sync recovery (pull fallback):**
 
-If a server misses SYNC pushes (e.g., downtime exceeding the retry window), members can pull the latest version of a shared file directly from a co-member's server:
+If a server misses SYNC pushes (e.g., downtime exceeding the retry window), members can pull the latest version of a shared file directly from a co-member's server. The requester doesn't know the co-member's local path, so it first resolves the `file_id`:
 
 ```
-GET https://example.com/ark/alice/.ark/files/<file_id>
+GET https://example.com/ark/alice/.ark/paths/<file_id>
 Authorization: ArkUser <signature>
 ```
 
-The server resolves `file_id` to the local path, verifies the requester's identity key is in the file's member list, and returns the full file (header + body). Returns `404` if the file_id is unknown or `403` if the requester is not a member.
+The server resolves `file_id` to the local path and returns it. Returns `404` if the file_id is unknown. The requester then HEADs or GETs the file at that path; membership is enforced on the file read itself.
 
-**Recovery flow:** On startup (or periodically), a client can check each shared file by sending a HEAD request to co-members' `.ark/files/<file_id>` endpoint. If the remote `modified` timestamp is newer than the local copy, the client fetches the full file via GET.
+**Recovery flow:** On startup (or periodically), a client resolves each shared file's path via `.ark/paths/<file_id>`, then HEADs the file. If the remote `modified` timestamp is newer than the local copy, the client fetches the full file via GET.
 
 ### 7.5 Real-time events
 
@@ -963,7 +899,7 @@ storage = "./data"
 3. Create the config file (2 lines minimum).
 4. Start the server. It auto-provisions a TLS certificate via Let's Encrypt.
 5. Add users locally: `ark-server user add alice`.
-6. Or users self-register via the accounts endpoint.
+6. Or users self-register by PUTting their identity document to `/ark/<user>/.ark/identity.json`.
 7. Alice's client registers her public key (Mode A) or the server generates one for her (Mode B).
 
 **Storage:**
@@ -1400,7 +1336,7 @@ GET https://gateway.example.com/ark/x-a7f3k2m9p4q8r2/.ark/identity
   "type": "legacy_email",
   "address": "x-a7f3k2m9p4q8r2@gateway.example.com",
   "legacy_email": "carol@gmail.com",
-  "identity_key": {
+  "key": {
     "algorithm": "ed25519",
     "public_key": "base64url-encoded"
   },
@@ -1472,12 +1408,12 @@ A directory can have its own member list, stored at `.ark/members` within the di
   "members": [
     {
       "address": "alice@example.com",
-      "identity_key": { "algorithm": "ed25519", "public_key": "..." },
+      "key": { "algorithm": "ed25519", "public_key": "..." },
       "permission": "owner"
     },
     {
       "address": "bob@other.com",
-      "identity_key": { "algorithm": "ed25519", "public_key": "..." },
+      "key": { "algorithm": "ed25519", "public_key": "..." },
       "permission": "write"
     }
   ],
@@ -1523,7 +1459,7 @@ V1 uses last-write-wins for shared files. A future extension could support real-
 
 ---
 
-## Appendix A: Cryptographic Algorithms Summary
+## Appendix A: Cryptographic Algorithms
 
 | Purpose | Algorithm | Key Size | Output Size |
 |---|---|---|---|
@@ -1536,46 +1472,274 @@ V1 uses last-write-wins for shared files. A future extension could support real-
 | No encryption | None | — | raw bytes |
 | Seed phrase | BIP-39 | 256-bit entropy | 24 words |
 
-## Appendix B: URL Structure Summary
+## Appendix B: Endpoints
 
-All Ark paths are under `https://<domain>/ark/`.
+All Ark endpoints are under `https://<domain>/ark/<user>/`.
 
-**Server-level (no auth required):**
+Most endpoints are standard file resource requests which require an `ArkUser` Authentication header:
 
-| Path | Method | Purpose |
-|---|---|---|
-| `/ark/.ark/accounts` | POST | Create account |
+| Endpoint | Body | Response | Purpose |
+|---|---|---|---|
+| `GET    /ark/<user>/<dir_path>` | - | `DirectoryEntry[]` | List directory entries |
+| `HEAD   /ark/<user>/<file_path>` | - | - | Fetch file header/metadata |
+| `GET    /ark/<user>/<file_path>` | - | `File` | Fetch file |
+| `PUT    /ark/<user>/<file_path>` | `File` | - | Create or update file |
+| `DELETE /ark/<user>/<file_path>` | - | - | Delete file |
 
-**User-level (public, no auth):**
+The `/ark/<user>/.ark/` directory is a special directory that is limited to specific Ark files. These files are of the format specified instead of the standard `File` format:
 
-| Path | Method | Purpose |
-|---|---|---|
-| `/ark/<user>/.ark/identity.json` | GET | Identity document (JSON) |
-| `/ark/<user>/.ark/identity` | GET | Contact card (HTML) |
-| `/ark/<user>/.ark/contact-invites/<token>` | GET/POST | View/redeem invite (HTML/JSON) |
+- `/ark/<user>/.ark/contacts.json`: `Identity[]`. Only users listed in this file can deliver files to `<user>`.
+- `/ark/<user>/.ark/identity.html`: Contact HTML page, auto-generated, HEAD/GET only, no authentication required. This should contain a link to add the user to your contacts.
+- `/ark/<user>/.ark/identity.json`: `Identity`, no authentication required for PUT if creating new file. The creation of this file creates a new user.
+- `/ark/<user>/.ark/inbox/<message_id>`: `Envelope`, users listed in `/ark/<user>/.ark/contacts.json` allowed for PUT if creating new file.
+- `/ark/<user>/.ark/invitations/<token>.html`: Invitation HTML page, auto-generated, no authentication required. This should contain a link to redeem the invitation i.e. add yourself to their contacts (HEAD/GET only, no authentication required)
+- `/ark/<user>/.ark/invitations/<token>.json`: `Invitation`
+- `/ark/<user>/.ark/paths/<file_id>`: File path e.g. `/ark/<user>/my_dir/my_file.txt`, auto-generated, HEAD/GET only, users listed in `/ark/<user>/.ark/contacts.json` allowed.
 
-**User-level (authenticated — member):**
+The following are special requests that do not fit the standard file resource model:
 
-| Path | Method | Purpose |
-|---|---|---|
-| `/ark/<user>/<path>` | GET | Fetch file (header + body) |
-| `/ark/<user>/<path>` | HEAD | Fetch header/metadata only |
-| `/ark/<user>/<path>` | PUT | Create or update file |
-| `/ark/<user>/<path>` | DELETE | Delete file |
-| `/ark/<user>/<dir>` | GET | List directory |
-| `/ark/<user>/.ark/files/<file_id>` | GET/HEAD | Fetch/check shared file by ID (sync recovery) |
-| `/ark/<user>/.ark/contacts.json` | GET/PUT | Manage contacts allowlist |
-| `/ark/<user>/.ark/stream` | GET | Real-time event stream |
-
-**Cross-server delivery (server auth):**
-
-| Path | Method | Purpose |
-|---|---|---|
-| `/ark/<user>/.ark/inbox/` | POST | Deliver envelope (file, notification, registration) |
+| Endpoint | Body | Response | Purpose |
+|---|---|---|---|
+| `POST   /ark/<user>/.ark/invitations/<token>` | `Identity` | `Identity` | Redeem invitation. The body is the identity of the redeemer, the response is the identity of `<user>`. |
+| `GET    /ark/<user>/.ark/stream` | - | `Event` stream | Subscribe to a real-time event stream |
 
 ---
 
-## Appendix C: Example Usage
+## Appendix C: Types
+
+### C.1 Identity
+
+```json
+{
+  "version": 1,
+  "address": "alice@example.com",
+  "public": false,
+  "key": Key,
+  "updated": "2026-04-11T12:00:00Z",
+  "signature": Signature,
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `version` | integer | Yes | Protocol version. Currently `1`. |
+| `address` | string | Yes | Full `user@domain` address. |
+| `public` | boolean | No | If `true`, inbox accepts delivery from anyone. Default `false`. |
+| `key` | Key | Yes | The key that identifies the user. |
+| `updated` | string | Yes | ISO 8601 timestamp of last update. |
+| `signature` | Signature | Yes | A signature over all fields above by the identified user. |
+
+**Optional extension fields (Section 10.1):**
+
+| Field | Type | Description |
+|---|---|---|
+| `prekeys.signed_prekey` | string | Base64url X25519 public key for ratchet session establishment. |
+| `prekeys.signed_prekey_signature` | string | Ed25519 signature over the signed prekey. |
+| `prekeys.one_time_prekeys` | string[] | List of single-use base64url X25519 public keys. |
+
+### C.2 Alias Identity Document
+
+```json
+{
+  "version": 1,
+  "type": "alias",
+  "redirect": "alice@example.com"
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `version` | integer | Yes | Protocol version. |
+| `type` | string | Yes | `"alias"`. |
+| `redirect` | string | Yes | Primary address to redirect to. |
+
+### C.3 Legacy Email Identity Document (Section 10.2)
+
+```json
+{
+  "version": 1,
+  "type": "legacy_email",
+  "address": "x-a7f3k2m9p4q8r2@gateway.example.com",
+  "legacy_email": "carol@gmail.com",
+  "key": {
+    "algorithm": "ed25519",
+    "public_key": "<base64url>"
+  },
+  "notify": true,
+  "updated": "2026-04-14T12:00:00Z",
+  "signature": {
+    "algorithm": "ed25519",
+    "signature": "<base64url>"
+  }
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `type` | string | Yes | `"legacy_email"`. |
+| `legacy_email` | string | Yes | Original email address this account represents. |
+| `notify` | boolean | Yes | Whether notification emails are sent on delivery. |
+
+All other fields follow the standard identity document schema (C.1).
+
+### C.4 Key Transition Document
+
+```json
+{
+  "type": "key_transition",
+  "old_key": "<base64url>",
+  "new_key": "<base64url>",
+  "old_signs_new": "<base64url>",
+  "new_signs_old": "<base64url>",
+  "reason": "scheduled_rotation",
+  "timestamp": "2026-04-11T12:00:00Z"
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `type` | string | Yes | `"key_transition"`. |
+| `old_key` | string | Yes | Base64url old identity public key. |
+| `new_key` | string | Yes | Base64url new identity public key. |
+| `old_signs_new` | string | Yes | Signature of new key by old key. |
+| `new_signs_old` | string | Yes | Signature of old key by new key. |
+| `reason` | string | No | Human-readable reason (e.g., `"scheduled_rotation"`, `"key_compromise"`). |
+| `timestamp` | string | Yes | ISO 8601 timestamp. |
+
+### C.5 Invitation
+
+```json
+{
+  "max_uses": 1,
+  "expires": "2026-05-10T00:00:00Z"
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `max_uses` | integer | No | Maximum redemptions. Default: `1`. |
+| `expires` | string | No | ISO 8601 expiry. Default: no expiry. |
+
+### C.6 DirectoryEntry
+
+```json
+{
+  "type": "file",
+  "name": "todo",
+  "size": 4096,
+  "modified": "2026-04-11T12:00:00Z",
+  "modified_by": "alice@example.com"
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `type` | string | Yes | `"directory"` for subdirectories, `"file"` for files. |
+| `name` | string | Yes | Entry name. |
+| `size` | integer | No | File size in bytes. Absent for directories. |
+| `modified` | string | No | ISO 8601 last modification time. Absent for directories. |
+| `modified_by` | string | No | Address of last modifier. Absent for directories. |
+
+### C.7 DirectoryMembers (Section 10.4)
+
+```json
+{
+  "members": Member[],
+  "signature": Signature
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `members` | array | Yes | List of directory members. |
+| `signature` | object | Yes | Signature over the members list by an owner. |
+
+### C.8 Event
+
+```json
+{"event": "created", "path": "/ark/alice/.ark/inbox/abc123", "from": "bob@example.com"}
+{"event": "modified", "path": "/ark/alice/notes/todo", "modified_by": "alice@example.com"}
+{"event": "deleted", "path": "/ark/alice/mail/trash/old-msg"}
+{"event": "sync", "path": "/ark/alice/docs/project-plan", "file_id": "def456"}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `event` | string | Yes | `"created"`, `"modified"`, `"deleted"`, or `"sync"`. |
+| `path` | string | Yes | Path of affected file. |
+| `from` | string | No | Sender address (for `created` events from delivery). |
+| `modified_by` | string | No | Modifier address (for `modified` events). |
+| `file_id` | string | No | File ID (for `sync` events). |
+
+### C.9 Key
+
+```json
+{
+  "algorithm": "ed25519",
+  "public_key": "<base64url>"
+},
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `algorithm` | string | Yes | Signing algorithm e.g. `"ed25519"`. |
+| `public_key` | string | Yes | Base64url-encoded public key. |
+
+### C.10 Signature
+
+```json
+{
+  "algorithm": "ed25519",
+  "signature": "<base64url>"
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `algorithm` | string | Yes | Signing algorithm e.g. `"ed25519"`. |
+| `signature` | string | Yes | Base64url-encoded signature. |
+
+### C.11 Member
+
+```json
+{
+  "address": "alice@example.com",
+  "key": Key,
+  "permission": "owner"
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `address` | string | Yes | Member's full address. |
+| `key` | object | Yes | Member's identity key. |
+| `permission` | string | Yes | `"owner"`, `"write"`, or `"read"`. |
+
+---
+
+## Appendix D: Configuration
+
+### D.1 Server Configuration (`ark.toml`)
+
+```toml
+# Required
+domain = "example.com"            # Server's public hostname
+storage = "./data"                # Path to file storage directory
+
+# Optional (all have sensible defaults)
+listen = "0.0.0.0:443"           # Bind address and port
+tls = true                       # Enable built-in TLS (disable if behind reverse proxy)
+acme_email = "admin@example.com" # Email for Let's Encrypt certificate provisioning
+max_account_size = "1GB"         # Maximum storage per account
+max_file_size = "100MB"          # Maximum single file size
+max_delivery_size = "25MB"       # Maximum envelope payload size
+allow_remote_registration = true # Allow account creation via PUT /ark/<user>/.ark/identity.json
+legacy_gateway = ""              # Gateway server address for legacy email interop (Section 10.2)
+```
+
+---
+
+## Appendix E: Example Usage
 
 ### Message flow (end to end)
 
