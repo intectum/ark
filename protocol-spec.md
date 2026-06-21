@@ -25,7 +25,7 @@
 
 ## 1. Overview
 
-Ark is a federated, encrypted protocol for synchronizing personal and shared data. It is built on cryptographic identity and end-to-end encryption with six core systems:
+Ark is a federated, encrypted protocol for synchronizing and sharing files. It is built on cryptographic identity and end-to-end encryption with six core systems:
 
 | System | Purpose |
 |---|---|
@@ -51,435 +51,330 @@ Ark is a federated, encrypted protocol for synchronizing personal and shared dat
 
 ---
 
-## 2. System 1: Identity
+## 2 Accounts
 
-### 2.1 Concept
+Every account has a cryptographic keypair — like a crypto wallet. The public key *is* the identity of the account. It's mapped to a human-readable address like `alice@example.com`, where `example.com` is the server that hosts Alice's account.
 
-Every account has a cryptographic keypair — like a crypto wallet. The public key *is* the identity. It's mapped to a human-readable address like `alice@example.com`, where `example.com` is the server that hosts Alice's account.
+[TODO move address info to 4.1 Identities?]
+### 2.1 Address
 
-### 2.2 Address format
-
-Addresses use the familiar `user@domain` format:
+Addresses use the familiar `account@host` format:
 
 ```
 alice@example.com
 bob@ark.myserver.org
+charlie@127.0.0.1:8080
 ```
 
-- `user` — the local part, unique within the server. Lowercase alphanumeric, dots, hyphens, underscores. Max 64 characters.
-- `domain` — the server's hostname.
+- `account`: The local part, unique within the server. Lowercase alphanumeric, dots, hyphens, underscores. Max 64 characters.
+- `host`: The server's hostname or IP address (and optional port, defaults to `443`).
 
 This format is deliberately identical to email. Users already understand it, and it requires no new mental model.
 
-Addresses can also use IP addresses (`alice@127.0.0.1`) and include paths to specific files (`alice@example.com/.ark/groups/contacts.json` or `/.ark/groups/contacts.json`). Paths must point to an `Identity` or `Group` file.
+### 2.2 Creation
 
-### 2.3 Keypair generation
+The creation of an identity file (`/ark/<account>/.ark/identity.json`) is equivalent to the creation of an account. The client must first create a keypair and include the public key (and algorithm) in the identity file. Only the client needs to have the private key and should not store it unencrypted. The server **must never have the unencrypted private key**.
 
-Each account has a single **identity keypair**. This keypair is used for both signing and encryption [TODO: ?] (converted to X25519 for Diffie-Hellman operations — this is a standard, well-defined mathematical conversion).
+See 4.1 Identities for more information about identity files.
 
-There are two modes of key generation, chosen at account creation:
+**Account setup steps:**
 
-**Mode A: Client-generated key (maximum security)**
+Clients should perform the following steps after account creation.
 
-1. Alice's client generates a **seed phrase**: 24 random words using the BIP-39 wordlist (2048 words, 256 bits of entropy).
-   ```
-   witch collapse practice feed shame open despair creek road again ice least
-   glimpse tree mango mandate concert problem grief attack mosquito task final jeans
-   ```
-2. The seed phrase is run through HKDF-SHA256 to derive a 32-byte master secret.
-3. The master secret derives an **Ed25519 identity keypair**:
-   - Private key (32 bytes) — stays on Alice's device, never transmitted to the server.
-   - Public key (32 bytes) — sent to the server during registration.
-4. Alice writes down the seed phrase and stores it securely offline.
-5. The server **never has the private key**. If Alice loses her seed phrase and all devices, the key is gone.
+1. Grant the Ark account the `write` permission for the `/ark/<account>/.ark/paths` and `/ark/<account>/.ark/requests` directories (see 4 Ark files).
+2. Create the contacts group (see 4.2 Groups).
+3. Grant the contacts group the `write` permission for the `/ark/<account>/.ark/inbox/` directory.
 
-**Mode B: Server-hosted key (maximum convenience)**
+Servers can disable remote account creation:
 
-1. Alice's client generates the Ed25519 identity keypair locally — the server never sees the private key.
-2. The client stores it as an ordinary file at `/ark/<user>/.ark/identity.key` whose members are credential members — passwords and/or passkeys (Sections 2.11, 3.10) — so only a holder of one of those credentials can decrypt it, and the server gates access to it. The client creates this file exactly as it creates any other (encrypt body, wrap the file key to each member, sign, PUT); the server stores ciphertext it cannot read.
-3. To log in on any device, Alice's client requests `identity.key` and decrypts it with her password or passkey, recovering the private key. The server verifies the credential before returning the file (Section 2.11), so the encrypted key is never freely downloadable. There is no seed phrase to manage, and multi-device works by entering the same credential on each device.
-4. By default the server holds no credential of its own, so it **cannot** read the key. Alice may optionally add a **server recovery member** so an admin can reset her password — this re-enables the server to decrypt her data, the classic "your provider can read your mail" trade-off.
-5. Alice can export her seed phrase at any time and switch to Mode A.
+```toml
+allow_remote_registration = false  # Only admin can create accounts (default: true)
+```
 
-The only difference from Mode A is *where the key lives and how it is recovered*: in Mode B the encrypted key is hosted on the server and unlocked by a password/passkey; in Mode A nothing is hosted and the key is recovered from a seed phrase. In neither mode does the server see the private key (absent a server recovery member).
+When disabled, attempting to create an identity file returns `403 Forbidden`. Local account creation (via the admin CLI) always works regardless of this setting.
 
-**Why offer both modes?**
+### 2.3 Recovery
 
-Most people will choose Mode B — login with a password or passkey, like every web service. It means:
+In the event that an account's private key is lost, the account will no longer be accessible. There are a few methods recommended to allow recovery of the acccount.
+
+**Seed phrase:**
+
+During account creation the client can generate a 24-word seed phrase using a BIP-39 wordlist. This seed phrase can then be recorded (preferably offline) and can be used at a later date to recover the private key (and therefore access the account). Using this method, the server **never has the private key**. This is the best method for security conscious users.
+
+Example seed phrase:
+
+```
+witch collapse practice feed shame open despair creek road again ice least
+glimpse tree mango mandate concert problem grief attack mosquito task final jeans
+```
+
+**Passkey/password:**
+
+The client can create an identity key file (`/ark/<account>/.ark/identity.key`) and allow passkey and/or password access to that file. The passkey/password can be used at a later date to fetch and decrypt the private key (and therefore access the account). Using this method, the server **has an encrypted copy of the private key**. It never sees the unencrypted private key. This is the best method for users seeking convenience. Before accepting a private key from the server, the client should first derive and verify that the public key is the account's public key. [TODO the file is signed, is this necessary? No harm in an extra step I guess?] Removal of a member from the identity key file must be accompanied by a key transition since the removed member had access to the current private key.
+
+It is expected that most users will opt into this recovery method because:
+
 - No seed phrase to lose.
-- Seamless multi-device (each device decrypts the same `identity.key`).
-- Optionally, if Alice adds a server recovery member, a forgotten password can be reset by the admin (for self-hosters, you *are* the admin) — at the cost of letting the server read her data.
+- Seamless multi-device support (each device decrypts the identity key file to get the private key).
+- Optionally allows admin access (see below).
 
-Security-conscious users choose Mode A — the encrypted key is never hosted on the server at all, so there is nothing for a compromised server to brute-force. Recovery is by seed phrase only.
+**Admin access:**
 
-**Self-hosters get the best of both worlds:** They control the server, so Mode B gives them convenience without trusting a third party. The private key — and any recovery member — is on infrastructure they own.
+In some cases it may be helpful to give the Ark account the `owner` permission of the identity key file. This can be useful for accounts within organizations and allows the admin to reset your password. NOTE: This effectively gives the Ark account full access to your account!
 
-**Why Ed25519?**
-- Fast signing and verification (important for per-file signatures).
-- Small keys (32 bytes) and signatures (64 bytes).
-- Deterministic — same input always produces the same signature (no nonce-reuse vulnerabilities).
-- Well-audited, widely implemented, no known weaknesses.
-- Easily converted to X25519 for encryption operations.
+### 2.4 Key transition
 
-### 2.4 Identity document
+Keys should be changed as part of a regular rotation or if it is suspected that it may be compromised.
 
-Alice's public `Identity` is published as a JSON document on her server:
+[TODO how does key transition interact with groups/accounts that don't get notified?]
+[TODO what if the attacker transitions the key?]
 
-`https://example.com/ark/alice/.ark/identity.json`
+**Transition steps:**
 
-See Section C.1 for format.
+1. Generate a new identity keypair.
+2. Replace the `Key` and add a `KeyTransition` to the account's identity file.
+3. Broadcast the new identity file to the account's contacts to notify them of the key transition.
+4. All encrypted files with the account as a member must update the key wrapper using the new identity key.[TODO If the key was compromised, encrypted files may need to be re-encrypted with new keys?]
+5. After a transition period, the `KeyTransition` is removed.[TODO transition period? 30 days? how would this work?]
 
-**The self-signature is the key security property** (for Mode A users). The server hosts this document but cannot tamper with it — any modification invalidates the signature. This means:
-- A compromised server cannot swap in a different public key to intercept data.
-- A MITM attacker who compromises the TLS connection cannot forge the identity document.
-- The document is self-authenticating: anyone can verify it using only the public key it contains.
+### 2.5 Verification
 
-Note: A Mode B user with a server recovery member (Section 2.11) lets the server hold a credential to the private key, so the server *could* sign a different identity document — but the user already accepted that the server can read their data, so this doesn't change their trust model. A Mode B user without a server recovery member keeps the full self-signature guarantee, like Mode A.
-
-### 2.5 Key discovery
-
-When Bob wants to contact Alice for the first time:
+[TODO review]
+When Bob wants to verify Alice's account for the first time:
 
 1. Bob's client extracts the domain from `alice@example.com`.
 2. Bob's client makes an HTTPS GET to `https://example.com/ark/alice/.ark/identity.json`.
-3. Bob's client verifies the `signature` field against the `key` in the document.
-4. **Trust On First Use (TOFU):** Bob's client stores Alice's `key` locally. This is the first time Bob has seen this key, so he trusts it (like SSH's "The authenticity of host 'example.com' can't be established... Are you sure you want to continue?").
-5. On subsequent fetches, Bob's client compares the `key` against the stored value. If it has changed without a proper key transition (see 2.8), the client raises an alert.
+3. Bob's client verifies the `signature` field against the `Key` in the document.
+4. **Trust On First Use (TOFU):** Bob's client stores Alice's `Key` locally. This is the first time Bob has seen this key, so he trusts it (like SSH's "The authenticity of host 'example.com' can't be established... Are you sure you want to continue?").
+5. On subsequent fetches, Bob's client compares the `Key` against the stored value. If it has changed without a proper key transition (see 2.8), the client raises an alert.
 
-### 2.6 Multi-device support
+### 2.6 Aliases
 
-Alice uses a laptop and a phone. Multi-device works differently depending on the key mode:
+A single identity keypair can have **multiple addresses** that all resolve to the same account. One address is the **primary**. All others are **aliases** that redirect to the primary. For example, Alice may have the primary account `alice@example.com` and the alias account `alice-alias@example-alias.com`.
 
-**Mode B (server-hosted key):**
-- Each device fetches `identity.key` and decrypts it with Alice's password or passkey (Section 2.11) to recover the private key.
-- All devices can decrypt all files and sign operations (they all have the same identity keypair).
+To create an alias account, create an identity file with the primary account's address e.g. Alice would create a file at `https://example-alias.com/ark/alice-alias/.ark/identity.json` with the address `alice@example.com`. Servers must verify that the alias account is pointing to an account with the same identity key.
 
-**Mode A (client-managed key):**
-- Alice sets up her first device with the seed phrase.
-- To add a second device, Alice enters the seed phrase on the new device (or transfers the private key via QR code / secure channel).
-- All devices derive the same identity keypair.
+Clients who contact `alice@example-alias.com` are seamlessly redirected to the primary account. Clients who have Alice's key pinned via TOFU won't be alarmed — it's the same key, just a new address.
 
-### 2.7 Identity key transition
+**Use cases:**
 
-If Alice needs to change her identity key:
+- Name changes: Alice changes her username from `old-alice` to `alice`. The old address becomes an alias. Existing contacts are seamlessly redirected.
+- Vanity aliases: Alice has `alice@example.com` as primary but also wants `a@example.com`.
+- Generated aliases: Machine-generated aliases for special purposes.
 
-1. Alice generates a new identity keypair (from a new seed phrase, or derived from the same seed with an incremented index).
-2. Alice creates a **key transition document**:
-   ```json
-   {
-     "type": "key_transition",
-     "old_key": "base64url-old-identity-public-key",
-     "new_key": "base64url-new-identity-public-key",
-     "old_signs_new": "base64url-signature-of-new-key-by-old-key",
-     "new_signs_old": "base64url-signature-of-old-key-by-new-key",
-     "reason": "scheduled_rotation",
-     "timestamp": "2026-04-11T12:00:00Z"
-   }
-   ```
-3. This document is included in Alice's identity document alongside the new key for a transition period (default: 30 days).
-4. Contacts' clients see the transition:
-   - If the transition is properly cross-signed (old key endorsed new, new key endorsed old), it's accepted automatically (or with a mild notification).
-   - If only one direction is signed (e.g., old key is lost), clients warn the user and require manual acceptance.
-5. After the transition period, the old key and transition document are removed.
+### 2.7 Migration
 
-When an identity key changes, Alice must re-wrap her file keys. Each file has a symmetric file key encrypted to her identity key (Section 4). Alice decrypts each file key with the old identity key and re-encrypts it with the new one. For shared files, other members' entries are unaffected — they hold the file key wrapped to their own identity keys.
+Alice can change her account name and even move from one server to another while keeping the same identity keypair.
 
-### 2.8 Account recovery
+**Migration steps:**
 
-**Mode B (server-hosted key):**
-- With a remembered credential (password or passkey), Alice fetches and decrypts `identity.key` on a new device — files on the server remain accessible.
-- With a **server recovery member**, a forgotten password can be reset by the admin — the simplest recovery story, like email. This is what lets the server decrypt the key.
-- Without a server recovery member, losing **all** credentials means the identity key file can no longer be opened. Alice falls back to her exported seed phrase (Section 2.3, step 5); if she has none, the account is lost, as in Mode A.
-
-**Mode A (client-managed key):**
-- Alice enters her 24-word seed phrase on a new device.
-- The client derives the identity keypair from the seed.
-- The client authenticates with Alice's server using the identity key.
-- Files stored on the server (encrypted) can be decrypted because Alice has the same private key, which unwraps the file keys.
-
-**What is lost if the seed phrase is lost (Mode A):**
-- The identity key is gone. Alice must create a new account with a new keypair.
-- All files encrypted to the old key are unrecoverable.
-- Contacts will see a new key and need to re-verify.
-
-### 2.9 Server migration
-
-Alice can move from one server to another while keeping the same identity keypair.
-
-**When the old server is still online:**
-
-1. Alice creates an account on the new server with her existing identity key (Mode A: enters seed phrase; Mode B: uploads her encrypted `identity.key` to the new server).
+1. Alice creates an account on the new server with her existing identity keypair.
 2. Alice copies her files from the old server to the new server. No re-encryption needed — all file keys are encrypted to the same identity key regardless of which server stores them.
-3. Alice copies her contacts file to the new server.
-4. On the old server, Alice's identity document is replaced with an alias redirect:
-   ```json
-   {
-     "type": "alias",
-     "redirect": "alice@new-server.com"
-   }
-   ```
-5. Anyone who contacts `alice@old-server.com` is seamlessly redirected to the new address. Contacts who have Alice's key pinned via TOFU won't be alarmed — it's the same key, just a new address.
-6. After a transition period, Alice can delete her account on the old server.
+3. On the old server, Alice's identity file is converted to an alias file.
+4. Alice broadcasts her new identity file to her contacts to notify them of the migration.
+5. After a transition period, Alice can delete her account on the old server.
 
 **When the old server is gone:**
 
-If Alice's old server goes offline (provider shut down, lost access), the alias redirect can't be set up. Contacts who send to the old address will get a DNS failure or 404. This is the same as losing an email provider — Alice needs to tell her contacts the new address out-of-band. When they look up her identity document on the new server, they'll see the same identity key they had pinned, confirming it's really her.
+If Alice's old server goes offline (provider shut down, lost access), the alias can't be set up. Clients who contact the old address will get a DNS failure or 404. This is the same as losing an email provider — Alice needs to tell her contacts the new address out-of-band. When they look up her identity document on the new server, they'll see the same identity key they had pinned, confirming it's really her.
 
-**What migrates:**
-- Identity keypair (same key on both servers).
-- All files (copy from old server to new — encrypted, no re-encryption needed).
-- Contacts file.
-- Alias redirect on old server (if still online).
+**What doesn't migrate:**
 
-**What doesn't migrate automatically:**
-- Other people's allowlists. Contacts who had Alice allowlisted on the old address may need to re-allowlist the new address. However, since allowlists are keyed by identity public key (not address), a smart server implementation can recognize that the same key is now at a new address and preserve the allowlist entry.
-- Shared file co-membership. Other members of shared files have Alice's old server address in the member list. Alice notifies co-members by sending them her new identity document (Section 7.4) so they update the address. Since membership is verified by identity key, the transition is seamless once addresses are updated.
+[TODO review]
+- Shared file co-membership. Other members of shared files have Alice's old address in the member list. Alice notifies co-members by sending them her new identity document (Section 7.4) so they update the address. Since membership is verified by identity key, the transition is seamless once addresses are updated.
 
-### 2.10 Aliases
+### 2.8 Multi-device support
 
-A single identity (one keypair) can have **multiple addresses** that all resolve to the same account. One address is the **primary** and has a full identity document. All others are **aliases** that redirect to the primary.
+Alice uses a laptop and a phone. Multi-device support works differently depending on the recovery method:
 
-**Alias identity document:**
+**Seed phrase:**
 
-```
-GET https://example.com/ark/old-alice/.ark/identity
-```
+- Alice records her seed phrase during the setup of her first device.
+- To add a second device, Alice enters the seed phrase on the new device (or transfers the private key via QR code / secure channel).
+- All devices derive the same identity keypair.
 
-```json
-{
-  "version": 1,
-  "type": "alias",
-  "redirect": "alice@example.com"
-}
-```
+**Passkey/password:**
 
-When someone encounters an alias document, they follow the `redirect` to fetch the real identity document and deliver to the primary address. The alias is transparent — addressing to either the alias or the primary reaches the same account.
+- Each device fetches and decrypts the identity key file with Alice's password or passkey to recover the private key.
 
-**Use cases:**
-- **Name changes.** Alice changes her username from `old-alice` to `alice`. The old address becomes an alias. Existing contacts are seamlessly redirected.
-- **Vanity aliases.** Alice has `alice@example.com` as primary but also wants `a@example.com`.
-- **Generated aliases.** Machine-generated aliases for special purposes.
+In both cases, all devices can decrypt all files and sign operations (they all have the same identity keypair).
 
-**Cross-server aliases** are not supported in v1. An alias must be on the same server as the primary address. Cross-server migration is handled by key transitions (Section 2.7).
+### 2.9 Ark account
 
-### 2.11 Identity key file (Mode B)
-
-A Mode B account stores its identity private key in a file at `/ark/<user>/.ark/identity.key`. This is an **ordinary Ark file** (Section 8), not a special format: its **body** is the identity private key (encrypted with a file key, like any file), and its **members** are **credential members** — passwords and/or passkeys (Section 3.10) — with `read` permission, plus the identity itself as `owner`.
-
-Because access is governed by the file's members, the server **verifies a credential before returning the body** (Section 3.10) — exactly as it would for any credential-gated file. The private key is never handed to an unauthenticated requester, and attempts are rate-limited. This gives Mode B its convenience — password/passkey login, seamless multi-device, no seed phrase — while keeping the server unable to decrypt (the credential's decryption key never reaches it, Section 3.10).
-
-**Login flow:**
-
-1. The client requests `identity.key`, presenting a password or passkey proof (Section 7.2). The server verifies it against a credential member and returns the file; a failed or unauthenticated request gets `403` — no ciphertext leaks.
-2. The client derives its wrapping key from the credential, unwraps the file key from its member entry, and decrypts the body to recover the private key (Section 3.10).
-3. The client derives the public key and verifies it equals the `key` in `identity.json`. This catches substitution of the file.
-4. The client signs subsequent `ArkUser` requests (Section 7.2) with the private key. Possession of a credential *is* possession of the account.
-
-**Adding / removing a credential.** Both are ordinary `owner`-level edits to the file, made with the recovered identity key:
-- *Add:* unwrap the file key (via any credential, or the `owner` entry), then add a credential member that wraps it. The body is not re-encrypted.
-- *Remove:* drop the member. This is **soft revocation only** — the holder may have cached the key, and the identity key is unchanged — so true revocation is an identity key transition (Section 2.7). Parallels Section 3.7.
-
-The file is self-signed by the identity key like any file (Section 5.2), so a malicious server cannot tamper with the member list — e.g. it cannot strip a strong passkey member to force a weaker password path (a downgrade attack).
-
-**Server recovery (optional).** Adding a credential member the server controls lets an admin reset access — and lets the server decrypt the private key (classic Mode B). Explicit per-account opt-in, not the default.
-
-The key is generated by the client and uploaded encrypted, so the server never sees the private key (absent a server recovery member). The difference from Mode A is only that Mode A keeps nothing on the server and recovers from a seed phrase.
+The `ark` account is a special account created when the server is first started. It is used to sign files or directories created or modified by the server itself.
 
 ---
 
-## 3. System 2: Files ��� "The core primitive"
+## 3 Files & Directories
 
-### 3.1 Concept
+Ark is - at it's core - a file server. All files and directories managed by Ark are given additional metadata. This metadata is not encrypted but is signed by the last modifier of the file or directory to prevent tampering. File content is encrypted by default but can be unencrypted with `algorithm = "none"`. The [TODO] algorithm must be supported for encryption by all clients. Since the file metadata declares the encryption algorithm, any algorithm can be used, however clients may not support other algorithms (and will therefore be unable to decrypt the file).
 
-Everything in Ark is a **file** — data stored on the server's filesystem, accessed by path over HTTPS. A file is its **body** (the content — ciphertext, or raw bytes for public files) plus a small signed **metadata** record (ownership, members, wrapped keys) kept alongside the body rather than inside it (Section 8). The URL is the path:
+### 3.1 ID
 
-```
-GET  https://example.com/ark/alice/notes/todo     → body + metadata
-HEAD https://example.com/ark/alice/notes/todo     → metadata only
-GET  https://example.com/ark/alice/notes/         → directory listing
-```
+The metadata includes a UUID used to identify the file or directory.
 
-Messages, notes, documents, photos — all the same thing underneath. Different apps organize them into different directories, but the protocol doesn't care. It just stores and serves files.
+### 3.2 Signature
 
-### 3.2 File structure
+The metdata includes the address of the last modifier and is signed by their identity key. When Alice creates or modifies a file:
 
-Every Ark file consists of two parts, stored separately:
+1. Alice computes a signature over the canonical serialization of the metadata fields as well as a SHA-256 [TODO alg agnostic] hash of the body.
+2. The signature is stored in the file metadata's `signature` field.
+3. Clients can verify by fetching Alice's identity key.
 
-1. **Metadata** — a small signed blob the server needs to index, serve, and enforce access control: member list, permissions, timestamps, algorithm, wrapped file keys, signature. Stored out-of-band (a `user.ark` xattr at rest, an `X-Ark-Metadata` header in transit), never inside the body.
-2. **Body** — the content. Ciphertext for encrypted files (`nonce ‖ ciphertext + tag`), raw bytes for `algorithm = "none"`. Opaque to the server.
+### 3.3 Membership
 
-See Section 8 for the full format.
+One or more members are listed in the metadata. For encrypted files, every member entry includes the file's private key encrypted (ECIES-wrapped) [TODO do we allow algorithm agnostic for all algorithms used?] by the member's encryption key. This means any member can decrypt the content.
 
-### 3.4 Membership
+**Member types:**
 
-Each file has one or more members, listed in the metadata. Every member holds the file's symmetric key, wrapped to their key. This means any member can decrypt the content. Members are usually **identity members** (identified by an identity key); a file may also have **credential members** — passwords or passkeys the server verifies before serving (Section 3.10) — and a **wildcard member** for public access (Section 3.8).
+| Type | Available permissions |
+|---|---|
+| Account (see 2 Accounts) | All |
+| Group (see 4.2 Groups) | All |
+| Passkey (see 4.4 Passkeys) | `read` only (not verifiable as an author) |
+| Password (see 4.5 Passwords) | `read` only (not verifiable as an author) |
+| Public (see below) | All |
+
+Public members are denoted by the wildcard address (`*`) and require identity verification to modify (all modifications require a verifiable author) but can read without being verified. This means that a file with a public member can be fetched without any form of authentication.
 
 **Member permissions:**
 
-| Permission | Can decrypt | Can modify | Can change members |
+| Permission | Can read | Can modify | Can modify members |
 |---|---|---|---|
 | `owner` | Yes | Yes | Yes |
 | `write` | Yes | Yes | No |
 | `read` | Yes | No | No |
 
-Permission enforcement is server-side. When a file is updated via PUT, the server:
+**Adding or removing a member:**
 
-1. Verifies the request signer is in the file's current member list.
-2. If the **body** changed, requires `write` or `owner` permission. Rejects `read` members with `403`.
-3. If the **member list** changed (members added, removed, or permissions modified), requires `owner` permission. Rejects `write` and `read` members with `403`.
+Must be performed by an existing member with the `owner` permission.
 
-This is not cryptographically enforced — any member has the file key and *could* craft a modified file locally, but other members' servers won't accept it during sync because they check the modifier's permission level against the current member list.
+To add a member:
 
-```
-Member {
-  address: "alice@example.com"
-  identity_key_algorithm: "ed25519"
-  identity_key: ...
-  permission: "owner"
-  ephemeral_key_algorithm: "x25519"
-  ephemeral_key: ...
-  wrapped_file_key: ...
-}
-```
+1. Add an entry to the member list.
+2. Sign the updated metadata.
+3. Sync the updated metadata to all members.
 
-**Single member (default):** Notes, personal files. One member entry (self, owner).
+To remove a member:
 
-**Two members (messaging):** Sender creates file with two members — self (owner) and recipient (read). A copy is delivered to the recipient's `.ark/inbox/` (Section 7). The recipient's app can move it to any path.
+[TODO keep old and new key in member entry to avoid re-encrypting before modifications made?]
+More steps are required for encrypted files since the removed member still has the file's encryption key.
 
-**Multiple members (collaboration):** Shared documents. All members at `write` or `owner` permission can read and modify. See Section 3.6 for sync.
+1. Remove the entry from the member list.
+2. Generate a new encryption key. 
+3. Update the remaining members' entries with the new encryption key.
+4. Re-encrypt the file with the new encryption key.
+5. Sync the updated file or directory to all members.
 
-### 3.5 Directory listings
+Steps 2-4 are skipped for directories and unencrypted files. The removed member still has their old copy (can't prevent this). New modifications use the new encryption key they don't have so they won't be able to access them.
 
-A GET request to a directory path returns a listing of entries with their headers. The server knows whether a path is a file or a directory — no trailing slash needed:
+### 3.4 Timestamps
 
-```
-GET https://example.com/ark/alice/notes
-Authorization: ArkUser <signature>
-```
+The metadata includes creation and modification timestamps. These are different to the local file timestamps, they represent when the file was first/most recently signed.
 
-Response (JSON):
+### 3.5 Synchronization
 
-```json
-{
-  "entries": [
-    {
-      "name": "todo",
-      "size": 4096,
-      "modified": "2026-04-11T12:00:00Z",
-      "modified_by": "alice@example.com"
-    },
-    {
-      "name": "meeting-notes",
-      "size": 2048,
-      "modified": "2026-04-10T09:00:00Z",
-      "modified_by": "alice@example.com"
-    },
-    {
-      "name": "work",
-      "type": "directory"
-    }
-  ]
-}
-```
+When a file or directory has multiple members, modifications need to propagate.
 
-Entries include metadata (members, timestamps) but not the body. Subdirectories are listed with `"type": "directory"`.
+**Last-write-wins.** The modification timestamp is the tiebreaker. No merging, no conflict resolution. When Alice modifies a shared file:
 
-### 3.6 Multi-member sync
-
-When a file has multiple members with `write` or `owner` permission, edits need to propagate.
-
-**Last-write-wins.** The `modified` timestamp is the tiebreaker. No merge, no conflict resolution in v1. When Alice updates a shared file:
-
-1. Alice edits the content, re-encrypts with the file key, bumps `modified`, signs with her identity key.
-2. Alice's client writes the updated file to her server.
-3. Alice's server delivers the updated file to each co-member's `.ark/inbox/` (co-membership is already established).
+[TODO could the server lookup the file path and update it directly in-place? If not found, send to inbox?]
+1. Alice modifies the content, re-encrypts with the encryption key, bumps `modified` and signs the metadata with her identity key.
+2. Alice's client writes the modified file to her server.
+3. Alice's server relays the modified file to each co-member's `/ark/<account>/.ark/inbox/` directory.
 4. The receiving server matches the file by `file_id` in the metadata. If a local file with that `file_id` already exists, it compares `modified` timestamps and keeps the newer version (updating the local copy in place).
-5. If a co-member also made an edit concurrently, the higher `modified` timestamp wins. The losing edit is discarded.
+5. If a co-member also made a modification concurrently, the higher modification timestamp wins. The losing modification is discarded.
 
 **No fetch step required.** Unlike a notification-based approach, the full file is pushed directly. This eliminates the need for co-members to know each other's file paths and removes any path resolution or polling mechanism.
 
-### 3.7 Adding and removing members
+## 4 Ark files
 
-**Adding a member:**
+The following files are used by Ark.
 
-1. An existing member (with `owner` permission) decrypts the file key.
-2. Encrypts the file key to the new member's identity key (fetched via key discovery, Section 2.5).
-3. Adds a new `Member` entry to the file's metadata.
-4. Signs the updated file and syncs to other members.
+[TODO add section for identity/any key files?]
+### 4.1 Identities
 
-**Removing a member:**
+An identity file is a JSON file that identifies an Ark account. Each account has an identity file: `/ark/<account>/.ark/identity.json`.
 
-1. An existing member (with `owner` permission) removes the `Member` entry.
-2. Remaining members generate a **new file key** (the removed member knew the old one).
-3. Re-encrypt the body with the new key.
-4. Re-wrap the new key for each remaining member.
-5. The removed member still has their old copy (can't prevent this — they had the key). But new edits use the new key they don't have.
+The Ed25519 algorithm must be supported for identity keys by all clients. Since the identity file declares the key algorithm, any algorithm can be used, however clients may not support other algorithms (and will therefore be unable to verify the account).
 
-### 3.8 Wildcard members (public files)
+The identity file is self-signed. The server hosts this document but cannot tamper with it — any modification invalidates the signature. This means:
+- A compromised server cannot swap in a different public key to intercept data.
+- A MITM attacker who compromises the TLS connection cannot forge the identity document.
+- The document is self-authenticating: anyone can verify it using only the public key it contains.
 
-A special member entry with `address = "*"` represents public access. The wildcard member has no `identity_key` and no `wrapped_file_key`. It is only valid on unencrypted files (`algorithm = "none"`).
+See [TODO] for the full format of identity files.
 
-| Wildcard permission | Meaning |
-|---|---|
-| `read` | Anyone can GET the file without authentication. |
-| `write` | Any authenticated Ark user can read and modify the file. |
-| `owner` | Any authenticated Ark user can read, modify, and change the file's members. |
+The identity files of other accounts are cached in the `/ark/<account>/.ark/identities/` directory. If verification of an account fails with the cached identity file, it is re-fetched (the key may have changed via transition) and verification is retried once with the new file.
 
-The server skips authentication on GET requests when a `*` member with `read` (or higher) permission is present. For `write` and `owner`, the server still requires a valid `ArkUser` authorization header — "public write" means any authenticated Ark user, not unauthenticated HTTP requests.
+### 4.2 Groups
 
-**Use cases:**
+[TODO do we need to reference accounts by identity key? or both address and identity key?]
+A group file is a JSON file that contains a collection of members. They are stored in the `ark/<account>/.ark/groups/` directory.
 
-- `*` (read): Public website, blog, published documents, open-source project files.
-- `*` (write): Anonymous drop box, public wiki, open submission folder.
-- `*` (owner): Fully open collaborative space (uncommon but not prohibited).
+To address the group file `ark/<account>/.ark/groups/contacts.json` (e.g. as a file member) use the address `groups:contacts`. A group that is used to decrypt files also requires a group key file (same file name but with the `.key` extension) to be stored in the same directory. The group key file must have a member with the `read` permission for every group member. Members of the group file with the `write` or `owner` permission must have the `owner` permission for the group key file as well. [TODO could bad actor with "write" then remove others from group key file?]
 
-### 3.9 Groups
+See [TODO] for the full format of group files.
 
-A **group** is a reusable, named set of members. Instead of wrapping a file key to every member individually, a file is shared with the group once, and group members decrypt through the group's key.
+**The contacts group:**
 
-A group is two files, **replicated to every member's account** and synced like any shared file (Section 7.4), so each member holds a copy at the same local path:
+Alice's contacts group (`ark/<account>/.ark/groups/contacts.json`) contains all accounts that Alice accepts files from. By default, the `/ark/<account>/inbox/` directory includes the `groups:contacts` member with the `write` permission. This means that any account in the contacts group can create files in this directory. This is effectively how Alice receives files from her contacts.
 
-- **Group document** (`/ark/<user>/.ark/groups/<name>.json`) — like an identity document, but identifying a **member list** instead of a single address. Self-signed by an `owner` member. Holds the group's current **public key** and the members, each with a permission (`owner`, `write`, or `read`) within the group. See Section C.7.
-- **Group key file** (`/ark/<user>/.ark/groups/<name>.key`) — the group's **private key**, wrapped to each member's identity key. Members-only read. Omitted for allowlist-only groups (no keypair).
+**To add a member:**
 
-**Addressing.** A group is addressed by the **local path** to its document, e.g. `/.ark/groups/team.json` (Section 2.2), used anywhere a user address is used — including the `address` field of a file `Member` entry. The path is local and contains no owner; because the group is replicated to every member at the same path, the address resolves for each member, and ownership can transfer without changing it.
+1. Add an entry to the group file. 
+2. Add a corresponding member to the group key file.
+3. Sync both files to all members.
 
-**Sharing a file with a group.**
+Step 2 is skipped for groups without a group key file.
 
-1. Take the group's current public key from the group document.
-2. Wrap the file key to it via ECIES (Section 4.3).
-3. Add a `Member` entry to the file: `address` = the group's local path, `key` = group public key, `permission` = the group's permission on this file.
+**To remove a member:**
 
-**Decrypting a file shared with a group.**
+More steps are required since the removed member still has the group's identity key.
 
-1. Read your replicated copy of the group key file (`.key`) and unwrap the group private key with your own identity key.
-2. Use it to unwrap the file key from the file's group member entry (Section 4.4).
-3. Decrypt the body.
+1. Remove the entry from the group file.
+2. Remove the member from the group key file (see 3.3 Membership).
+3. Generate a new identity key.
+4. Update the group file with the new identity key.
+5. Replace the content of the group key file with the new identity key.
+6. Sync both files to all members.
 
-**Effective permission.** A user's permission on a file shared with a group is the **lower** of: the group's permission on the file, and the user's permission within the group (the group document). The server enforces writes by reading the (public) group document.
+Steps 2-5 are skipped for groups without a group key file.
 
-**Ownership transfer.** Ownership is just the `owner` permission in the group document. The current owner grants `owner` to another member (and optionally drops their own). Nothing about the address changes.
+### 4.3 Invitations
 
-**Adding a member.** Add them to the group document and re-wrap the private key to them in the `.key` file. Both sync to members. Files already shared with the group are unaffected — instant.
+Invitations are JSON files that represent redeemable invitations for other accounts to add themselves to the inviting account's contacts. They are stored in the `ark/<account>/.ark/invitations/` directory.
 
-**Removing a member.** The removed member knew the group private key, so the group is **re-keyed**: generate a new group keypair, re-wrap the new private key to the remaining members in the `.key` file, and re-wrap the file key of every file shared with the group to the new group public key. Cost scales with the number of files shared with the group.
+They can include a public member (or a password member for password protection) with the `read` permission. To redeem an invitation, a `POST` request must be sent to the invitation file where the body of the request is the redeemer's identity file. The server will delete the invitation file upon redemption and, for convenience, return the inviting account's identity file so that the redeemer can also add them to their contacts.
 
-**Default group for a directory (client hint).** A reserved marker file `<dir>/.ark/group` containing a group's local path:
+See [TODO] for the full format of invitation files.
 
-```
-/ark/alice/projects/.ark/group   →   /.ark/groups/team.json
-```
+### 4.4 Passkeys
 
-When a client creates a file in that directory, it shares with that group by default. This is a **hint only** — the server does not enforce it, and files in the directory may use any membership.
+A passkey file is a text file containing an unencrypted WebAuthn public key that can be used to verify a requestor has the passkey. They are stored in the `ark/<account>/.ark/passkeys/` directory.
 
+To address the passkey file `ark/<account>/.ark/passkeys/phone.json` (e.g. as a file member) use the address `passkeys:phone`. Passkey files must have one member, the account in which they are contained (with the `owner` permission).
+
+### 4.5 Passwords
+
+A password file is a text file containing an unencrypted verifier that can be used to verify a requestor has the password. They are stored in the `ark/<account>/.ark/passwords/` directory.
+
+To address the password file `ark/<account>/.ark/passwords/primary.json` (e.g. as a file member) use the address `passwords:primary`. Password files must have one member, the account in which they are contained (with the `owner` permission). A *compromised* server holding the verifier can brute-force a weak password offline, so passwords are the weaker option — prefer passkeys. The server cannot enforce strong passwords but it is strongly recommended that clients do.
+
+### 4.6 Paths
+
+A path file is a text file that provides a mapping from a file or directory's UUID to their path within the account. They are created by the Ark account for every file (except for the path files themselves) and stored in the `ark/<account>/.ark/paths/` directory. This requires the Ark account to have the `write` permission in this directory.
+
+They include a public member with the `read` permission. The name of the file is the UUID (with the `.txt` extension) and the content is the path of the file in the account e.g. `/ark/<account>/path/to/my/file.txt`.
+
+### 4.7 Requests
+
+A request file is a text file containing an unencrypted method and path e.g. `GET /ark/<account>/path/to/my/file.txt`. It also has the file metadata received with the request (if any). They are created by the Ark account for every request made to the account and stored in the `/ark/<account>/.ark/requests/` directory. Requests made to the `/ark/<account>/.ark/requests/` directory or files within it are not stored.
+
+The name of the file is the timestamp when the request was received (with the `.txt` extension).
+
+[TODO extract what we need from here]
 ### 3.10 Credential members (password / passkey)
-
-Most members are **identity members**, identified by an identity key (the default). A **credential member** is instead identified by a secret — a **password** or a **passkey**. Two things make it useful:
-
-- The file can be shared with someone who is **not an Ark identity** — a link plus a password, or a passkey — with no key discovery.
-- The server can **verify the credential before returning the file**, so gated content is never handed to an unauthenticated requester (and attempts are rate-limited).
-
-A credential member is set by `credential_type` in its member entry (Section 8.2): `"password"` or `"passkey"` (vs. `"identity"`). It is **read-only** in v1 (see *Writes*). Each carries two independent pieces:
 
 **1. Gate material** — what the server checks to authorize a request:
 - *Passkey:* the credential's WebAuthn public key. On access the server runs a challenge-response (`401` + challenge → client returns a signed assertion → server verifies, Section 7.2). Nothing here is offline-attackable — the authenticator private key never leaves the device.
@@ -491,19 +386,9 @@ A credential member is set by `credential_type` in its member entry (Section 8.2
 
 **The gate key and the wrap key are domain-separated.** For passwords, `auth_secret = HKDF-SHA256(Argon2id(password, salt), info: "auth")` while `wrap_key` uses `info: "wrap"` — so the server learns `auth_secret` but can never derive `wrap_key`. The server gates access **without being able to decrypt**; end-to-end encryption is preserved.
 
-**Access flow (GET):**
-
-1. The server sees the file has credential members and challenges accordingly (Section 7.2).
-2. The client proves a credential. The server verifies it against a member with `read` (or higher) and returns the file; otherwise `403`.
-3. The client derives `wrap_key`, unwraps the file key from that member entry, and decrypts the body.
-
 **Metadata exposure.** A password member's `verifier` and `salt` are brute-force material, so for a file with password members the server MUST require the same authorization for `HEAD` and directory listings as for `GET` — it must not reveal those fields to an unauthenticated requester. Passkey gate material (a public key) is safe to expose.
 
-**Writes.** Modifying a file requires an Ed25519 signature by an identity key (Section 5.2); a credential member has none. So credential members are **read-only** in v1 — a credential-shared file is still authored and modified by its identity `owner`/`write` members. (Credential-based authorship would need a signing extension; out of scope for v1.)
-
 **Browser fallback.** As with invitations (Section 6.4), a server may serve an HTML page that prompts for the password (or invokes the passkey) and fetches the file, so recipients without a native client can open a credential-shared file.
-
-The identity key file (Section 2.11) is the canonical use of credential members: its body is the identity private key, its members are the passwords/passkeys that can unlock it.
 
 ---
 
@@ -570,142 +455,28 @@ When Alice decrypts a file:
 4. Alice decrypts the wrapped file key.
 5. Alice decrypts the file body with the file key.
 
-### 4.5 Why a symmetric file key?
-
-Direct ECIES encryption (as in v0.3) encrypts content directly to each recipient's public key. This works for one-to-one messages but breaks down for shared files:
-
-- **N members would require N copies of the ciphertext** (each encrypted to a different key). A 100MB file shared with 5 people would require 500MB of storage.
-- **Adding a member requires re-encrypting the entire content.** With a symmetric file key, adding a member only wraps the 32-byte key — instant, regardless of content size.
-
-The symmetric key approach encrypts content once and wraps the small key per-member. Standard construction, used by Signal (group messages), PGP (session keys), and every major encrypted storage system.
-
-### 4.6 Multi-device decryption
-
-Since there's a single identity keypair per user, multi-device is straightforward:
-
-- **Mode B (server-hosted key):** All devices decrypt the same `identity.key` with Alice's password or passkey (Section 2.11) to obtain the private key. Any device can unwrap any file key.
-- **Mode A (client-managed key):** All devices derive the same private key from the seed phrase. Same result.
-
-File keys are wrapped to the **identity key**, not per-device. One wrap per member, regardless of how many devices that member has.
-
-### 4.7 Encryption algorithms
-
-| Operation | Algorithm | Parameters |
-|---|---|---|
-| Identity keys (signing) | Ed25519 | — |
-| Encryption key exchange | X25519 | — |
-| Key derivation | HKDF-SHA256 | ��� |
-| File key wrapping | AES-256-GCM | 96-bit nonce, 128-bit tag |
-| File body encryption | AES-256-GCM | 96-bit nonce, 128-bit tag |
-| Alternative body encryption | ChaCha20-Poly1305 | 96-bit nonce, 128-bit tag |
-| Unencrypted body | None | Raw bytes, no nonce or tag |
-
-Clients MUST support AES-256-GCM and `none` (unencrypted). ChaCha20-Poly1305 is recommended as an alternative (faster on devices without AES hardware acceleration). The algorithm used is indicated in the file metadata.
-
-### 4.8 Why not PGP?
-
-PGP/GPG uses a similar model (session keys wrapped with public keys) but has well-known usability problems:
-- Key management is manual and error-prone (keyrings, keyservers, web of trust).
-- The PGP message format is complex and has accumulated decades of legacy.
-- No standard for key discovery (keyservers are unreliable and have privacy issues).
-
-This protocol uses the same fundamental cryptographic approach but with:
-- Automatic key discovery via the identity document.
-- A simple, modern binary file format.
-- Built-in server infrastructure for key hosting and file storage.
-
 ---
 
-## 5. System 4: Authentication — "This really came from Alice"
+## 5 Authentication & Authorization
 
-### 5.1 Concept
+When receiving a request for a file, the server performs several authentication checks. The requestor is granted the highest permission granted by any of the checks.
 
-Every file modification is digitally signed by the author's identity key, and identity and group documents are self-signed. When data is delivered cross-server, the receiving server verifies these signatures directly — there is no separate transport signature — so it authenticates the author without decrypting the content. Identity forgery is mathematically impossible without the private key.
+The Authorization header can be one of:
 
-### 5.2 File signature
+[TODO unique signature - with recent timestamp?]
+- `ArkAccount <signature>`
+- `ArkPasskey <WebAuthn public key>`
+- `ArkPassword <auth secret>`
 
-When Alice creates or modifies a file:
+An `ArkAccount` authorization header can identify the requestor as the same account that is receiving the request. In this case, the requestor is granted the `owner` permission. Otherwise, the authorization is applied to the current member list of the file or directory and the requestor is given the highest permission of all the members it has been authenticated as. Creation of a file is considered an operation of the directory it is being created in.
 
-1. Alice computes an Ed25519 signature over the canonical serialization of the metadata fields (`file_id`, timestamps, members, algorithm, `modified_by` — Section 8.2) plus the SHA-256 hash of the body:
-   ```
-   signature = Ed25519_Sign(
-     identity_private_key,
-     metadata_fields || SHA-256(body)
-   )
-   ```
-2. The signature is stored in the metadata's `signature` field.
-3. Any server or client can verify by fetching the modifier's identity document and checking the identity key.
+If authorization fails, the request is rejected with `401 Unauthorized`. If authorization succeeds but the permission granted is not sufficient for the operation requested, the request is rejected with `403 Forbidden`. The signature of the request is also verified to ensure the content and metadata has not been tampered with. If the signature is invalid, the request is rejected with `403 Forbidden`.
 
-### 5.3 Cross-server verification
-
-Files are POSTed to a recipient's `.ark/inbox/` directly (Section 7.3) — there is no transport wrapper and no separate transport signature. The receiving server authenticates the payload by its own signature:
-
-- **File:** verify the metadata signature (Section 5.2) against the identity key of `modified_by`. The verified `modified_by` is the sender, used for the contacts/membership gate (Section 7.3).
-- **Identity document:** verify the document's self-signature against the key it contains.
-
-If verification fails, the delivery is rejected with `403 Forbidden`.
-
-**Cache policy for identity documents:**
-- Servers cache fetched identity documents for a configurable period (default: 1 hour).
-- If a signature fails to verify, the server re-fetches the identity document (the key may have changed via transition) and retries verification once.
-
-### 5.4 Non-repudiation
-
-The Ed25519 signature provides **non-repudiation**: Alice can prove to a third party that Bob authored a specific file. This is a deliberate design choice — you *want* proof of who sent what (contracts, agreements, records).
+[TODO rate limiting / PoW for certain requests like ArkPasskey, ArkPassword, account creation?]
 
 ---
 
 ## 6. System 5: Delivery Control — "Who can reach you"
-
-### 6.1 Concept
-
-Spam is possible because anyone can send to anyone. This protocol inverts that: by default, only your contacts can deliver to your inbox. Accounts that want to receive from anyone (e.g., `info@business.com`) opt into a public inbox.
-
-By default, the `/akr/<user>/.ark/inbox/` directory has the permission `group:contacts = "write"`. To opt into a public inbox, change the permission to `* = "write"`.
-
-### 6.2 Public vs. private inboxes
-
-The identity document includes a `public` flag:
-
-```json
-{
-  "version": 1,
-  "address": "alice@example.com",
-  "key": { "algorithm": "ed25519", "public_key": "..." },
-  "public": false,
-  "updated": "...",
-  "signature": { "algorithm": "ed25519", "signature": "..." }
-}
-```
-
-| `public` | Behavior |
-|---|---|
-| `false` (default) | Only senders in the contacts allowlist can deliver to `.ark/inbox/`. Unknown senders are rejected with `403`. |
-| `true` | Any sender can deliver. The server may apply its own rate limiting or abuse prevention (not specified by the protocol). |
-
-### 6.3 Contacts allowlist
-
-A user's contacts are a **group** (Section 3.9) — the built-in contacts group, whose document is at `/ark/<user>/.ark/contacts.json` (a `Group`, Section C.7). Its members are the user's contacts. Delivery control reduces to group membership: a sender may deliver iff its identity key is a member of the recipient's contacts group. Matching is by **identity key**, not address. This means:
-- Bob can change servers and remain a contact as long as he keeps the same identity key.
-- Someone who registers `bob@attacker.com` with a different key is NOT a contact.
-
-The contacts group is an allowlist by default (no group keypair, so no `.key` file). If the user gives it a keypair, it doubles as a "share with all my contacts" group.
-
-**How contacts are added:**
-- Alice adds Bob manually (out-of-band exchange of addresses).
-- Alice replies to Bob → Bob is automatically allowlisted.
-- Bob redeems an invitation created by Alice (see Section 6.4).
-- Alice removes Bob → future deliveries from Bob are rejected.
-
-**Delivery flow:**
-
-When a file arrives for a user with `public: false`:
-1. The server verifies the file's signature and takes `modified_by` as the sender (Section 5.3).
-2. The server checks if the sender's identity key is in the recipient's contacts allowlist.
-3. If not in contacts → reject with `403 Forbidden`.
-4. If in contacts → accept delivery.
-
-For users with `public: true`, step 2–3 are skipped.
 
 ### 6.4 Invitations
 
@@ -745,41 +516,6 @@ Invitations are shared as regular HTTPS URLs: `https://example.com/ark/alice/.ar
 
 - **QR code**: Encode the URL. Recipient scans, their client POSTs to redeem.
 - **Web fallback**: A GET to `invitations/<token>.html` serves an HTML page with a confirm button for users without a native client.
-
-### 6.5 Account creation
-
-An account is created by PUTting an identity document to its address. No authentication is required when the file does not yet exist — the document is self-signed (Section C.1), so the server verifies the signature against the `key` it contains:
-
-```
-PUT https://example.com/ark/alice/.ark/identity.json
-Content-Type: application/json
-
-{
-  "version": 1,
-  "address": "alice@example.com",
-  "public": false,
-  "key": { "algorithm": "ed25519", "public_key": "base64url-encoded" },
-  "updated": "2026-04-11T12:00:00Z",
-  "signature": { "algorithm": "ed25519", "signature": "base64url-encoded" }
-}
-```
-
-Servers can disable remote account creation:
-
-```toml
-allow_remote_registration = false  # Only admin can create accounts (default: true)
-```
-
-When disabled, the endpoint returns `403 Forbidden`. Local account creation (via the admin CLI) always works regardless of this setting.
-
-### 6.6 Why this eliminates IP reputation
-
-| Email problem | How Ark solves it |
-|---|---|
-| Unknown IP → spam folder | Identity is cryptographic, not IP-based. |
-| IP blocklists | Not needed. Contacts allowlist prevents unwanted delivery. |
-| Shared IP risk (cloud hosting) | IP doesn't matter. Your cryptographic identity is unique. |
-| SPF/DKIM/DMARC complexity | None of these exist. Authentication is per-file signatures. |
 
 ---
 
@@ -1516,22 +1252,20 @@ The following are special requests that do not fit the standard file resource mo
 
 ```json
 {
-  "version": 1,
-  "address": "alice@example.com",
-  "public": false,
   "key": Key,
+  "address": "alice@example.com",
   "updated": "2026-04-11T12:00:00Z",
+  "key_transition": KeyTransition,
   "signature": Signature,
 }
 ```
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `version` | integer | Yes | Protocol version. Currently `1`. |
-| `address` | string | Yes | Full `user@domain` address. |
-| `public` | boolean | No | If `true`, inbox accepts delivery from anyone. Default `false`. |
 | `key` | Key | Yes | The key that identifies the user. |
+| `address` | string | Yes | Full `user@domain` address. |
 | `updated` | string | Yes | ISO 8601 timestamp of last update. |
+| `key_transition` | KeyTransition | No | The most recent key transition. |[TODO list all?]
 | `signature` | Signature | Yes | A signature over all fields above by the identified user. |
 
 **Optional extension fields (Section 10.1):**
@@ -1542,23 +1276,7 @@ The following are special requests that do not fit the standard file resource mo
 | `prekeys.signed_prekey_signature` | string | Ed25519 signature over the signed prekey. |
 | `prekeys.one_time_prekeys` | string[] | List of single-use base64url X25519 public keys. |
 
-### C.2 Alias Identity Document
-
-```json
-{
-  "version": 1,
-  "type": "alias",
-  "redirect": "alice@example.com"
-}
-```
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `version` | integer | Yes | Protocol version. |
-| `type` | string | Yes | `"alias"`. |
-| `redirect` | string | Yes | Primary address to redirect to. |
-
-### C.3 Legacy Email Identity Document (Section 10.2)
+### C.2 Legacy Email Identity Document (Section 10.2)
 
 ```json
 {
@@ -1585,13 +1303,10 @@ The following are special requests that do not fit the standard file resource mo
 | `legacy_email` | string | Yes | Original email address this account represents. |
 | `notify` | boolean | Yes | Whether notification emails are sent on delivery. |
 
-All other fields follow the standard identity document schema (C.1).
-
-### C.4 Key Transition Document
+### C.3 KeyTransition
 
 ```json
 {
-  "type": "key_transition",
   "old_key": "<base64url>",
   "new_key": "<base64url>",
   "old_signs_new": "<base64url>",
@@ -1601,9 +1316,9 @@ All other fields follow the standard identity document schema (C.1).
 }
 ```
 
+[TODO review what is needed to prove the owner had access to both keys]
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `type` | string | Yes | `"key_transition"`. |
 | `old_key` | string | Yes | Base64url old identity public key. |
 | `new_key` | string | Yes | Base64url new identity public key. |
 | `old_signs_new` | string | Yes | Signature of new key by old key. |
@@ -1611,7 +1326,9 @@ All other fields follow the standard identity document schema (C.1).
 | `reason` | string | No | Human-readable reason (e.g., `"scheduled_rotation"`, `"key_compromise"`). |
 | `timestamp` | string | Yes | ISO 8601 timestamp. |
 
-### C.5 Invitation
+### C.4 Invitation
+
+[TODO remove max_uses? - server cannot modify files...]
 
 ```json
 {
@@ -1625,7 +1342,7 @@ All other fields follow the standard identity document schema (C.1).
 | `max_uses` | integer | No | Maximum redemptions. Default: `1`. |
 | `expires` | string | No | ISO 8601 expiry. Default: no expiry. |
 
-### C.6 DirectoryEntry
+### C.5 DirectoryEntry
 
 ```json
 {
@@ -1645,7 +1362,7 @@ All other fields follow the standard identity document schema (C.1).
 | `modified` | string | No | ISO 8601 last modification time. Absent for directories. |
 | `modified_by` | string | No | Address of last modifier. Absent for directories. |
 
-### C.7 Group (Section 3.9)
+### C.6 Group
 
 Like an identity document, but identifies a set of members instead of a single address. This is the public group document; the matching private key lives in the members-only `.key` file. Addressed by its local path (Section 2.2).
 
@@ -1667,7 +1384,7 @@ Like an identity document, but identifies a set of members instead of a single a
 | `updated` | string | Yes | ISO 8601 timestamp of last update. |
 | `signature` | Signature | Yes | An `owner` member's signature over all fields above. |
 
-### C.8 Event
+### C.7 Event
 
 ```json
 {"event": "created", "path": "/ark/alice/.ark/inbox/abc123", "from": "bob@example.com"}
@@ -1684,7 +1401,7 @@ Like an identity document, but identifies a set of members instead of a single a
 | `modified_by` | string | No | Modifier address (for `modified` events). |
 | `file_id` | string | No | File ID (for `sync` events). |
 
-### C.9 Key
+### C.8 Key
 
 ```json
 {
@@ -1698,7 +1415,7 @@ Like an identity document, but identifies a set of members instead of a single a
 | `algorithm` | string | Yes | Signing algorithm e.g. `"ed25519"`. |
 | `public_key` | string | Yes | Base64url-encoded public key. |
 
-### C.10 Signature
+### C.9 Signature
 
 ```json
 {
@@ -1712,7 +1429,7 @@ Like an identity document, but identifies a set of members instead of a single a
 | `algorithm` | string | Yes | Signing algorithm e.g. `"ed25519"`. |
 | `signature` | string | Yes | Base64url-encoded signature. |
 
-### C.11 Member
+### C.10 Member
 
 ```json
 {
@@ -1728,7 +1445,7 @@ Like an identity document, but identifies a set of members instead of a single a
 | `key` | object | Yes | Member's identity key. |
 | `permission` | string | Yes | `"owner"`, `"write"`, or `"read"`. |
 
-### C.12 Identity key file (`identity.key`, Section 2.11)
+### C.11 Identity key file (`identity.key`, Section 2.11)
 
 Not a distinct document type — an ordinary Ark **File** (Section 8) served at `/ark/<user>/.ark/identity.key`:
 
@@ -1754,6 +1471,28 @@ The server verifies a credential before returning the body (Section 3.10), so th
 | Seed phrase | BIP-39 | 256-bit entropy | 24 words |
 | Password member KDF (Section 3.10) | Argon2id | — | 256-bit wrapping key |
 | Passkey member secret (Section 3.10) | WebAuthn PRF (`hmac-secret`) | — | 256-bit |
+
+[TODO review everything below here]
+
+**Why Ed25519?**
+- Fast signing and verification (important for per-file signatures).
+- Small keys (32 bytes) and signatures (64 bytes).
+- Deterministic — same input always produces the same signature (no nonce-reuse vulnerabilities).
+- Well-audited, widely implemented, no known weaknesses.
+- Easily converted to X25519 for encryption operations.
+
+
+| Operation | Algorithm | Parameters |
+|---|---|---|
+| Identity keys (signing) | Ed25519 | — |
+| Encryption key exchange | X25519 | — |
+| Key derivation | HKDF-SHA256 | ��� |
+| File key wrapping | AES-256-GCM | 96-bit nonce, 128-bit tag |
+| File body encryption | AES-256-GCM | 96-bit nonce, 128-bit tag |
+| Alternative body encryption | ChaCha20-Poly1305 | 96-bit nonce, 128-bit tag |
+| Unencrypted body | None | Raw bytes, no nonce or tag |
+
+Clients MUST support AES-256-GCM and `none` (unencrypted). ChaCha20-Poly1305 is recommended as an alternative (faster on devices without AES hardware acceleration). The algorithm used is indicated in the file metadata.
 
 ---
 
