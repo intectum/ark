@@ -71,6 +71,14 @@ fn handle(mut stream: TcpStream, root: &Path, verbose: bool) -> std::io::Result<
         eprintln!("{:?} {} {}", peer, method, target);
     }
 
+    if !is_allowed(target) {
+        return write_status(&mut stream, 403, "Forbidden", b"forbidden");
+    }
+
+    if is_ark_root(target) && method != "GET" && method != "HEAD" {
+        return write_status(&mut stream, 405, "Method Not Allowed", b"method not allowed");
+    }
+
     let path = match resolve(root, target) {
         Some(p) => p,
         None => return write_status(&mut stream, 400, "Bad Request", b"bad path"),
@@ -83,6 +91,18 @@ fn handle(mut stream: TcpStream, root: &Path, verbose: bool) -> std::io::Result<
         "DELETE" => serve_delete(&mut stream, &path),
         _ => write_status(&mut stream, 405, "Method Not Allowed", b"method not allowed"),
     }
+}
+
+fn is_allowed(target: &str) -> bool {
+    let path = target.split('?').next().unwrap_or("");
+    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    parts.len() >= 2 && parts[0] == "ark"
+}
+
+fn is_ark_root(target: &str) -> bool {
+    let path = target.split('?').next().unwrap_or("");
+    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    parts.len() == 2 && parts[0] == "ark"
 }
 
 fn resolve(root: &Path, target: &str) -> Option<PathBuf> {
@@ -330,12 +350,19 @@ mod tests {
         headers.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
     }
 
+    fn ark(td: &Path) -> PathBuf {
+        let p = td.join("ark").join("test");
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
     #[test]
     fn get_file_returns_content() {
         let td = TempDir::new();
-        fs::write(td.0.join("hello.txt"), b"hi there").unwrap();
+        let a = ark(&td.0);
+        fs::write(a.join("hello.txt"), b"hi there").unwrap();
         let port = start_server(td.0.clone());
-        let (code, body, headers) = request(port, "GET", "/hello.txt", &[]);
+        let (code, body, headers) = request(port, "GET", "/ark/test/hello.txt", &[]);
         assert_eq!(code, 200);
         assert_eq!(body, b"hi there");
         assert_eq!(header(&headers, "content-length"), Some("8"));
@@ -344,18 +371,20 @@ mod tests {
     #[test]
     fn get_missing_file_404() {
         let td = TempDir::new();
+        ark(&td.0);
         let port = start_server(td.0.clone());
-        let (code, _, _) = request(port, "GET", "/nope.txt", &[]);
+        let (code, _, _) = request(port, "GET", "/ark/test/nope.txt", &[]);
         assert_eq!(code, 404);
     }
 
     #[test]
     fn get_dir_returns_json_listing() {
         let td = TempDir::new();
-        fs::write(td.0.join("a.txt"), b"a").unwrap();
-        fs::create_dir(td.0.join("sub")).unwrap();
+        let a = ark(&td.0);
+        fs::write(a.join("a.txt"), b"a").unwrap();
+        fs::create_dir(a.join("sub")).unwrap();
         let port = start_server(td.0.clone());
-        let (code, body, headers) = request(port, "GET", "/", &[]);
+        let (code, body, headers) = request(port, "GET", "/ark/test/", &[]);
         assert_eq!(code, 200);
         assert_eq!(header(&headers, "content-type"), Some("application/json"));
         let s = std::str::from_utf8(&body).unwrap();
@@ -368,9 +397,10 @@ mod tests {
     #[test]
     fn head_file_no_body_with_length() {
         let td = TempDir::new();
-        fs::write(td.0.join("x"), b"abcde").unwrap();
+        let a = ark(&td.0);
+        fs::write(a.join("x"), b"abcde").unwrap();
         let port = start_server(td.0.clone());
-        let (code, body, headers) = request(port, "HEAD", "/x", &[]);
+        let (code, body, headers) = request(port, "HEAD", "/ark/test/x", &[]);
         assert_eq!(code, 200);
         assert!(body.is_empty());
         assert_eq!(header(&headers, "content-length"), Some("5"));
@@ -379,8 +409,9 @@ mod tests {
     #[test]
     fn head_dir_no_body_with_json_type() {
         let td = TempDir::new();
+        ark(&td.0);
         let port = start_server(td.0.clone());
-        let (code, body, headers) = request(port, "HEAD", "/", &[]);
+        let (code, body, headers) = request(port, "HEAD", "/ark/test/", &[]);
         assert_eq!(code, 200);
         assert!(body.is_empty());
         assert_eq!(header(&headers, "content-type"), Some("application/json"));
@@ -389,38 +420,41 @@ mod tests {
     #[test]
     fn put_new_file_returns_201() {
         let td = TempDir::new();
+        ark(&td.0);
         let port = start_server(td.0.clone());
-        let (code, _, _) = request(port, "PUT", "/new.txt", b"payload");
+        let (code, _, _) = request(port, "PUT", "/ark/test/new.txt", b"payload");
         assert_eq!(code, 201);
-        assert_eq!(fs::read(td.0.join("new.txt")).unwrap(), b"payload");
+        assert_eq!(fs::read(td.0.join("ark/test/new.txt")).unwrap(), b"payload");
     }
 
     #[test]
     fn put_overwrite_returns_204() {
         let td = TempDir::new();
-        fs::write(td.0.join("x"), b"old").unwrap();
+        let a = ark(&td.0);
+        fs::write(a.join("x"), b"old").unwrap();
         let port = start_server(td.0.clone());
-        let (code, _, _) = request(port, "PUT", "/x", b"new content");
+        let (code, _, _) = request(port, "PUT", "/ark/test/x", b"new content");
         assert_eq!(code, 204);
-        assert_eq!(fs::read(td.0.join("x")).unwrap(), b"new content");
+        assert_eq!(fs::read(td.0.join("ark/test/x")).unwrap(), b"new content");
     }
 
     #[test]
     fn put_nested_path_creates_dirs() {
         let td = TempDir::new();
         let port = start_server(td.0.clone());
-        let (code, _, _) = request(port, "PUT", "/a/b/c.txt", b"deep");
+        let (code, _, _) = request(port, "PUT", "/ark/test/a/b/c.txt", b"deep");
         assert_eq!(code, 201);
-        assert_eq!(fs::read(td.0.join("a/b/c.txt")).unwrap(), b"deep");
+        assert_eq!(fs::read(td.0.join("ark/test/a/b/c.txt")).unwrap(), b"deep");
     }
 
     #[test]
     fn delete_file_removes_and_returns_204() {
         let td = TempDir::new();
-        let p = td.0.join("d.txt");
+        let a = ark(&td.0);
+        let p = a.join("d.txt");
         fs::write(&p, b"bye").unwrap();
         let port = start_server(td.0.clone());
-        let (code, _, _) = request(port, "DELETE", "/d.txt", &[]);
+        let (code, _, _) = request(port, "DELETE", "/ark/test/d.txt", &[]);
         assert_eq!(code, 204);
         assert!(!p.exists());
     }
@@ -428,11 +462,12 @@ mod tests {
     #[test]
     fn delete_dir_recursively_removes_and_returns_204() {
         let td = TempDir::new();
-        let d = td.0.join("sub");
+        let a = ark(&td.0);
+        let d = a.join("sub");
         fs::create_dir(&d).unwrap();
         fs::write(d.join("inner"), b"x").unwrap();
         let port = start_server(td.0.clone());
-        let (code, _, _) = request(port, "DELETE", "/sub", &[]);
+        let (code, _, _) = request(port, "DELETE", "/ark/test/sub", &[]);
         assert_eq!(code, 204);
         assert!(!d.exists());
     }
@@ -440,24 +475,81 @@ mod tests {
     #[test]
     fn delete_missing_404() {
         let td = TempDir::new();
+        ark(&td.0);
         let port = start_server(td.0.clone());
-        let (code, _, _) = request(port, "DELETE", "/nope", &[]);
+        let (code, _, _) = request(port, "DELETE", "/ark/test/nope", &[]);
         assert_eq!(code, 404);
     }
 
     #[test]
     fn unsupported_method_returns_405() {
         let td = TempDir::new();
+        ark(&td.0);
         let port = start_server(td.0.clone());
-        let (code, _, _) = request(port, "POST", "/x", b"hello");
+        let (code, _, _) = request(port, "POST", "/ark/test/x", b"hello");
         assert_eq!(code, 405);
     }
 
     #[test]
     fn path_traversal_blocked() {
         let td = TempDir::new();
+        ark(&td.0);
         let port = start_server(td.0.clone());
-        let (code, _, _) = request(port, "GET", "/../etc/passwd", &[]);
+        let (code, _, _) = request(port, "GET", "/ark/test/../../../etc/passwd", &[]);
         assert_eq!(code, 400);
+    }
+
+    #[test]
+    fn root_blocked_403() {
+        let td = TempDir::new();
+        let port = start_server(td.0.clone());
+        let (code, _, _) = request(port, "GET", "/", &[]);
+        assert_eq!(code, 403);
+    }
+
+    #[test]
+    fn non_ark_path_blocked_403() {
+        let td = TempDir::new();
+        let port = start_server(td.0.clone());
+        let (code, _, _) = request(port, "GET", "/something/else", &[]);
+        assert_eq!(code, 403);
+    }
+
+    #[test]
+    fn ark_without_subdir_blocked_403() {
+        let td = TempDir::new();
+        let port = start_server(td.0.clone());
+        let (code1, _, _) = request(port, "GET", "/ark", &[]);
+        let (code2, _, _) = request(port, "GET", "/ark/", &[]);
+        assert_eq!(code1, 403);
+        assert_eq!(code2, 403);
+    }
+
+    #[test]
+    fn put_at_ark_root_405() {
+        let td = TempDir::new();
+        ark(&td.0);
+        let port = start_server(td.0.clone());
+        let (code, _, _) = request(port, "PUT", "/ark/test", b"x");
+        assert_eq!(code, 405);
+    }
+
+    #[test]
+    fn delete_at_ark_root_405() {
+        let td = TempDir::new();
+        ark(&td.0);
+        let port = start_server(td.0.clone());
+        let (code, _, _) = request(port, "DELETE", "/ark/test", &[]);
+        assert_eq!(code, 405);
+        assert!(td.0.join("ark/test").exists());
+    }
+
+    #[test]
+    fn put_outside_ark_blocked_403() {
+        let td = TempDir::new();
+        let port = start_server(td.0.clone());
+        let (code, _, _) = request(port, "PUT", "/oops.txt", b"x");
+        assert_eq!(code, 403);
+        assert!(!td.0.join("oops.txt").exists());
     }
 }
