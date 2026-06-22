@@ -1,24 +1,23 @@
 use std::env;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::SigningKey;
 
-use base64::Engine;
-
-use crate::util::{B64, canonicalize_for_sig, is_valid_account_name, is_valid_host_port, unix_to_iso8601};
+use crate::identity::{
+    key_from_verifying_key, new_signed_identity, parse_address, write_identity, write_signing_key,
+};
 
 pub fn cmd_create_account(address: &str) -> std::io::Result<()> {
     let root = env::current_dir()?;
     let (sk, id_path) = create_account(&root, address)?;
-    let pk = sk.verifying_key();
     let key_path = id_path.with_file_name("identity.key");
+    let key = key_from_verifying_key(&sk.verifying_key());
     println!("identity:    {}", id_path.display());
     println!("identity key: {}", key_path.display());
     println!("address:     {}", address);
-    println!("public key (b64url): {}", B64.encode(pk.to_bytes()));
+    println!("public key (b64url): {}", key.public_key);
     println!("KEEP {} SECRET. Required to sign requests.", key_path.display());
     Ok(())
 }
@@ -30,25 +29,8 @@ pub fn create_account(root: &Path, address: &str) -> std::io::Result<(SigningKey
 }
 
 pub fn create_account_with_seed(root: &Path, address: &str, seed: [u8; 32]) -> std::io::Result<(SigningKey, PathBuf)> {
-    let (name, host) = address.split_once('@').ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "address must be in the form <name>@<host>[:<port>]",
-        )
-    })?;
-    if !is_valid_account_name(name) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "invalid account name (must be lowercase alphanumeric, dots, hyphens, underscores; 1-64 chars; not pure dots)",
-        ));
-    }
-    if !is_valid_host_port(host) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "invalid host[:port] in address",
-        ));
-    }
-    let dir = root.join("ark").join(name).join(".ark");
+    let (name, _host) = parse_address(address)?;
+    let dir = root.join("ark").join(&name).join(".ark");
     let id_path = dir.join("identity.json");
     let key_path = dir.join("identity.key");
     if id_path.exists() {
@@ -60,51 +42,19 @@ pub fn create_account_with_seed(root: &Path, address: &str, seed: [u8; 32]) -> s
 
     let sk = SigningKey::from_bytes(&seed);
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-    let doc = build_signed_identity(&sk, address, now);
+    let identity = new_signed_identity(&sk, address, now)?;
 
     fs::create_dir_all(&dir)?;
-    let pretty = serde_json::to_string_pretty(&doc)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-    fs::write(&id_path, pretty)?;
-    write_identity_key(&key_path, &seed)?;
+    write_identity(&id_path, &identity)?;
+    write_signing_key(&key_path, &sk)?;
     Ok((sk, id_path))
-}
-
-#[cfg(unix)]
-fn write_identity_key(path: &Path, seed: &[u8; 32]) -> std::io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
-    f.write_all(B64.encode(seed).as_bytes())?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn write_identity_key(path: &Path, seed: &[u8; 32]) -> std::io::Result<()> {
-    fs::write(path, B64.encode(seed))
-}
-
-fn build_signed_identity(sk: &SigningKey, address: &str, now_secs: u64) -> serde_json::Value {
-    let pk = sk.verifying_key();
-    let mut doc = serde_json::json!({
-        "key": { "algorithm": "ed25519", "public_key": B64.encode(pk.to_bytes()) },
-        "address": address,
-        "updated": unix_to_iso8601(now_secs),
-        "signature": { "algorithm": "ed25519", "signature": "" }
-    });
-    let canonical = canonicalize_for_sig(&doc);
-    let sig = sk.sign(&canonical);
-    doc["signature"]["signature"] = serde_json::Value::String(B64.encode(sig.to_bytes()));
-    doc
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::{Signature, Verifier};
+    use crate::util::B64;
+    use base64::Engine;
 
     struct TempDir(PathBuf);
     impl TempDir {
@@ -159,17 +109,6 @@ mod tests {
         assert_eq!(derived.verifying_key().to_bytes(), sk.verifying_key().to_bytes());
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn identity_key_file_has_restricted_permissions() {
-        use std::os::unix::fs::PermissionsExt;
-        let td = TempDir::new();
-        let (_sk, id_path) = create_account_with_seed(&td.0, "gyan@example.com", [56u8; 32]).unwrap();
-        let key_path = id_path.with_file_name("identity.key");
-        let mode = fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
-    }
-
     #[test]
     fn create_account_rejects_invalid_addresses() {
         let td = TempDir::new();
@@ -200,34 +139,4 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
     }
 
-    #[test]
-    fn identity_self_signature_verifies() {
-        let td = TempDir::new();
-        let (sk, id_path) = create_account_with_seed(&td.0, "alice@example.com", [42u8; 32]).unwrap();
-        let content = fs::read_to_string(&id_path).unwrap();
-        let doc: serde_json::Value = serde_json::from_str(&content).unwrap();
-
-        let sig_b64 = doc["signature"]["signature"].as_str().unwrap();
-        assert!(!sig_b64.is_empty());
-        let sig_bytes: [u8; 64] = B64.decode(sig_b64).unwrap().try_into().unwrap();
-        let sig = Signature::from_bytes(&sig_bytes);
-
-        let canonical = canonicalize_for_sig(&doc);
-        assert!(sk.verifying_key().verify(&canonical, &sig).is_ok());
-    }
-
-    #[test]
-    fn identity_self_signature_detects_tampering() {
-        let td = TempDir::new();
-        let (sk, id_path) = create_account_with_seed(&td.0, "alice@example.com", [43u8; 32]).unwrap();
-        let content = fs::read_to_string(&id_path).unwrap();
-        let mut doc: serde_json::Value = serde_json::from_str(&content).unwrap();
-        let sig_b64 = doc["signature"]["signature"].as_str().unwrap().to_string();
-        let sig_bytes: [u8; 64] = B64.decode(&sig_b64).unwrap().try_into().unwrap();
-        let sig = Signature::from_bytes(&sig_bytes);
-
-        doc["address"] = serde_json::Value::String("mallory@example.com".to_string());
-        let canonical = canonicalize_for_sig(&doc);
-        assert!(sk.verifying_key().verify(&canonical, &sig).is_err());
-    }
 }

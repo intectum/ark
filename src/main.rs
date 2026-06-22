@@ -1,5 +1,6 @@
 mod create_account;
 mod get;
+mod identity;
 mod server;
 mod util;
 

@@ -7,8 +7,9 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Verifier};
 
+use crate::identity::{read_identity, verifying_key_from_key};
 use crate::util::B64;
 
 const MAX_CLOCK_SKEW_SECS: u64 = 300;
@@ -186,37 +187,13 @@ fn verify_auth(
     };
 
     let id_path = root.join("ark").join(account).join(".ark").join("identity.json");
-    let id_content = match fs::read_to_string(&id_path) {
-        Ok(s) => s,
-        Err(_) => return AuthResult::Forbidden("identity not found"),
+    let identity = match read_identity(&id_path) {
+        Ok(i) => i,
+        Err(_) => return AuthResult::Forbidden("identity not valid"),
     };
-    let id_json: serde_json::Value = match serde_json::from_str(&id_content) {
+    let vk = match verifying_key_from_key(&identity.key) {
         Ok(v) => v,
-        Err(_) => return AuthResult::Forbidden("identity not parseable"),
-    };
-    let key_obj = match id_json.get("key") {
-        Some(k) => k,
-        None => return AuthResult::Forbidden("missing key field"),
-    };
-    let algo = key_obj.get("algorithm").and_then(|v| v.as_str()).unwrap_or("");
-    if algo != "ed25519" {
-        return AuthResult::Forbidden("unsupported key algorithm");
-    }
-    let key_b64 = match key_obj.get("public_key").and_then(|v| v.as_str()) {
-        Some(s) => s,
-        None => return AuthResult::Forbidden("missing public_key"),
-    };
-    let key_bytes = match B64.decode(key_b64) {
-        Ok(b) => b,
-        Err(_) => return AuthResult::Forbidden("public_key not base64url"),
-    };
-    let key_arr: [u8; 32] = match key_bytes.as_slice().try_into() {
-        Ok(a) => a,
-        Err(_) => return AuthResult::Forbidden("public_key wrong length"),
-    };
-    let vk = match VerifyingKey::from_bytes(&key_arr) {
-        Ok(v) => v,
-        Err(_) => return AuthResult::Forbidden("public_key invalid"),
+        Err(_) => return AuthResult::Forbidden("identity key not valid"),
     };
 
     let sig_bytes = match B64.decode(sig_b64) {

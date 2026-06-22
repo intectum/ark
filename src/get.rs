@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};
 
+use crate::identity::{parse_address, read_identity, read_signing_key};
 use crate::util::B64;
 
 pub fn cmd_get(arg: &str, output: Option<&str>) -> std::io::Result<()> {
@@ -42,33 +43,18 @@ fn load_identity_from_tree(start: &Path) -> std::io::Result<IdentityCtx> {
         let id_path = ark_meta.join("identity.json");
         let key_path = ark_meta.join("identity.key");
         if id_path.is_file() && key_path.is_file() {
-            let id_content = fs::read_to_string(&id_path)?;
-            let id: serde_json::Value = serde_json::from_str(&id_content)
-                .map_err(|e| io_err(&format!("identity.json parse: {}", e)))?;
-            let address = id["address"]
-                .as_str()
-                .ok_or_else(|| io_err("identity.json missing address"))?;
-            let (_name, host) = address
-                .split_once('@')
-                .ok_or_else(|| io_err("identity address has no @host"))?;
+            let identity = read_identity(&id_path)?;
+            let (_name, host) = parse_address(&identity.address)?;
             let account = d
                 .file_name()
                 .and_then(|s| s.to_str())
                 .ok_or_else(|| io_err("account dir name not utf-8"))?
                 .to_string();
-
-            let key_b64 = fs::read_to_string(&key_path)?;
-            let decoded = B64
-                .decode(key_b64.trim())
-                .map_err(|e| io_err(&format!("identity.key decode: {}", e)))?;
-            let seed: [u8; 32] = decoded
-                .try_into()
-                .map_err(|_| io_err("identity.key wrong length"))?;
-            let sk = SigningKey::from_bytes(&seed);
+            let sk = read_signing_key(&key_path)?;
             return Ok(IdentityCtx {
                 account_dir: d.to_path_buf(),
                 account,
-                host: host.to_string(),
+                host,
                 sk,
             });
         }
