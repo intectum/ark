@@ -9,7 +9,7 @@ use crate::util::io_err;
 
 pub fn cmd_put(arg: &str, input: Option<&str>) -> std::io::Result<()> {
     let input_path: Option<PathBuf> = input.map(PathBuf::from);
-    let plaintext = match &input_path {
+    let body_input = match &input_path {
         Some(p) => fs::read(p)?,
         None => {
             let mut buf = Vec::new();
@@ -21,23 +21,44 @@ pub fn cmd_put(arg: &str, input: Option<&str>) -> std::io::Result<()> {
         Some(p) => read_metadata_attributes(p)?,
         None => Metadata::default(),
     };
-    let algorithm = existing.encryption.unwrap_or_else(|| ENCRYPTION_ALGORITHM.to_string());
+    let already_encrypted = existing.encrypted == Some(true);
+    let algorithm = existing
+        .encryption
+        .unwrap_or_else(|| ENCRYPTION_ALGORITHM.to_string());
     let file_key = match existing.file_key {
         Some(k) => k,
+        None if already_encrypted => {
+            return Err(io_err("file marked encrypted=true but missing filekey metadata"));
+        }
         None => random_key()?,
     };
-    let mut nonce = [0u8; 12];
-    getrandom::getrandom(&mut nonce).map_err(|e| io_err(&e.to_string()))?;
-    let ciphertext = encrypt_body_with(&plaintext, &file_key, &nonce)?;
-    let meta = Metadata { encryption: Some(algorithm), file_key: Some(file_key), encrypted: Some(false) };
-    let header_strs = write_metadata_headers(&meta);
+
+    let body = if already_encrypted {
+        body_input
+    } else {
+        let mut nonce = [0u8; 12];
+        getrandom::getrandom(&mut nonce).map_err(|e| io_err(&e.to_string()))?;
+        encrypt_body_with(&body_input, &file_key, &nonce)?
+    };
+
+    let send_meta = Metadata {
+        encryption: Some(algorithm.clone()),
+        file_key: Some(file_key),
+        encrypted: None,
+    };
+    let header_strs = write_metadata_headers(&send_meta);
     let extra: Vec<(&str, &str)> = header_strs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    let (code, _, resp) = request_ark("PUT", arg, &ciphertext, &extra)?;
+    let (code, _, resp) = request_ark("PUT", arg, &body, &extra)?;
     if code != 201 && code != 204 {
         return Err(io_err(&format!("HTTP {}: {}", code, String::from_utf8_lossy(&resp))));
     }
     if let Some(p) = input_path.as_deref() {
-        write_metadata_attributes(p, &meta)?;
+        let back = Metadata {
+            encryption: Some(algorithm),
+            file_key: Some(file_key),
+            encrypted: Some(already_encrypted),
+        };
+        write_metadata_attributes(p, &back)?;
     }
     Ok(())
 }
@@ -230,6 +251,73 @@ mod tests {
         put_via_cmd(&td, &arg, b"via address", "ark/gyan");
 
         assert!(td.0.join("ark/gyan/explicit.txt").exists());
+    }
+
+    #[test]
+    fn cmd_put_sends_already_encrypted_body_unchanged() {
+        let td = TempDir::new("ark_put_test");
+        let port = start_test_server(td.0.clone());
+        let address = format!("gyan@127.0.0.1:{}", port);
+        create_account_with_seed(&td.0, &address, [150u8; 32]).unwrap();
+
+        // pre-encrypted input
+        let key = [88u8; 32];
+        let nonce = [9u8; 12];
+        let ciphertext = encrypt_body_with(b"hidden", &key, &nonce).unwrap();
+        let input = td.0.join("input.bin");
+        fs::write(&input, &ciphertext).unwrap();
+        xattr::set(&input, "user.ark.encryption", b"aes-256-gcm").unwrap();
+        xattr::set(&input, "user.ark.filekey", B64.encode(key).as_bytes()).unwrap();
+        xattr::set(&input, "user.ark.encrypted", b"true").unwrap();
+
+        let account_dir = td.0.join("ark/gyan");
+        with_cwd(&account_dir, || {
+            cmd_put("file.bin", Some(input.to_str().unwrap())).unwrap();
+        });
+
+        let server_path = td.0.join("ark/gyan/file.bin");
+        let server_body = fs::read(&server_path).unwrap();
+        assert_eq!(server_body, ciphertext, "server received raw input bytes");
+        // input encrypted flag preserved
+        assert_eq!(
+            xattr::get(&input, "user.ark.encrypted").unwrap().as_deref(),
+            Some(b"true".as_slice())
+        );
+        // decryption with same key recovers original plaintext
+        assert_eq!(decrypt_body_with(&server_body, &key).unwrap(), b"hidden");
+    }
+
+    #[test]
+    fn cmd_put_marks_input_encrypted_false_after_fresh_encrypt() {
+        let td = TempDir::new("ark_put_test");
+        let port = start_test_server(td.0.clone());
+        let address = format!("gyan@127.0.0.1:{}", port);
+        create_account_with_seed(&td.0, &address, [151u8; 32]).unwrap();
+
+        let input = put_via_cmd(&td, "out.bin", b"plain", "ark/gyan");
+        assert_eq!(
+            xattr::get(&input, "user.ark.encrypted").unwrap().as_deref(),
+            Some(b"false".as_slice())
+        );
+    }
+
+    #[test]
+    fn cmd_put_errors_when_encrypted_true_but_no_filekey() {
+        let td = TempDir::new("ark_put_test");
+        let port = start_test_server(td.0.clone());
+        let address = format!("gyan@127.0.0.1:{}", port);
+        create_account_with_seed(&td.0, &address, [152u8; 32]).unwrap();
+
+        let input = td.0.join("input.bin");
+        fs::write(&input, b"x").unwrap();
+        xattr::set(&input, "user.ark.encrypted", b"true").unwrap();
+        // intentionally no filekey
+
+        let account_dir = td.0.join("ark/gyan");
+        let err = with_cwd(&account_dir, || {
+            cmd_put("file.bin", Some(input.to_str().unwrap())).unwrap_err()
+        });
+        assert!(err.to_string().contains("missing filekey"), "msg was {}", err);
     }
 
     #[test]
