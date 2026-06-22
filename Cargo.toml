@@ -8,14 +8,15 @@ name = "ark"
 path = "src/main.rs"
 
 [dependencies]
-ed25519-dalek = "2"
-base64 = "0.22"
-serde_json = "1"
-serde_jcs = "0.1"
-sha2 = "0.10"
-getrandom = "0.2"
-time = { version = "0.3", features = ["formatting"] }
 aes-gcm = "0.10"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+ed25519-dalek = "2"
+getrandom = "0.2"
+serde_jcs = "0.1"
+serde_json = "1"
+sha2 = "0.10"
+time = { version = "0.3", features = ["formatting"] }
 xattr = "1"
 
 [profile.release]
