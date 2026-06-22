@@ -62,6 +62,7 @@ fn handle(mut stream: TcpStream, root: &Path, verbose: bool) -> std::io::Result<
     let mut content_length: usize = 0;
     let mut auth_header: Option<String> = None;
     let mut timestamp_header: Option<u64> = None;
+    let mut meta_headers: Vec<(String, String)> = Vec::new();
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line)? == 0 {
@@ -80,6 +81,8 @@ fn handle(mut stream: TcpStream, root: &Path, verbose: bool) -> std::io::Result<
                 auth_header = Some(val.to_string());
             } else if key.eq_ignore_ascii_case("x-ark-timestamp") {
                 timestamp_header = val.parse().ok();
+            } else if let Some(meta_name) = strip_meta_prefix(key) {
+                meta_headers.push((meta_name.to_ascii_lowercase(), val.to_string()));
             }
         }
     }
@@ -116,7 +119,7 @@ fn handle(mut stream: TcpStream, root: &Path, verbose: bool) -> std::io::Result<
     match method.as_str() {
         "GET" => serve_get(&mut stream, &path, true),
         "HEAD" => serve_get(&mut stream, &path, false),
-        "PUT" => serve_put(&mut stream, &path, &body),
+        "PUT" => serve_put(&mut stream, &path, &body, &meta_headers),
         "DELETE" => serve_delete(&mut stream, &path),
         _ => write_status(&mut stream, 405, "Method Not Allowed", b"method not allowed"),
     }
@@ -285,17 +288,31 @@ fn serve_get(stream: &mut TcpStream, path: &Path, send_body: bool) -> std::io::R
     Ok(())
 }
 
-fn serve_put(stream: &mut TcpStream, path: &Path, body: &[u8]) -> std::io::Result<()> {
+fn serve_put(stream: &mut TcpStream, path: &Path, body: &[u8], meta: &[(String, String)]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let existed = path.exists();
     let mut f = fs::File::create(path)?;
     f.write_all(body)?;
+    drop(f);
+    for (name, val) in meta {
+        let attr = format!("user.ark.{}", name);
+        xattr::set(path, &attr, val.as_bytes())?;
+    }
     let (code, msg) = if existed { (204, "No Content") } else { (201, "Created") };
     let response = format!("HTTP/1.1 {} {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", code, msg);
     stream.write_all(response.as_bytes())?;
     Ok(())
+}
+
+fn strip_meta_prefix(key: &str) -> Option<&str> {
+    let prefix = "x-ark-meta-";
+    if key.len() > prefix.len() && key[..prefix.len()].eq_ignore_ascii_case(prefix) {
+        Some(&key[prefix.len()..])
+    } else {
+        None
+    }
 }
 
 fn serve_delete(stream: &mut TcpStream, path: &Path) -> std::io::Result<()> {
@@ -446,11 +463,17 @@ mod tests {
     }
 
     fn signed_request(port: u16, sk: &SigningKey, method: &str, path: &str, body: &[u8]) -> (u16, Vec<u8>, Vec<(String, String)>) {
+        signed_request_with_headers(port, sk, method, path, body, &[])
+    }
+
+    fn signed_request_with_headers(port: u16, sk: &SigningKey, method: &str, path: &str, body: &[u8], extra: &[(&str, &str)]) -> (u16, Vec<u8>, Vec<(String, String)>) {
         let ts = now_secs();
         let sig_b64 = sign(sk, method, path, ts, body);
         let auth = format!("ArkAccount {}", sig_b64);
         let ts_str = ts.to_string();
-        request(port, method, path, body, &[("Authorization", &auth), ("X-Ark-Timestamp", &ts_str)])
+        let mut headers: Vec<(&str, &str)> = vec![("Authorization", &auth), ("X-Ark-Timestamp", &ts_str)];
+        headers.extend_from_slice(extra);
+        request(port, method, path, body, &headers)
     }
 
     fn header<'a>(headers: &'a [(String, String)], key: &str) -> Option<&'a str> {
@@ -744,5 +767,59 @@ mod tests {
         let (code, _, _) = request(port, "PUT", "/ark/test/file", b"tampered", &[("Authorization", &auth), ("X-Ark-Timestamp", &ts_s)]);
         assert_eq!(code, 403);
         assert!(!td.0.join("ark/test/file").exists());
+    }
+
+    #[test]
+    fn put_stores_x_ark_meta_headers_as_xattr() {
+        let td = TempDir::new("ark_server_test");
+        let (_acc, sk) = setup_account(&td.0, "test", [23u8; 32]);
+        let port = start_server(td.0.clone());
+        let extra = [
+            ("X-Ark-Meta-Encryption", "aes-256-gcm"),
+            ("X-Ark-Meta-Foo", "bar"),
+        ];
+        let (code, _, _) = signed_request_with_headers(port, &sk, "PUT", "/ark/test/secret", b"ciphertext", &extra);
+        assert_eq!(code, 201);
+        let p = td.0.join("ark/test/secret");
+        assert_eq!(
+            xattr::get(&p, "user.ark.encryption").unwrap().as_deref(),
+            Some(b"aes-256-gcm".as_slice())
+        );
+        assert_eq!(
+            xattr::get(&p, "user.ark.foo").unwrap().as_deref(),
+            Some(b"bar".as_slice())
+        );
+    }
+
+    #[test]
+    fn put_without_meta_headers_writes_no_xattr() {
+        let td = TempDir::new("ark_server_test");
+        let (_acc, sk) = setup_account(&td.0, "test", [24u8; 32]);
+        let port = start_server(td.0.clone());
+        let (code, _, _) = signed_request(port, &sk, "PUT", "/ark/test/plain", b"data");
+        assert_eq!(code, 201);
+        let p = td.0.join("ark/test/plain");
+        assert_eq!(xattr::get(&p, "user.ark.encryption").unwrap(), None);
+    }
+
+    #[test]
+    fn put_ignores_non_meta_custom_headers() {
+        let td = TempDir::new("ark_server_test");
+        let (_acc, sk) = setup_account(&td.0, "test", [25u8; 32]);
+        let port = start_server(td.0.clone());
+        let extra = [("X-Custom-Foo", "bar")];
+        let (code, _, _) = signed_request_with_headers(port, &sk, "PUT", "/ark/test/file", b"x", &extra);
+        assert_eq!(code, 201);
+        let p = td.0.join("ark/test/file");
+        assert_eq!(xattr::get(&p, "user.ark.foo").unwrap(), None);
+    }
+
+    #[test]
+    fn strip_meta_prefix_recognises_case_insensitive() {
+        assert_eq!(strip_meta_prefix("X-Ark-Meta-Encryption"), Some("Encryption"));
+        assert_eq!(strip_meta_prefix("x-ark-meta-foo"), Some("foo"));
+        assert_eq!(strip_meta_prefix("X-Custom-Foo"), None);
+        assert_eq!(strip_meta_prefix("X-Ark-Meta-"), None);
+        assert_eq!(strip_meta_prefix(""), None);
     }
 }

@@ -5,7 +5,7 @@ use crate::request::request_ark;
 use crate::util::io_err;
 
 pub fn cmd_get(arg: &str, output: Option<&str>) -> std::io::Result<()> {
-    let (code, body) = request_ark("GET", arg, &[])?;
+    let (code, body) = request_ark("GET", arg, &[], &[])?;
     if code != 200 {
         return Err(io_err(&format!("HTTP {}: {}", code, String::from_utf8_lossy(&body))));
     }

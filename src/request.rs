@@ -28,6 +28,7 @@ pub fn request(
     path: &str,
     body: &[u8],
     sk: &SigningKey,
+    extra_headers: &[(&str, &str)],
 ) -> std::io::Result<(u16, Vec<u8>)> {
     let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
     let msg = signing_message(method, path, ts, body);
@@ -35,10 +36,14 @@ pub fn request(
 
     let mut stream = TcpStream::connect((connect_host, port))?;
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-    let req_head = format!(
-        "{} {} HTTP/1.1\r\nHost: {}\r\nAuthorization: ArkAccount {}\r\nX-Ark-Timestamp: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+    let mut req_head = format!(
+        "{} {} HTTP/1.1\r\nHost: {}\r\nAuthorization: ArkAccount {}\r\nX-Ark-Timestamp: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
         method, path, host_header, sig_b64, ts, body.len()
     );
+    for (k, v) in extra_headers {
+        req_head.push_str(&format!("{}: {}\r\n", k, v));
+    }
+    req_head.push_str("\r\n");
     stream.write_all(req_head.as_bytes())?;
     if !body.is_empty() {
         stream.write_all(body)?;
@@ -63,12 +68,17 @@ pub fn request(
     Ok((code, resp_body))
 }
 
-pub fn request_ark(method: &str, arg: &str, body: &[u8]) -> std::io::Result<(u16, Vec<u8>)> {
+pub fn request_ark(
+    method: &str,
+    arg: &str,
+    body: &[u8],
+    extra_headers: &[(&str, &str)],
+) -> std::io::Result<(u16, Vec<u8>)> {
     let cwd = std::env::current_dir()?;
     let ctx = load_identity_from_tree(&cwd)?;
     let target = resolve_target(&cwd, &ctx, arg);
     let (host, port) = parse_host_port(&target.host);
-    request(method, &host, port, &target.host, &target.url_path, body, &ctx.sk)
+    request(method, &host, port, &target.host, &target.url_path, body, &ctx.sk, extra_headers)
 }
 
 #[cfg(test)]
@@ -134,7 +144,7 @@ mod tests {
         });
 
         let sk = SigningKey::from_bytes(&[1u8; 32]);
-        let (code, body) = request("PUT", "127.0.0.1", port, "127.0.0.1", "/x", b"data", &sk).unwrap();
+        let (code, body) = request("PUT", "127.0.0.1", port, "127.0.0.1", "/x", b"data", &sk, &[]).unwrap();
         assert_eq!(code, 201);
         assert_eq!(body, b"hello");
         handle.join().unwrap();
@@ -151,7 +161,7 @@ mod tests {
         });
 
         let sk = SigningKey::from_bytes(&[2u8; 32]);
-        let (code, _) = request("PUT", "127.0.0.1", port, "example.com", "/ark/alice/x", b"payload", &sk).unwrap();
+        let (code, _) = request("PUT", "127.0.0.1", port, "example.com", "/ark/alice/x", b"payload", &sk, &[]).unwrap();
         assert_eq!(code, 204);
 
         let req = captured.join().unwrap();
@@ -173,7 +183,7 @@ mod tests {
         });
 
         let sk = SigningKey::from_bytes(&[3u8; 32]);
-        request("GET", "127.0.0.1", port, "127.0.0.1", "/ark/x", &[], &sk).unwrap();
+        request("GET", "127.0.0.1", port, "127.0.0.1", "/ark/x", &[], &sk, &[]).unwrap();
 
         let req = captured.join().unwrap();
         let auth = parse_header(&req, "Authorization").unwrap();
@@ -197,8 +207,35 @@ mod tests {
         });
 
         let sk = SigningKey::from_bytes(&[4u8; 32]);
-        let (code, body) = request("GET", "127.0.0.1", port, "127.0.0.1", "/ark/x", &[], &sk).unwrap();
+        let (code, body) = request("GET", "127.0.0.1", port, "127.0.0.1", "/ark/x", &[], &sk, &[]).unwrap();
         assert_eq!(code, 403);
         assert_eq!(body, b"denied!");
+    }
+
+    #[test]
+    fn request_sends_extra_headers() {
+        let (listener, port) = bind_local();
+        let captured = thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let req = read_full_request(&mut s);
+            s.write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            req
+        });
+
+        let sk = SigningKey::from_bytes(&[5u8; 32]);
+        request(
+            "PUT",
+            "127.0.0.1",
+            port,
+            "127.0.0.1",
+            "/x",
+            b"d",
+            &sk,
+            &[("X-Ark-Meta-Encryption", "aes-256-gcm"), ("X-Custom", "hi")],
+        ).unwrap();
+
+        let req = captured.join().unwrap();
+        assert_eq!(parse_header(&req, "X-Ark-Meta-Encryption"), Some("aes-256-gcm"));
+        assert_eq!(parse_header(&req, "X-Custom"), Some("hi"));
     }
 }
