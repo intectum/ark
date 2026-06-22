@@ -2,23 +2,41 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 
+use crate::crypto::{ENCRYPTION_ALGORITHM, decrypt_body_with};
 use crate::metadata::{read_metadata_headers, write_metadata_attributes};
 use crate::request::request_ark;
 use crate::util::io_err;
 
-pub fn cmd_get(arg: &str, output: Option<&str>) -> std::io::Result<()> {
+pub fn cmd_get(arg: &str, output: Option<&str>, decrypt: bool) -> std::io::Result<()> {
     let (code, headers, body) = request_ark("GET", arg, &[], &[])?;
     if code != 200 {
         return Err(io_err(&format!("HTTP {}: {}", code, String::from_utf8_lossy(&body))));
     }
+    let mut meta = read_metadata_headers(&headers);
+    let final_body = if decrypt {
+        let algorithm = meta.encryption.as_deref().unwrap_or(ENCRYPTION_ALGORITHM);
+        if algorithm != ENCRYPTION_ALGORITHM {
+            return Err(io_err(&format!("unsupported algorithm: {}", algorithm)));
+        }
+        let key = meta.file_key.ok_or_else(|| {
+            io_err("no filekey in response metadata; cannot decrypt")
+        })?;
+        decrypt_body_with(&body, &key).map_err(|e| {
+            io_err(&format!(
+                "{} — server data may not be encrypted or the key may be wrong",
+                e
+            ))
+        })?
+    } else {
+        body
+    };
     match output {
         Some(f) => {
-            fs::write(f, &body)?;
-            let mut meta = read_metadata_headers(&headers);
-            meta.encrypted = Some(true);
+            fs::write(f, &final_body)?;
+            meta.encrypted = Some(!decrypt);
             write_metadata_attributes(Path::new(f), &meta)?;
         }
-        None => std::io::stdout().write_all(&body)?,
+        None => std::io::stdout().write_all(&final_body)?,
     }
     Ok(())
 }
@@ -42,7 +60,7 @@ mod tests {
         let out = td.0.join("out.bin");
 
         with_cwd(&account_dir, || {
-            cmd_get("hello.txt", Some(out.to_str().unwrap())).unwrap();
+            cmd_get("hello.txt", Some(out.to_str().unwrap()), false).unwrap();
         });
 
         assert_eq!(fs::read(&out).unwrap(), b"hi from server");
@@ -60,7 +78,7 @@ mod tests {
 
         let out = td.0.join("out.bin");
         with_cwd(&notes, || {
-            cmd_get("todo.txt", Some(out.to_str().unwrap())).unwrap();
+            cmd_get("todo.txt", Some(out.to_str().unwrap()), false).unwrap();
         });
         assert_eq!(fs::read(&out).unwrap(), b"buy milk");
     }
@@ -78,7 +96,7 @@ mod tests {
         let out = td.0.join("out.bin");
         let cwd = td.0.join("ark/gyan/sub");
         with_cwd(&cwd, || {
-            cmd_get("/ark/gyan/sub/file.txt", Some(out.to_str().unwrap())).unwrap();
+            cmd_get("/ark/gyan/sub/file.txt", Some(out.to_str().unwrap()), false).unwrap();
         });
         assert_eq!(fs::read(&out).unwrap(), b"absolute");
     }
@@ -95,7 +113,7 @@ mod tests {
         let cwd = td.0.join("ark/gyan");
         let arg = format!("gyan@127.0.0.1:{}/explicit.txt", port);
         with_cwd(&cwd, || {
-            cmd_get(&arg, Some(out.to_str().unwrap())).unwrap();
+            cmd_get(&arg, Some(out.to_str().unwrap()), false).unwrap();
         });
         assert_eq!(fs::read(&out).unwrap(), b"via address");
     }
@@ -116,7 +134,7 @@ mod tests {
         let account_dir = td.0.join("ark").join("gyan");
         let out = td.0.join("out.bin");
         with_cwd(&account_dir, || {
-            cmd_get("secret", Some(out.to_str().unwrap())).unwrap();
+            cmd_get("secret", Some(out.to_str().unwrap()), false).unwrap();
         });
 
         assert_eq!(fs::read(&out).unwrap(), b"ciphertext");
@@ -131,9 +149,56 @@ mod tests {
     }
 
     #[test]
+    fn get_with_decrypt_returns_plaintext() {
+        use base64::Engine;
+        use crate::crypto::encrypt_body_with;
+        let td = TempDir::new("ark_get_test");
+        let port = start_test_server(td.0.clone());
+        let address = format!("gyan@127.0.0.1:{}", port);
+        create_account_with_seed(&td.0, &address, [220u8; 32]).unwrap();
+
+        let key = [44u8; 32];
+        let nonce = [5u8; 12];
+        let ct = encrypt_body_with(b"clear text", &key, &nonce).unwrap();
+        let server_file = td.0.join("ark/gyan/secret");
+        fs::write(&server_file, &ct).unwrap();
+        let key_b64 = crate::util::B64.encode(key);
+        xattr::set(&server_file, "user.ark.encryption", b"aes-256-gcm").unwrap();
+        xattr::set(&server_file, "user.ark.filekey", key_b64.as_bytes()).unwrap();
+
+        let account_dir = td.0.join("ark").join("gyan");
+        let out = td.0.join("out.bin");
+        with_cwd(&account_dir, || {
+            cmd_get("secret", Some(out.to_str().unwrap()), true).unwrap();
+        });
+
+        assert_eq!(fs::read(&out).unwrap(), b"clear text");
+        assert_eq!(
+            xattr::get(&out, "user.ark.encrypted").unwrap().as_deref(),
+            Some(b"false".as_slice())
+        );
+    }
+
+    #[test]
+    fn get_with_decrypt_errors_when_no_key_in_response() {
+        let td = TempDir::new("ark_get_test");
+        let port = start_test_server(td.0.clone());
+        let address = format!("gyan@127.0.0.1:{}", port);
+        create_account_with_seed(&td.0, &address, [221u8; 32]).unwrap();
+        fs::write(td.0.join("ark/gyan/plain"), b"raw").unwrap();
+
+        let account_dir = td.0.join("ark").join("gyan");
+        let out = td.0.join("out.bin");
+        let err = with_cwd(&account_dir, || {
+            cmd_get("plain", Some(out.to_str().unwrap()), true).unwrap_err()
+        });
+        assert!(err.to_string().contains("no filekey"), "msg was {}", err);
+    }
+
+    #[test]
     fn get_missing_identity_errors() {
         let td = TempDir::new("ark_get_test");
-        let err = with_cwd(&td.0, || cmd_get("anything", None).unwrap_err());
+        let err = with_cwd(&td.0, || cmd_get("anything", None, false).unwrap_err());
         let msg = format!("{}", err);
         assert!(msg.contains("no .ark"), "msg was {}", msg);
     }

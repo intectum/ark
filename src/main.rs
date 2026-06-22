@@ -41,6 +41,9 @@ enum Cmd {
         /// Write body to FILE instead of stdout.
         #[arg(short, long, value_name = "FILE")]
         output: Option<String>,
+        /// Decrypt the response body using its metadata key.
+        #[arg(short, long)]
+        decrypt: bool,
         /// Ark URL or path.
         path: String,
     },
@@ -49,6 +52,9 @@ enum Cmd {
         /// Read body from FILE instead of stdin.
         #[arg(short, long, value_name = "FILE")]
         input: Option<String>,
+        /// Skip encryption; send body as-is.
+        #[arg(long)]
+        no_encrypt: bool,
         /// Ark URL or path.
         path: String,
     },
@@ -80,8 +86,8 @@ fn main() {
             Ok(())
         }
         Cmd::CreateAccount { address } => cmd_create_account(&address),
-        Cmd::Get { output, path } => cmd_get(&path, output.as_deref()),
-        Cmd::Put { input, path } => cmd_put(&path, input.as_deref()),
+        Cmd::Get { output, decrypt, path } => cmd_get(&path, output.as_deref(), decrypt),
+        Cmd::Put { input, no_encrypt, path } => cmd_put(&path, input.as_deref(), no_encrypt),
         Cmd::Decrypt { input, output, in_place, key, algorithm } => {
             cmd_decrypt(DecryptArgs { input, output, in_place, key, algorithm })
         }

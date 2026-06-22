@@ -7,7 +7,7 @@ use crate::metadata::{Metadata, read_metadata_attributes, write_metadata_attribu
 use crate::request::request_ark;
 use crate::util::io_err;
 
-pub fn cmd_put(arg: &str, input: Option<&str>) -> std::io::Result<()> {
+pub fn cmd_put(arg: &str, input: Option<&str>, no_encrypt: bool) -> std::io::Result<()> {
     let input_path: Option<PathBuf> = input.map(PathBuf::from);
     let body_input = match &input_path {
         Some(p) => fs::read(p)?,
@@ -22,30 +22,53 @@ pub fn cmd_put(arg: &str, input: Option<&str>) -> std::io::Result<()> {
         None => Metadata::default(),
     };
     let already_encrypted = existing.encrypted == Some(true);
-    let algorithm = existing
-        .encryption
-        .unwrap_or_else(|| ENCRYPTION_ALGORITHM.to_string());
-    let file_key = match existing.file_key {
-        Some(k) => k,
-        None if already_encrypted => {
-            return Err(io_err("file marked encrypted=true but missing filekey metadata"));
-        }
-        None => random_key()?,
-    };
 
-    let body = if already_encrypted {
-        body_input
+    if already_encrypted && !no_encrypt && existing.file_key.is_none() {
+        return Err(io_err("file marked encrypted=true but missing filekey metadata"));
+    }
+
+    let (body, send_meta, back_encrypted) = if no_encrypt {
+        (
+            body_input,
+            Metadata {
+                encryption: existing.encryption.clone(),
+                file_key: existing.file_key,
+                encrypted: None,
+            },
+            existing.encrypted,
+        )
+    } else if already_encrypted {
+        (
+            body_input,
+            Metadata {
+                encryption: existing.encryption.clone(),
+                file_key: existing.file_key,
+                encrypted: None,
+            },
+            Some(true),
+        )
     } else {
+        let algorithm = existing
+            .encryption
+            .unwrap_or_else(|| ENCRYPTION_ALGORITHM.to_string());
+        let file_key = match existing.file_key {
+            Some(k) => k,
+            None => random_key()?,
+        };
         let mut nonce = [0u8; 12];
         getrandom::getrandom(&mut nonce).map_err(|e| io_err(&e.to_string()))?;
-        encrypt_body_with(&body_input, &file_key, &nonce)?
+        let ct = encrypt_body_with(&body_input, &file_key, &nonce)?;
+        (
+            ct,
+            Metadata {
+                encryption: Some(algorithm),
+                file_key: Some(file_key),
+                encrypted: None,
+            },
+            Some(false),
+        )
     };
 
-    let send_meta = Metadata {
-        encryption: Some(algorithm.clone()),
-        file_key: Some(file_key),
-        encrypted: None,
-    };
     let header_strs = write_metadata_headers(&send_meta);
     let extra: Vec<(&str, &str)> = header_strs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     let (code, _, resp) = request_ark("PUT", arg, &body, &extra)?;
@@ -54,9 +77,9 @@ pub fn cmd_put(arg: &str, input: Option<&str>) -> std::io::Result<()> {
     }
     if let Some(p) = input_path.as_deref() {
         let back = Metadata {
-            encryption: Some(algorithm),
-            file_key: Some(file_key),
-            encrypted: Some(already_encrypted),
+            encryption: send_meta.encryption,
+            file_key: send_meta.file_key,
+            encrypted: back_encrypted,
         };
         write_metadata_attributes(p, &back)?;
     }
@@ -84,7 +107,7 @@ mod tests {
         fs::write(&input, plaintext).unwrap();
         let cwd = td.0.join(cwd_subpath);
         with_cwd(&cwd, || {
-            cmd_put(arg, Some(input.to_str().unwrap())).unwrap();
+            cmd_put(arg, Some(input.to_str().unwrap()), false).unwrap();
         });
         input
     }
@@ -144,7 +167,7 @@ mod tests {
 
         let account_dir = td.0.join("ark/gyan");
         with_cwd(&account_dir, || {
-            cmd_put("notes.txt", Some(input.to_str().unwrap())).unwrap();
+            cmd_put("notes.txt", Some(input.to_str().unwrap()), false).unwrap();
         });
 
         let server_path = td.0.join("ark/gyan/notes.txt");
@@ -167,13 +190,13 @@ mod tests {
         fs::write(&input, b"v1").unwrap();
         let account_dir = td.0.join("ark/gyan");
         with_cwd(&account_dir, || {
-            cmd_put("notes.txt", Some(input.to_str().unwrap())).unwrap();
+            cmd_put("notes.txt", Some(input.to_str().unwrap()), false).unwrap();
         });
         let key1 = xattr::get(&input, "user.ark.filekey").unwrap().unwrap();
 
         fs::write(&input, b"v2").unwrap();
         with_cwd(&account_dir, || {
-            cmd_put("notes.txt", Some(input.to_str().unwrap())).unwrap();
+            cmd_put("notes.txt", Some(input.to_str().unwrap()), false).unwrap();
         });
         let key2 = xattr::get(&input, "user.ark.filekey").unwrap().unwrap();
 
@@ -272,7 +295,7 @@ mod tests {
 
         let account_dir = td.0.join("ark/gyan");
         with_cwd(&account_dir, || {
-            cmd_put("file.bin", Some(input.to_str().unwrap())).unwrap();
+            cmd_put("file.bin", Some(input.to_str().unwrap()), false).unwrap();
         });
 
         let server_path = td.0.join("ark/gyan/file.bin");
@@ -315,9 +338,61 @@ mod tests {
 
         let account_dir = td.0.join("ark/gyan");
         let err = with_cwd(&account_dir, || {
-            cmd_put("file.bin", Some(input.to_str().unwrap())).unwrap_err()
+            cmd_put("file.bin", Some(input.to_str().unwrap()), false).unwrap_err()
         });
         assert!(err.to_string().contains("missing filekey"), "msg was {}", err);
+    }
+
+    #[test]
+    fn cmd_put_no_encrypt_sends_raw_body() {
+        let td = TempDir::new("ark_put_test");
+        let port = start_test_server(td.0.clone());
+        let address = format!("gyan@127.0.0.1:{}", port);
+        create_account_with_seed(&td.0, &address, [160u8; 32]).unwrap();
+
+        let input = td.0.join("input.bin");
+        fs::write(&input, b"plain bytes").unwrap();
+
+        let account_dir = td.0.join("ark/gyan");
+        with_cwd(&account_dir, || {
+            cmd_put("raw.bin", Some(input.to_str().unwrap()), true).unwrap();
+        });
+
+        let server_path = td.0.join("ark/gyan/raw.bin");
+        assert_eq!(fs::read(&server_path).unwrap(), b"plain bytes");
+        // no filekey written since no metadata existed
+        assert_eq!(xattr::get(&server_path, "user.ark.filekey").unwrap(), None);
+        // input file has no metadata written back
+        assert_eq!(xattr::get(&input, "user.ark.filekey").unwrap(), None);
+    }
+
+    #[test]
+    fn cmd_put_no_encrypt_passes_through_existing_metadata() {
+        let td = TempDir::new("ark_put_test");
+        let port = start_test_server(td.0.clone());
+        let address = format!("gyan@127.0.0.1:{}", port);
+        create_account_with_seed(&td.0, &address, [161u8; 32]).unwrap();
+
+        let key = [55u8; 32];
+        let nonce = [8u8; 12];
+        let ct = encrypt_body_with(b"secret", &key, &nonce).unwrap();
+        let input = td.0.join("input.bin");
+        fs::write(&input, &ct).unwrap();
+        xattr::set(&input, "user.ark.encryption", b"aes-256-gcm").unwrap();
+        xattr::set(&input, "user.ark.filekey", B64.encode(key).as_bytes()).unwrap();
+
+        let account_dir = td.0.join("ark/gyan");
+        with_cwd(&account_dir, || {
+            cmd_put("file.bin", Some(input.to_str().unwrap()), true).unwrap();
+        });
+
+        let server_path = td.0.join("ark/gyan/file.bin");
+        assert_eq!(fs::read(&server_path).unwrap(), ct);
+        // metadata forwarded to server
+        assert_eq!(
+            xattr::get(&server_path, "user.ark.filekey").unwrap().as_deref(),
+            Some(B64.encode(key).as_bytes())
+        );
     }
 
     #[test]
@@ -325,7 +400,7 @@ mod tests {
         let td = TempDir::new("ark_put_test");
         let input = td.0.join("input.bin");
         fs::write(&input, b"x").unwrap();
-        let err = with_cwd(&td.0, || cmd_put("anything", Some(input.to_str().unwrap())).unwrap_err());
+        let err = with_cwd(&td.0, || cmd_put("anything", Some(input.to_str().unwrap()), false).unwrap_err());
         let msg = format!("{}", err);
         assert!(msg.contains("no .ark"), "msg was {}", msg);
     }
