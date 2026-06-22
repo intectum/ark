@@ -210,24 +210,8 @@ fn io_err(s: &str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::testutil::TempDir;
     use ed25519_dalek::{Signature as DalekSig, Verifier};
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    struct TempDir(PathBuf);
-    impl TempDir {
-        fn new() -> Self {
-            let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-            let p = std::env::temp_dir().join(format!("ark_identity_test_{}_{}", std::process::id(), nanos));
-            fs::create_dir_all(&p).unwrap();
-            TempDir(p)
-        }
-    }
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
 
     #[test]
     fn parse_address_accepts_valid() {
@@ -304,7 +288,7 @@ mod tests {
 
     #[test]
     fn read_write_identity_round_trip() {
-        let td = TempDir::new();
+        let td = TempDir::new("ark_identity_test");
         let sk = SigningKey::from_bytes(&[45u8; 32]);
         let identity = new_signed_identity(&sk, "alice@example.com", 1_700_000_000).unwrap();
         let path = td.0.join("identity.json");
@@ -337,7 +321,7 @@ mod tests {
 
     #[test]
     fn read_write_signing_key_round_trip() {
-        let td = TempDir::new();
+        let td = TempDir::new("ark_identity_test");
         let sk = SigningKey::from_bytes(&[77u8; 32]);
         let path = td.0.join("identity.key");
         write_signing_key(&path, &sk).unwrap();
@@ -349,7 +333,7 @@ mod tests {
     #[test]
     fn write_signing_key_sets_0600() {
         use std::os::unix::fs::PermissionsExt;
-        let td = TempDir::new();
+        let td = TempDir::new("ark_identity_test");
         let sk = SigningKey::from_bytes(&[78u8; 32]);
         let path = td.0.join("identity.key");
         write_signing_key(&path, &sk).unwrap();

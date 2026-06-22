@@ -54,26 +54,12 @@ pub fn create_account_with_seed(root: &Path, address: &str, seed: [u8; 32]) -> s
 mod tests {
     use super::*;
     use crate::util::B64;
+    use crate::util::testutil::TempDir;
     use base64::Engine;
-
-    struct TempDir(PathBuf);
-    impl TempDir {
-        fn new() -> Self {
-            let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-            let p = env::temp_dir().join(format!("ark_create_account_test_{}_{}", std::process::id(), nanos));
-            fs::create_dir_all(&p).unwrap();
-            TempDir(p)
-        }
-    }
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
 
     #[test]
     fn create_account_writes_identity_file() {
-        let td = TempDir::new();
+        let td = TempDir::new("ark_create_account_test");
         let (sk, id_path) = create_account(&td.0, "gyan@example.com:8080").unwrap();
         assert_eq!(id_path, td.0.join("ark/gyan/.ark/identity.json"));
         assert!(id_path.exists());
@@ -95,7 +81,7 @@ mod tests {
 
     #[test]
     fn create_account_writes_identity_key_file() {
-        let td = TempDir::new();
+        let td = TempDir::new("ark_create_account_test");
         let (sk, id_path) = create_account_with_seed(&td.0, "gyan@example.com", [55u8; 32]).unwrap();
         let key_path = id_path.with_file_name("identity.key");
         assert!(key_path.exists());
@@ -111,7 +97,7 @@ mod tests {
 
     #[test]
     fn create_account_rejects_invalid_addresses() {
-        let td = TempDir::new();
+        let td = TempDir::new("ark_create_account_test");
         let bad: &[&str] = &[
             "",
             "noatsign",
@@ -133,7 +119,7 @@ mod tests {
 
     #[test]
     fn create_account_rejects_duplicate() {
-        let td = TempDir::new();
+        let td = TempDir::new("ark_create_account_test");
         create_account(&td.0, "gyan@example.com").unwrap();
         let err = create_account(&td.0, "gyan@example.com").unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
