@@ -14,7 +14,8 @@ pub fn cmd_get(arg: &str, output: Option<&str>) -> std::io::Result<()> {
     match output {
         Some(f) => {
             fs::write(f, &body)?;
-            let meta = read_metadata_headers(&headers);
+            let mut meta = read_metadata_headers(&headers);
+            meta.encrypted = Some(true);
             write_metadata_attributes(Path::new(f), &meta)?;
         }
         None => std::io::stdout().write_all(&body)?,

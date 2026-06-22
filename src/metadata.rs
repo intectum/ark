@@ -10,10 +10,13 @@ const HEADER_PREFIX: &str = "X-Ark-Meta-";
 
 const FIELD_ENCRYPTION: &str = "encryption";
 const FIELD_FILE_KEY: &str = "filekey";
+const FIELD_ENCRYPTED: &str = "encrypted";
 
+#[derive(Default)]
 pub struct Metadata {
     pub encryption: Option<String>,
     pub file_key: Option<[u8; 32]>,
+    pub encrypted: Option<bool>,
 }
 
 pub fn read_metadata_headers(headers: &[(String, String)]) -> Metadata {
@@ -36,7 +39,7 @@ pub fn read_metadata_headers(headers: &[(String, String)]) -> Metadata {
             _ => {}
         }
     }
-    Metadata { encryption, file_key }
+    Metadata { encryption, file_key, encrypted: None }
 }
 
 pub fn write_metadata_headers(metadata: &Metadata) -> Vec<(String, String)> {
@@ -65,7 +68,15 @@ pub fn read_metadata_attributes(path: &Path) -> io::Result<Metadata> {
         }
         None => None,
     };
-    Ok(Metadata { encryption, file_key })
+    let encrypted = match get_attribute(path, FIELD_ENCRYPTED)? {
+        Some(s) => match s.trim() {
+            "true" => Some(true),
+            "false" => Some(false),
+            other => return Err(io_err(&format!("encrypted xattr invalid: {}", other))),
+        },
+        None => None,
+    };
+    Ok(Metadata { encryption, file_key, encrypted })
 }
 
 pub fn write_metadata_attributes(path: &Path, metadata: &Metadata) -> io::Result<()> {
@@ -74,6 +85,9 @@ pub fn write_metadata_attributes(path: &Path, metadata: &Metadata) -> io::Result
     }
     if let Some(k) = &metadata.file_key {
         set_attribute(path, FIELD_FILE_KEY, &B64.encode(k))?;
+    }
+    if let Some(b) = metadata.encrypted {
+        set_attribute(path, FIELD_ENCRYPTED, if b { "true" } else { "false" })?;
     }
     Ok(())
 }
@@ -117,7 +131,7 @@ mod tests {
 
     #[test]
     fn write_headers_emits_present_fields() {
-        let meta = Metadata { encryption: Some("aes-256-gcm".to_string()), file_key: Some([7u8; 32]) };
+        let meta = Metadata { encryption: Some("aes-256-gcm".to_string()), file_key: Some([7u8; 32]), ..Default::default() };
         let headers = write_metadata_headers(&meta);
         assert_eq!(headers.len(), 2);
         assert_eq!(headers[0].0, "X-Ark-Meta-Encryption");
@@ -128,7 +142,7 @@ mod tests {
 
     #[test]
     fn write_headers_skips_none_fields() {
-        let meta = Metadata { encryption: None, file_key: None };
+        let meta = Metadata::default();
         assert!(write_metadata_headers(&meta).is_empty());
     }
 
@@ -157,11 +171,12 @@ mod tests {
         let td = TempDir::new("ark_metadata_test");
         let p = td.0.join("file");
         fs::write(&p, b"x").unwrap();
-        let meta = Metadata { encryption: Some("aes-256-gcm".to_string()), file_key: Some([42u8; 32]) };
+        let meta = Metadata { encryption: Some("aes-256-gcm".to_string()), file_key: Some([42u8; 32]), encrypted: Some(true) };
         write_metadata_attributes(&p, &meta).unwrap();
         let loaded = read_metadata_attributes(&p).unwrap();
         assert_eq!(loaded.encryption, meta.encryption);
         assert_eq!(loaded.file_key, meta.file_key);
+        assert_eq!(loaded.encrypted, Some(true));
     }
 
     #[test]
@@ -169,12 +184,13 @@ mod tests {
         let td = TempDir::new("ark_metadata_test");
         let p = td.0.join("file");
         fs::write(&p, b"x").unwrap();
-        let meta = Metadata { encryption: Some("aes-256-gcm".to_string()), file_key: Some([55u8; 32]) };
+        let meta = Metadata { encryption: Some("aes-256-gcm".to_string()), file_key: Some([55u8; 32]), encrypted: Some(true) };
         write_metadata_attributes(&p, &meta).unwrap();
         let attrs = read_metadata_attributes(&p).unwrap();
         let headers = write_metadata_headers(&attrs);
         let back = read_metadata_headers(&headers);
         assert_eq!(back.encryption, meta.encryption);
         assert_eq!(back.file_key, meta.file_key);
+        assert_eq!(back.encrypted, None, "encrypted is client-only, must not round-trip through headers");
     }
 }

@@ -2,14 +2,10 @@ use std::fs;
 use std::io::Read;
 use std::path::PathBuf;
 
-use aes_gcm::aead::Aead;
-use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
-
+use crate::crypto::{ENCRYPTION_ALGORITHM, encrypt_body_with};
 use crate::metadata::{Metadata, read_metadata_attributes, write_metadata_attributes, write_metadata_headers};
 use crate::request::request_ark;
-use crate::util::{io_err};
-
-pub const ENCRYPTION_ALGORITHM: &str = "aes-256-gcm";
+use crate::util::io_err;
 
 pub fn cmd_put(arg: &str, input: Option<&str>) -> std::io::Result<()> {
     let input_path: Option<PathBuf> = input.map(PathBuf::from);
@@ -23,7 +19,7 @@ pub fn cmd_put(arg: &str, input: Option<&str>) -> std::io::Result<()> {
     };
     let existing = match input_path.as_deref() {
         Some(p) => read_metadata_attributes(p)?,
-        None => Metadata { encryption: None, file_key: None },
+        None => Metadata::default(),
     };
     let algorithm = existing.encryption.unwrap_or_else(|| ENCRYPTION_ALGORITHM.to_string());
     let file_key = match existing.file_key {
@@ -33,7 +29,7 @@ pub fn cmd_put(arg: &str, input: Option<&str>) -> std::io::Result<()> {
     let mut nonce = [0u8; 12];
     getrandom::getrandom(&mut nonce).map_err(|e| io_err(&e.to_string()))?;
     let ciphertext = encrypt_body_with(&plaintext, &file_key, &nonce)?;
-    let meta = Metadata { encryption: Some(algorithm), file_key: Some(file_key) };
+    let meta = Metadata { encryption: Some(algorithm), file_key: Some(file_key), encrypted: Some(false) };
     let header_strs = write_metadata_headers(&meta);
     let extra: Vec<(&str, &str)> = header_strs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     let (code, _, resp) = request_ark("PUT", arg, &ciphertext, &extra)?;
@@ -52,35 +48,15 @@ fn random_key() -> std::io::Result<[u8; 32]> {
     Ok(k)
 }
 
-pub fn encrypt_body_with(plaintext: &[u8], key: &[u8; 32], nonce: &[u8; 12]) -> std::io::Result<Vec<u8>> {
-    let cipher = Aes256Gcm::new(key.into());
-    let ct = cipher
-        .encrypt(Nonce::from_slice(nonce), plaintext)
-        .map_err(|e| io_err(&format!("encrypt: {}", e)))?;
-    let mut out = Vec::with_capacity(12 + ct.len());
-    out.extend_from_slice(nonce);
-    out.extend_from_slice(&ct);
-    Ok(out)
-}
-
-#[cfg(test)]
-pub fn decrypt_body_with(ciphertext: &[u8], key: &[u8; 32]) -> std::io::Result<Vec<u8>> {
-    if ciphertext.len() < 12 {
-        return Err(io_err("ciphertext too short"));
-    }
-    let cipher = Aes256Gcm::new(key.into());
-    let nonce = Nonce::from_slice(&ciphertext[..12]);
-    cipher
-        .decrypt(nonce, &ciphertext[12..])
-        .map_err(|e| io_err(&format!("decrypt: {}", e)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::create_account::create_account_with_seed;
+    use crate::crypto::decrypt_body_with;
     use crate::server::start_test_server;
+    use crate::util::B64;
     use crate::util::testutil::{TempDir, with_cwd};
+    use base64::Engine;
 
     fn put_via_cmd(td: &TempDir, arg: &str, plaintext: &[u8], cwd_subpath: &str) -> PathBuf {
         let input = td.0.join("input.bin");
@@ -92,19 +68,7 @@ mod tests {
         input
     }
 
-    #[test]
-    fn encrypt_decrypt_round_trip() {
-        let key = [9u8; 32];
-        let nonce = [3u8; 12];
-        let plaintext = b"secret payload";
-        let ct = encrypt_body_with(plaintext, &key, &nonce).unwrap();
-        assert_eq!(&ct[..12], &nonce);
-        assert_ne!(&ct[12..], plaintext);
-        let pt = decrypt_body_with(&ct, &key).unwrap();
-        assert_eq!(pt, plaintext);
-    }
-
-    #[test]
+#[test]
     fn cmd_put_encrypts_body_and_stores_meta_xattr() {
         let td = TempDir::new("ark_put_test");
         let port = start_test_server(td.0.clone());
