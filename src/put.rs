@@ -20,7 +20,7 @@ pub fn cmd_put(arg: &str, input: Option<&str>) -> std::io::Result<()> {
     };
     let (ciphertext, _key) = encrypt_body(&plaintext)?;
     let extra = [("X-Ark-Meta-Encryption", ENCRYPTION_ALGORITHM)];
-    let (code, resp) = request_ark("PUT", arg, &ciphertext, &extra)?;
+    let (code, _, resp) = request_ark("PUT", arg, &ciphertext, &extra)?;
     if code != 201 && code != 204 {
         return Err(io_err(&format!("HTTP {}: {}", code, String::from_utf8_lossy(&resp))));
     }

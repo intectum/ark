@@ -275,17 +275,36 @@ fn serve_get(stream: &mut TcpStream, path: &Path, send_body: bool) -> std::io::R
         return Ok(());
     }
     let len = meta.len();
-    let headers = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+    let mut headers = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
         content_type(path),
         len
     );
+    for (name, val) in read_ark_xattrs(path)? {
+        headers.push_str(&format!("X-Ark-Meta-{}: {}\r\n", name, val));
+    }
+    headers.push_str("\r\n");
     stream.write_all(headers.as_bytes())?;
     if send_body {
         let mut f = fs::File::open(path)?;
         std::io::copy(&mut f, stream)?;
     }
     Ok(())
+}
+
+fn read_ark_xattrs(path: &Path) -> std::io::Result<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    for attr in xattr::list(path)? {
+        let name = attr.to_string_lossy().into_owned();
+        if let Some(suffix) = name.strip_prefix("user.ark.") {
+            if let Some(val) = xattr::get(path, &name)? {
+                if let Ok(s) = String::from_utf8(val) {
+                    out.push((suffix.to_string(), s));
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn serve_put(stream: &mut TcpStream, path: &Path, body: &[u8], meta: &[(String, String)]) -> std::io::Result<()> {
@@ -789,6 +808,35 @@ mod tests {
             xattr::get(&p, "user.ark.foo").unwrap().as_deref(),
             Some(b"bar".as_slice())
         );
+    }
+
+    #[test]
+    fn get_returns_x_ark_meta_headers_from_xattr() {
+        let td = TempDir::new("ark_server_test");
+        let (acc, sk) = setup_account(&td.0, "test", [30u8; 32]);
+        let file = acc.join("secret");
+        fs::write(&file, b"ciphertext").unwrap();
+        xattr::set(&file, "user.ark.encryption", b"aes-256-gcm").unwrap();
+        xattr::set(&file, "user.ark.foo", b"bar").unwrap();
+        let port = start_server(td.0.clone());
+
+        let (code, body, headers) = signed_request(port, &sk, "GET", "/ark/test/secret", &[]);
+        assert_eq!(code, 200);
+        assert_eq!(body, b"ciphertext");
+        assert_eq!(header(&headers, "x-ark-meta-encryption"), Some("aes-256-gcm"));
+        assert_eq!(header(&headers, "x-ark-meta-foo"), Some("bar"));
+    }
+
+    #[test]
+    fn get_file_without_xattr_omits_meta_headers() {
+        let td = TempDir::new("ark_server_test");
+        let (acc, sk) = setup_account(&td.0, "test", [31u8; 32]);
+        fs::write(acc.join("plain"), b"raw").unwrap();
+        let port = start_server(td.0.clone());
+
+        let (code, _, headers) = signed_request(port, &sk, "GET", "/ark/test/plain", &[]);
+        assert_eq!(code, 200);
+        assert!(headers.iter().all(|(k, _)| !k.starts_with("x-ark-meta-")));
     }
 
     #[test]

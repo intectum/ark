@@ -29,7 +29,7 @@ pub fn request(
     body: &[u8],
     sk: &SigningKey,
     extra_headers: &[(&str, &str)],
-) -> std::io::Result<(u16, Vec<u8>)> {
+) -> std::io::Result<(u16, Vec<(String, String)>, Vec<u8>)> {
     let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
     let msg = signing_message(method, path, ts, body);
     let sig_b64 = B64.encode(sk.sign(&msg).to_bytes());
@@ -57,15 +57,22 @@ pub fn request(
         .position(|w| w == b"\r\n\r\n")
         .ok_or_else(|| io_err("malformed response (no header end)"))?;
     let header_str = std::str::from_utf8(&buf[..split]).map_err(|_| io_err("non-utf8 headers"))?;
-    let status_line = header_str.lines().next().ok_or_else(|| io_err("empty response"))?;
+    let mut lines = header_str.split("\r\n");
+    let status_line = lines.next().ok_or_else(|| io_err("empty response"))?;
     let code: u16 = status_line
         .split_whitespace()
         .nth(1)
         .ok_or_else(|| io_err("no status code"))?
         .parse()
         .map_err(|_| io_err("bad status code"))?;
+    let mut resp_headers = Vec::new();
+    for line in lines {
+        if let Some((k, v)) = line.split_once(':') {
+            resp_headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
+        }
+    }
     let resp_body = buf[split + 4..].to_vec();
-    Ok((code, resp_body))
+    Ok((code, resp_headers, resp_body))
 }
 
 pub fn request_ark(
@@ -73,7 +80,7 @@ pub fn request_ark(
     arg: &str,
     body: &[u8],
     extra_headers: &[(&str, &str)],
-) -> std::io::Result<(u16, Vec<u8>)> {
+) -> std::io::Result<(u16, Vec<(String, String)>, Vec<u8>)> {
     let cwd = std::env::current_dir()?;
     let ctx = load_identity_from_tree(&cwd)?;
     let target = resolve_target(&cwd, &ctx, arg);
@@ -144,9 +151,10 @@ mod tests {
         });
 
         let sk = SigningKey::from_bytes(&[1u8; 32]);
-        let (code, body) = request("PUT", "127.0.0.1", port, "127.0.0.1", "/x", b"data", &sk, &[]).unwrap();
+        let (code, headers, body) = request("PUT", "127.0.0.1", port, "127.0.0.1", "/x", b"data", &sk, &[]).unwrap();
         assert_eq!(code, 201);
         assert_eq!(body, b"hello");
+        assert!(headers.iter().any(|(k, v)| k == "content-length" && v == "5"));
         handle.join().unwrap();
     }
 
@@ -161,7 +169,7 @@ mod tests {
         });
 
         let sk = SigningKey::from_bytes(&[2u8; 32]);
-        let (code, _) = request("PUT", "127.0.0.1", port, "example.com", "/ark/alice/x", b"payload", &sk, &[]).unwrap();
+        let (code, _, _) = request("PUT", "127.0.0.1", port, "example.com", "/ark/alice/x", b"payload", &sk, &[]).unwrap();
         assert_eq!(code, 204);
 
         let req = captured.join().unwrap();
@@ -183,7 +191,7 @@ mod tests {
         });
 
         let sk = SigningKey::from_bytes(&[3u8; 32]);
-        request("GET", "127.0.0.1", port, "127.0.0.1", "/ark/x", &[], &sk, &[]).unwrap();
+        let _ = request("GET", "127.0.0.1", port, "127.0.0.1", "/ark/x", &[], &sk, &[]).unwrap();
 
         let req = captured.join().unwrap();
         let auth = parse_header(&req, "Authorization").unwrap();
@@ -207,7 +215,7 @@ mod tests {
         });
 
         let sk = SigningKey::from_bytes(&[4u8; 32]);
-        let (code, body) = request("GET", "127.0.0.1", port, "127.0.0.1", "/ark/x", &[], &sk, &[]).unwrap();
+        let (code, _, body) = request("GET", "127.0.0.1", port, "127.0.0.1", "/ark/x", &[], &sk, &[]).unwrap();
         assert_eq!(code, 403);
         assert_eq!(body, b"denied!");
     }
@@ -223,7 +231,7 @@ mod tests {
         });
 
         let sk = SigningKey::from_bytes(&[5u8; 32]);
-        request(
+        let _ = request(
             "PUT",
             "127.0.0.1",
             port,

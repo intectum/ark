@@ -1,17 +1,31 @@
 use std::fs;
 use std::io::Write;
+use std::path::Path;
 
 use crate::request::request_ark;
 use crate::util::io_err;
 
 pub fn cmd_get(arg: &str, output: Option<&str>) -> std::io::Result<()> {
-    let (code, body) = request_ark("GET", arg, &[], &[])?;
+    let (code, headers, body) = request_ark("GET", arg, &[], &[])?;
     if code != 200 {
         return Err(io_err(&format!("HTTP {}: {}", code, String::from_utf8_lossy(&body))));
     }
     match output {
-        Some(f) => fs::write(f, body)?,
+        Some(f) => {
+            fs::write(f, &body)?;
+            write_meta_xattrs(Path::new(f), &headers)?;
+        }
         None => std::io::stdout().write_all(&body)?,
+    }
+    Ok(())
+}
+
+fn write_meta_xattrs(path: &Path, headers: &[(String, String)]) -> std::io::Result<()> {
+    for (k, v) in headers {
+        if let Some(suffix) = k.strip_prefix("x-ark-meta-") {
+            let attr = format!("user.ark.{}", suffix);
+            xattr::set(path, &attr, v.as_bytes())?;
+        }
     }
     Ok(())
 }
@@ -104,6 +118,37 @@ mod tests {
             cmd_get(&arg, Some(out.to_str().unwrap())).unwrap();
         });
         assert_eq!(fs::read(&out).unwrap(), b"via address");
+    }
+
+    #[test]
+    fn get_writes_xattrs_from_response_headers() {
+        let td = TempDir::new("ark_get_test");
+        let (listener, port) = bind_local();
+        let address = format!("gyan@127.0.0.1:{}", port);
+        create_account_with_seed(&td.0, &address, [210u8; 32]).unwrap();
+        let server_file = td.0.join("ark/gyan/secret");
+        fs::write(&server_file, b"ciphertext").unwrap();
+        xattr::set(&server_file, "user.ark.encryption", b"aes-256-gcm").unwrap();
+        xattr::set(&server_file, "user.ark.foo", b"bar").unwrap();
+
+        let root = td.0.clone();
+        thread::spawn(move || serve(listener, root, false));
+
+        let account_dir = td.0.join("ark").join("gyan");
+        let out = td.0.join("out.bin");
+        with_cwd(&account_dir, || {
+            cmd_get("secret", Some(out.to_str().unwrap())).unwrap();
+        });
+
+        assert_eq!(fs::read(&out).unwrap(), b"ciphertext");
+        assert_eq!(
+            xattr::get(&out, "user.ark.encryption").unwrap().as_deref(),
+            Some(b"aes-256-gcm".as_slice())
+        );
+        assert_eq!(
+            xattr::get(&out, "user.ark.foo").unwrap().as_deref(),
+            Some(b"bar".as_slice())
+        );
     }
 
     #[test]
