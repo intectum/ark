@@ -4,16 +4,23 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-fn main() {
-    let port: u16 = env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(8080);
+use base64::Engine;
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+use crate::util::B64;
+
+const MAX_CLOCK_SKEW_SECS: u64 = 300;
+
+pub fn cmd_server(port: u16) {
     let root = env::current_dir().expect("cwd");
     let listener = TcpListener::bind(("0.0.0.0", port)).expect("bind");
     eprintln!("serving {} on http://0.0.0.0:{}", root.display(), port);
     serve(listener, root, true);
 }
 
-fn serve(listener: TcpListener, root: PathBuf, verbose: bool) {
+pub fn serve(listener: TcpListener, root: PathBuf, verbose: bool) {
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
@@ -47,10 +54,12 @@ fn handle(mut stream: TcpStream, root: &Path, verbose: bool) -> std::io::Result<
     if parts.len() != 3 {
         return write_status(&mut stream, 400, "Bad Request", b"bad request line");
     }
-    let method = parts[0];
-    let target = parts[1];
+    let method = parts[0].to_string();
+    let target = parts[1].to_string();
 
     let mut content_length: usize = 0;
+    let mut auth_header: Option<String> = None;
+    let mut timestamp_header: Option<u64> = None;
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line)? == 0 {
@@ -61,8 +70,14 @@ fn handle(mut stream: TcpStream, root: &Path, verbose: bool) -> std::io::Result<
             break;
         }
         if let Some((k, v)) = trimmed.split_once(':') {
-            if k.trim().eq_ignore_ascii_case("content-length") {
-                content_length = v.trim().parse().unwrap_or(0);
+            let key = k.trim();
+            let val = v.trim();
+            if key.eq_ignore_ascii_case("content-length") {
+                content_length = val.parse().unwrap_or(0);
+            } else if key.eq_ignore_ascii_case("authorization") {
+                auth_header = Some(val.to_string());
+            } else if key.eq_ignore_ascii_case("x-ark-timestamp") {
+                timestamp_header = val.parse().ok();
             }
         }
     }
@@ -71,26 +86,46 @@ fn handle(mut stream: TcpStream, root: &Path, verbose: bool) -> std::io::Result<
         eprintln!("{:?} {} {}", peer, method, target);
     }
 
-    if !is_allowed(target) {
+    if !is_allowed(&target) {
         return write_status(&mut stream, 403, "Forbidden", b"forbidden");
     }
 
-    if is_ark_root(target) && method != "GET" && method != "HEAD" {
+    let body = read_body(&mut reader, content_length)?;
+
+    match verify_auth(root, &target, &method, auth_header.as_deref(), timestamp_header, &body) {
+        AuthResult::Ok => {}
+        AuthResult::Unauthorized(msg) => {
+            return write_status(&mut stream, 401, "Unauthorized", msg.as_bytes());
+        }
+        AuthResult::Forbidden(msg) => {
+            return write_status(&mut stream, 403, "Forbidden", msg.as_bytes());
+        }
+    }
+
+    if is_ark_root(&target) && method != "GET" && method != "HEAD" {
         return write_status(&mut stream, 405, "Method Not Allowed", b"method not allowed");
     }
 
-    let path = match resolve(root, target) {
+    let path = match resolve(root, &target) {
         Some(p) => p,
         None => return write_status(&mut stream, 400, "Bad Request", b"bad path"),
     };
 
-    match method {
+    match method.as_str() {
         "GET" => serve_get(&mut stream, &path, true),
         "HEAD" => serve_get(&mut stream, &path, false),
-        "PUT" => serve_put(&mut stream, &mut reader, &path, content_length),
+        "PUT" => serve_put(&mut stream, &path, &body),
         "DELETE" => serve_delete(&mut stream, &path),
         _ => write_status(&mut stream, 405, "Method Not Allowed", b"method not allowed"),
     }
+}
+
+fn read_body(reader: &mut BufReader<TcpStream>, len: usize) -> std::io::Result<Vec<u8>> {
+    let mut buf = vec![0u8; len];
+    if len > 0 {
+        reader.read_exact(&mut buf)?;
+    }
+    Ok(buf)
 }
 
 fn is_allowed(target: &str) -> bool {
@@ -103,6 +138,111 @@ fn is_ark_root(target: &str) -> bool {
     let path = target.split('?').next().unwrap_or("");
     let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     parts.len() == 2 && parts[0] == "ark"
+}
+
+fn account_from_target(target: &str) -> Option<&str> {
+    let path = target.split('?').next()?;
+    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.len() < 2 || parts[0] != "ark" {
+        return None;
+    }
+    Some(parts[1])
+}
+
+enum AuthResult {
+    Ok,
+    Unauthorized(&'static str),
+    Forbidden(&'static str),
+}
+
+fn verify_auth(
+    root: &Path,
+    target: &str,
+    method: &str,
+    auth_header: Option<&str>,
+    timestamp: Option<u64>,
+    body: &[u8],
+) -> AuthResult {
+    let header = match auth_header {
+        Some(h) => h,
+        None => return AuthResult::Unauthorized("missing Authorization header"),
+    };
+    let sig_b64 = match header.strip_prefix("ArkAccount ") {
+        Some(s) => s.trim(),
+        None => return AuthResult::Unauthorized("unsupported Authorization scheme"),
+    };
+    let ts = match timestamp {
+        Some(t) => t,
+        None => return AuthResult::Unauthorized("missing X-Ark-Timestamp header"),
+    };
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    if now.abs_diff(ts) > MAX_CLOCK_SKEW_SECS {
+        return AuthResult::Unauthorized("timestamp outside allowed window");
+    }
+
+    let account = match account_from_target(target) {
+        Some(a) if a != ".." && !a.is_empty() => a,
+        _ => return AuthResult::Forbidden("invalid account"),
+    };
+
+    let id_path = root.join("ark").join(account).join(".ark").join("identity.json");
+    let id_content = match fs::read_to_string(&id_path) {
+        Ok(s) => s,
+        Err(_) => return AuthResult::Forbidden("identity not found"),
+    };
+    let id_json: serde_json::Value = match serde_json::from_str(&id_content) {
+        Ok(v) => v,
+        Err(_) => return AuthResult::Forbidden("identity not parseable"),
+    };
+    let key_obj = match id_json.get("key") {
+        Some(k) => k,
+        None => return AuthResult::Forbidden("missing key field"),
+    };
+    let algo = key_obj.get("algorithm").and_then(|v| v.as_str()).unwrap_or("");
+    if algo != "ed25519" {
+        return AuthResult::Forbidden("unsupported key algorithm");
+    }
+    let key_b64 = match key_obj.get("public_key").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => return AuthResult::Forbidden("missing public_key"),
+    };
+    let key_bytes = match B64.decode(key_b64) {
+        Ok(b) => b,
+        Err(_) => return AuthResult::Forbidden("public_key not base64url"),
+    };
+    let key_arr: [u8; 32] = match key_bytes.as_slice().try_into() {
+        Ok(a) => a,
+        Err(_) => return AuthResult::Forbidden("public_key wrong length"),
+    };
+    let vk = match VerifyingKey::from_bytes(&key_arr) {
+        Ok(v) => v,
+        Err(_) => return AuthResult::Forbidden("public_key invalid"),
+    };
+
+    let sig_bytes = match B64.decode(sig_b64) {
+        Ok(b) => b,
+        Err(_) => return AuthResult::Forbidden("signature not base64"),
+    };
+    let sig_arr: [u8; 64] = match sig_bytes.as_slice().try_into() {
+        Ok(a) => a,
+        Err(_) => return AuthResult::Forbidden("signature wrong length"),
+    };
+    let sig = Signature::from_bytes(&sig_arr);
+
+    let mut msg = Vec::with_capacity(method.len() + target.len() + 32 + body.len());
+    msg.extend_from_slice(method.as_bytes());
+    msg.push(b'\n');
+    msg.extend_from_slice(target.as_bytes());
+    msg.push(b'\n');
+    msg.extend_from_slice(ts.to_string().as_bytes());
+    msg.push(b'\n');
+    msg.extend_from_slice(body);
+
+    if vk.verify(&msg, &sig).is_ok() {
+        AuthResult::Ok
+    } else {
+        AuthResult::Forbidden("signature verification failed")
+    }
 }
 
 fn resolve(root: &Path, target: &str) -> Option<PathBuf> {
@@ -174,28 +314,13 @@ fn serve_get(stream: &mut TcpStream, path: &Path, send_body: bool) -> std::io::R
     Ok(())
 }
 
-fn serve_put(
-    stream: &mut TcpStream,
-    reader: &mut BufReader<TcpStream>,
-    path: &Path,
-    len: usize,
-) -> std::io::Result<()> {
+fn serve_put(stream: &mut TcpStream, path: &Path, body: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let existed = path.exists();
     let mut f = fs::File::create(path)?;
-    let mut remaining = len;
-    let mut buf = [0u8; 8192];
-    while remaining > 0 {
-        let want = remaining.min(buf.len());
-        let n = reader.read(&mut buf[..want])?;
-        if n == 0 {
-            break;
-        }
-        f.write_all(&buf[..n])?;
-        remaining -= n;
-    }
+    f.write_all(body)?;
     let (code, msg) = if existed { (204, "No Content") } else { (201, "Created") };
     let response = format!("HTTP/1.1 {} {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", code, msg);
     stream.write_all(response.as_bytes())?;
@@ -292,13 +417,15 @@ fn write_status(stream: &mut TcpStream, code: u16, msg: &str, body: &[u8]) -> st
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use crate::create_account::create_account_with_seed;
+    use ed25519_dalek::{Signer, SigningKey};
+    use std::time::Duration;
 
     struct TempDir(PathBuf);
     impl TempDir {
         fn new() -> Self {
             let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-            let p = env::temp_dir().join(format!("file_server_test_{}_{}", std::process::id(), nanos));
+            let p = env::temp_dir().join(format!("ark_server_test_{}_{}", std::process::id(), nanos));
             fs::create_dir_all(&p).unwrap();
             TempDir(p)
         }
@@ -316,15 +443,38 @@ mod tests {
         port
     }
 
-    fn request(port: u16, method: &str, path: &str, body: &[u8]) -> (u16, Vec<u8>, Vec<(String, String)>) {
+    fn setup_account(td: &Path, account: &str, seed: [u8; 32]) -> (PathBuf, SigningKey) {
+        let address = format!("{}@example.com", account);
+        let (sk, _) = create_account_with_seed(td, &address, seed).unwrap();
+        let acc_dir = td.join("ark").join(account);
+        (acc_dir, sk)
+    }
+
+    fn sign(sk: &SigningKey, method: &str, path: &str, ts: u64, body: &[u8]) -> String {
+        let mut msg = Vec::new();
+        msg.extend_from_slice(method.as_bytes());
+        msg.push(b'\n');
+        msg.extend_from_slice(path.as_bytes());
+        msg.push(b'\n');
+        msg.extend_from_slice(ts.to_string().as_bytes());
+        msg.push(b'\n');
+        msg.extend_from_slice(body);
+        let sig = sk.sign(&msg);
+        B64.encode(sig.to_bytes())
+    }
+
+    fn now_secs() -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+    }
+
+    fn request(port: u16, method: &str, path: &str, body: &[u8], extra: &[(&str, &str)]) -> (u16, Vec<u8>, Vec<(String, String)>) {
         let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let head = format!(
-            "{} {} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            method,
-            path,
-            body.len()
-        );
+        let mut head = format!("{} {} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n", method, path, body.len());
+        for (k, v) in extra {
+            head.push_str(&format!("{}: {}\r\n", k, v));
+        }
+        head.push_str("\r\n");
         s.write_all(head.as_bytes()).unwrap();
         if !body.is_empty() {
             s.write_all(body).unwrap();
@@ -346,23 +496,25 @@ mod tests {
         (code, body_bytes, headers)
     }
 
-    fn header<'a>(headers: &'a [(String, String)], key: &str) -> Option<&'a str> {
-        headers.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    fn signed_request(port: u16, sk: &SigningKey, method: &str, path: &str, body: &[u8]) -> (u16, Vec<u8>, Vec<(String, String)>) {
+        let ts = now_secs();
+        let sig_b64 = sign(sk, method, path, ts, body);
+        let auth = format!("ArkAccount {}", sig_b64);
+        let ts_str = ts.to_string();
+        request(port, method, path, body, &[("Authorization", &auth), ("X-Ark-Timestamp", &ts_str)])
     }
 
-    fn ark(td: &Path) -> PathBuf {
-        let p = td.join("ark").join("test");
-        fs::create_dir_all(&p).unwrap();
-        p
+    fn header<'a>(headers: &'a [(String, String)], key: &str) -> Option<&'a str> {
+        headers.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
     }
 
     #[test]
     fn get_file_returns_content() {
         let td = TempDir::new();
-        let a = ark(&td.0);
-        fs::write(a.join("hello.txt"), b"hi there").unwrap();
+        let (acc, sk) = setup_account(&td.0, "test", [1u8; 32]);
+        fs::write(acc.join("hello.txt"), b"hi there").unwrap();
         let port = start_server(td.0.clone());
-        let (code, body, headers) = request(port, "GET", "/ark/test/hello.txt", &[]);
+        let (code, body, headers) = signed_request(port, &sk, "GET", "/ark/test/hello.txt", &[]);
         assert_eq!(code, 200);
         assert_eq!(body, b"hi there");
         assert_eq!(header(&headers, "content-length"), Some("8"));
@@ -371,20 +523,20 @@ mod tests {
     #[test]
     fn get_missing_file_404() {
         let td = TempDir::new();
-        ark(&td.0);
+        let (_acc, sk) = setup_account(&td.0, "test", [2u8; 32]);
         let port = start_server(td.0.clone());
-        let (code, _, _) = request(port, "GET", "/ark/test/nope.txt", &[]);
+        let (code, _, _) = signed_request(port, &sk, "GET", "/ark/test/nope.txt", &[]);
         assert_eq!(code, 404);
     }
 
     #[test]
     fn get_dir_returns_json_listing() {
         let td = TempDir::new();
-        let a = ark(&td.0);
-        fs::write(a.join("a.txt"), b"a").unwrap();
-        fs::create_dir(a.join("sub")).unwrap();
+        let (acc, sk) = setup_account(&td.0, "test", [3u8; 32]);
+        fs::write(acc.join("a.txt"), b"a").unwrap();
+        fs::create_dir(acc.join("sub")).unwrap();
         let port = start_server(td.0.clone());
-        let (code, body, headers) = request(port, "GET", "/ark/test/", &[]);
+        let (code, body, headers) = signed_request(port, &sk, "GET", "/ark/test/", &[]);
         assert_eq!(code, 200);
         assert_eq!(header(&headers, "content-type"), Some("application/json"));
         let s = std::str::from_utf8(&body).unwrap();
@@ -397,10 +549,10 @@ mod tests {
     #[test]
     fn head_file_no_body_with_length() {
         let td = TempDir::new();
-        let a = ark(&td.0);
-        fs::write(a.join("x"), b"abcde").unwrap();
+        let (acc, sk) = setup_account(&td.0, "test", [4u8; 32]);
+        fs::write(acc.join("x"), b"abcde").unwrap();
         let port = start_server(td.0.clone());
-        let (code, body, headers) = request(port, "HEAD", "/ark/test/x", &[]);
+        let (code, body, headers) = signed_request(port, &sk, "HEAD", "/ark/test/x", &[]);
         assert_eq!(code, 200);
         assert!(body.is_empty());
         assert_eq!(header(&headers, "content-length"), Some("5"));
@@ -409,9 +561,9 @@ mod tests {
     #[test]
     fn head_dir_no_body_with_json_type() {
         let td = TempDir::new();
-        ark(&td.0);
+        let (_acc, sk) = setup_account(&td.0, "test", [5u8; 32]);
         let port = start_server(td.0.clone());
-        let (code, body, headers) = request(port, "HEAD", "/ark/test/", &[]);
+        let (code, body, headers) = signed_request(port, &sk, "HEAD", "/ark/test/", &[]);
         assert_eq!(code, 200);
         assert!(body.is_empty());
         assert_eq!(header(&headers, "content-type"), Some("application/json"));
@@ -420,9 +572,9 @@ mod tests {
     #[test]
     fn put_new_file_returns_201() {
         let td = TempDir::new();
-        ark(&td.0);
+        let (_acc, sk) = setup_account(&td.0, "test", [6u8; 32]);
         let port = start_server(td.0.clone());
-        let (code, _, _) = request(port, "PUT", "/ark/test/new.txt", b"payload");
+        let (code, _, _) = signed_request(port, &sk, "PUT", "/ark/test/new.txt", b"payload");
         assert_eq!(code, 201);
         assert_eq!(fs::read(td.0.join("ark/test/new.txt")).unwrap(), b"payload");
     }
@@ -430,10 +582,10 @@ mod tests {
     #[test]
     fn put_overwrite_returns_204() {
         let td = TempDir::new();
-        let a = ark(&td.0);
-        fs::write(a.join("x"), b"old").unwrap();
+        let (acc, sk) = setup_account(&td.0, "test", [7u8; 32]);
+        fs::write(acc.join("x"), b"old").unwrap();
         let port = start_server(td.0.clone());
-        let (code, _, _) = request(port, "PUT", "/ark/test/x", b"new content");
+        let (code, _, _) = signed_request(port, &sk, "PUT", "/ark/test/x", b"new content");
         assert_eq!(code, 204);
         assert_eq!(fs::read(td.0.join("ark/test/x")).unwrap(), b"new content");
     }
@@ -441,8 +593,9 @@ mod tests {
     #[test]
     fn put_nested_path_creates_dirs() {
         let td = TempDir::new();
+        let (_acc, sk) = setup_account(&td.0, "test", [8u8; 32]);
         let port = start_server(td.0.clone());
-        let (code, _, _) = request(port, "PUT", "/ark/test/a/b/c.txt", b"deep");
+        let (code, _, _) = signed_request(port, &sk, "PUT", "/ark/test/a/b/c.txt", b"deep");
         assert_eq!(code, 201);
         assert_eq!(fs::read(td.0.join("ark/test/a/b/c.txt")).unwrap(), b"deep");
     }
@@ -450,11 +603,11 @@ mod tests {
     #[test]
     fn delete_file_removes_and_returns_204() {
         let td = TempDir::new();
-        let a = ark(&td.0);
-        let p = a.join("d.txt");
+        let (acc, sk) = setup_account(&td.0, "test", [9u8; 32]);
+        let p = acc.join("d.txt");
         fs::write(&p, b"bye").unwrap();
         let port = start_server(td.0.clone());
-        let (code, _, _) = request(port, "DELETE", "/ark/test/d.txt", &[]);
+        let (code, _, _) = signed_request(port, &sk, "DELETE", "/ark/test/d.txt", &[]);
         assert_eq!(code, 204);
         assert!(!p.exists());
     }
@@ -462,12 +615,12 @@ mod tests {
     #[test]
     fn delete_dir_recursively_removes_and_returns_204() {
         let td = TempDir::new();
-        let a = ark(&td.0);
-        let d = a.join("sub");
+        let (acc, sk) = setup_account(&td.0, "test", [10u8; 32]);
+        let d = acc.join("sub");
         fs::create_dir(&d).unwrap();
         fs::write(d.join("inner"), b"x").unwrap();
         let port = start_server(td.0.clone());
-        let (code, _, _) = request(port, "DELETE", "/ark/test/sub", &[]);
+        let (code, _, _) = signed_request(port, &sk, "DELETE", "/ark/test/sub", &[]);
         assert_eq!(code, 204);
         assert!(!d.exists());
     }
@@ -475,27 +628,27 @@ mod tests {
     #[test]
     fn delete_missing_404() {
         let td = TempDir::new();
-        ark(&td.0);
+        let (_acc, sk) = setup_account(&td.0, "test", [11u8; 32]);
         let port = start_server(td.0.clone());
-        let (code, _, _) = request(port, "DELETE", "/ark/test/nope", &[]);
+        let (code, _, _) = signed_request(port, &sk, "DELETE", "/ark/test/nope", &[]);
         assert_eq!(code, 404);
     }
 
     #[test]
     fn unsupported_method_returns_405() {
         let td = TempDir::new();
-        ark(&td.0);
+        let (_acc, sk) = setup_account(&td.0, "test", [12u8; 32]);
         let port = start_server(td.0.clone());
-        let (code, _, _) = request(port, "POST", "/ark/test/x", b"hello");
+        let (code, _, _) = signed_request(port, &sk, "POST", "/ark/test/x", b"hello");
         assert_eq!(code, 405);
     }
 
     #[test]
     fn path_traversal_blocked() {
         let td = TempDir::new();
-        ark(&td.0);
+        let (_acc, sk) = setup_account(&td.0, "test", [13u8; 32]);
         let port = start_server(td.0.clone());
-        let (code, _, _) = request(port, "GET", "/ark/test/../../../etc/passwd", &[]);
+        let (code, _, _) = signed_request(port, &sk, "GET", "/ark/test/../../../etc/passwd", &[]);
         assert_eq!(code, 400);
     }
 
@@ -503,7 +656,7 @@ mod tests {
     fn root_blocked_403() {
         let td = TempDir::new();
         let port = start_server(td.0.clone());
-        let (code, _, _) = request(port, "GET", "/", &[]);
+        let (code, _, _) = request(port, "GET", "/", &[], &[]);
         assert_eq!(code, 403);
     }
 
@@ -511,7 +664,7 @@ mod tests {
     fn non_ark_path_blocked_403() {
         let td = TempDir::new();
         let port = start_server(td.0.clone());
-        let (code, _, _) = request(port, "GET", "/something/else", &[]);
+        let (code, _, _) = request(port, "GET", "/something/else", &[], &[]);
         assert_eq!(code, 403);
     }
 
@@ -519,27 +672,27 @@ mod tests {
     fn ark_without_subdir_blocked_403() {
         let td = TempDir::new();
         let port = start_server(td.0.clone());
-        let (code1, _, _) = request(port, "GET", "/ark", &[]);
-        let (code2, _, _) = request(port, "GET", "/ark/", &[]);
-        assert_eq!(code1, 403);
-        assert_eq!(code2, 403);
+        let (c1, _, _) = request(port, "GET", "/ark", &[], &[]);
+        let (c2, _, _) = request(port, "GET", "/ark/", &[], &[]);
+        assert_eq!(c1, 403);
+        assert_eq!(c2, 403);
     }
 
     #[test]
     fn put_at_ark_root_405() {
         let td = TempDir::new();
-        ark(&td.0);
+        let (_acc, sk) = setup_account(&td.0, "test", [14u8; 32]);
         let port = start_server(td.0.clone());
-        let (code, _, _) = request(port, "PUT", "/ark/test", b"x");
+        let (code, _, _) = signed_request(port, &sk, "PUT", "/ark/test", b"x");
         assert_eq!(code, 405);
     }
 
     #[test]
     fn delete_at_ark_root_405() {
         let td = TempDir::new();
-        ark(&td.0);
+        let (_acc, sk) = setup_account(&td.0, "test", [15u8; 32]);
         let port = start_server(td.0.clone());
-        let (code, _, _) = request(port, "DELETE", "/ark/test", &[]);
+        let (code, _, _) = signed_request(port, &sk, "DELETE", "/ark/test", &[]);
         assert_eq!(code, 405);
         assert!(td.0.join("ark/test").exists());
     }
@@ -548,8 +701,99 @@ mod tests {
     fn put_outside_ark_blocked_403() {
         let td = TempDir::new();
         let port = start_server(td.0.clone());
-        let (code, _, _) = request(port, "PUT", "/oops.txt", b"x");
+        let (code, _, _) = request(port, "PUT", "/oops.txt", b"x", &[]);
         assert_eq!(code, 403);
         assert!(!td.0.join("oops.txt").exists());
+    }
+
+    #[test]
+    fn missing_auth_header_401() {
+        let td = TempDir::new();
+        let (_acc, _sk) = setup_account(&td.0, "test", [16u8; 32]);
+        let port = start_server(td.0.clone());
+        let (code, _, _) = request(port, "GET", "/ark/test/anything", &[], &[]);
+        assert_eq!(code, 401);
+    }
+
+    #[test]
+    fn missing_timestamp_header_401() {
+        let td = TempDir::new();
+        let (_acc, sk) = setup_account(&td.0, "test", [17u8; 32]);
+        let port = start_server(td.0.clone());
+        let sig = sign(&sk, "GET", "/ark/test/x", now_secs(), &[]);
+        let auth = format!("ArkAccount {}", sig);
+        let (code, _, _) = request(port, "GET", "/ark/test/x", &[], &[("Authorization", &auth)]);
+        assert_eq!(code, 401);
+    }
+
+    #[test]
+    fn stale_timestamp_401() {
+        let td = TempDir::new();
+        let (_acc, sk) = setup_account(&td.0, "test", [18u8; 32]);
+        let port = start_server(td.0.clone());
+        let old = now_secs() - (MAX_CLOCK_SKEW_SECS + 60);
+        let sig = sign(&sk, "GET", "/ark/test/x", old, &[]);
+        let auth = format!("ArkAccount {}", sig);
+        let ts = old.to_string();
+        let (code, _, _) = request(port, "GET", "/ark/test/x", &[], &[("Authorization", &auth), ("X-Ark-Timestamp", &ts)]);
+        assert_eq!(code, 401);
+    }
+
+    #[test]
+    fn wrong_signature_403() {
+        let td = TempDir::new();
+        let (_acc, sk) = setup_account(&td.0, "test", [19u8; 32]);
+        let port = start_server(td.0.clone());
+        let ts = now_secs();
+        let sig = sign(&sk, "GET", "/ark/test/somethingelse", ts, &[]);
+        let auth = format!("ArkAccount {}", sig);
+        let ts_s = ts.to_string();
+        let (code, _, _) = request(port, "GET", "/ark/test/realtarget", &[], &[("Authorization", &auth), ("X-Ark-Timestamp", &ts_s)]);
+        assert_eq!(code, 403);
+    }
+
+    #[test]
+    fn wrong_key_403() {
+        let td = TempDir::new();
+        let (_acc, _sk) = setup_account(&td.0, "test", [20u8; 32]);
+        let attacker = SigningKey::from_bytes(&[99u8; 32]);
+        let port = start_server(td.0.clone());
+        let (code, _, _) = signed_request(port, &attacker, "GET", "/ark/test/x", &[]);
+        assert_eq!(code, 403);
+    }
+
+    #[test]
+    fn no_identity_file_403() {
+        let td = TempDir::new();
+        let attacker = SigningKey::from_bytes(&[21u8; 32]);
+        let port = start_server(td.0.clone());
+        let (code, _, _) = signed_request(port, &attacker, "GET", "/ark/ghost/x", &[]);
+        assert_eq!(code, 403);
+    }
+
+    #[test]
+    fn created_identity_authenticates_with_server() {
+        let td = TempDir::new();
+        let (sk, _) = create_account_with_seed(&td.0, "gyan@example.com", [77u8; 32]).unwrap();
+        fs::write(td.0.join("ark/gyan/hello.txt"), b"hi gyan").unwrap();
+        let port = start_server(td.0.clone());
+        let (code, body, _) = signed_request(port, &sk, "GET", "/ark/gyan/hello.txt", &[]);
+        assert_eq!(code, 200);
+        assert_eq!(body, b"hi gyan");
+    }
+
+    #[test]
+    fn put_signature_covers_body() {
+        let td = TempDir::new();
+        let (_acc, sk) = setup_account(&td.0, "test", [22u8; 32]);
+        let port = start_server(td.0.clone());
+        let ts = now_secs();
+        let signed_body = b"original";
+        let sig = sign(&sk, "PUT", "/ark/test/file", ts, signed_body);
+        let auth = format!("ArkAccount {}", sig);
+        let ts_s = ts.to_string();
+        let (code, _, _) = request(port, "PUT", "/ark/test/file", b"tampered", &[("Authorization", &auth), ("X-Ark-Timestamp", &ts_s)]);
+        assert_eq!(code, 403);
+        assert!(!td.0.join("ark/test/file").exists());
     }
 }
