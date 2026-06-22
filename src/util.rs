@@ -216,11 +216,18 @@ pub mod testutil {
 
     pub fn with_cwd<R>(dir: &Path, f: impl FnOnce() -> R) -> R {
         let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = env::current_dir().unwrap();
+        let prev = env::current_dir().unwrap_or_else(|_| env::temp_dir());
+
+        struct Restore(PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = env::set_current_dir(&self.0);
+            }
+        }
+        let _restore = Restore(prev);
+
         env::set_current_dir(dir).unwrap();
-        let result = f();
-        env::set_current_dir(&prev).unwrap();
-        result
+        f()
     }
 
     pub struct TempDir(pub PathBuf);

@@ -1,7 +1,9 @@
 mod create_account;
 mod crypto;
 mod decrypt;
+mod delete;
 mod get;
+mod head;
 mod identity;
 mod metadata;
 mod put;
@@ -13,7 +15,9 @@ use clap::{Parser, Subcommand};
 
 use crate::create_account::cmd_create_account;
 use crate::decrypt::{DecryptArgs, cmd_decrypt};
+use crate::delete::cmd_delete;
 use crate::get::cmd_get;
+use crate::head::cmd_head;
 use crate::put::cmd_put;
 use crate::server::cmd_server;
 
@@ -35,6 +39,16 @@ enum Cmd {
     CreateAccount {
         /// Address in the form <name>@<host>[:<port>].
         address: String,
+    },
+    /// Print response headers (HEAD request).
+    Head {
+        /// Ark URL or path.
+        path: String,
+    },
+    /// Delete a file or directory.
+    Delete {
+        /// Ark URL or path.
+        path: String,
     },
     /// Fetch a file or directory listing.
     Get {
@@ -86,6 +100,8 @@ fn main() {
             Ok(())
         }
         Cmd::CreateAccount { address } => cmd_create_account(&address),
+        Cmd::Head { path } => cmd_head(&path),
+        Cmd::Delete { path } => cmd_delete(&path),
         Cmd::Get { output, decrypt, path } => cmd_get(&path, output.as_deref(), decrypt),
         Cmd::Put { input, no_encrypt, path } => cmd_put(&path, input.as_deref(), no_encrypt),
         Cmd::Decrypt { input, output, in_place, key, algorithm } => {
