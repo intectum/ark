@@ -207,7 +207,7 @@ The `ark` account is a special account created when the server is first started.
 
 ## 3 Files & Directories
 
-Ark is - at it's core - a file server. All files and directories managed by Ark are given additional metadata. This metadata is not encrypted but is signed by the last modifier of the file or directory to prevent tampering. File content is encrypted by default but can be unencrypted with `algorithm = "none"`. The [TODO] algorithm must be supported for encryption by all clients. Since the file metadata declares the encryption algorithm, any algorithm can be used, however clients may not support other algorithms (and will therefore be unable to decrypt the file).
+Ark is - at it's core - a file server. All files and directories managed by Ark are given additional metadata. This metadata is not encrypted but is signed by the last modifier of the file or directory to prevent tampering. File content is encrypted by default but can be unencrypted with `algorithm = "none"` [move alg into wrapped key?]. The [TODO] algorithm must be supported for encryption by all clients. Since the file metadata declares the encryption algorithm, any algorithm can be used, however clients may not support other algorithms (and will therefore be unable to decrypt the file).
 
 ### 3.1 ID
 

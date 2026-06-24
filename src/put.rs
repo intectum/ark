@@ -2,14 +2,17 @@ use std::fs;
 use std::io::Read;
 use std::path::PathBuf;
 
-use crate::crypto::{ENCRYPTION_ALGORITHM, encrypt_body_with};
-use crate::metadata::{Metadata, read_metadata_attributes, write_metadata_attributes, write_metadata_headers};
-use crate::request::request_ark;
+use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, encrypt_bytes};
+use crate::identity::read_nearest_identity;
+use crate::metadata::{get_member, read_metadata_attributes, write_metadata_attributes, write_metadata_headers};
+use crate::request::ark_request;
+use crate::types::{Member, Metadata};
 use crate::util::io_err;
 
 pub fn cmd_put(arg: &str, input: Option<&str>, no_encrypt: bool) -> std::io::Result<()> {
     let input_path: Option<PathBuf> = input.map(PathBuf::from);
-    let body_input = match &input_path {
+
+    let body = match &input_path {
         Some(p) => fs::read(p)?,
         None => {
             let mut buf = Vec::new();
@@ -17,90 +20,79 @@ pub fn cmd_put(arg: &str, input: Option<&str>, no_encrypt: bool) -> std::io::Res
             buf
         }
     };
-    let existing = match input_path.as_deref() {
-        Some(p) => read_metadata_attributes(p)?,
-        None => Metadata::default(),
+
+    let (identity, _) = read_nearest_identity()?;
+
+    let has_existing_metadata = match input_path.as_deref() {
+        Some(p) => xattr::get(p, "user.ark.encryption")?.is_some(),
+        None => false,
     };
-    let already_encrypted = existing.encrypted == Some(true);
 
-    if already_encrypted && !no_encrypt && existing.file_key.is_none() {
-        return Err(io_err("file marked encrypted=true but missing filekey metadata"));
-    }
-
-    let (body, send_meta, back_encrypted) = if no_encrypt {
-        (
-            body_input,
-            Metadata {
-                encryption: existing.encryption.clone(),
-                file_key: existing.file_key,
-                encrypted: None,
-            },
-            existing.encrypted,
-        )
-    } else if already_encrypted {
-        (
-            body_input,
-            Metadata {
-                encryption: existing.encryption.clone(),
-                file_key: existing.file_key,
-                encrypted: None,
-            },
-            Some(true),
-        )
+    let metadata = if has_existing_metadata {
+        read_metadata_attributes(input_path.as_deref().unwrap())?
     } else {
-        let algorithm = existing
-            .encryption
-            .unwrap_or_else(|| ENCRYPTION_ALGORITHM.to_string());
-        let file_key = match existing.file_key {
-            Some(k) => k,
-            None => random_key()?,
-        };
-        let mut nonce = [0u8; 12];
-        getrandom::getrandom(&mut nonce).map_err(|e| io_err(&e.to_string()))?;
-        let ct = encrypt_body_with(&body_input, &file_key, &nonce)?;
-        (
-            ct,
-            Metadata {
-                encryption: Some(algorithm),
-                file_key: Some(file_key),
-                encrypted: None,
-            },
-            Some(false),
-        )
+        Metadata {
+            encryption: DEFAULT_ENCRYPTION_ALGORITHM.to_string(),
+            encrypted: Some(false),
+            members: vec![Member {
+                address: identity.address.clone(),
+                identity_key: identity.key.public_key.clone(),
+                permission: "owner".to_string(),
+                wrapped_file_key: random_key()?
+            }]
+        }
     };
 
-    let header_strs = write_metadata_headers(&send_meta);
-    let extra: Vec<(&str, &str)> = header_strs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    let (code, _, resp) = request_ark("PUT", arg, &body, &extra)?;
-    if code != 201 && code != 204 {
-        return Err(io_err(&format!("HTTP {}: {}", code, String::from_utf8_lossy(&resp))));
+    let member = match get_member(&metadata.members, &identity.address) {
+        Some(m) => m,
+        None => return Err(io_err("no member entry for current account"))
+    };
+
+    let final_body = if metadata.encrypted != Some(true) && !no_encrypt {
+        encrypt_bytes(&member.wrapped_file_key, &body)?
+    } else {
+        body
+    };
+
+    let metadata_headers = write_metadata_headers(&metadata);
+    let extra_headers: Vec<(&str, &str)> = metadata_headers.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
+
+    let (response_code, _, response_body) = ark_request("PUT", arg, &final_body, &extra_headers)?;
+    if response_code != 201 && response_code != 204 {
+        return Err(io_err(&format!("HTTP {}: {}", response_code, String::from_utf8_lossy(&response_body))));
     }
+
     if let Some(p) = input_path.as_deref() {
-        let back = Metadata {
-            encryption: send_meta.encryption,
-            file_key: send_meta.file_key,
-            encrypted: back_encrypted,
-        };
-        write_metadata_attributes(p, &back)?;
+        if !no_encrypt || has_existing_metadata {
+            write_metadata_attributes(p, &metadata)?;
+        }
     }
+
     Ok(())
 }
 
-fn random_key() -> std::io::Result<[u8; 32]> {
-    let mut k = [0u8; 32];
-    getrandom::getrandom(&mut k).map_err(|e| io_err(&e.to_string()))?;
-    Ok(k)
+fn random_key() -> std::io::Result<Vec<u8>> {
+    let mut key = [0u8; 32];
+    getrandom::getrandom(&mut key).map_err(|e| io_err(&e.to_string()))?;
+    Ok(key.to_vec())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::create_account::create_account_with_seed;
-    use crate::crypto::decrypt_body_with;
+    use crate::create_account::create_account_with_key;
+    use crate::crypto::decrypt_bytes;
+    use crate::metadata::read_metadata_attributes;
     use crate::server::start_test_server;
-    use crate::util::B64;
-    use crate::util::testutil::{TempDir, with_cwd};
-    use base64::Engine;
+    use crate::util::test::{TempDir, with_cwd};
+
+    fn read_file_key(path: &std::path::Path) -> Vec<u8> {
+        let m = read_metadata_attributes(path).unwrap();
+        m.members
+            .iter()
+            .next()
+            .expect("file key in members").wrapped_file_key.clone()
+    }
 
     fn put_via_cmd(td: &TempDir, arg: &str, plaintext: &[u8], cwd_subpath: &str) -> PathBuf {
         let input = td.0.join("input.bin");
@@ -117,7 +109,7 @@ mod tests {
         let td = TempDir::new("ark_put_test");
         let port = start_test_server(td.0.clone());
         let address = format!("gyan@127.0.0.1:{}", port);
-        create_account_with_seed(&td.0, &address, [130u8; 32]).unwrap();
+        create_account_with_key(&td.0, &address, &[130u8; 32]).unwrap();
 
         put_via_cmd(&td, "notes.txt", b"plaintext", "ark/gyan");
 
@@ -127,10 +119,8 @@ mod tests {
 
         let alg = xattr::get(&server_path, "user.ark.encryption").unwrap();
         assert_eq!(alg.as_deref(), Some(b"aes-256-gcm".as_slice()));
-        let key_b64 = xattr::get(&server_path, "user.ark.filekey").unwrap().unwrap();
-        let key_bytes = B64.decode(&key_b64).unwrap();
-        let key_arr: [u8; 32] = key_bytes.try_into().unwrap();
-        let decrypted = decrypt_body_with(&on_disk, &key_arr).unwrap();
+        let key = read_file_key(&server_path);
+        let decrypted = decrypt_bytes(&key, &on_disk).unwrap();
         assert_eq!(decrypted, b"plaintext");
     }
 
@@ -139,16 +129,14 @@ mod tests {
         let td = TempDir::new("ark_put_test");
         let port = start_test_server(td.0.clone());
         let address = format!("gyan@127.0.0.1:{}", port);
-        create_account_with_seed(&td.0, &address, [131u8; 32]).unwrap();
+        create_account_with_key(&td.0, &address, &[131u8; 32]).unwrap();
 
         let input = put_via_cmd(&td, "out.bin", b"hello", "ark/gyan");
         assert_eq!(
             xattr::get(&input, "user.ark.encryption").unwrap().as_deref(),
             Some(b"aes-256-gcm".as_slice())
         );
-        let key_b64 = xattr::get(&input, "user.ark.filekey").unwrap().unwrap();
-        let key_bytes = B64.decode(&key_b64).unwrap();
-        assert_eq!(key_bytes.len(), 32);
+        let _key = read_file_key(&input);
     }
 
     #[test]
@@ -156,14 +144,19 @@ mod tests {
         let td = TempDir::new("ark_put_test");
         let port = start_test_server(td.0.clone());
         let address = format!("gyan@127.0.0.1:{}", port);
-        create_account_with_seed(&td.0, &address, [132u8; 32]).unwrap();
+        create_account_with_key(&td.0, &address, &[132u8; 32]).unwrap();
 
         let preset_key = [77u8; 32];
-        let preset_key_b64 = B64.encode(preset_key);
         let input = td.0.join("input.bin");
         fs::write(&input, b"hello").unwrap();
-        xattr::set(&input, "user.ark.encryption", b"aes-256-gcm").unwrap();
-        xattr::set(&input, "user.ark.filekey", preset_key_b64.as_bytes()).unwrap();
+        let owner = Member {
+            address: format!("gyan@127.0.0.1:{}", port),
+            identity_key: [0u8; 32].to_vec(),
+            permission: "owner".to_string(),
+            wrapped_file_key: preset_key.to_vec(),
+        };
+        let preset_meta = Metadata { encryption: "aes-256-gcm".to_string(), encrypted: None, members: vec![owner] };
+        write_metadata_attributes(&input, &preset_meta).unwrap();
 
         let account_dir = td.0.join("ark/gyan");
         with_cwd(&account_dir, || {
@@ -171,11 +164,11 @@ mod tests {
         });
 
         let server_path = td.0.join("ark/gyan/notes.txt");
-        let server_key = xattr::get(&server_path, "user.ark.filekey").unwrap().unwrap();
-        assert_eq!(server_key, preset_key_b64.as_bytes());
+        let server_key = read_file_key(&server_path);
+        assert_eq!(server_key, preset_key);
 
         let ciphertext = fs::read(&server_path).unwrap();
-        let plaintext = decrypt_body_with(&ciphertext, &preset_key).unwrap();
+        let plaintext = decrypt_bytes(&preset_key, &ciphertext).unwrap();
         assert_eq!(plaintext, b"hello");
     }
 
@@ -184,7 +177,7 @@ mod tests {
         let td = TempDir::new("ark_put_test");
         let port = start_test_server(td.0.clone());
         let address = format!("gyan@127.0.0.1:{}", port);
-        create_account_with_seed(&td.0, &address, [133u8; 32]).unwrap();
+        create_account_with_key(&td.0, &address, &[133u8; 32]).unwrap();
 
         let input = td.0.join("input.bin");
         fs::write(&input, b"v1").unwrap();
@@ -192,21 +185,19 @@ mod tests {
         with_cwd(&account_dir, || {
             cmd_put("notes.txt", Some(input.to_str().unwrap()), false).unwrap();
         });
-        let key1 = xattr::get(&input, "user.ark.filekey").unwrap().unwrap();
+        let key1 = read_file_key(&input);
 
         fs::write(&input, b"v2").unwrap();
         with_cwd(&account_dir, || {
             cmd_put("notes.txt", Some(input.to_str().unwrap()), false).unwrap();
         });
-        let key2 = xattr::get(&input, "user.ark.filekey").unwrap().unwrap();
+        let key2 = read_file_key(&input);
 
         assert_eq!(key1, key2);
 
         let server_path = td.0.join("ark/gyan/notes.txt");
-        let key_bytes = B64.decode(&key2).unwrap();
-        let key_arr: [u8; 32] = key_bytes.try_into().unwrap();
         let ciphertext = fs::read(&server_path).unwrap();
-        let plaintext = decrypt_body_with(&ciphertext, &key_arr).unwrap();
+        let plaintext = decrypt_bytes(&key2, &ciphertext).unwrap();
         assert_eq!(plaintext, b"v2");
     }
 
@@ -215,7 +206,7 @@ mod tests {
         let td = TempDir::new("ark_put_test");
         let port = start_test_server(td.0.clone());
         let address = format!("gyan@127.0.0.1:{}", port);
-        create_account_with_seed(&td.0, &address, [134u8; 32]).unwrap();
+        create_account_with_key(&td.0, &address, &[134u8; 32]).unwrap();
 
         put_via_cmd(&td, "notes.txt", b"hello", "ark/gyan");
 
@@ -227,7 +218,7 @@ mod tests {
         let td = TempDir::new("ark_put_test");
         let port = start_test_server(td.0.clone());
         let address = format!("gyan@127.0.0.1:{}", port);
-        create_account_with_seed(&td.0, &address, [135u8; 32]).unwrap();
+        create_account_with_key(&td.0, &address, &[135u8; 32]).unwrap();
         fs::write(td.0.join("ark/gyan/x.txt"), b"old").unwrap();
 
         put_via_cmd(&td, "x.txt", b"new plaintext", "ark/gyan");
@@ -242,7 +233,7 @@ mod tests {
         let td = TempDir::new("ark_put_test");
         let port = start_test_server(td.0.clone());
         let address = format!("gyan@127.0.0.1:{}", port);
-        create_account_with_seed(&td.0, &address, [136u8; 32]).unwrap();
+        create_account_with_key(&td.0, &address, &[136u8; 32]).unwrap();
         let notes = td.0.join("ark/gyan/notes");
         fs::create_dir_all(&notes).unwrap();
 
@@ -256,9 +247,9 @@ mod tests {
         let td = TempDir::new("ark_put_test");
         let port = start_test_server(td.0.clone());
         let address = format!("gyan@127.0.0.1:{}", port);
-        create_account_with_seed(&td.0, &address, [137u8; 32]).unwrap();
+        create_account_with_key(&td.0, &address, &[137u8; 32]).unwrap();
 
-        put_via_cmd(&td, "/ark/gyan/sub/file.txt", b"absolute", "ark/gyan");
+        put_via_cmd(&td, "/sub/file.txt", b"absolute", "ark/gyan");
 
         assert!(td.0.join("ark/gyan/sub/file.txt").exists());
     }
@@ -268,7 +259,7 @@ mod tests {
         let td = TempDir::new("ark_put_test");
         let port = start_test_server(td.0.clone());
         let address = format!("gyan@127.0.0.1:{}", port);
-        create_account_with_seed(&td.0, &address, [138u8; 32]).unwrap();
+        create_account_with_key(&td.0, &address, &[138u8; 32]).unwrap();
 
         let arg = format!("gyan@127.0.0.1:{}/explicit.txt", port);
         put_via_cmd(&td, &arg, b"via address", "ark/gyan");
@@ -281,17 +272,24 @@ mod tests {
         let td = TempDir::new("ark_put_test");
         let port = start_test_server(td.0.clone());
         let address = format!("gyan@127.0.0.1:{}", port);
-        create_account_with_seed(&td.0, &address, [150u8; 32]).unwrap();
+        create_account_with_key(&td.0, &address, &[150u8; 32]).unwrap();
 
         // pre-encrypted input
         let key = [88u8; 32];
-        let nonce = [9u8; 12];
-        let ciphertext = encrypt_body_with(b"hidden", &key, &nonce).unwrap();
+        let ciphertext = encrypt_bytes(&key, b"hidden").unwrap();
         let input = td.0.join("input.bin");
         fs::write(&input, &ciphertext).unwrap();
-        xattr::set(&input, "user.ark.encryption", b"aes-256-gcm").unwrap();
-        xattr::set(&input, "user.ark.filekey", B64.encode(key).as_bytes()).unwrap();
-        xattr::set(&input, "user.ark.encrypted", b"true").unwrap();
+        let owner = Member {
+            address: format!("gyan@127.0.0.1:{}", port),
+            identity_key: [0u8; 32].to_vec(),
+            permission: "owner".to_string(),
+            wrapped_file_key: key.to_vec(),
+        };
+        write_metadata_attributes(&input, &Metadata {
+            encryption: "aes-256-gcm".to_string(),
+            encrypted: Some(true),
+            members: vec![owner],
+        }).unwrap();
 
         let account_dir = td.0.join("ark/gyan");
         with_cwd(&account_dir, || {
@@ -307,7 +305,7 @@ mod tests {
             Some(b"true".as_slice())
         );
         // decryption with same key recovers original plaintext
-        assert_eq!(decrypt_body_with(&server_body, &key).unwrap(), b"hidden");
+        assert_eq!(decrypt_bytes(&key, &server_body).unwrap(), b"hidden");
     }
 
     #[test]
@@ -315,7 +313,7 @@ mod tests {
         let td = TempDir::new("ark_put_test");
         let port = start_test_server(td.0.clone());
         let address = format!("gyan@127.0.0.1:{}", port);
-        create_account_with_seed(&td.0, &address, [151u8; 32]).unwrap();
+        create_account_with_key(&td.0, &address, &[151u8; 32]).unwrap();
 
         let input = put_via_cmd(&td, "out.bin", b"plain", "ark/gyan");
         assert_eq!(
@@ -325,30 +323,11 @@ mod tests {
     }
 
     #[test]
-    fn cmd_put_errors_when_encrypted_true_but_no_filekey() {
-        let td = TempDir::new("ark_put_test");
-        let port = start_test_server(td.0.clone());
-        let address = format!("gyan@127.0.0.1:{}", port);
-        create_account_with_seed(&td.0, &address, [152u8; 32]).unwrap();
-
-        let input = td.0.join("input.bin");
-        fs::write(&input, b"x").unwrap();
-        xattr::set(&input, "user.ark.encrypted", b"true").unwrap();
-        // intentionally no filekey
-
-        let account_dir = td.0.join("ark/gyan");
-        let err = with_cwd(&account_dir, || {
-            cmd_put("file.bin", Some(input.to_str().unwrap()), false).unwrap_err()
-        });
-        assert!(err.to_string().contains("missing filekey"), "msg was {}", err);
-    }
-
-    #[test]
     fn cmd_put_no_encrypt_sends_raw_body() {
         let td = TempDir::new("ark_put_test");
         let port = start_test_server(td.0.clone());
         let address = format!("gyan@127.0.0.1:{}", port);
-        create_account_with_seed(&td.0, &address, [160u8; 32]).unwrap();
+        create_account_with_key(&td.0, &address, &[160u8; 32]).unwrap();
 
         let input = td.0.join("input.bin");
         fs::write(&input, b"plain bytes").unwrap();
@@ -360,10 +339,9 @@ mod tests {
 
         let server_path = td.0.join("ark/gyan/raw.bin");
         assert_eq!(fs::read(&server_path).unwrap(), b"plain bytes");
-        // no filekey written since no metadata existed
-        assert_eq!(xattr::get(&server_path, "user.ark.filekey").unwrap(), None);
-        // input file has no metadata written back
-        assert_eq!(xattr::get(&input, "user.ark.filekey").unwrap(), None);
+        // server has default metadata (invariant); input file left untouched
+        assert!(xattr::get(&server_path, "user.ark.encryption").unwrap().is_some());
+        assert_eq!(xattr::get(&input, "user.ark.member_0_address").unwrap(), None);
     }
 
     #[test]
@@ -371,15 +349,23 @@ mod tests {
         let td = TempDir::new("ark_put_test");
         let port = start_test_server(td.0.clone());
         let address = format!("gyan@127.0.0.1:{}", port);
-        create_account_with_seed(&td.0, &address, [161u8; 32]).unwrap();
+        create_account_with_key(&td.0, &address, &[161u8; 32]).unwrap();
 
         let key = [55u8; 32];
-        let nonce = [8u8; 12];
-        let ct = encrypt_body_with(b"secret", &key, &nonce).unwrap();
+        let ct = encrypt_bytes(&key, b"secret").unwrap();
         let input = td.0.join("input.bin");
         fs::write(&input, &ct).unwrap();
-        xattr::set(&input, "user.ark.encryption", b"aes-256-gcm").unwrap();
-        xattr::set(&input, "user.ark.filekey", B64.encode(key).as_bytes()).unwrap();
+        let owner = Member {
+            address: format!("gyan@127.0.0.1:{}", port),
+            identity_key: [0u8; 32].to_vec(),
+            permission: "owner".to_string(),
+            wrapped_file_key: key.to_vec(),
+        };
+        write_metadata_attributes(&input, &Metadata {
+            encryption: "aes-256-gcm".to_string(),
+            encrypted: None,
+            members: vec![owner],
+        }).unwrap();
 
         let account_dir = td.0.join("ark/gyan");
         with_cwd(&account_dir, || {
@@ -389,10 +375,7 @@ mod tests {
         let server_path = td.0.join("ark/gyan/file.bin");
         assert_eq!(fs::read(&server_path).unwrap(), ct);
         // metadata forwarded to server
-        assert_eq!(
-            xattr::get(&server_path, "user.ark.filekey").unwrap().as_deref(),
-            Some(B64.encode(key).as_bytes())
-        );
+        assert_eq!(read_file_key(&server_path), key);
     }
 
     #[test]

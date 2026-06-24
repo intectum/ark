@@ -2,282 +2,177 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use base64::Engine;
-use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
+use crate::crypto::{DEFAULT_SIGNING_ALGORITHM, sign_json, to_public_key, verify_json};
+use crate::types::{Identity, Key, Signature};
+use crate::util::encode_base64url;
+use crate::util::{decode_base64url, io_err, io_invalid_input, now_iso, resolve_url};
 
-use crate::util::{B64, canonicalize_for_sig, is_valid_account_name, is_valid_host_port, unix_to_iso8601};
-
-pub const ED25519: &str = "ed25519";
-
-pub struct Key {
-    pub algorithm: String,
-    pub public_key: String,
-}
-
-pub struct Signature {
-    pub algorithm: String,
-    pub signature: String,
-}
-
-pub struct Identity {
-    pub key: Key,
-    pub address: String,
-    pub updated: String,
-    pub signature: Signature,
-}
-
-pub fn parse_address(address: &str) -> io::Result<(String, String)> {
-    let (name, host) = address.split_once('@').ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "address must be in the form <name>@<host>[:<port>]",
-        )
-    })?;
-    if !is_valid_account_name(name) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "invalid account name (must be lowercase alphanumeric, dots, hyphens, underscores; 1-64 chars; not pure dots)",
-        ));
-    }
-    if !is_valid_host_port(host) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "invalid host[:port] in address",
-        ));
-    }
-    Ok((name.to_string(), host.to_string()))
-}
-
-pub fn verifying_key_from_key(key: &Key) -> io::Result<VerifyingKey> {
-    if key.algorithm != ED25519 {
-        return Err(io_err("unsupported key algorithm"));
-    }
-    let bytes = B64
-        .decode(&key.public_key)
-        .map_err(|e| io_err(&format!("public_key decode: {}", e)))?;
-    let arr: [u8; 32] = bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| io_err("public_key wrong length"))?;
-    VerifyingKey::from_bytes(&arr).map_err(|_| io_err("public_key invalid"))
-}
-
-pub fn key_from_verifying_key(vk: &VerifyingKey) -> Key {
-    Key {
-        algorithm: ED25519.to_string(),
-        public_key: B64.encode(vk.to_bytes()),
-    }
-}
-
-pub fn new_signed_identity(sk: &SigningKey, address: &str, now_secs: u64) -> io::Result<Identity> {
-    parse_address(address)?;
-    let key = key_from_verifying_key(&sk.verifying_key());
-    let updated = unix_to_iso8601(now_secs);
-    let unsigned = serde_json::json!({
-        "key": key_to_json(&key),
-        "address": address,
-        "updated": updated,
-        "signature": { "algorithm": ED25519, "signature": "" }
-    });
-    let canonical = canonicalize_for_sig(&unsigned);
-    let sig = sk.sign(&canonical);
-    Ok(Identity {
-        key,
-        address: address.to_string(),
-        updated,
-        signature: Signature {
-            algorithm: ED25519.to_string(),
-            signature: B64.encode(sig.to_bytes()),
+pub fn create_identity(key: &[u8], address: &str) -> Identity {
+    let mut identity = Identity {
+        key: Key {
+            algorithm: DEFAULT_SIGNING_ALGORITHM.to_string(),
+            public_key: to_public_key(key)
         },
-    })
-}
+        address: address.to_string(),
+        updated: now_iso(),
+        signature: Signature {
+            algorithm: DEFAULT_SIGNING_ALGORITHM.to_string(),
+            signature: Vec::new()
+        }
+    };
 
-pub fn key_from_json(v: &serde_json::Value) -> io::Result<Key> {
-    let algorithm = v
-        .get("algorithm")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| io_err("missing key algorithm"))?
-        .to_string();
-    let public_key = v
-        .get("public_key")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| io_err("missing public_key"))?
-        .to_string();
-    Ok(Key { algorithm, public_key })
-}
+    let json = serde_json::to_value(&identity).expect("serialize identity");
+    identity.signature.signature = sign_json(key, &json);
 
-pub fn key_to_json(key: &Key) -> serde_json::Value {
-    serde_json::json!({
-        "algorithm": key.algorithm,
-        "public_key": key.public_key,
-    })
-}
-
-pub fn signature_from_json(v: &serde_json::Value) -> io::Result<Signature> {
-    let algorithm = v
-        .get("algorithm")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| io_err("missing signature algorithm"))?
-        .to_string();
-    let signature = v
-        .get("signature")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| io_err("missing signature"))?
-        .to_string();
-    Ok(Signature { algorithm, signature })
-}
-
-pub fn signature_to_json(sig: &Signature) -> serde_json::Value {
-    serde_json::json!({
-        "algorithm": sig.algorithm,
-        "signature": sig.signature,
-    })
-}
-
-pub fn identity_from_json(v: &serde_json::Value) -> io::Result<Identity> {
-    let key = key_from_json(v.get("key").ok_or_else(|| io_err("missing key field"))?)?;
-    let address = v
-        .get("address")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| io_err("identity.json missing address"))?
-        .to_string();
-    let updated = v
-        .get("updated")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let signature = signature_from_json(
-        v.get("signature").ok_or_else(|| io_err("missing signature field"))?,
-    )?;
-    Ok(Identity { key, address, updated, signature })
-}
-
-pub fn identity_to_json(identity: &Identity) -> serde_json::Value {
-    serde_json::json!({
-        "key": key_to_json(&identity.key),
-        "address": identity.address,
-        "updated": identity.updated,
-        "signature": signature_to_json(&identity.signature),
-    })
+    identity
 }
 
 pub fn read_identity(path: &Path) -> io::Result<Identity> {
     let content = fs::read_to_string(path)?;
-    let v: serde_json::Value = serde_json::from_str(&content)
+    let identity: Identity = serde_json::from_str(&content)
         .map_err(|e| io_err(&format!("identity.json parse: {}", e)))?;
-    identity_from_json(&v)
+    validate_identity(&identity)?;
+
+    Ok(identity)
+}
+
+pub fn read_nearest_identity() -> io::Result<(Identity, std::path::PathBuf)> {
+    let cwd = std::env::current_dir()?;
+    let mut current: Option<&Path> = Some(&cwd);
+    while let Some(d) = current {
+        let id_path = d.join(".ark").join("identity.json");
+        if id_path.is_file() {
+            let identity = read_identity(&id_path)?;
+            return Ok((identity, d.to_path_buf()));
+        }
+        current = d.parent();
+    }
+
+    Err(io_err("no .ark/identity.json found in cwd or any parent"))
 }
 
 pub fn write_identity(path: &Path, identity: &Identity) -> io::Result<()> {
-    let pretty = serde_json::to_string_pretty(&identity_to_json(identity))
+    let pretty = serde_json::to_string_pretty(identity)
         .map_err(|e| io_err(&e.to_string()))?;
     fs::write(path, pretty)
 }
 
-pub fn read_signing_key(path: &Path) -> io::Result<SigningKey> {
-    let key_b64 = fs::read_to_string(path)?;
-    let decoded = B64
-        .decode(key_b64.trim())
-        .map_err(|e| io_err(&format!("identity.key decode: {}", e)))?;
-    let seed: [u8; 32] = decoded
-        .try_into()
-        .map_err(|_| io_err("identity.key wrong length"))?;
-    Ok(SigningKey::from_bytes(&seed))
+pub fn validate_identity(identity: &Identity) -> io::Result<()> {
+    if identity.key.algorithm == DEFAULT_SIGNING_ALGORITHM {
+        if identity.key.public_key.len() != 32 {
+            return Err(io_invalid_input("public key wrong length"));
+        }
+    } else {
+        return Err(io_invalid_input("unsupported key algorithm"));
+    }
+
+    let url = resolve_url("", &identity.address, Path::new(""))?;
+
+    if !is_valid_account_name(url.username()) {
+        return Err(io_invalid_input("invalid account name (must be lowercase alphanumeric, dots, hyphens, underscores; 1-64 chars; not pure dots)"));
+    }
+
+    time::OffsetDateTime::parse(&identity.updated, &time::format_description::well_known::Rfc3339)
+        .map_err(|e| io_invalid_input(&format!("updated is not a valid RFC 3339 timestamp: {}", e)))?;
+
+    if identity.signature.algorithm == DEFAULT_SIGNING_ALGORITHM {
+        if identity.signature.signature.len() != 64 {
+            return Err(io_invalid_input("signature wrong length"));
+        }
+    } else {
+        return Err(io_invalid_input("unsupported signature algorithm"));
+    }
+
+    let mut identity_without_signature = identity.clone();
+    identity_without_signature.signature.signature = Vec::new();
+
+    let json = serde_json::to_value(&identity_without_signature)
+        .map_err(|e| io_err(&e.to_string()))?;
+    verify_json(&identity.key.public_key, &identity.signature.signature, &json)
+        .map_err(|_| io_invalid_input("signature verification failed"))?;
+
+    Ok(())
+}
+
+pub fn is_valid_account_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 64 { return false };
+
+    let allowed = name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-' || c == '_');
+    if !allowed { return false };
+
+    name.chars().any(|c| c != '.')
+}
+
+pub fn read_identity_key(path: &Path) -> io::Result<Vec<u8>> {
+    let content = fs::read_to_string(path)?;
+    let key = decode_base64url(content)
+        .map_err(|_| io_invalid_input("public key is not base64url encoded"))?;
+
+    Ok(key)
 }
 
 #[cfg(unix)]
-pub fn write_signing_key(path: &Path, sk: &SigningKey) -> io::Result<()> {
+pub fn write_identity_key(path: &Path, key: &[u8]) -> io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    let mut f = fs::OpenOptions::new()
+
+    let mut file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(path)?;
-    f.write_all(B64.encode(sk.to_bytes()).as_bytes())?;
+    file.write_all(encode_base64url(key).as_bytes())?;
+
     Ok(())
 }
 
 #[cfg(not(unix))]
-pub fn write_signing_key(path: &Path, sk: &SigningKey) -> io::Result<()> {
-    fs::write(path, B64.encode(sk.to_bytes()))
-}
-
-fn io_err(s: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, s.to_string())
+pub fn write_identity_key(path: &Path, key: &[u8]) -> io::Result<()> {
+    fs::write(path, encode_base64url(key))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::testutil::TempDir;
-    use ed25519_dalek::{Signature as DalekSig, Verifier};
+    use crate::util::test::TempDir;
 
     #[test]
-    fn parse_address_accepts_valid() {
-        let (name, host) = parse_address("alice@example.com:8080").unwrap();
-        assert_eq!(name, "alice");
-        assert_eq!(host, "example.com:8080");
-
-        let (name, host) = parse_address("bob@127.0.0.1").unwrap();
-        assert_eq!(name, "bob");
-        assert_eq!(host, "127.0.0.1");
-    }
-
-    #[test]
-    fn parse_address_rejects_invalid() {
-        let bad: &[&str] = &[
-            "",
-            "noatsign",
-            "@host",
-            "name@",
-            "UPPER@host",
-            "with/slash@host",
-            "name@bad_host",
-            "name@host:0",
-            "name@host:abc",
-            "name@-bad.com",
-        ];
-        for b in bad {
-            let err = parse_address(b).unwrap_err();
-            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{} should be InvalidInput", b);
-        }
-    }
-
-    #[test]
-    fn new_signed_identity_has_valid_signature() {
-        let sk = SigningKey::from_bytes(&[42u8; 32]);
-        let identity = new_signed_identity(&sk, "alice@example.com", 1_700_000_000).unwrap();
+    fn create_identity_has_valid_signature() {
+        let identity = create_identity(&[42u8; 32], "alice@example.com");
         assert_eq!(identity.address, "alice@example.com");
-        assert_eq!(identity.key.algorithm, ED25519);
-        assert_eq!(identity.signature.algorithm, ED25519);
+        assert_eq!(identity.key.algorithm, DEFAULT_SIGNING_ALGORITHM);
+        assert_eq!(identity.signature.algorithm, DEFAULT_SIGNING_ALGORITHM);
 
-        let doc = identity_to_json(&identity);
-        let canonical = canonicalize_for_sig(&doc);
-        let sig_bytes: [u8; 64] = B64.decode(&identity.signature.signature).unwrap().try_into().unwrap();
-        let sig = DalekSig::from_bytes(&sig_bytes);
-        assert!(sk.verifying_key().verify(&canonical, &sig).is_ok());
+        let mut identity_without_signature = identity.clone();
+        identity_without_signature.signature.signature = Vec::new();
+
+        let json = serde_json::to_value(&identity_without_signature).unwrap();
+        assert!(verify_json(&identity.key.public_key, &identity.signature.signature, &json).is_ok());
     }
 
     #[test]
-    fn new_signed_identity_signature_detects_tampering() {
-        let sk = SigningKey::from_bytes(&[43u8; 32]);
-        let identity = new_signed_identity(&sk, "alice@example.com", 1_700_000_000).unwrap();
-        let mut doc = identity_to_json(&identity);
-        let sig_bytes: [u8; 64] = B64.decode(&identity.signature.signature).unwrap().try_into().unwrap();
-        let sig = DalekSig::from_bytes(&sig_bytes);
+    fn create_identity_signature_detects_tampering() {
+        let identity = create_identity(&[43u8; 32], "alice@example.com");
+        assert_eq!(identity.address, "alice@example.com");
+        assert_eq!(identity.key.algorithm, DEFAULT_SIGNING_ALGORITHM);
+        assert_eq!(identity.signature.algorithm, DEFAULT_SIGNING_ALGORITHM);
 
-        doc["address"] = serde_json::Value::String("mallory@example.com".to_string());
-        let canonical = canonicalize_for_sig(&doc);
-        assert!(sk.verifying_key().verify(&canonical, &sig).is_err());
+        let mut identity_without_signature = identity.clone();
+        identity_without_signature.signature.signature = Vec::new();
+
+        identity_without_signature.address = "mallory@example.com".to_string();
+
+        let json = serde_json::to_value(&identity_without_signature).unwrap();
+        assert!(verify_json(&identity.key.public_key, &identity.signature.signature, &json).is_err());
     }
 
     #[test]
     fn identity_json_round_trip() {
-        let sk = SigningKey::from_bytes(&[44u8; 32]);
-        let identity = new_signed_identity(&sk, "alice@example.com", 1_700_000_000).unwrap();
-        let doc = identity_to_json(&identity);
-        let parsed = identity_from_json(&doc).unwrap();
+        let identity = create_identity(&[44u8; 32], "alice@example.com");
+        let s = serde_json::to_string(&identity).unwrap();
+        let parsed: Identity = serde_json::from_str(&s).unwrap();
         assert_eq!(parsed.address, identity.address);
         assert_eq!(parsed.updated, identity.updated);
         assert_eq!(parsed.key.algorithm, identity.key.algorithm);
@@ -289,54 +184,126 @@ mod tests {
     #[test]
     fn read_write_identity_round_trip() {
         let td = TempDir::new("ark_identity_test");
-        let sk = SigningKey::from_bytes(&[45u8; 32]);
-        let identity = new_signed_identity(&sk, "alice@example.com", 1_700_000_000).unwrap();
+        let identity = create_identity(&[45u8; 32], "alice@example.com");
         let path = td.0.join("identity.json");
         write_identity(&path, &identity).unwrap();
         let loaded = read_identity(&path).unwrap();
         assert_eq!(loaded.address, identity.address);
+        assert_eq!(loaded.updated, identity.updated);
+        assert_eq!(loaded.key.algorithm, identity.key.algorithm);
         assert_eq!(loaded.key.public_key, identity.key.public_key);
+        assert_eq!(loaded.signature.algorithm, identity.signature.algorithm);
         assert_eq!(loaded.signature.signature, identity.signature.signature);
     }
 
     #[test]
-    fn verifying_key_from_key_rejects_wrong_algorithm() {
-        let key = Key { algorithm: "rsa".to_string(), public_key: B64.encode([0u8; 32]) };
-        let err = verifying_key_from_key(&key).unwrap_err();
+    fn account_name_validation_matches_spec() {
+        let valid = ["a", "gyan", "alice123", "user.name", "user-name", "user_name", "a.b-c_d.0", &"a".repeat(64)];
+        for n in valid {
+            assert!(is_valid_account_name(n), "{} should be valid", n);
+        }
+        let invalid: &[&str] = &[
+            "",
+            ".",
+            "..",
+            "...",
+            "Alice",
+            "ALICE",
+            "user@host",
+            "user name",
+            "user/slash",
+            "user\\back",
+            "user+plus",
+            "user#hash",
+            "café",
+            &"a".repeat(65),
+        ];
+        for n in invalid {
+            assert!(!is_valid_account_name(n), "{} should be invalid", n);
+        }
+    }
+
+    #[test]
+    fn validate_identity_accepts_well_formed() {
+        let identity = create_identity(&[60u8; 32], "alice@example.com");
+        validate_identity(&identity).unwrap();
+    }
+
+    #[test]
+    fn validate_identity_rejects_unsupported_key_algorithm() {
+        let mut identity = create_identity(&[61u8; 32], "alice@example.com");
+        identity.key.algorithm = "rsa".to_string();
+        let err = validate_identity(&identity).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         assert!(err.to_string().contains("unsupported key algorithm"));
     }
 
     #[test]
-    fn verifying_key_from_key_rejects_bad_base64() {
-        let key = Key { algorithm: ED25519.to_string(), public_key: "!!!not-b64!!!".to_string() };
-        assert!(verifying_key_from_key(&key).is_err());
+    fn validate_identity_rejects_wrong_public_key_length() {
+        let mut identity = create_identity(&[62u8; 32], "alice@example.com");
+        identity.key.public_key = vec![0u8; 16];
+        let err = validate_identity(&identity).unwrap_err();
+        assert!(err.to_string().contains("public key wrong length"));
     }
 
     #[test]
-    fn verifying_key_from_key_rejects_wrong_length() {
-        let key = Key { algorithm: ED25519.to_string(), public_key: B64.encode([1u8; 16]) };
-        let err = verifying_key_from_key(&key).unwrap_err();
-        assert!(err.to_string().contains("wrong length"));
+    fn validate_identity_rejects_invalid_account_name() {
+        let mut identity = create_identity(&[63u8; 32], "alice@example.com");
+        identity.address = "BAD@example.com".to_string();
+        let err = validate_identity(&identity).unwrap_err();
+        assert!(err.to_string().contains("invalid account name"));
     }
 
     #[test]
-    fn read_write_signing_key_round_trip() {
+    fn validate_identity_rejects_bad_timestamp() {
+        let mut identity = create_identity(&[64u8; 32], "alice@example.com");
+        identity.updated = "not-a-timestamp".to_string();
+        let err = validate_identity(&identity).unwrap_err();
+        assert!(err.to_string().contains("not a valid RFC 3339 timestamp"));
+    }
+
+    #[test]
+    fn validate_identity_rejects_unsupported_signature_algorithm() {
+        let mut identity = create_identity(&[65u8; 32], "alice@example.com");
+        identity.signature.algorithm = "rsa".to_string();
+        let err = validate_identity(&identity).unwrap_err();
+        assert!(err.to_string().contains("unsupported signature algorithm"));
+    }
+
+    #[test]
+    fn validate_identity_rejects_wrong_signature_length() {
+        let mut identity = create_identity(&[66u8; 32], "alice@example.com");
+        identity.signature.signature = vec![0u8; 32];
+        let err = validate_identity(&identity).unwrap_err();
+        assert!(err.to_string().contains("signature wrong length"));
+    }
+
+    #[test]
+    fn validate_identity_rejects_tampered_address() {
+        let mut identity = create_identity(&[67u8; 32], "alice@example.com");
+        identity.address = "bob@example.com".to_string();
+        let err = validate_identity(&identity).unwrap_err();
+        assert!(err.to_string().contains("signature verification failed"));
+    }
+
+    #[test]
+    fn read_write_identity_key_round_trip() {
         let td = TempDir::new("ark_identity_test");
-        let sk = SigningKey::from_bytes(&[77u8; 32]);
+        let key = [77u8; 32];
         let path = td.0.join("identity.key");
-        write_signing_key(&path, &sk).unwrap();
-        let loaded = read_signing_key(&path).unwrap();
-        assert_eq!(loaded.to_bytes(), sk.to_bytes());
+        write_identity_key(&path, &key).unwrap();
+        let loaded = read_identity_key(&path).unwrap();
+        assert_eq!(loaded, key);
     }
 
     #[cfg(unix)]
     #[test]
-    fn write_signing_key_sets_0600() {
+    fn write_identity_key_sets_0600() {
         use std::os::unix::fs::PermissionsExt;
+
         let td = TempDir::new("ark_identity_test");
-        let sk = SigningKey::from_bytes(&[78u8; 32]);
         let path = td.0.join("identity.key");
-        write_signing_key(&path, &sk).unwrap();
+        write_identity_key(&path, &[78u8; 32]).unwrap();
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
     }

@@ -9,6 +9,7 @@ mod metadata;
 mod put;
 mod request;
 mod server;
+mod types;
 mod util;
 
 use clap::{Parser, Subcommand};

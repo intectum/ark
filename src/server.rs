@@ -4,22 +4,19 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use base64::Engine;
-use ed25519_dalek::{Signature, Verifier};
-
-use crate::identity::{read_identity, verifying_key_from_key};
-use crate::metadata::{read_metadata_attributes, read_metadata_headers, strip_metadata_header_prefix, write_metadata_attributes, write_metadata_headers};
-use crate::request::signing_message;
-use crate::util::B64;
+use crate::crypto::verify_bytes;
+use crate::identity::read_identity;
+use crate::metadata::{read_metadata_attributes, read_metadata_headers, write_metadata_attributes, write_metadata_headers};
+use crate::types::{DirectoryEntry, DirectoryEntryKind};
+use crate::util::{decode_base64url, io_err, now_seconds, request_to_bytes};
 
 const MAX_CLOCK_SKEW_SECS: u64 = 300;
 
 pub fn cmd_server(port: u16) {
     let root = env::current_dir().expect("cwd");
     let listener = TcpListener::bind(("0.0.0.0", port)).expect("bind");
-    eprintln!("serving {} on http://0.0.0.0:{}", root.display(), port);
+    eprintln!("Ark serving {} on http://0.0.0.0:{}", root.display(), port);
     serve(listener, root, true);
 }
 
@@ -39,14 +36,14 @@ pub fn serve(listener: TcpListener, root: PathBuf, verbose: bool) {
                 thread::spawn(move || {
                     if let Err(e) = handle(s, &root, verbose) {
                         if verbose {
-                            eprintln!("error: {}", e);
+                            eprintln!("ERROR: {}", e);
                         }
                     }
                 });
             }
             Err(e) => {
                 if verbose {
-                    eprintln!("accept: {}", e);
+                    eprintln!("ERROR: {}", e);
                 }
             }
         }
@@ -68,10 +65,10 @@ fn handle(mut stream: TcpStream, root: &Path, verbose: bool) -> std::io::Result<
     let method = parts[0].to_string();
     let target = parts[1].to_string();
 
-    let mut content_length: usize = 0;
-    let mut auth_header: Option<String> = None;
-    let mut timestamp_header: Option<u64> = None;
-    let mut meta_headers: Vec<(String, String)> = Vec::new();
+    let mut authorization: Option<String> = None;
+    let mut content_length: Option<usize> = None;
+    let mut timestamp: Option<u64> = None;
+    let mut headers: Vec<(String, String)> = Vec::new();
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line)? == 0 {
@@ -81,18 +78,18 @@ fn handle(mut stream: TcpStream, root: &Path, verbose: bool) -> std::io::Result<
         if trimmed.is_empty() {
             break;
         }
-        if let Some((k, v)) = trimmed.split_once(':') {
-            let key = k.trim();
-            let val = v.trim();
-            if key.eq_ignore_ascii_case("content-length") {
-                content_length = val.parse().unwrap_or(0);
-            } else if key.eq_ignore_ascii_case("authorization") {
-                auth_header = Some(val.to_string());
-            } else if key.eq_ignore_ascii_case("x-ark-timestamp") {
-                timestamp_header = val.parse().ok();
-            } else if strip_metadata_header_prefix(key).is_some() {
-                meta_headers.push((key.to_string(), val.to_string()));
+        if let Some((name, value)) = trimmed.split_once(':') {
+            let trimmed_name = name.trim();
+            let trimmed_value = value.trim();
+            if trimmed_name.eq_ignore_ascii_case("authorization") {
+                authorization = Some(trimmed_value.to_string());
+            } else if trimmed_name.eq_ignore_ascii_case("content-length") {
+                content_length = trimmed_value.parse().ok();
+            } else if trimmed_name.eq_ignore_ascii_case("x-ark-timestamp") {
+                timestamp = trimmed_value.parse().ok();
             }
+
+            headers.push((trimmed_name.to_string(), trimmed_value.to_string()));
         }
     }
 
@@ -100,13 +97,18 @@ fn handle(mut stream: TcpStream, root: &Path, verbose: bool) -> std::io::Result<
         eprintln!("{:?} {} {}", peer, method, target);
     }
 
+    let content_length_value = match content_length {
+        Some(v) => v,
+        None => return write_status(&mut stream, 411, "Length Required", &[])
+    };
+
     if !is_allowed(&target) {
         return write_status(&mut stream, 403, "Forbidden", b"forbidden");
     }
 
-    let body = read_body(&mut reader, content_length)?;
+    let body = read_body(&mut reader, content_length_value)?;
 
-    match verify_auth(root, &target, &method, auth_header.as_deref(), timestamp_header, &body) {
+    match verify_auth(root, &target, &method, authorization.as_deref(), timestamp, &body) {
         AuthResult::Ok => {}
         AuthResult::Unauthorized(msg) => {
             return write_status(&mut stream, 401, "Unauthorized", msg.as_bytes());
@@ -125,10 +127,14 @@ fn handle(mut stream: TcpStream, root: &Path, verbose: bool) -> std::io::Result<
         None => return write_status(&mut stream, 400, "Bad Request", b"bad path"),
     };
 
+    if fs::symlink_metadata(&path).map(|m| m.is_symlink()).unwrap_or(false) {
+        return write_status(&mut stream, 403, "Forbidden", b"symlinks not allowed");
+    }
+
     match method.as_str() {
         "GET" => serve_get(&mut stream, &path, true),
         "HEAD" => serve_get(&mut stream, &path, false),
-        "PUT" => serve_put(&mut stream, &path, &body, &meta_headers),
+        "PUT" => serve_put(&mut stream, &path, &body, &headers),
         "DELETE" => serve_delete(&mut stream, &path),
         _ => write_status(&mut stream, 405, "Method Not Allowed", b"method not allowed"),
     }
@@ -173,24 +179,26 @@ fn verify_auth(
     root: &Path,
     target: &str,
     method: &str,
-    auth_header: Option<&str>,
+    authorization: Option<&str>,
     timestamp: Option<u64>,
     body: &[u8],
 ) -> AuthResult {
-    let header = match auth_header {
+    let authorization_value = match authorization {
         Some(h) => h,
         None => return AuthResult::Unauthorized("missing Authorization header"),
     };
-    let sig_b64 = match header.strip_prefix("ArkAccount ") {
+
+    let signature_b64 = match authorization_value.strip_prefix("ArkAccount ") {
         Some(s) => s.trim(),
         None => return AuthResult::Unauthorized("unsupported Authorization scheme"),
     };
-    let ts = match timestamp {
+
+    let timestamp_value = match timestamp {
         Some(t) => t,
         None => return AuthResult::Unauthorized("missing X-Ark-Timestamp header"),
     };
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    if now.abs_diff(ts) > MAX_CLOCK_SKEW_SECS {
+
+    if now_seconds().abs_diff(timestamp_value) > MAX_CLOCK_SKEW_SECS {
         return AuthResult::Unauthorized("timestamp outside allowed window");
     }
 
@@ -199,29 +207,23 @@ fn verify_auth(
         _ => return AuthResult::Forbidden("invalid account"),
     };
 
-    let id_path = root.join("ark").join(account).join(".ark").join("identity.json");
-    let identity = match read_identity(&id_path) {
+    let identity_path = root.join("ark").join(account).join(".ark").join("identity.json");
+    let identity = match read_identity(&identity_path) {
         Ok(i) => i,
         Err(_) => return AuthResult::Forbidden("identity not valid"),
     };
-    let vk = match verifying_key_from_key(&identity.key) {
-        Ok(v) => v,
-        Err(_) => return AuthResult::Forbidden("identity key not valid"),
-    };
 
-    let sig_bytes = match B64.decode(sig_b64) {
+    let signature = match decode_base64url(signature_b64) {
         Ok(b) => b,
-        Err(_) => return AuthResult::Forbidden("signature not base64"),
+        Err(_) => return AuthResult::Forbidden("auth signature not base64url encoded"),
     };
-    let sig_arr: [u8; 64] = match sig_bytes.as_slice().try_into() {
-        Ok(a) => a,
-        Err(_) => return AuthResult::Forbidden("signature wrong length"),
-    };
-    let sig = Signature::from_bytes(&sig_arr);
 
-    let msg = signing_message(method, target, ts, body);
+    if signature.len() != 64 {
+        return AuthResult::Forbidden("auth signature wrong length");
+    }
 
-    if vk.verify(&msg, &sig).is_ok() {
+    let bytes = request_to_bytes(method, target, timestamp_value, body);
+    if verify_bytes(&identity.key.public_key, &signature, bytes).is_ok() {
         AuthResult::Ok
     } else {
         AuthResult::Forbidden("signature verification failed")
@@ -267,54 +269,67 @@ fn percent_decode(s: &str) -> Option<String> {
 }
 
 fn serve_get(stream: &mut TcpStream, path: &Path, send_body: bool) -> std::io::Result<()> {
-    let meta = match fs::metadata(path) {
+    let fs_metadata = match fs::metadata(path) {
         Ok(m) => m,
         Err(_) => return write_status(stream, 404, "Not Found", b"not found"),
     };
-    if meta.is_dir() {
+
+    if fs_metadata.is_dir() {
         let body = list_dir(path)?;
+
         let headers = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         );
         stream.write_all(headers.as_bytes())?;
-        if send_body {
-            stream.write_all(body.as_bytes())?;
-        }
+
+        if send_body { stream.write_all(body.as_bytes())?; }
+
         return Ok(());
     }
-    let len = meta.len();
+
+    let metadata = match read_metadata_attributes(path) {
+        Ok(m) => m,
+        Err(e) => return write_status(stream, 500, "Internal Server Error", e.to_string().as_bytes()),
+    };
+
     let mut headers = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
         content_type(path),
-        len
+        fs_metadata.len()
     );
-    let meta = read_metadata_attributes(path)?;
-    for (k, v) in write_metadata_headers(&meta) {
-        headers.push_str(&format!("{}: {}\r\n", k, v));
+    for (name, value) in write_metadata_headers(&metadata) {
+        headers.push_str(&format!("{}: {}\r\n", name, value));
     }
     headers.push_str("\r\n");
     stream.write_all(headers.as_bytes())?;
+
     if send_body {
-        let mut f = fs::File::open(path)?;
-        std::io::copy(&mut f, stream)?;
+        let mut file = fs::File::open(path)?;
+        std::io::copy(&mut file, stream)?;
     }
+
     Ok(())
 }
 
-fn serve_put(stream: &mut TcpStream, path: &Path, body: &[u8], meta: &[(String, String)]) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let existed = path.exists();
-    let mut f = fs::File::create(path)?;
-    f.write_all(body)?;
-    drop(f);
-    let m = read_metadata_headers(meta);
-    write_metadata_attributes(path, &m)?;
-    let (code, msg) = if existed { (204, "No Content") } else { (201, "Created") };
-    let response = format!("HTTP/1.1 {} {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", code, msg);
+fn serve_put(stream: &mut TcpStream, path: &Path, body: &[u8], headers: &[(String, String)]) -> std::io::Result<()> {
+    let metadata = match read_metadata_headers(headers) {
+        Ok(m) => m,
+        Err(e) => return write_status(stream, 400, "Bad Request", e.to_string().as_bytes()),
+    };
+
+    if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
+
+    let (response_code, response_msg) = if path.exists() { (204, "No Content") } else { (201, "Created") };
+
+    let mut file = fs::File::create(path)?;
+    file.write_all(body)?;
+    drop(file);
+
+    write_metadata_attributes(path, &metadata)?;
+    let response = format!("HTTP/1.1 {} {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", response_code, response_msg);
     stream.write_all(response.as_bytes())?;
+
     Ok(())
 }
 
@@ -337,44 +352,21 @@ fn serve_delete(stream: &mut TcpStream, path: &Path) -> std::io::Result<()> {
 fn list_dir(path: &Path) -> std::io::Result<String> {
     let mut entries: Vec<_> = fs::read_dir(path)?.filter_map(|e| e.ok()).collect();
     entries.sort_by_key(|e| e.file_name());
-    let mut body = String::from("[");
-    let mut first = true;
-    for e in entries {
-        let name = e.file_name().to_string_lossy().into_owned();
-        let meta = e.metadata()?;
-        let kind = if meta.is_dir() { "dir" } else if meta.is_symlink() { "symlink" } else { "file" };
-        let size = meta.len();
-        if !first {
-            body.push(',');
-        }
-        first = false;
-        body.push_str(&format!(
-            "{{\"name\":\"{}\",\"type\":\"{}\",\"size\":{}}}",
-            json_escape(&name),
-            kind,
-            size
-        ));
-    }
-    body.push(']');
-    Ok(body)
-}
-
-fn json_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\x08' => out.push_str("\\b"),
-            '\x0c' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out
+    let items: Vec<DirectoryEntry> = entries
+        .into_iter()
+        .map(|e| {
+            let meta = e.metadata()?;
+            let kind = if meta.is_dir() { DirectoryEntryKind::Dir }
+                else if meta.is_symlink() { DirectoryEntryKind::Symlink }
+                else { DirectoryEntryKind::File };
+            Ok(DirectoryEntry {
+                kind,
+                name: e.file_name().to_string_lossy().into_owned(),
+                size: meta.len(),
+            })
+        })
+        .collect::<std::io::Result<_>>()?;
+    serde_json::to_string(&items).map_err(|e| io_err(&e.to_string()))
 }
 
 fn content_type(path: &Path) -> &'static str {
@@ -407,26 +399,24 @@ fn write_status(stream: &mut TcpStream, code: u16, msg: &str, body: &[u8]) -> st
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::create_account::create_account_with_seed;
-    use crate::util::testutil::TempDir;
-    use ed25519_dalek::{Signer, SigningKey};
     use std::time::Duration;
 
-    fn setup_account(td: &Path, account: &str, seed: [u8; 32]) -> (PathBuf, SigningKey) {
+    use super::*;
+    use crate::create_account::create_account_with_key;
+    use crate::crypto::sign_bytes;
+    use crate::types::{Member, Metadata};
+    use crate::util::encode_base64url;
+    use crate::util::test::{TempDir, get_default_test_metadata, write_file_with_default_test_metadata};
+
+    fn setup_account(td: &Path, account: &str, key: &[u8]) -> PathBuf {
         let address = format!("{}@example.com", account);
-        let (sk, _) = create_account_with_seed(td, &address, seed).unwrap();
-        let acc_dir = td.join("ark").join(account);
-        (acc_dir, sk)
+        create_account_with_key(td, &address, key).unwrap();
+        td.join("ark").join(account)
     }
 
-    fn sign(sk: &SigningKey, method: &str, path: &str, ts: u64, body: &[u8]) -> String {
-        let msg = signing_message(method, path, ts, body);
-        B64.encode(sk.sign(&msg).to_bytes())
-    }
-
-    fn now_secs() -> u64 {
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+    fn sign(key: &[u8], method: &str, path: &str, ts: u64, body: &[u8]) -> String {
+        let bytes = request_to_bytes(method, path, ts, body);
+        encode_base64url(sign_bytes(key, &bytes))
     }
 
     fn request(port: u16, method: &str, path: &str, body: &[u8], extra: &[(&str, &str)]) -> (u16, Vec<u8>, Vec<(String, String)>) {
@@ -458,18 +448,24 @@ mod tests {
         (code, body_bytes, headers)
     }
 
-    fn signed_request(port: u16, sk: &SigningKey, method: &str, path: &str, body: &[u8]) -> (u16, Vec<u8>, Vec<(String, String)>) {
-        signed_request_with_headers(port, sk, method, path, body, &[])
+    fn signed_request(port: u16, key: &[u8], method: &str, path: &str, body: &[u8]) -> (u16, Vec<u8>, Vec<(String, String)>) {
+        signed_request_with_headers(port, key, method, path, body, &[])
     }
 
-    fn signed_request_with_headers(port: u16, sk: &SigningKey, method: &str, path: &str, body: &[u8], extra: &[(&str, &str)]) -> (u16, Vec<u8>, Vec<(String, String)>) {
-        let ts = now_secs();
-        let sig_b64 = sign(sk, method, path, ts, body);
+    fn signed_request_with_headers(port: u16, key: &[u8], method: &str, path: &str, body: &[u8], extra: &[(&str, &str)]) -> (u16, Vec<u8>, Vec<(String, String)>) {
+        let timestamp = now_seconds();
+        let sig_b64 = sign(key, method, path, timestamp, body);
         let auth = format!("ArkAccount {}", sig_b64);
-        let ts_str = ts.to_string();
+        let ts_str = timestamp.to_string();
         let mut headers: Vec<(&str, &str)> = vec![("Authorization", &auth), ("X-Ark-Timestamp", &ts_str)];
         headers.extend_from_slice(extra);
         request(port, method, path, body, &headers)
+    }
+
+    fn signed_put_with_default_metadata(port: u16, key: &[u8], path: &str, body: &[u8]) -> (u16, Vec<u8>, Vec<(String, String)>) {
+        let meta = write_metadata_headers(&get_default_test_metadata());
+        let extra: Vec<(&str, &str)> = meta.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        signed_request_with_headers(port, key, "PUT", path, body, &extra)
     }
 
     fn header<'a>(headers: &'a [(String, String)], key: &str) -> Option<&'a str> {
@@ -479,10 +475,11 @@ mod tests {
     #[test]
     fn get_file_returns_content() {
         let td = TempDir::new("ark_server_test");
-        let (acc, sk) = setup_account(&td.0, "test", [1u8; 32]);
-        fs::write(acc.join("hello.txt"), b"hi there").unwrap();
+        let key = [1u8; 32];
+        let acc = setup_account(&td.0, "test", &key);
+        write_file_with_default_test_metadata(&acc.join("hello.txt"), b"hi there");
         let port = start_test_server(td.0.clone());
-        let (code, body, headers) = signed_request(port, &sk, "GET", "/ark/test/hello.txt", &[]);
+        let (code, body, headers) = signed_request(port, &key, "GET", "/ark/test/hello.txt", &[]);
         assert_eq!(code, 200);
         assert_eq!(body, b"hi there");
         assert_eq!(header(&headers, "content-length"), Some("8"));
@@ -491,36 +488,71 @@ mod tests {
     #[test]
     fn get_missing_file_404() {
         let td = TempDir::new("ark_server_test");
-        let (_acc, sk) = setup_account(&td.0, "test", [2u8; 32]);
+        let key = [2u8; 32];
+        setup_account(&td.0, "test", &key);
         let port = start_test_server(td.0.clone());
-        let (code, _, _) = signed_request(port, &sk, "GET", "/ark/test/nope.txt", &[]);
+        let (code, _, _) = signed_request(port, &key, "GET", "/ark/test/nope.txt", &[]);
         assert_eq!(code, 404);
     }
 
     #[test]
     fn get_dir_returns_json_listing() {
         let td = TempDir::new("ark_server_test");
-        let (acc, sk) = setup_account(&td.0, "test", [3u8; 32]);
-        fs::write(acc.join("a.txt"), b"a").unwrap();
+        let key = [3u8; 32];
+        let acc = setup_account(&td.0, "test", &key);
+        fs::write(acc.join("a.txt"), b"hello").unwrap();
         fs::create_dir(acc.join("sub")).unwrap();
         let port = start_test_server(td.0.clone());
-        let (code, body, headers) = signed_request(port, &sk, "GET", "/ark/test/", &[]);
+        let (code, body, headers) = signed_request(port, &key, "GET", "/ark/test/", &[]);
         assert_eq!(code, 200);
         assert_eq!(header(&headers, "content-type"), Some("application/json"));
-        let s = std::str::from_utf8(&body).unwrap();
-        assert!(s.contains("\"name\":\"a.txt\""), "body was {}", s);
-        assert!(s.contains("\"type\":\"file\""), "body was {}", s);
-        assert!(s.contains("\"name\":\"sub\""), "body was {}", s);
-        assert!(s.contains("\"type\":\"dir\""), "body was {}", s);
+
+        let entries: Vec<DirectoryEntry> = serde_json::from_slice(&body).unwrap();
+        let file = entries.iter().find(|e| e.name == "a.txt").unwrap();
+        assert!(matches!(file.kind, DirectoryEntryKind::File));
+        assert_eq!(file.size, 5);
+        let dir = entries.iter().find(|e| e.name == "sub").unwrap();
+        assert!(matches!(dir.kind, DirectoryEntryKind::Dir));
+    }
+
+    #[test]
+    fn get_dir_empty_returns_empty_array() {
+        let td = TempDir::new("ark_server_test");
+        let key = [40u8; 32];
+        let acc = setup_account(&td.0, "test", &key);
+        fs::create_dir(acc.join("empty")).unwrap();
+        let port = start_test_server(td.0.clone());
+        let (code, body, _) = signed_request(port, &key, "GET", "/ark/test/empty/", &[]);
+        assert_eq!(code, 200);
+        let entries: Vec<DirectoryEntry> = serde_json::from_slice(&body).unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn get_dir_lists_symlink_as_symlink_kind() {
+        let td = TempDir::new("ark_server_test");
+        let key = [41u8; 32];
+        let acc = setup_account(&td.0, "test", &key);
+        let target = acc.join("real.txt");
+        fs::write(&target, b"hi").unwrap();
+        std::os::unix::fs::symlink(&target, acc.join("link")).unwrap();
+        let port = start_test_server(td.0.clone());
+        let (code, body, _) = signed_request(port, &key, "GET", "/ark/test/", &[]);
+        assert_eq!(code, 200);
+        let entries: Vec<DirectoryEntry> = serde_json::from_slice(&body).unwrap();
+        let link = entries.iter().find(|e| e.name == "link").unwrap();
+        assert!(matches!(link.kind, DirectoryEntryKind::Symlink));
     }
 
     #[test]
     fn head_file_no_body_with_length() {
         let td = TempDir::new("ark_server_test");
-        let (acc, sk) = setup_account(&td.0, "test", [4u8; 32]);
-        fs::write(acc.join("x"), b"abcde").unwrap();
+        let key = [4u8; 32];
+        let acc = setup_account(&td.0, "test", &key);
+        write_file_with_default_test_metadata(&acc.join("x"), b"abcde");
         let port = start_test_server(td.0.clone());
-        let (code, body, headers) = signed_request(port, &sk, "HEAD", "/ark/test/x", &[]);
+        let (code, body, headers) = signed_request(port, &key, "HEAD", "/ark/test/x", &[]);
         assert_eq!(code, 200);
         assert!(body.is_empty());
         assert_eq!(header(&headers, "content-length"), Some("5"));
@@ -529,9 +561,10 @@ mod tests {
     #[test]
     fn head_dir_no_body_with_json_type() {
         let td = TempDir::new("ark_server_test");
-        let (_acc, sk) = setup_account(&td.0, "test", [5u8; 32]);
+        let key = [5u8; 32];
+         setup_account(&td.0, "test", &key);
         let port = start_test_server(td.0.clone());
-        let (code, body, headers) = signed_request(port, &sk, "HEAD", "/ark/test/", &[]);
+        let (code, body, headers) = signed_request(port, &key, "HEAD", "/ark/test/", &[]);
         assert_eq!(code, 200);
         assert!(body.is_empty());
         assert_eq!(header(&headers, "content-type"), Some("application/json"));
@@ -540,9 +573,10 @@ mod tests {
     #[test]
     fn put_new_file_returns_201() {
         let td = TempDir::new("ark_server_test");
-        let (_acc, sk) = setup_account(&td.0, "test", [6u8; 32]);
+        let key = [6u8; 32];
+        setup_account(&td.0, "test", &key);
         let port = start_test_server(td.0.clone());
-        let (code, _, _) = signed_request(port, &sk, "PUT", "/ark/test/new.txt", b"payload");
+        let (code, _, _) = signed_put_with_default_metadata(port, &key, "/ark/test/new.txt", b"payload");
         assert_eq!(code, 201);
         assert_eq!(fs::read(td.0.join("ark/test/new.txt")).unwrap(), b"payload");
     }
@@ -550,10 +584,11 @@ mod tests {
     #[test]
     fn put_overwrite_returns_204() {
         let td = TempDir::new("ark_server_test");
-        let (acc, sk) = setup_account(&td.0, "test", [7u8; 32]);
-        fs::write(acc.join("x"), b"old").unwrap();
+        let key = [7u8; 32];
+        let acc = setup_account(&td.0, "test", &key);
+        write_file_with_default_test_metadata(&acc.join("x"), b"old");
         let port = start_test_server(td.0.clone());
-        let (code, _, _) = signed_request(port, &sk, "PUT", "/ark/test/x", b"new content");
+        let (code, _, _) = signed_put_with_default_metadata(port, &key, "/ark/test/x", b"new content");
         assert_eq!(code, 204);
         assert_eq!(fs::read(td.0.join("ark/test/x")).unwrap(), b"new content");
     }
@@ -561,9 +596,10 @@ mod tests {
     #[test]
     fn put_nested_path_creates_dirs() {
         let td = TempDir::new("ark_server_test");
-        let (_acc, sk) = setup_account(&td.0, "test", [8u8; 32]);
+        let key = [8u8; 32];
+        setup_account(&td.0, "test", &key);
         let port = start_test_server(td.0.clone());
-        let (code, _, _) = signed_request(port, &sk, "PUT", "/ark/test/a/b/c.txt", b"deep");
+        let (code, _, _) = signed_put_with_default_metadata(port, &key, "/ark/test/a/b/c.txt", b"deep");
         assert_eq!(code, 201);
         assert_eq!(fs::read(td.0.join("ark/test/a/b/c.txt")).unwrap(), b"deep");
     }
@@ -571,11 +607,12 @@ mod tests {
     #[test]
     fn delete_file_removes_and_returns_204() {
         let td = TempDir::new("ark_server_test");
-        let (acc, sk) = setup_account(&td.0, "test", [9u8; 32]);
+        let key = [9u8; 32];
+        let acc = setup_account(&td.0, "test", &key);
         let p = acc.join("d.txt");
         fs::write(&p, b"bye").unwrap();
         let port = start_test_server(td.0.clone());
-        let (code, _, _) = signed_request(port, &sk, "DELETE", "/ark/test/d.txt", &[]);
+        let (code, _, _) = signed_request(port, &key, "DELETE", "/ark/test/d.txt", &[]);
         assert_eq!(code, 204);
         assert!(!p.exists());
     }
@@ -583,12 +620,13 @@ mod tests {
     #[test]
     fn delete_dir_recursively_removes_and_returns_204() {
         let td = TempDir::new("ark_server_test");
-        let (acc, sk) = setup_account(&td.0, "test", [10u8; 32]);
+        let key = [10u8; 32];
+        let acc = setup_account(&td.0, "test", &key);
         let d = acc.join("sub");
         fs::create_dir(&d).unwrap();
         fs::write(d.join("inner"), b"x").unwrap();
         let port = start_test_server(td.0.clone());
-        let (code, _, _) = signed_request(port, &sk, "DELETE", "/ark/test/sub", &[]);
+        let (code, _, _) = signed_request(port, &key, "DELETE", "/ark/test/sub", &[]);
         assert_eq!(code, 204);
         assert!(!d.exists());
     }
@@ -596,27 +634,91 @@ mod tests {
     #[test]
     fn delete_missing_404() {
         let td = TempDir::new("ark_server_test");
-        let (_acc, sk) = setup_account(&td.0, "test", [11u8; 32]);
+        let key = [11u8; 32];
+        setup_account(&td.0, "test", &key);
         let port = start_test_server(td.0.clone());
-        let (code, _, _) = signed_request(port, &sk, "DELETE", "/ark/test/nope", &[]);
+        let (code, _, _) = signed_request(port, &key, "DELETE", "/ark/test/nope", &[]);
         assert_eq!(code, 404);
     }
 
     #[test]
     fn unsupported_method_returns_405() {
         let td = TempDir::new("ark_server_test");
-        let (_acc, sk) = setup_account(&td.0, "test", [12u8; 32]);
+        let key = [12u8; 32];
+        setup_account(&td.0, "test", &key);
         let port = start_test_server(td.0.clone());
-        let (code, _, _) = signed_request(port, &sk, "POST", "/ark/test/x", b"hello");
+        let (code, body, _) = signed_request(port, &key, "POST", "/ark/test/x", b"hello");
+        println!("code: {}, body: {}", code, std::str::from_utf8(&body).unwrap());
         assert_eq!(code, 405);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_get_blocked_403() {
+        let td = TempDir::new("ark_server_test");
+        let key = [50u8; 32];
+        let acc = setup_account(&td.0, "test", &key);
+        let target = acc.join("real.txt");
+        write_file_with_default_test_metadata(&target, b"secret");
+        std::os::unix::fs::symlink(&target, acc.join("link")).unwrap();
+        let port = start_test_server(td.0.clone());
+        let (code, _, _) = signed_request(port, &key, "GET", "/ark/test/link", &[]);
+        assert_eq!(code, 403);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_head_blocked_403() {
+        let td = TempDir::new("ark_server_test");
+        let key = [51u8; 32];
+        let acc = setup_account(&td.0, "test", &key);
+        let target = acc.join("real.txt");
+        write_file_with_default_test_metadata(&target, b"secret");
+        std::os::unix::fs::symlink(&target, acc.join("link")).unwrap();
+        let port = start_test_server(td.0.clone());
+        let (code, _, _) = signed_request(port, &key, "HEAD", "/ark/test/link", &[]);
+        assert_eq!(code, 403);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_put_blocked_403() {
+        let td = TempDir::new("ark_server_test");
+        let key = [52u8; 32];
+        let acc = setup_account(&td.0, "test", &key);
+        let target = acc.join("real.txt");
+        write_file_with_default_test_metadata(&target, b"original");
+        std::os::unix::fs::symlink(&target, acc.join("link")).unwrap();
+        let port = start_test_server(td.0.clone());
+        let (code, _, _) = signed_put_with_default_metadata(port, &key, "/ark/test/link", b"clobber");
+        assert_eq!(code, 403);
+        assert_eq!(fs::read(&target).unwrap(), b"original");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_delete_blocked_403() {
+        let td = TempDir::new("ark_server_test");
+        let key = [53u8; 32];
+        let acc = setup_account(&td.0, "test", &key);
+        let target = acc.join("real.txt");
+        write_file_with_default_test_metadata(&target, b"keep");
+        let link = acc.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let port = start_test_server(td.0.clone());
+        let (code, _, _) = signed_request(port, &key, "DELETE", "/ark/test/link", &[]);
+        assert_eq!(code, 403);
+        assert!(link.exists());
+        assert!(target.exists());
     }
 
     #[test]
     fn path_traversal_blocked() {
         let td = TempDir::new("ark_server_test");
-        let (_acc, sk) = setup_account(&td.0, "test", [13u8; 32]);
+        let key = [13u8; 32];
+        setup_account(&td.0, "test", &key);
         let port = start_test_server(td.0.clone());
-        let (code, _, _) = signed_request(port, &sk, "GET", "/ark/test/../../../etc/passwd", &[]);
+        let (code, _, _) = signed_request(port, &key, "GET", "/ark/test/../../../etc/passwd", &[]);
         assert_eq!(code, 400);
     }
 
@@ -649,18 +751,20 @@ mod tests {
     #[test]
     fn put_at_ark_root_405() {
         let td = TempDir::new("ark_server_test");
-        let (_acc, sk) = setup_account(&td.0, "test", [14u8; 32]);
+        let key = [14u8; 32];
+        setup_account(&td.0, "test", &key);
         let port = start_test_server(td.0.clone());
-        let (code, _, _) = signed_request(port, &sk, "PUT", "/ark/test", b"x");
+        let (code, _, _) = signed_request(port, &key, "PUT", "/ark/test", b"x");
         assert_eq!(code, 405);
     }
 
     #[test]
     fn delete_at_ark_root_405() {
         let td = TempDir::new("ark_server_test");
-        let (_acc, sk) = setup_account(&td.0, "test", [15u8; 32]);
+        let key = [15u8; 32];
+        setup_account(&td.0, "test", &key);
         let port = start_test_server(td.0.clone());
-        let (code, _, _) = signed_request(port, &sk, "DELETE", "/ark/test", &[]);
+        let (code, _, _) = signed_request(port, &key, "DELETE", "/ark/test", &[]);
         assert_eq!(code, 405);
         assert!(td.0.join("ark/test").exists());
     }
@@ -677,7 +781,7 @@ mod tests {
     #[test]
     fn missing_auth_header_401() {
         let td = TempDir::new("ark_server_test");
-        let (_acc, _sk) = setup_account(&td.0, "test", [16u8; 32]);
+        setup_account(&td.0, "test", &[16u8; 32]);
         let port = start_test_server(td.0.clone());
         let (code, _, _) = request(port, "GET", "/ark/test/anything", &[], &[]);
         assert_eq!(code, 401);
@@ -686,9 +790,10 @@ mod tests {
     #[test]
     fn missing_timestamp_header_401() {
         let td = TempDir::new("ark_server_test");
-        let (_acc, sk) = setup_account(&td.0, "test", [17u8; 32]);
+        let key = [17u8; 32];
+        setup_account(&td.0, "test", &key);
         let port = start_test_server(td.0.clone());
-        let sig = sign(&sk, "GET", "/ark/test/x", now_secs(), &[]);
+        let sig = sign(&key, "GET", "/ark/test/x", now_seconds(), &[]);
         let auth = format!("ArkAccount {}", sig);
         let (code, _, _) = request(port, "GET", "/ark/test/x", &[], &[("Authorization", &auth)]);
         assert_eq!(code, 401);
@@ -697,10 +802,11 @@ mod tests {
     #[test]
     fn stale_timestamp_401() {
         let td = TempDir::new("ark_server_test");
-        let (_acc, sk) = setup_account(&td.0, "test", [18u8; 32]);
+        let key = [18u8; 32];
+        setup_account(&td.0, "test", &key);
         let port = start_test_server(td.0.clone());
-        let old = now_secs() - (MAX_CLOCK_SKEW_SECS + 60);
-        let sig = sign(&sk, "GET", "/ark/test/x", old, &[]);
+        let old = now_seconds() - (MAX_CLOCK_SKEW_SECS + 60);
+        let sig = sign(&key, "GET", "/ark/test/x", old, &[]);
         let auth = format!("ArkAccount {}", sig);
         let ts = old.to_string();
         let (code, _, _) = request(port, "GET", "/ark/test/x", &[], &[("Authorization", &auth), ("X-Ark-Timestamp", &ts)]);
@@ -710,10 +816,11 @@ mod tests {
     #[test]
     fn wrong_signature_403() {
         let td = TempDir::new("ark_server_test");
-        let (_acc, sk) = setup_account(&td.0, "test", [19u8; 32]);
+        let key = [19u8; 32];
+        setup_account(&td.0, "test", &key);
         let port = start_test_server(td.0.clone());
-        let ts = now_secs();
-        let sig = sign(&sk, "GET", "/ark/test/somethingelse", ts, &[]);
+        let ts = now_seconds();
+        let sig = sign(&key, "GET", "/ark/test/somethingelse", ts, &[]);
         let auth = format!("ArkAccount {}", sig);
         let ts_s = ts.to_string();
         let (code, _, _) = request(port, "GET", "/ark/test/realtarget", &[], &[("Authorization", &auth), ("X-Ark-Timestamp", &ts_s)]);
@@ -723,8 +830,8 @@ mod tests {
     #[test]
     fn wrong_key_403() {
         let td = TempDir::new("ark_server_test");
-        let (_acc, _sk) = setup_account(&td.0, "test", [20u8; 32]);
-        let attacker = SigningKey::from_bytes(&[99u8; 32]);
+        setup_account(&td.0, "test", &[20u8; 32]);
+        let attacker = [99u8; 32];
         let port = start_test_server(td.0.clone());
         let (code, _, _) = signed_request(port, &attacker, "GET", "/ark/test/x", &[]);
         assert_eq!(code, 403);
@@ -733,7 +840,7 @@ mod tests {
     #[test]
     fn no_identity_file_403() {
         let td = TempDir::new("ark_server_test");
-        let attacker = SigningKey::from_bytes(&[21u8; 32]);
+        let attacker = [21u8; 32];
         let port = start_test_server(td.0.clone());
         let (code, _, _) = signed_request(port, &attacker, "GET", "/ark/ghost/x", &[]);
         assert_eq!(code, 403);
@@ -742,10 +849,10 @@ mod tests {
     #[test]
     fn created_identity_authenticates_with_server() {
         let td = TempDir::new("ark_server_test");
-        let (sk, _) = create_account_with_seed(&td.0, "gyan@example.com", [77u8; 32]).unwrap();
-        fs::write(td.0.join("ark/gyan/hello.txt"), b"hi gyan").unwrap();
+        create_account_with_key(&td.0, "gyan@example.com", &[77u8; 32]).unwrap();
+        write_file_with_default_test_metadata(&td.0.join("ark/gyan/hello.txt"), b"hi gyan");
         let port = start_test_server(td.0.clone());
-        let (code, body, _) = signed_request(port, &sk, "GET", "/ark/gyan/hello.txt", &[]);
+        let (code, body, _) = signed_request(port, &[77u8; 32], "GET", "/ark/gyan/hello.txt", &[]);
         assert_eq!(code, 200);
         assert_eq!(body, b"hi gyan");
     }
@@ -753,11 +860,12 @@ mod tests {
     #[test]
     fn put_signature_covers_body() {
         let td = TempDir::new("ark_server_test");
-        let (_acc, sk) = setup_account(&td.0, "test", [22u8; 32]);
+        let key = [22u8; 32];
+        setup_account(&td.0, "test", &key);
         let port = start_test_server(td.0.clone());
-        let ts = now_secs();
+        let ts = now_seconds();
         let signed_body = b"original";
-        let sig = sign(&sk, "PUT", "/ark/test/file", ts, signed_body);
+        let sig = sign(&key, "PUT", "/ark/test/file", ts, signed_body);
         let auth = format!("ArkAccount {}", sig);
         let ts_s = ts.to_string();
         let (code, _, _) = request(port, "PUT", "/ark/test/file", b"tampered", &[("Authorization", &auth), ("X-Ark-Timestamp", &ts_s)]);
@@ -768,33 +876,41 @@ mod tests {
     #[test]
     fn put_stores_metadata_headers_as_xattr() {
         let td = TempDir::new("ark_server_test");
-        let (_acc, sk) = setup_account(&td.0, "test", [23u8; 32]);
+        let key = [23u8; 32];
+        setup_account(&td.0, "test", &key);
         let port = start_test_server(td.0.clone());
-        let key_b64 = B64.encode([7u8; 32]);
+        let key_b64 = encode_base64url([7u8; 32]);
+        let identity_b64 = encode_base64url([1u8; 32]);
         let extra = [
             ("X-Ark-Meta-Encryption", "aes-256-gcm"),
-            ("X-Ark-Meta-FileKey", key_b64.as_str()),
+            ("X-Ark-Meta-Member-0-Address", "alice@x"),
+            ("X-Ark-Meta-Member-0-Identity-Key", identity_b64.as_str()),
+            ("X-Ark-Meta-Member-0-Permission", "owner"),
+            ("X-Ark-Meta-Member-0-Wrapped-File-Key", key_b64.as_str()),
         ];
-        let (code, _, _) = signed_request_with_headers(port, &sk, "PUT", "/ark/test/secret", b"ciphertext", &extra);
+        let (code, _, _) = signed_request_with_headers(port, &key, "PUT", "/ark/test/secret", b"ciphertext", &extra);
         assert_eq!(code, 201);
         let p = td.0.join("ark/test/secret");
         assert_eq!(
             xattr::get(&p, "user.ark.encryption").unwrap().as_deref(),
             Some(b"aes-256-gcm".as_slice())
         );
-        assert_eq!(
-            xattr::get(&p, "user.ark.filekey").unwrap().as_deref(),
-            Some(key_b64.as_bytes())
-        );
+        let m = read_metadata_attributes(&p).unwrap();
+        assert_eq!(m.members.len(), 1);
+        assert_eq!(m.members[0].address, "alice@x");
+        assert_eq!(m.members[0].wrapped_file_key, [7u8; 32]);
     }
 
     #[test]
     fn put_ignores_unknown_meta_headers() {
         let td = TempDir::new("ark_server_test");
-        let (_acc, sk) = setup_account(&td.0, "test", [26u8; 32]);
+        let key = [26u8; 32];
+        setup_account(&td.0, "test", &key);
         let port = start_test_server(td.0.clone());
-        let extra = [("X-Ark-Meta-Foo", "bar")];
-        let (code, _, _) = signed_request_with_headers(port, &sk, "PUT", "/ark/test/file", b"x", &extra);
+        let meta = write_metadata_headers(&get_default_test_metadata());
+        let mut extra: Vec<(&str, &str)> = meta.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        extra.push(("X-Ark-Meta-Foo", "bar"));
+        let (code, _, _) = signed_request_with_headers(port, &key, "PUT", "/ark/test/file", b"x", &extra);
         assert_eq!(code, 201);
         let p = td.0.join("ark/test/file");
         assert_eq!(xattr::get(&p, "user.ark.foo").unwrap(), None);
@@ -803,68 +919,83 @@ mod tests {
     #[test]
     fn get_returns_metadata_headers_from_xattr() {
         let td = TempDir::new("ark_server_test");
-        let (acc, sk) = setup_account(&td.0, "test", [30u8; 32]);
+        let key = [30u8; 32];
+        let acc = setup_account(&td.0, "test", &key);
         let file = acc.join("secret");
         fs::write(&file, b"ciphertext").unwrap();
-        let key_b64 = B64.encode([8u8; 32]);
-        xattr::set(&file, "user.ark.encryption", b"aes-256-gcm").unwrap();
-        xattr::set(&file, "user.ark.filekey", key_b64.as_bytes()).unwrap();
+        let wrapped_key = [8u8; 32];
+        let wrapped_key_b64 = encode_base64url(wrapped_key);
+        let owner = Member {
+            address: "alice@x".to_string(),
+            identity_key: [1u8; 32].to_vec(),
+            permission: "owner".to_string(),
+            wrapped_file_key: wrapped_key.to_vec(),
+        };
+        write_metadata_attributes(&file, &Metadata {
+            encryption: "aes-256-gcm".to_string(),
+            encrypted: None,
+            members: vec![owner],
+        }).unwrap();
         let port = start_test_server(td.0.clone());
 
-        let (code, body, headers) = signed_request(port, &sk, "GET", "/ark/test/secret", &[]);
+        let (code, body, headers) = signed_request(port, &key, "GET", "/ark/test/secret", &[]);
         assert_eq!(code, 200);
         assert_eq!(body, b"ciphertext");
         assert_eq!(header(&headers, "x-ark-meta-encryption"), Some("aes-256-gcm"));
-        assert_eq!(header(&headers, "x-ark-meta-filekey"), Some(key_b64.as_str()));
+        assert_eq!(header(&headers, "x-ark-meta-member-0-address"), Some("alice@x"));
+        assert_eq!(header(&headers, "x-ark-meta-member-0-wrapped-file-key"), Some(wrapped_key_b64.as_str()));
     }
 
     #[test]
     fn get_ignores_unknown_user_ark_xattrs() {
         let td = TempDir::new("ark_server_test");
-        let (acc, sk) = setup_account(&td.0, "test", [32u8; 32]);
+        let key = [32u8; 32];
+        let acc = setup_account(&td.0, "test", &key);
         let file = acc.join("file");
-        fs::write(&file, b"data").unwrap();
+        write_file_with_default_test_metadata(&file, b"data");
         xattr::set(&file, "user.ark.foo", b"bar").unwrap();
         let port = start_test_server(td.0.clone());
 
-        let (code, _, headers) = signed_request(port, &sk, "GET", "/ark/test/file", &[]);
+        let (code, _, headers) = signed_request(port, &key, "GET", "/ark/test/file", &[]);
         assert_eq!(code, 200);
         assert_eq!(header(&headers, "x-ark-meta-foo"), None);
     }
 
     #[test]
-    fn get_file_without_xattr_omits_meta_headers() {
+    fn get_file_without_xattr_returns_500() {
         let td = TempDir::new("ark_server_test");
-        let (acc, sk) = setup_account(&td.0, "test", [31u8; 32]);
+        let key = [31u8; 32];
+        let acc = setup_account(&td.0, "test", &key);
         fs::write(acc.join("plain"), b"raw").unwrap();
         let port = start_test_server(td.0.clone());
 
-        let (code, _, headers) = signed_request(port, &sk, "GET", "/ark/test/plain", &[]);
-        assert_eq!(code, 200);
-        assert!(headers.iter().all(|(k, _)| !k.starts_with("x-ark-meta-")));
+        let (code, _, _) = signed_request(port, &key, "GET", "/ark/test/plain", &[]);
+        assert_eq!(code, 500);
     }
 
     #[test]
-    fn put_without_meta_headers_writes_no_xattr() {
+    fn put_without_meta_headers_returns_400() {
         let td = TempDir::new("ark_server_test");
-        let (_acc, sk) = setup_account(&td.0, "test", [24u8; 32]);
+        let key = [24u8; 32];
+        setup_account(&td.0, "test", &key);
         let port = start_test_server(td.0.clone());
-        let (code, _, _) = signed_request(port, &sk, "PUT", "/ark/test/plain", b"data");
-        assert_eq!(code, 201);
-        let p = td.0.join("ark/test/plain");
-        assert_eq!(xattr::get(&p, "user.ark.encryption").unwrap(), None);
+        let (code, _, _) = signed_request(port, &key, "PUT", "/ark/test/plain", b"data");
+        assert_eq!(code, 400);
+        assert!(!td.0.join("ark/test/plain").exists());
     }
 
     #[test]
     fn put_ignores_non_meta_custom_headers() {
         let td = TempDir::new("ark_server_test");
-        let (_acc, sk) = setup_account(&td.0, "test", [25u8; 32]);
+        let key = [25u8; 32];
+        setup_account(&td.0, "test", &key);
         let port = start_test_server(td.0.clone());
-        let extra = [("X-Custom-Foo", "bar")];
-        let (code, _, _) = signed_request_with_headers(port, &sk, "PUT", "/ark/test/file", b"x", &extra);
+        let meta = write_metadata_headers(&get_default_test_metadata());
+        let mut extra: Vec<(&str, &str)> = meta.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        extra.push(("X-Custom-Foo", "bar"));
+        let (code, _, _) = signed_request_with_headers(port, &key, "PUT", "/ark/test/file", b"x", &extra);
         assert_eq!(code, 201);
         let p = td.0.join("ark/test/file");
         assert_eq!(xattr::get(&p, "user.ark.foo").unwrap(), None);
     }
-
 }
