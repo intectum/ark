@@ -34,13 +34,13 @@ pub fn verify_json(public_key: &[u8], signature: &[u8], json: &serde_json::Value
     verify_bytes(public_key, signature, jcs)
 }
 
-pub fn encrypt_bytes(key: &[u8], bytes: &[u8]) -> std::io::Result<Vec<u8>> {
+pub fn encrypt_bytes(key: &[u8], plaintext: &[u8]) -> std::io::Result<Vec<u8>> {
     let mut nonce = [0u8; 12];
     getrandom::getrandom(&mut nonce).map_err(|e| io_err(&e.to_string()))?;
 
     let cipher = Aes256Gcm::new(key.into());
     let ciphertext = cipher
-        .encrypt(Nonce::from_slice(&nonce), bytes)
+        .encrypt(Nonce::from_slice(&nonce), plaintext)
         .map_err(|e| io_err(&format!("encrypt: {}", e)))?;
 
     let mut out = Vec::with_capacity(12 + ciphertext.len());

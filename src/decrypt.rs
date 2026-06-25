@@ -2,11 +2,13 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
 
-use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, decrypt_bytes};
+use uuid::Uuid;
+
+use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, DEFAULT_SIGNING_ALGORITHM, decrypt_bytes};
 use crate::identity::read_nearest_identity;
 use crate::metadata::{get_member, read_metadata_attributes, validate_metadata, write_metadata_attributes};
-use crate::types::{Member, Metadata};
-use crate::util::{decode_base64url, io_err};
+use crate::types::{Member, Metadata, Signature};
+use crate::util::{decode_base64url, io_err, now_iso};
 
 pub struct DecryptArgs {
     pub input: Option<String>,
@@ -48,15 +50,22 @@ pub fn cmd_decrypt(args: DecryptArgs) -> std::io::Result<()> {
                 None => return Err(io_err("no file key available: pass --key or use -i/--in-place on a file with metadata"))
             };
 
+            let now = now_iso();
             let metadata = Metadata {
+                id: Uuid::new_v4().to_string(),
+                created: now.clone(),
+                modified: now,
+                modified_by: identity.address.clone(),
                 encryption: args.algorithm.clone().unwrap_or(DEFAULT_ENCRYPTION_ALGORITHM.to_string()),
-                encrypted: Some(true),
                 members: vec![Member {
                     address: identity.address.clone(),
                     identity_key: identity.key.public_key.clone(),
                     permission: "owner".to_string(),
                     wrapped_file_key: file_key,
                 }],
+                body_hash: Vec::new(),
+                signature: Signature { algorithm: DEFAULT_SIGNING_ALGORITHM.to_string(), signature: Vec::new() },
+                encrypted: Some(true),
             };
 
             validate_metadata(&metadata)?;
@@ -101,13 +110,10 @@ pub fn cmd_decrypt(args: DecryptArgs) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use crate::create_account::create_account_with_key;
-    use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, encrypt_bytes};
+    use crate::crypto::encrypt_bytes;
     use crate::metadata::write_metadata_attributes;
-    use crate::types::{Member, Metadata};
     use crate::util::encode_base64url;
-    use crate::util::test::{TempDir, with_cwd};
-
-    const TEST_ADDRESS: &str = "test@example.com";
+    use crate::util::test::{get_default_test_metadata, TempDir, TEST_ADDRESS, with_cwd};
 
     fn setup(td: &TempDir, key_byte: u8) -> std::path::PathBuf {
         create_account_with_key(&td.0, TEST_ADDRESS, &[key_byte; 32]).unwrap();
@@ -118,13 +124,9 @@ mod tests {
         let p = td.0.join(name);
         let ct = encrypt_bytes(key, plaintext).unwrap();
         fs::write(&p, &ct).unwrap();
-        let owner = Member {
-            address: TEST_ADDRESS.to_string(),
-            identity_key: [1u8; 32].to_vec(),
-            permission: "owner".to_string(),
-            wrapped_file_key: key.to_vec(),
-        };
-        let meta = Metadata { encryption: DEFAULT_ENCRYPTION_ALGORITHM.to_string(), encrypted: Some(true), members: vec![owner] };
+        let mut meta = get_default_test_metadata(&[1u8; 32], TEST_ADDRESS, &ct);
+        meta.members[0].wrapped_file_key = key.to_vec();
+        meta.encrypted = Some(true);
         write_metadata_attributes(&p, &meta).unwrap();
         p
     }
@@ -193,17 +195,11 @@ mod tests {
         let real_key = [13u8; 32];
         let p = encrypted_file(&td, "in.bin", b"x", &real_key);
         // overwrite member with wrong key — explicit --key should still win
-        let wrong_owner = Member {
-            address: TEST_ADDRESS.to_string(),
-            identity_key: [1u8; 32].to_vec(),
-            permission: "owner".to_string(),
-            wrapped_file_key: [99u8; 32].to_vec(),
-        };
-        write_metadata_attributes(&p, &Metadata {
-            encryption: DEFAULT_ENCRYPTION_ALGORITHM.to_string(),
-            encrypted: Some(true),
-            members: vec![wrong_owner],
-        }).unwrap();
+        let ct = fs::read(&p).unwrap();
+        let mut wrong_meta = get_default_test_metadata(&[1u8; 32], TEST_ADDRESS, &ct);
+        wrong_meta.members[0].wrapped_file_key = [99u8; 32].to_vec();
+        wrong_meta.encrypted = Some(true);
+        write_metadata_attributes(&p, &wrong_meta).unwrap();
         let out = td.0.join("out.bin");
         with_cwd(&acc, || {
             cmd_decrypt(DecryptArgs {
@@ -270,18 +266,11 @@ mod tests {
         let acc = setup(&td, 18);
         let p = td.0.join("plain.bin");
         // 42 bytes of plaintext masquerading as ciphertext
-        fs::write(&p, vec![0u8; 42]).unwrap();
-        let owner = Member {
-            address: TEST_ADDRESS.to_string(),
-            identity_key: [1u8; 32].to_vec(),
-            permission: "owner".to_string(),
-            wrapped_file_key: [0u8; 32].to_vec(),
-        };
-        write_metadata_attributes(&p, &Metadata {
-            encryption: "aes-256-gcm".to_string(),
-            encrypted: None,
-            members: vec![owner],
-        }).unwrap();
+        let body = vec![0u8; 42];
+        fs::write(&p, &body).unwrap();
+        let mut m = get_default_test_metadata(&[1u8; 32], TEST_ADDRESS, &body);
+        m.members[0].wrapped_file_key = [0u8; 32].to_vec();
+        write_metadata_attributes(&p, &m).unwrap();
         // no encrypted flag → decrypt attempts and fails
         let err = with_cwd(&acc, || cmd_decrypt(DecryptArgs {
             input: Some(p.to_string_lossy().into_owned()),

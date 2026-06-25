@@ -68,9 +68,9 @@ mod tests {
         assert_eq!(pk_arr.to_vec(), SigningKey::from_bytes(&key).verifying_key().to_bytes());
 
         assert_eq!(v["address"].as_str(), Some("gyan@example.com:8080"));
-        let updated = v["updated"].as_str().unwrap();
-        time::OffsetDateTime::parse(updated, &time::format_description::well_known::Rfc3339)
-            .unwrap_or_else(|e| panic!("updated is not RFC 3339: {} ({})", updated, e));
+        let modified = v["modified"].as_str().unwrap();
+        time::OffsetDateTime::parse(modified, &time::format_description::well_known::Rfc3339)
+            .unwrap_or_else(|e| panic!("modified is not RFC 3339: {} ({})", modified, e));
         assert_eq!(v["signature"]["algorithm"].as_str(), Some("ed25519"));
     }
 

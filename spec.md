@@ -1130,7 +1130,7 @@ GET https://gateway.example.com/ark/x-a7f3k2m9p4q8r2/.ark/identity
     "public_key": "base64url-encoded"
   },
   "notify": true,
-  "updated": "2026-04-14T12:00:00Z",
+  "modified": "2026-04-14T12:00:00Z",
   "signature": {
     "algorithm": "ed25519",
     "signature": "base64url-encoded"
@@ -1254,7 +1254,7 @@ The following are special requests that do not fit the standard file resource mo
 {
   "key": Key,
   "address": "alice@example.com",
-  "updated": "2026-04-11T12:00:00Z",
+  "modified": "2026-04-11T12:00:00Z",
   "key_transition": KeyTransition,
   "signature": Signature,
 }
@@ -1264,7 +1264,7 @@ The following are special requests that do not fit the standard file resource mo
 |---|---|---|---|
 | `key` | Key | Yes | The key that identifies the user. |
 | `address` | string | Yes | Full `user@domain` address. |
-| `updated` | string | Yes | ISO 8601 timestamp of last update. |
+| `modified` | string | Yes | RFC 3339 timestamp of last update. |
 | `key_transition` | KeyTransition | No | The most recent key transition. |[TODO list all?]
 | `signature` | Signature | Yes | A signature over all fields above by the identified user. |
 
@@ -1289,7 +1289,7 @@ The following are special requests that do not fit the standard file resource mo
     "public_key": "<base64url>"
   },
   "notify": true,
-  "updated": "2026-04-14T12:00:00Z",
+  "modified": "2026-04-14T12:00:00Z",
   "signature": {
     "algorithm": "ed25519",
     "signature": "<base64url>"
@@ -1324,7 +1324,7 @@ The following are special requests that do not fit the standard file resource mo
 | `old_signs_new` | string | Yes | Signature of new key by old key. |
 | `new_signs_old` | string | Yes | Signature of old key by new key. |
 | `reason` | string | No | Human-readable reason (e.g., `"scheduled_rotation"`, `"key_compromise"`). |
-| `timestamp` | string | Yes | ISO 8601 timestamp. |
+| `timestamp` | string | Yes | RFC 3339 timestamp. |
 
 ### C.4 Invitation
 
@@ -1340,7 +1340,7 @@ The following are special requests that do not fit the standard file resource mo
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `max_uses` | integer | No | Maximum redemptions. Default: `1`. |
-| `expires` | string | No | ISO 8601 expiry. Default: no expiry. |
+| `expires` | string | No | RFC 3339 expiry. Default: no expiry. |
 
 ### C.5 DirectoryEntry
 
@@ -1359,7 +1359,7 @@ The following are special requests that do not fit the standard file resource mo
 | `type` | string | Yes | `"directory"` for subdirectories, `"file"` for files. |
 | `name` | string | Yes | Entry name. |
 | `size` | integer | No | File size in bytes. Absent for directories. |
-| `modified` | string | No | ISO 8601 last modification time. Absent for directories. |
+| `modified` | string | No | RFC 3339 last modification time. Absent for directories. |
 | `modified_by` | string | No | Address of last modifier. Absent for directories. |
 
 ### C.6 Group
@@ -1381,7 +1381,7 @@ Like an identity document, but identifies a set of members instead of a single a
 | `version` | integer | Yes | Protocol version. |
 | `members` | array | Yes | Group members (`Member[]`), each with a permission within the group. |
 | `key` | Key | No | Current group public key. Present when the group is used for sharing; absent for allowlist-only groups (e.g. a contacts group with no shared files). |
-| `updated` | string | Yes | ISO 8601 timestamp of last update. |
+| `updated` | string | Yes | RFC 3339 timestamp of last update. |
 | `signature` | Signature | Yes | An `owner` member's signature over all fields above. |
 
 ### C.7 Event

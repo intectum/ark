@@ -7,7 +7,7 @@ use std::thread;
 
 use crate::crypto::verify_bytes;
 use crate::identity::read_identity;
-use crate::metadata::{read_metadata_attributes, read_metadata_headers, write_metadata_attributes, write_metadata_headers};
+use crate::metadata::{get_member, read_metadata_attributes, read_metadata_headers, verify_metadata, write_metadata_attributes, write_metadata_headers};
 use crate::types::{DirectoryEntry, DirectoryEntryKind};
 use crate::util::{decode_base64url, io_err, now_seconds, request_to_bytes};
 
@@ -318,6 +318,15 @@ fn serve_put(stream: &mut TcpStream, path: &Path, body: &[u8], headers: &[(Strin
         Err(e) => return write_status(stream, 400, "Bad Request", e.to_string().as_bytes()),
     };
 
+    let modifier = match get_member(&metadata.members, &metadata.modified_by) {
+        Some(m) => m,
+        None => return write_status(stream, 403, "Forbidden", b"modifier not in member list"),
+    };
+
+    if let Err(e) = verify_metadata(&modifier.identity_key, &metadata, body) {
+        return write_status(stream, 403, "Forbidden", e.to_string().as_bytes());
+    }
+
     if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
 
     let (response_code, response_msg) = if path.exists() { (204, "No Content") } else { (201, "Created") };
@@ -404,9 +413,9 @@ mod tests {
     use super::*;
     use crate::create_account::create_account_with_key;
     use crate::crypto::sign_bytes;
-    use crate::types::{Member, Metadata};
+    use crate::metadata::sign_metadata;
     use crate::util::encode_base64url;
-    use crate::util::test::{TempDir, get_default_test_metadata, write_file_with_default_test_metadata};
+    use crate::util::test::{TEST_ADDRESS, TempDir, get_default_test_metadata, write_file_with_default_test_metadata};
 
     fn setup_account(td: &Path, account: &str, key: &[u8]) -> PathBuf {
         let address = format!("{}@example.com", account);
@@ -463,7 +472,7 @@ mod tests {
     }
 
     fn signed_put_with_default_metadata(port: u16, key: &[u8], path: &str, body: &[u8]) -> (u16, Vec<u8>, Vec<(String, String)>) {
-        let meta = write_metadata_headers(&get_default_test_metadata());
+        let meta = write_metadata_headers(&get_default_test_metadata(key, TEST_ADDRESS, body));
         let extra: Vec<(&str, &str)> = meta.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         signed_request_with_headers(port, key, "PUT", path, body, &extra)
     }
@@ -477,7 +486,7 @@ mod tests {
         let td = TempDir::new("ark_server_test");
         let key = [1u8; 32];
         let acc = setup_account(&td.0, "test", &key);
-        write_file_with_default_test_metadata(&acc.join("hello.txt"), b"hi there");
+        write_file_with_default_test_metadata(&acc.join("hello.txt"), &key, TEST_ADDRESS, b"hi there");
         let port = start_test_server(td.0.clone());
         let (code, body, headers) = signed_request(port, &key, "GET", "/ark/test/hello.txt", &[]);
         assert_eq!(code, 200);
@@ -550,7 +559,7 @@ mod tests {
         let td = TempDir::new("ark_server_test");
         let key = [4u8; 32];
         let acc = setup_account(&td.0, "test", &key);
-        write_file_with_default_test_metadata(&acc.join("x"), b"abcde");
+        write_file_with_default_test_metadata(&acc.join("x"), &key, TEST_ADDRESS, b"abcde");
         let port = start_test_server(td.0.clone());
         let (code, body, headers) = signed_request(port, &key, "HEAD", "/ark/test/x", &[]);
         assert_eq!(code, 200);
@@ -586,7 +595,7 @@ mod tests {
         let td = TempDir::new("ark_server_test");
         let key = [7u8; 32];
         let acc = setup_account(&td.0, "test", &key);
-        write_file_with_default_test_metadata(&acc.join("x"), b"old");
+        write_file_with_default_test_metadata(&acc.join("x"), &key, TEST_ADDRESS, b"old");
         let port = start_test_server(td.0.clone());
         let (code, _, _) = signed_put_with_default_metadata(port, &key, "/ark/test/x", b"new content");
         assert_eq!(code, 204);
@@ -659,7 +668,7 @@ mod tests {
         let key = [50u8; 32];
         let acc = setup_account(&td.0, "test", &key);
         let target = acc.join("real.txt");
-        write_file_with_default_test_metadata(&target, b"secret");
+        write_file_with_default_test_metadata(&target, &key, TEST_ADDRESS, b"secret");
         std::os::unix::fs::symlink(&target, acc.join("link")).unwrap();
         let port = start_test_server(td.0.clone());
         let (code, _, _) = signed_request(port, &key, "GET", "/ark/test/link", &[]);
@@ -673,7 +682,7 @@ mod tests {
         let key = [51u8; 32];
         let acc = setup_account(&td.0, "test", &key);
         let target = acc.join("real.txt");
-        write_file_with_default_test_metadata(&target, b"secret");
+        write_file_with_default_test_metadata(&target, &key, TEST_ADDRESS, b"secret");
         std::os::unix::fs::symlink(&target, acc.join("link")).unwrap();
         let port = start_test_server(td.0.clone());
         let (code, _, _) = signed_request(port, &key, "HEAD", "/ark/test/link", &[]);
@@ -687,7 +696,7 @@ mod tests {
         let key = [52u8; 32];
         let acc = setup_account(&td.0, "test", &key);
         let target = acc.join("real.txt");
-        write_file_with_default_test_metadata(&target, b"original");
+        write_file_with_default_test_metadata(&target, &key, TEST_ADDRESS, b"original");
         std::os::unix::fs::symlink(&target, acc.join("link")).unwrap();
         let port = start_test_server(td.0.clone());
         let (code, _, _) = signed_put_with_default_metadata(port, &key, "/ark/test/link", b"clobber");
@@ -702,7 +711,7 @@ mod tests {
         let key = [53u8; 32];
         let acc = setup_account(&td.0, "test", &key);
         let target = acc.join("real.txt");
-        write_file_with_default_test_metadata(&target, b"keep");
+        write_file_with_default_test_metadata(&target, &key, TEST_ADDRESS, b"keep");
         let link = acc.join("link");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let port = start_test_server(td.0.clone());
@@ -850,7 +859,7 @@ mod tests {
     fn created_identity_authenticates_with_server() {
         let td = TempDir::new("ark_server_test");
         create_account_with_key(&td.0, "gyan@example.com", &[77u8; 32]).unwrap();
-        write_file_with_default_test_metadata(&td.0.join("ark/gyan/hello.txt"), b"hi gyan");
+        write_file_with_default_test_metadata(&td.0.join("ark/gyan/hello.txt"), &[77u8; 32], "gyan@example.com", b"hi gyan");
         let port = start_test_server(td.0.clone());
         let (code, body, _) = signed_request(port, &[77u8; 32], "GET", "/ark/gyan/hello.txt", &[]);
         assert_eq!(code, 200);
@@ -879,15 +888,12 @@ mod tests {
         let key = [23u8; 32];
         setup_account(&td.0, "test", &key);
         let port = start_test_server(td.0.clone());
-        let key_b64 = encode_base64url([7u8; 32]);
-        let identity_b64 = encode_base64url([1u8; 32]);
-        let extra = [
-            ("X-Ark-Meta-Encryption", "aes-256-gcm"),
-            ("X-Ark-Meta-Member-0-Address", "alice@x"),
-            ("X-Ark-Meta-Member-0-Identity-Key", identity_b64.as_str()),
-            ("X-Ark-Meta-Member-0-Permission", "owner"),
-            ("X-Ark-Meta-Member-0-Wrapped-File-Key", key_b64.as_str()),
-        ];
+        let alice_key = [99u8; 32];
+        let mut m = get_default_test_metadata(&alice_key, "alice@x", b"ciphertext");
+        m.members[0].wrapped_file_key = [7u8; 32].to_vec();
+        sign_metadata(&alice_key, &mut m, b"ciphertext");
+        let headers = write_metadata_headers(&m);
+        let extra: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         let (code, _, _) = signed_request_with_headers(port, &key, "PUT", "/ark/test/secret", b"ciphertext", &extra);
         assert_eq!(code, 201);
         let p = td.0.join("ark/test/secret");
@@ -895,10 +901,10 @@ mod tests {
             xattr::get(&p, "user.ark.encryption").unwrap().as_deref(),
             Some(b"aes-256-gcm".as_slice())
         );
-        let m = read_metadata_attributes(&p).unwrap();
-        assert_eq!(m.members.len(), 1);
-        assert_eq!(m.members[0].address, "alice@x");
-        assert_eq!(m.members[0].wrapped_file_key, [7u8; 32]);
+        let loaded = read_metadata_attributes(&p).unwrap();
+        assert_eq!(loaded.members.len(), 1);
+        assert_eq!(loaded.members[0].address, "alice@x");
+        assert_eq!(loaded.members[0].wrapped_file_key, [7u8; 32]);
     }
 
     #[test]
@@ -907,7 +913,7 @@ mod tests {
         let key = [26u8; 32];
         setup_account(&td.0, "test", &key);
         let port = start_test_server(td.0.clone());
-        let meta = write_metadata_headers(&get_default_test_metadata());
+        let meta = write_metadata_headers(&get_default_test_metadata(&key, TEST_ADDRESS, b"x"));
         let mut extra: Vec<(&str, &str)> = meta.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         extra.push(("X-Ark-Meta-Foo", "bar"));
         let (code, _, _) = signed_request_with_headers(port, &key, "PUT", "/ark/test/file", b"x", &extra);
@@ -922,28 +928,14 @@ mod tests {
         let key = [30u8; 32];
         let acc = setup_account(&td.0, "test", &key);
         let file = acc.join("secret");
-        fs::write(&file, b"ciphertext").unwrap();
-        let wrapped_key = [8u8; 32];
-        let wrapped_key_b64 = encode_base64url(wrapped_key);
-        let owner = Member {
-            address: "alice@x".to_string(),
-            identity_key: [1u8; 32].to_vec(),
-            permission: "owner".to_string(),
-            wrapped_file_key: wrapped_key.to_vec(),
-        };
-        write_metadata_attributes(&file, &Metadata {
-            encryption: "aes-256-gcm".to_string(),
-            encrypted: None,
-            members: vec![owner],
-        }).unwrap();
+        write_file_with_default_test_metadata(&file, &key, TEST_ADDRESS, b"ciphertext");
         let port = start_test_server(td.0.clone());
 
         let (code, body, headers) = signed_request(port, &key, "GET", "/ark/test/secret", &[]);
         assert_eq!(code, 200);
         assert_eq!(body, b"ciphertext");
         assert_eq!(header(&headers, "x-ark-meta-encryption"), Some("aes-256-gcm"));
-        assert_eq!(header(&headers, "x-ark-meta-member-0-address"), Some("alice@x"));
-        assert_eq!(header(&headers, "x-ark-meta-member-0-wrapped-file-key"), Some(wrapped_key_b64.as_str()));
+        assert_eq!(header(&headers, "x-ark-meta-member-0-address"), Some(TEST_ADDRESS));
     }
 
     #[test]
@@ -952,7 +944,7 @@ mod tests {
         let key = [32u8; 32];
         let acc = setup_account(&td.0, "test", &key);
         let file = acc.join("file");
-        write_file_with_default_test_metadata(&file, b"data");
+        write_file_with_default_test_metadata(&file, &key, TEST_ADDRESS, b"data");
         xattr::set(&file, "user.ark.foo", b"bar").unwrap();
         let port = start_test_server(td.0.clone());
 
@@ -990,7 +982,7 @@ mod tests {
         let key = [25u8; 32];
         setup_account(&td.0, "test", &key);
         let port = start_test_server(td.0.clone());
-        let meta = write_metadata_headers(&get_default_test_metadata());
+        let meta = write_metadata_headers(&get_default_test_metadata(&key, TEST_ADDRESS, b"x"));
         let mut extra: Vec<(&str, &str)> = meta.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         extra.push(("X-Custom-Foo", "bar"));
         let (code, _, _) = signed_request_with_headers(port, &key, "PUT", "/ark/test/file", b"x", &extra);

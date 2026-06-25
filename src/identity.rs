@@ -14,15 +14,14 @@ pub fn create_identity(key: &[u8], address: &str) -> Identity {
             public_key: to_public_key(key)
         },
         address: address.to_string(),
-        updated: now_iso(),
+        modified: now_iso(),
         signature: Signature {
             algorithm: DEFAULT_SIGNING_ALGORITHM.to_string(),
             signature: Vec::new()
         }
     };
 
-    let json = serde_json::to_value(&identity).expect("serialize identity");
-    identity.signature.signature = sign_json(key, &json);
+    sign_identity(key, &mut identity);
 
     identity
 }
@@ -72,8 +71,8 @@ pub fn validate_identity(identity: &Identity) -> io::Result<()> {
         return Err(io_invalid_input("invalid account name (must be lowercase alphanumeric, dots, hyphens, underscores; 1-64 chars; not pure dots)"));
     }
 
-    time::OffsetDateTime::parse(&identity.updated, &time::format_description::well_known::Rfc3339)
-        .map_err(|e| io_invalid_input(&format!("updated is not a valid RFC 3339 timestamp: {}", e)))?;
+    time::OffsetDateTime::parse(&identity.modified, &time::format_description::well_known::Rfc3339)
+        .map_err(|e| io_invalid_input(&format!("modified is not a valid RFC 3339 timestamp: {}", e)))?;
 
     if identity.signature.algorithm == DEFAULT_SIGNING_ALGORITHM {
         if identity.signature.signature.len() != 64 {
@@ -83,26 +82,28 @@ pub fn validate_identity(identity: &Identity) -> io::Result<()> {
         return Err(io_invalid_input("unsupported signature algorithm"));
     }
 
-    let mut identity_without_signature = identity.clone();
-    identity_without_signature.signature.signature = Vec::new();
-
-    let json = serde_json::to_value(&identity_without_signature)
-        .map_err(|e| io_err(&e.to_string()))?;
-    verify_json(&identity.key.public_key, &identity.signature.signature, &json)
+    verify_identity(&identity)
         .map_err(|_| io_invalid_input("signature verification failed"))?;
 
     Ok(())
 }
 
-pub fn is_valid_account_name(name: &str) -> bool {
-    if name.is_empty() || name.len() > 64 { return false };
+pub fn sign_identity(key: &[u8], identity: &mut Identity) {
+    identity.signature.algorithm = DEFAULT_SIGNING_ALGORITHM.to_string();
+    let json = serde_json::to_value(identity_for_signing(identity)).expect("serialize identity");
+    identity.signature.signature = sign_json(key, &json);
+}
 
-    let allowed = name
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-' || c == '_');
-    if !allowed { return false };
+pub fn verify_identity(identity: &Identity) -> io::Result<()> {
+    let json = serde_json::to_value(identity_for_signing(identity)).expect("serialize identity");
+    verify_json(&identity.key.public_key, &identity.signature.signature, &json)
+        .map_err(|_| io_err("identity signature verification failed"))
+}
 
-    name.chars().any(|c| c != '.')
+fn identity_for_signing(identity: &Identity) -> Identity {
+    let mut clone = identity.clone();
+    clone.signature.signature = Vec::new();
+    clone
 }
 
 pub fn read_identity_key(path: &Path) -> io::Result<Vec<u8>> {
@@ -133,6 +134,17 @@ pub fn write_identity_key(path: &Path, key: &[u8]) -> io::Result<()> {
     fs::write(path, encode_base64url(key))
 }
 
+fn is_valid_account_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 64 { return false };
+
+    let allowed = name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-' || c == '_');
+    if !allowed { return false };
+
+    name.chars().any(|c| c != '.')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,11 +157,7 @@ mod tests {
         assert_eq!(identity.key.algorithm, DEFAULT_SIGNING_ALGORITHM);
         assert_eq!(identity.signature.algorithm, DEFAULT_SIGNING_ALGORITHM);
 
-        let mut identity_without_signature = identity.clone();
-        identity_without_signature.signature.signature = Vec::new();
-
-        let json = serde_json::to_value(&identity_without_signature).unwrap();
-        assert!(verify_json(&identity.key.public_key, &identity.signature.signature, &json).is_ok());
+        assert!(verify_identity(&identity).is_ok());
     }
 
     #[test]
@@ -159,13 +167,10 @@ mod tests {
         assert_eq!(identity.key.algorithm, DEFAULT_SIGNING_ALGORITHM);
         assert_eq!(identity.signature.algorithm, DEFAULT_SIGNING_ALGORITHM);
 
-        let mut identity_without_signature = identity.clone();
-        identity_without_signature.signature.signature = Vec::new();
+        let mut identity_tampered = identity.clone();
+        identity_tampered.address = "mallory@example.com".to_string();
 
-        identity_without_signature.address = "mallory@example.com".to_string();
-
-        let json = serde_json::to_value(&identity_without_signature).unwrap();
-        assert!(verify_json(&identity.key.public_key, &identity.signature.signature, &json).is_err());
+        assert!(verify_identity(&identity_tampered).is_err());
     }
 
     #[test]
@@ -174,7 +179,7 @@ mod tests {
         let s = serde_json::to_string(&identity).unwrap();
         let parsed: Identity = serde_json::from_str(&s).unwrap();
         assert_eq!(parsed.address, identity.address);
-        assert_eq!(parsed.updated, identity.updated);
+        assert_eq!(parsed.modified, identity.modified);
         assert_eq!(parsed.key.algorithm, identity.key.algorithm);
         assert_eq!(parsed.key.public_key, identity.key.public_key);
         assert_eq!(parsed.signature.algorithm, identity.signature.algorithm);
@@ -189,7 +194,7 @@ mod tests {
         write_identity(&path, &identity).unwrap();
         let loaded = read_identity(&path).unwrap();
         assert_eq!(loaded.address, identity.address);
-        assert_eq!(loaded.updated, identity.updated);
+        assert_eq!(loaded.modified, identity.modified);
         assert_eq!(loaded.key.algorithm, identity.key.algorithm);
         assert_eq!(loaded.key.public_key, identity.key.public_key);
         assert_eq!(loaded.signature.algorithm, identity.signature.algorithm);
@@ -257,7 +262,7 @@ mod tests {
     #[test]
     fn validate_identity_rejects_bad_timestamp() {
         let mut identity = create_identity(&[64u8; 32], "alice@example.com");
-        identity.updated = "not-a-timestamp".to_string();
+        identity.modified = "not-a-timestamp".to_string();
         let err = validate_identity(&identity).unwrap_err();
         assert!(err.to_string().contains("not a valid RFC 3339 timestamp"));
     }

@@ -4,7 +4,7 @@ use std::path::Path;
 
 use crate::crypto::{decrypt_bytes};
 use crate::identity::read_nearest_identity;
-use crate::metadata::{get_member, read_metadata_headers, write_metadata_attributes};
+use crate::metadata::{get_member, read_metadata_headers, verify_metadata, write_metadata_attributes};
 use crate::request::ark_request;
 use crate::util::io_err;
 
@@ -15,6 +15,12 @@ pub fn cmd_get(arg: &str, output: Option<&str>, decrypt: bool) -> std::io::Resul
     }
 
     let mut metadata = read_metadata_headers(&headers)?;
+
+    let modifier = match get_member(&metadata.members, &metadata.modified_by) {
+        Some(m) => m,
+        None => return Err(io_err("modifier not in member list")),
+    };
+    verify_metadata(&modifier.identity_key, &metadata, &body)?;
 
     let final_body = if decrypt {
         let (identity, _) = read_nearest_identity()?;
@@ -51,10 +57,9 @@ mod tests {
     use super::*;
     use crate::create_account::create_account_with_key;
     use crate::crypto::encrypt_bytes;
-    use crate::metadata::{read_metadata_attributes, write_metadata_attributes};
+    use crate::metadata::{read_metadata_attributes, sign_metadata, write_metadata_attributes};
     use crate::server::start_test_server;
-    use crate::types::{Member, Metadata};
-    use crate::util::test::{TempDir, with_cwd, write_file_with_default_test_metadata};
+    use crate::util::test::{TempDir, get_default_test_metadata, with_cwd, write_file_with_default_test_metadata};
 
     #[test]
     fn get_file_via_cmd_get_writes_to_output() {
@@ -62,7 +67,7 @@ mod tests {
         let port = start_test_server(td.0.clone());
         let address = format!("gyan@127.0.0.1:{}", port);
         create_account_with_key(&td.0, &address, &[200u8; 32]).unwrap();
-        write_file_with_default_test_metadata(&td.0.join("ark/gyan/hello.txt"), b"hi from server");
+        write_file_with_default_test_metadata(&td.0.join("ark/gyan/hello.txt"), &[200u8; 32], &address, b"hi from server");
 
         let account_dir = td.0.join("ark").join("gyan");
         let out = td.0.join("out.bin");
@@ -82,7 +87,7 @@ mod tests {
         create_account_with_key(&td.0, &address, &[201u8; 32]).unwrap();
         let notes = td.0.join("ark/gyan/notes");
         fs::create_dir_all(&notes).unwrap();
-        write_file_with_default_test_metadata(&notes.join("todo.txt"), b"buy milk");
+        write_file_with_default_test_metadata(&notes.join("todo.txt"), &[201u8; 32], &address, b"buy milk");
 
         let out = td.0.join("out.bin");
         with_cwd(&notes, || {
@@ -99,7 +104,7 @@ mod tests {
         create_account_with_key(&td.0, &address, &[202u8; 32]).unwrap();
         let subdir = td.0.join("ark/gyan/sub");
         fs::create_dir_all(&subdir).unwrap();
-        write_file_with_default_test_metadata(&subdir.join("file.txt"), b"absolute");
+        write_file_with_default_test_metadata(&subdir.join("file.txt"), &[202u8; 32], &address, b"absolute");
 
         let out = td.0.join("out.bin");
         let cwd = td.0.join("ark/gyan/sub");
@@ -115,7 +120,7 @@ mod tests {
         let port = start_test_server(td.0.clone());
         let address = format!("gyan@127.0.0.1:{}", port);
         create_account_with_key(&td.0, &address, &[203u8; 32]).unwrap();
-        write_file_with_default_test_metadata(&td.0.join("ark/gyan/explicit.txt"), b"via address");
+        write_file_with_default_test_metadata(&td.0.join("ark/gyan/explicit.txt"), &[203u8; 32], &address, b"via address");
 
         let out = td.0.join("out.bin");
         let cwd = td.0.join("ark/gyan");
@@ -131,21 +136,15 @@ mod tests {
         let td = TempDir::new("ark_get_test");
         let port = start_test_server(td.0.clone());
         let address = format!("gyan@127.0.0.1:{}", port);
-        create_account_with_key(&td.0, &address, &[210u8; 32]).unwrap();
+        let account_key = [210u8; 32];
+        create_account_with_key(&td.0, &address, &account_key).unwrap();
         let server_file = td.0.join("ark/gyan/secret");
         fs::write(&server_file, b"ciphertext").unwrap();
         let key = [11u8; 32];
-        let owner = Member {
-            address: format!("gyan@127.0.0.1:{}", port),
-            identity_key: [0u8; 32].to_vec(),
-            permission: "owner".to_string(),
-            wrapped_file_key: key.to_vec(),
-        };
-        write_metadata_attributes(&server_file, &Metadata {
-            encryption: "aes-256-gcm".to_string(),
-            encrypted: None,
-            members: vec![owner],
-        }).unwrap();
+        let mut m = get_default_test_metadata(&account_key, &address, b"ciphertext");
+        m.members[0].wrapped_file_key = key.to_vec();
+        sign_metadata(&account_key, &mut m, b"ciphertext");
+        write_metadata_attributes(&server_file, &m).unwrap();
 
         let account_dir = td.0.join("ark").join("gyan");
         let out = td.0.join("out.bin");
@@ -164,23 +163,17 @@ mod tests {
         let td = TempDir::new("ark_get_test");
         let port = start_test_server(td.0.clone());
         let address = format!("gyan@127.0.0.1:{}", port);
-        create_account_with_key(&td.0, &address, &[220u8; 32]).unwrap();
+        let account_key = [220u8; 32];
+        create_account_with_key(&td.0, &address, &account_key).unwrap();
 
         let key = [44u8; 32];
         let ct = encrypt_bytes(&key, b"clear text").unwrap();
         let server_file = td.0.join("ark/gyan/secret");
         fs::write(&server_file, &ct).unwrap();
-        let owner = Member {
-            address: format!("gyan@127.0.0.1:{}", port),
-            identity_key: [0u8; 32].to_vec(),
-            permission: "owner".to_string(),
-            wrapped_file_key: key.to_vec(),
-        };
-        write_metadata_attributes(&server_file, &Metadata {
-            encryption: "aes-256-gcm".to_string(),
-            encrypted: None,
-            members: vec![owner],
-        }).unwrap();
+        let mut m = get_default_test_metadata(&account_key, &address, &ct);
+        m.members[0].wrapped_file_key = key.to_vec();
+        sign_metadata(&account_key, &mut m, &ct);
+        write_metadata_attributes(&server_file, &m).unwrap();
 
         let account_dir = td.0.join("ark").join("gyan");
         let out = td.0.join("out.bin");
@@ -201,7 +194,7 @@ mod tests {
         let port = start_test_server(td.0.clone());
         let address = format!("gyan@127.0.0.1:{}", port);
         create_account_with_key(&td.0, &address, &[221u8; 32]).unwrap();
-        write_file_with_default_test_metadata(&td.0.join("ark/gyan/plain"), b"raw");
+        write_file_with_default_test_metadata(&td.0.join("ark/gyan/plain"), &[99u8; 32], "other@example.com", b"raw");
 
         let account_dir = td.0.join("ark").join("gyan");
         let out = td.0.join("out.bin");
@@ -217,7 +210,7 @@ mod tests {
         let port = start_test_server(td.0.clone());
         let address = format!("gyan@127.0.0.1:{}", port);
         create_account_with_key(&td.0, &address, &[230u8; 32]).unwrap();
-        write_file_with_default_test_metadata(&td.0.join("ark/gyan/stdout.txt"), b"to stdout");
+        write_file_with_default_test_metadata(&td.0.join("ark/gyan/stdout.txt"), &[230u8; 32], &address, b"to stdout");
 
         let account_dir = td.0.join("ark").join("gyan");
         with_cwd(&account_dir, || {

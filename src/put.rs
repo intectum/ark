@@ -2,12 +2,14 @@ use std::fs;
 use std::io::Read;
 use std::path::PathBuf;
 
-use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, encrypt_bytes};
-use crate::identity::read_nearest_identity;
-use crate::metadata::{get_member, read_metadata_attributes, write_metadata_attributes, write_metadata_headers};
+use uuid::Uuid;
+
+use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, DEFAULT_SIGNING_ALGORITHM, encrypt_bytes};
+use crate::identity::{read_identity_key, read_nearest_identity};
+use crate::metadata::{get_member, read_metadata_attributes, sign_metadata, write_metadata_attributes, write_metadata_headers};
 use crate::request::ark_request;
-use crate::types::{Member, Metadata};
-use crate::util::io_err;
+use crate::types::{Member, Metadata, Signature};
+use crate::util::{io_err, now_iso};
 
 pub fn cmd_put(arg: &str, input: Option<&str>, no_encrypt: bool) -> std::io::Result<()> {
     let input_path: Option<PathBuf> = input.map(PathBuf::from);
@@ -21,30 +23,38 @@ pub fn cmd_put(arg: &str, input: Option<&str>, no_encrypt: bool) -> std::io::Res
         }
     };
 
-    let (identity, _) = read_nearest_identity()?;
+    let (identity, account_dir) = read_nearest_identity()?;
+    let signing_key = read_identity_key(&account_dir.join(".ark").join("identity.key"))?;
 
     let has_existing_metadata = match input_path.as_deref() {
         Some(p) => xattr::get(p, "user.ark.encryption")?.is_some(),
         None => false,
     };
 
-    let metadata = if has_existing_metadata {
+    let now = now_iso();
+    let mut metadata = if has_existing_metadata {
         read_metadata_attributes(input_path.as_deref().unwrap())?
     } else {
         Metadata {
+            id: Uuid::new_v4().to_string(),
+            created: now.clone(),
+            modified: now.clone(),
+            modified_by: identity.address.clone(),
             encryption: DEFAULT_ENCRYPTION_ALGORITHM.to_string(),
-            encrypted: Some(false),
             members: vec![Member {
                 address: identity.address.clone(),
                 identity_key: identity.key.public_key.clone(),
                 permission: "owner".to_string(),
                 wrapped_file_key: random_key()?
-            }]
+            }],
+            body_hash: Vec::new(),
+            signature: Signature { algorithm: DEFAULT_SIGNING_ALGORITHM.to_string(), signature: Vec::new() },
+            encrypted: Some(false),
         }
     };
 
     let member = match get_member(&metadata.members, &identity.address) {
-        Some(m) => m,
+        Some(m) => m.clone(),
         None => return Err(io_err("no member entry for current account"))
     };
 
@@ -53,6 +63,10 @@ pub fn cmd_put(arg: &str, input: Option<&str>, no_encrypt: bool) -> std::io::Res
     } else {
         body
     };
+
+    metadata.modified = now;
+    metadata.modified_by = identity.address.clone();
+    sign_metadata(&signing_key, &mut metadata, &final_body);
 
     let metadata_headers = write_metadata_headers(&metadata);
     let extra_headers: Vec<(&str, &str)> = metadata_headers.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
@@ -84,7 +98,7 @@ mod tests {
     use crate::crypto::decrypt_bytes;
     use crate::metadata::read_metadata_attributes;
     use crate::server::start_test_server;
-    use crate::util::test::{TempDir, with_cwd};
+    use crate::util::test::{TempDir, get_default_test_metadata, with_cwd};
 
     fn read_file_key(path: &std::path::Path) -> Vec<u8> {
         let m = read_metadata_attributes(path).unwrap();
@@ -144,18 +158,15 @@ mod tests {
         let td = TempDir::new("ark_put_test");
         let port = start_test_server(td.0.clone());
         let address = format!("gyan@127.0.0.1:{}", port);
-        create_account_with_key(&td.0, &address, &[132u8; 32]).unwrap();
+        let account_key = [132u8; 32];
+        create_account_with_key(&td.0, &address, &account_key).unwrap();
 
         let preset_key = [77u8; 32];
         let input = td.0.join("input.bin");
         fs::write(&input, b"hello").unwrap();
-        let owner = Member {
-            address: format!("gyan@127.0.0.1:{}", port),
-            identity_key: [0u8; 32].to_vec(),
-            permission: "owner".to_string(),
-            wrapped_file_key: preset_key.to_vec(),
-        };
-        let preset_meta = Metadata { encryption: "aes-256-gcm".to_string(), encrypted: None, members: vec![owner] };
+        let mut preset_meta = get_default_test_metadata(&account_key, &address, b"hello");
+        preset_meta.members[0].wrapped_file_key = preset_key.to_vec();
+        sign_metadata(&account_key, &mut preset_meta, b"hello");
         write_metadata_attributes(&input, &preset_meta).unwrap();
 
         let account_dir = td.0.join("ark/gyan");
@@ -272,24 +283,19 @@ mod tests {
         let td = TempDir::new("ark_put_test");
         let port = start_test_server(td.0.clone());
         let address = format!("gyan@127.0.0.1:{}", port);
-        create_account_with_key(&td.0, &address, &[150u8; 32]).unwrap();
+        let account_key = [150u8; 32];
+        create_account_with_key(&td.0, &address, &account_key).unwrap();
 
         // pre-encrypted input
         let key = [88u8; 32];
         let ciphertext = encrypt_bytes(&key, b"hidden").unwrap();
         let input = td.0.join("input.bin");
         fs::write(&input, &ciphertext).unwrap();
-        let owner = Member {
-            address: format!("gyan@127.0.0.1:{}", port),
-            identity_key: [0u8; 32].to_vec(),
-            permission: "owner".to_string(),
-            wrapped_file_key: key.to_vec(),
-        };
-        write_metadata_attributes(&input, &Metadata {
-            encryption: "aes-256-gcm".to_string(),
-            encrypted: Some(true),
-            members: vec![owner],
-        }).unwrap();
+        let mut m = get_default_test_metadata(&account_key, &address, &ciphertext);
+        m.members[0].wrapped_file_key = key.to_vec();
+        m.encrypted = Some(true);
+        sign_metadata(&account_key, &mut m, &ciphertext);
+        write_metadata_attributes(&input, &m).unwrap();
 
         let account_dir = td.0.join("ark/gyan");
         with_cwd(&account_dir, || {
@@ -349,23 +355,17 @@ mod tests {
         let td = TempDir::new("ark_put_test");
         let port = start_test_server(td.0.clone());
         let address = format!("gyan@127.0.0.1:{}", port);
-        create_account_with_key(&td.0, &address, &[161u8; 32]).unwrap();
+        let account_key = [161u8; 32];
+        create_account_with_key(&td.0, &address, &account_key).unwrap();
 
         let key = [55u8; 32];
         let ct = encrypt_bytes(&key, b"secret").unwrap();
         let input = td.0.join("input.bin");
         fs::write(&input, &ct).unwrap();
-        let owner = Member {
-            address: format!("gyan@127.0.0.1:{}", port),
-            identity_key: [0u8; 32].to_vec(),
-            permission: "owner".to_string(),
-            wrapped_file_key: key.to_vec(),
-        };
-        write_metadata_attributes(&input, &Metadata {
-            encryption: "aes-256-gcm".to_string(),
-            encrypted: None,
-            members: vec![owner],
-        }).unwrap();
+        let mut m = get_default_test_metadata(&account_key, &address, &ct);
+        m.members[0].wrapped_file_key = key.to_vec();
+        sign_metadata(&account_key, &mut m, &ct);
+        write_metadata_attributes(&input, &m).unwrap();
 
         let account_dir = td.0.join("ark/gyan");
         with_cwd(&account_dir, || {

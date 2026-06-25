@@ -59,16 +59,10 @@ pub fn decode_base64url<T: AsRef<[u8]>>(input: T) -> Result<Vec<u8>, DecodeError
     URL_SAFE_NO_PAD.decode(input)
 }
 
-#[allow(dead_code)]
-pub fn sha256_hex(data: &[u8]) -> String {
-    let mut h = Sha256::new();
-    h.update(data);
-    let out = h.finalize();
-    let mut s = String::with_capacity(64);
-    for b in out {
-        s.push_str(&format!("{:02x}", b));
-    }
-    s
+pub fn sha256(data: &[u8]) -> Vec<u8> {
+    let mut hash = Sha256::new();
+    hash.update(data);
+    hash.finalize().to_vec()
 }
 
 pub fn now_seconds() -> u64 {
@@ -139,22 +133,33 @@ pub mod test {
         (listener, port)
     }
 
-    pub fn get_default_test_metadata() -> crate::types::Metadata {
-        crate::types::Metadata {
+    pub const TEST_ADDRESS: &str = "test@example.com";
+
+    pub fn get_default_test_metadata(key: &[u8], address: &str, body: &[u8]) -> crate::types::Metadata {
+        let public_key = crate::crypto::to_public_key(key);
+        let mut m = crate::types::Metadata {
+            id: "00000000-0000-0000-0000-000000000001".to_string(),
+            modified_by: address.to_string(),
+            created: "2026-01-01T00:00:00Z".to_string(),
+            modified: "2026-01-01T00:00:00Z".to_string(),
             encryption: "aes-256-gcm".to_string(),
             encrypted: None,
             members: vec![crate::types::Member {
-                address: "test@example.com".to_string(),
-                identity_key: [1u8; 32].to_vec(),
+                address: address.to_string(),
+                identity_key: public_key,
                 permission: "owner".to_string(),
                 wrapped_file_key: [2u8; 32].to_vec(),
             }],
-        }
+            body_hash: Vec::new(),
+            signature: crate::types::Signature { algorithm: String::new(), signature: Vec::new() },
+        };
+        crate::metadata::sign_metadata(key, &mut m, body);
+        m
     }
 
-    pub fn write_file_with_default_test_metadata(path: &Path, body: &[u8]) {
+    pub fn write_file_with_default_test_metadata(path: &Path, key: &[u8], address: &str, body: &[u8]) {
         fs::write(path, body).unwrap();
-        crate::metadata::write_metadata_attributes(path, &get_default_test_metadata()).unwrap();
+        crate::metadata::write_metadata_attributes(path, &get_default_test_metadata(key, address, body)).unwrap();
     }
 }
 
@@ -229,9 +234,4 @@ mod tests {
         assert_eq!(url.path(), "/ark/alice/");
     }
 
-    #[test]
-    fn sha256_hex_known_vector() {
-        assert_eq!(sha256_hex(b""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
-        assert_eq!(sha256_hex(b"abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
-    }
 }

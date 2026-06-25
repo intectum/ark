@@ -20,7 +20,7 @@ pub enum DirectoryEntryKind {
 pub struct Identity {
     pub key: Key,
     pub address: String,
-    pub updated: String,
+    pub modified: String,
     pub signature: Signature,
 }
 
@@ -31,19 +31,30 @@ pub struct Key {
     pub public_key: Vec<u8>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Member {
     pub address: String,
+    #[serde(with = "base64url")]
     pub identity_key: Vec<u8>,
     pub permission: String,
+    #[serde(with = "base64url")]
     pub wrapped_file_key: Vec<u8>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Metadata {
+    pub id: String,
+    pub created: String,
+    pub modified: String,
+    pub modified_by: String,
     pub encryption: String,
-    pub encrypted: Option<bool>,
     pub members: Vec<Member>,
+    #[serde(with = "base64url")]
+    pub body_hash: Vec<u8>,
+    pub signature: Signature,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encrypted: Option<bool>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
