@@ -380,7 +380,7 @@ The name of the file is the timestamp when the request was received (with the `.
 - *Passkey:* the credential's WebAuthn public key. On access the server runs a challenge-response (`401` + challenge → client returns a signed assertion → server verifies, Section 7.2). Nothing here is offline-attackable — the authenticator private key never leaves the device.
 - *Password:* a `verifier`. The client sends an `auth_secret` over TLS; the server compares it to the verifier and rate-limits. A *compromised* server holding the verifier can brute-force the password offline, so passwords are the weaker option — prefer passkeys.
 
-**2. Wrapped file key** — the file key wrapped to a `wrap_key` derived from the same credential and stored in `wrapped_file_key` (with `key_nonce`; the `ephemeral_key` ECIES fields are empty — wrapping is direct AES-256-GCM under `wrap_key`, not ECIES):
+**2. Wrapped file key** — the file key wrapped to a `wrap_key` derived from the same credential and stored in `wrapped_key` (with `key_nonce`; the `ephemeral_key` ECIES fields are empty — wrapping is direct AES-256-GCM under `wrap_key`, not ECIES):
 - *Passkey:* `wrap_key = HKDF-SHA256(WebAuthn-PRF(prf_salt))`.
 - *Password:* `wrap_key = HKDF-SHA256(Argon2id(password, salt), info: "wrap")`.
 
@@ -410,11 +410,11 @@ The file metadata's `algorithm` field specifies whether and how the body is encr
 |---|---|---|---|
 | `aes-256-gcm` (default) | Encrypted | Yes — ECIES-wrapped per member | Private files, messages, shared documents |
 | `chacha20-poly1305` | Encrypted | Yes — ECIES-wrapped per member | Same, for devices without AES hardware acceleration |
-| `none` | Unencrypted (raw bytes) | No — `wrapped_file_key` fields are empty | Public content, websites, published documents |
+| `none` | Unencrypted (raw bytes) | No — `wrapped_key` fields are empty | Public content, websites, published documents |
 
 When `algorithm = "none"`:
 - The body is stored as raw bytes (no nonce, no AEAD tag).
-- Member entries have empty `ephemeral_key`, `key_nonce`, and `wrapped_file_key` fields.
+- Member entries have empty `ephemeral_key`, `key_nonce`, and `wrapped_key` fields.
 - The file signature still covers the body hash, providing integrity and authenticity (Section 5.2). This is the **only** integrity guarantee for unencrypted files — there is no AEAD tag to catch tampering.
 
 ### 4.3 File key generation
@@ -438,9 +438,9 @@ When a file is created in static mode:
      info: "file-key-wrap",
      length: 32
    )
-   wrapped_file_key = AES-256-GCM(wrapping_key, random_nonce, file_key)
+   wrapped_key = AES-256-GCM(wrapping_key, random_nonce, file_key)
    ```
-4. Each member entry in the metadata stores the `ephemeral_public`, `nonce`, and `wrapped_file_key`.
+4. Each member entry in the metadata stores the `ephemeral_public`, `nonce`, and `wrapped_key`.
 
 ### 4.4 Decryption
 
@@ -832,7 +832,7 @@ message Member {
   string ephemeral_key_algorithm = 5;  // "x25519" (identity members)
   bytes ephemeral_key = 6;            // Ephemeral public key (32 bytes); empty for credential members
   bytes key_nonce = 7;                // AES-256-GCM nonce for key wrapping (12 bytes)
-  bytes wrapped_file_key = 8;         // File key wrapped to this member (32 bytes + 16 byte tag)
+  bytes wrapped_key = 8;              // File key wrapped to this member (32 bytes + 16 byte tag)
 
   // Credential members (Section 3.10). credential_type defaults to "identity".
   string credential_type = 9;          // "identity" (default), "password", or "passkey"
@@ -1045,7 +1045,7 @@ The `message_key` is used as the file key for that file. It is used once and dis
 | `message_index` | Monotonic counter — position in the ratchet chain |
 | `ratchet_key` | Sender's current DH ratchet public key (X25519, 32 bytes) |
 
-The `members` list still exists in the metadata but `wrapped_file_key` fields are empty — the file key is derived from the ratchet, not wrapped via ECIES.
+The `members` list still exists in the metadata but `wrapped_key` fields are empty — the file key is derived from the ratchet, not wrapped via ECIES.
 
 #### 10.1.5 Ratchet state storage
 
@@ -1125,15 +1125,15 @@ GET https://gateway.example.com/ark/x-a7f3k2m9p4q8r2/.ark/identity
   "type": "legacy_email",
   "address": "x-a7f3k2m9p4q8r2@gateway.example.com",
   "legacy_email": "carol@gmail.com",
-  "key": {
+  "public_key": {
     "algorithm": "ed25519",
-    "public_key": "base64url-encoded"
+    "value": "base64url-encoded"
   },
   "notify": true,
   "modified": "2026-04-14T12:00:00Z",
   "signature": {
     "algorithm": "ed25519",
-    "signature": "base64url-encoded"
+    "value": "base64url-encoded"
   }
 }
 ```
@@ -1252,7 +1252,7 @@ The following are special requests that do not fit the standard file resource mo
 
 ```json
 {
-  "key": Key,
+  "public_key": Key,
   "address": "alice@example.com",
   "modified": "2026-04-11T12:00:00Z",
   "key_transition": KeyTransition,
@@ -1262,7 +1262,7 @@ The following are special requests that do not fit the standard file resource mo
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `key` | Key | Yes | The key that identifies the user. |
+| `public_key` | Key | Yes | The key that identifies the user. |
 | `address` | string | Yes | Full `user@domain` address. |
 | `modified` | string | Yes | RFC 3339 timestamp of last update. |
 | `key_transition` | KeyTransition | No | The most recent key transition. |[TODO list all?]
@@ -1284,15 +1284,15 @@ The following are special requests that do not fit the standard file resource mo
   "type": "legacy_email",
   "address": "x-a7f3k2m9p4q8r2@gateway.example.com",
   "legacy_email": "carol@gmail.com",
-  "key": {
+  "public_key": {
     "algorithm": "ed25519",
-    "public_key": "<base64url>"
+    "value": "<base64url>"
   },
   "notify": true,
   "modified": "2026-04-14T12:00:00Z",
   "signature": {
     "algorithm": "ed25519",
-    "signature": "<base64url>"
+    "value": "<base64url>"
   }
 }
 ```
@@ -1406,46 +1406,62 @@ Like an identity document, but identifies a set of members instead of a single a
 ```json
 {
   "algorithm": "ed25519",
-  "public_key": "<base64url>"
-},
+  "value": "<base64url>"
+}
 ```
 
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `algorithm` | string | Yes | Signing algorithm e.g. `"ed25519"`. |
-| `public_key` | string | Yes | Base64url-encoded public key. |
+| `value` | string | Yes | Base64url-encoded public key bytes. |
 
 ### C.9 Signature
 
 ```json
 {
   "algorithm": "ed25519",
-  "signature": "<base64url>"
+  "value": "<base64url>"
 }
 ```
 
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `algorithm` | string | Yes | Signing algorithm e.g. `"ed25519"`. |
-| `signature` | string | Yes | Base64url-encoded signature. |
+| `value` | string | Yes | Base64url-encoded signature bytes. |
 
-### C.10 Member
+### C.10 Hash
+
+```json
+{
+  "algorithm": "sha-256",
+  "value": "<base64url>"
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `algorithm` | string | Yes | Hash algorithm e.g. `"sha-256"`. |
+| `value` | string | Yes | Base64url-encoded hash bytes. |
+
+### C.11 Member
 
 ```json
 {
   "address": "alice@example.com",
-  "key": Key,
-  "permission": "owner"
+  "identity_key": "<base64url>",
+  "permission": "owner",
+  "wrapped_key": "<base64url>"
 }
 ```
 
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `address` | string | Yes | Member's full address. |
-| `key` | object | Yes | Member's identity key. |
+| `identity_key` | string | Yes | Base64url-encoded member identity public key bytes. |
 | `permission` | string | Yes | `"owner"`, `"write"`, or `"read"`. |
+| `wrapped_key` | string | Yes | Base64url-encoded file key wrapped to this member. Empty for `algorithm = "none"` files. |
 
-### C.11 Identity key file (`identity.key`, Section 2.11)
+### C.12 Identity key file (`identity.key`, Section 2.11)
 
 Not a distinct document type — an ordinary Ark **File** (Section 8) served at `/ark/<user>/.ark/identity.key`:
 
@@ -1453,7 +1469,7 @@ Not a distinct document type — an ordinary Ark **File** (Section 8) served at 
 - **Members:** one or more **credential members** (Section 3.10, `credential_type` `"password"` / `"passkey"`) with `read` permission — the credentials that can unlock the key — plus the identity itself as an `owner` identity member (used to add/remove credentials). An optional server-controlled credential member enables admin recovery (Section 2.11).
 - **Metadata / signature:** standard file metadata (Section 8.2), self-signed by the identity key. The signature binds the member list, so a malicious server cannot strip a credential member to force a downgrade.
 
-The server verifies a credential before returning the body (Section 3.10), so the encrypted key is never served to an unauthenticated requester. There is no bespoke schema: a credential member's fields (`kdf`, `kdf_salt`, `verifier`, `webauthn_public_key`, `prf_salt`, `wrapped_file_key`, …) live in the `Member` message (Section 8.2).
+The server verifies a credential before returning the body (Section 3.10), so the encrypted key is never served to an unauthenticated requester. There is no bespoke schema: a credential member's fields (`kdf`, `kdf_salt`, `verifier`, `webauthn_public_key`, `prf_salt`, `wrapped_key`, …) live in the `Member` message (Section 8.2).
 
 ---
 

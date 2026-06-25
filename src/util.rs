@@ -1,3 +1,4 @@
+use std::env;
 use std::io::{Error, ErrorKind};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -16,7 +17,7 @@ pub fn resolve_url(
 
     if !url_string.contains("@") {
         if !url_string.starts_with("/") {
-            let cwd = std::env::current_dir()?;
+            let cwd = env::current_dir()?;
             let rel = cwd.strip_prefix(account_dir).unwrap_or(Path::new("")).to_string_lossy();
             url_string = match rel.as_ref() {
                 "" => format!("/{}", url_string),
@@ -92,6 +93,10 @@ pub mod test {
     use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use crate::crypto::to_public_key;
+    use crate::metadata::{sign_metadata, write_metadata_attributes};
+    use crate::types::{Hash, Member, Metadata, Signature};
+
     static CWD_LOCK: Mutex<()> = Mutex::new(());
 
     pub fn with_cwd<R>(dir: &Path, f: impl FnOnce() -> R) -> R {
@@ -136,30 +141,30 @@ pub mod test {
     pub const TEST_ADDRESS: &str = "test@example.com";
 
     pub fn get_default_test_metadata(key: &[u8], address: &str, body: &[u8]) -> crate::types::Metadata {
-        let public_key = crate::crypto::to_public_key(key);
-        let mut m = crate::types::Metadata {
+        let public_key = to_public_key(key);
+        let mut m = Metadata {
             id: "00000000-0000-0000-0000-000000000001".to_string(),
             modified_by: address.to_string(),
             created: "2026-01-01T00:00:00Z".to_string(),
             modified: "2026-01-01T00:00:00Z".to_string(),
             encryption: "aes-256-gcm".to_string(),
             encrypted: None,
-            members: vec![crate::types::Member {
+            members: vec![Member {
                 address: address.to_string(),
                 identity_key: public_key,
                 permission: "owner".to_string(),
-                wrapped_file_key: [2u8; 32].to_vec(),
+                wrapped_key: [2u8; 32].to_vec(),
             }],
-            body_hash: Vec::new(),
-            signature: crate::types::Signature { algorithm: String::new(), signature: Vec::new() },
+            body_hash: Hash { algorithm: String::new(), value: Vec::new() },
+            signature: Signature { algorithm: String::new(), value: Vec::new() },
         };
-        crate::metadata::sign_metadata(key, &mut m, body);
+        sign_metadata(key, &mut m, body);
         m
     }
 
     pub fn write_file_with_default_test_metadata(path: &Path, key: &[u8], address: &str, body: &[u8]) {
         fs::write(path, body).unwrap();
-        crate::metadata::write_metadata_attributes(path, &get_default_test_metadata(key, address, body)).unwrap();
+        write_metadata_attributes(path, &get_default_test_metadata(key, address, body)).unwrap();
     }
 }
 
@@ -169,7 +174,7 @@ mod tests {
 
     #[test]
     fn resolve_url_absolute() {
-        let cwd = std::env::current_dir().unwrap();
+        let cwd = env::current_dir().unwrap();
         let account_dir = cwd.parent().unwrap();
         let url = resolve_url("/path/to/file.txt", "gyan@127.0.0.1:8080", Path::new(account_dir)).unwrap();
         assert_eq!(url.scheme(), "https");
@@ -180,7 +185,7 @@ mod tests {
 
     #[test]
     fn resolve_url_relative_at_account_root() {
-        let account_dir = std::env::current_dir().unwrap();
+        let account_dir = env::current_dir().unwrap();
         let url = resolve_url("path/to/file.txt", "gyan@127.0.0.1:8080", &account_dir).unwrap();
         assert_eq!(url.scheme(), "https");
         assert_eq!(url.host_str(), Some("127.0.0.1"));
@@ -190,7 +195,7 @@ mod tests {
 
     #[test]
     fn resolve_url_relative_in_subdir() {
-        let cwd = std::env::current_dir().unwrap();
+        let cwd = env::current_dir().unwrap();
         println!("cwd:i {}", cwd.to_string_lossy());
         let account_dir = cwd.parent().unwrap();
         let dir = cwd.file_name().unwrap();
@@ -203,7 +208,7 @@ mod tests {
 
     #[test]
     fn resolve_url_address_with_path() {
-        let cwd = std::env::current_dir().unwrap();
+        let cwd = env::current_dir().unwrap();
         let account_dir = cwd.parent().unwrap();
         let url = resolve_url("alice@example.com/path/to/file.txt", "gyan@127.0.0.1:8080", account_dir).unwrap();
         assert_eq!(url.scheme(), "https");
@@ -214,7 +219,7 @@ mod tests {
 
     #[test]
     fn resolve_url_address_with_scheme_and_port_and_path() {
-        let cwd = std::env::current_dir().unwrap();
+        let cwd = env::current_dir().unwrap();
         let account_dir = cwd.parent().unwrap();
         let url = resolve_url("http://alice@example.com:9000/path/to/file.txt", "gyan@127.0.0.1:8080", account_dir).unwrap();
         assert_eq!(url.scheme(), "http");
@@ -225,7 +230,7 @@ mod tests {
 
     #[test]
     fn resolve_url_address_only() {
-        let cwd = std::env::current_dir().unwrap();
+        let cwd = env::current_dir().unwrap();
         let account_dir = cwd.parent().unwrap();
         let url = resolve_url("alice@example.com", "gyan@127.0.0.1:8080", account_dir).unwrap();
         assert_eq!(url.scheme(), "https");

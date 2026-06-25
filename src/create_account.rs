@@ -61,8 +61,8 @@ mod tests {
         let content = fs::read_to_string(&identity_path).unwrap();
         let v: serde_json::Value = serde_json::from_str(&content).unwrap();
 
-        assert_eq!(v["key"]["algorithm"].as_str(), Some("ed25519"));
-        let pk_b64 = v["key"]["public_key"].as_str().unwrap();
+        assert_eq!(v["public_key"]["algorithm"].as_str(), Some("ed25519"));
+        let pk_b64 = v["public_key"]["value"].as_str().unwrap();
         let pk_bytes = decode_base64url(pk_b64).unwrap();
         let pk_arr: [u8; 32] = pk_bytes.try_into().unwrap();
         assert_eq!(pk_arr.to_vec(), SigningKey::from_bytes(&key).verifying_key().to_bytes());

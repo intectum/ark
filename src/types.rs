@@ -17,8 +17,15 @@ pub enum DirectoryEntryKind {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+pub struct Hash {
+    pub algorithm: String,
+    #[serde(with = "base64url")]
+    pub value: Vec<u8>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Identity {
-    pub key: Key,
+    pub public_key: Key,
     pub address: String,
     pub modified: String,
     pub signature: Signature,
@@ -28,7 +35,7 @@ pub struct Identity {
 pub struct Key {
     pub algorithm: String,
     #[serde(with = "base64url")]
-    pub public_key: Vec<u8>,
+    pub value: Vec<u8>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -38,7 +45,7 @@ pub struct Member {
     pub identity_key: Vec<u8>,
     pub permission: String,
     #[serde(with = "base64url")]
-    pub wrapped_file_key: Vec<u8>,
+    pub wrapped_key: Vec<u8>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -49,8 +56,7 @@ pub struct Metadata {
     pub modified_by: String,
     pub encryption: String,
     pub members: Vec<Member>,
-    #[serde(with = "base64url")]
-    pub body_hash: Vec<u8>,
+    pub body_hash: Hash,
     pub signature: Signature,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -61,7 +67,7 @@ pub struct Metadata {
 pub struct Signature {
     pub algorithm: String,
     #[serde(with = "base64url")]
-    pub signature: Vec<u8>,
+    pub value: Vec<u8>,
 }
 
 mod base64url {

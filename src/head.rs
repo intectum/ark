@@ -67,7 +67,7 @@ mod tests {
         let key = [6u8; 32];
         let key_b64 = encode_base64url(key);
         let mut m = get_default_test_metadata(&account_key, &address, b"ciphertext");
-        m.members[0].wrapped_file_key = key.to_vec();
+        m.members[0].wrapped_key = key.to_vec();
         sign_metadata(&account_key, &mut m, b"ciphertext");
         write_metadata_attributes(&f, &m).unwrap();
 
@@ -78,8 +78,8 @@ mod tests {
         assert_eq!(code, 200);
         assert!(body.is_empty());
         assert!(headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("x-ark-meta-encryption") && v == "aes-256-gcm"));
-        assert!(headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("x-ark-meta-member-0-wrapped-file-key") && v == &key_b64));
         assert!(headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("x-ark-meta-member-0-permission") && v == "owner"));
+        assert!(headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("x-ark-meta-member-0-wrapped-key") && v == &key_b64));
     }
 
     #[test]

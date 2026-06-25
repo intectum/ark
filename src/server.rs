@@ -223,7 +223,7 @@ fn verify_auth(
     }
 
     let bytes = request_to_bytes(method, target, timestamp_value, body);
-    if verify_bytes(&identity.key.public_key, &signature, bytes).is_ok() {
+    if verify_bytes(&identity.public_key.value, &signature, bytes).is_ok() {
         AuthResult::Ok
     } else {
         AuthResult::Forbidden("signature verification failed")
@@ -890,7 +890,7 @@ mod tests {
         let port = start_test_server(td.0.clone());
         let alice_key = [99u8; 32];
         let mut m = get_default_test_metadata(&alice_key, "alice@x", b"ciphertext");
-        m.members[0].wrapped_file_key = [7u8; 32].to_vec();
+        m.members[0].wrapped_key = [7u8; 32].to_vec();
         sign_metadata(&alice_key, &mut m, b"ciphertext");
         let headers = write_metadata_headers(&m);
         let extra: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
@@ -904,7 +904,7 @@ mod tests {
         let loaded = read_metadata_attributes(&p).unwrap();
         assert_eq!(loaded.members.len(), 1);
         assert_eq!(loaded.members[0].address, "alice@x");
-        assert_eq!(loaded.members[0].wrapped_file_key, [7u8; 32]);
+        assert_eq!(loaded.members[0].wrapped_key, [7u8; 32]);
     }
 
     #[test]

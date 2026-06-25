@@ -8,7 +8,7 @@ use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, DEFAULT_SIGNING_ALGORITHM, enc
 use crate::identity::{read_identity_key, read_nearest_identity};
 use crate::metadata::{get_member, read_metadata_attributes, sign_metadata, write_metadata_attributes, write_metadata_headers};
 use crate::request::ark_request;
-use crate::types::{Member, Metadata, Signature};
+use crate::types::{Hash, Member, Metadata, Signature};
 use crate::util::{io_err, now_iso};
 
 pub fn cmd_put(arg: &str, input: Option<&str>, no_encrypt: bool) -> std::io::Result<()> {
@@ -43,12 +43,12 @@ pub fn cmd_put(arg: &str, input: Option<&str>, no_encrypt: bool) -> std::io::Res
             encryption: DEFAULT_ENCRYPTION_ALGORITHM.to_string(),
             members: vec![Member {
                 address: identity.address.clone(),
-                identity_key: identity.key.public_key.clone(),
+                identity_key: identity.public_key.value.clone(),
                 permission: "owner".to_string(),
-                wrapped_file_key: random_key()?
+                wrapped_key: random_key()?
             }],
-            body_hash: Vec::new(),
-            signature: Signature { algorithm: DEFAULT_SIGNING_ALGORITHM.to_string(), signature: Vec::new() },
+            body_hash: Hash { algorithm: String::new(), value: Vec::new() },
+            signature: Signature { algorithm: DEFAULT_SIGNING_ALGORITHM.to_string(), value: Vec::new() },
             encrypted: Some(false),
         }
     };
@@ -59,7 +59,7 @@ pub fn cmd_put(arg: &str, input: Option<&str>, no_encrypt: bool) -> std::io::Res
     };
 
     let final_body = if metadata.encrypted != Some(true) && !no_encrypt {
-        encrypt_bytes(&member.wrapped_file_key, &body)?
+        encrypt_bytes(&member.wrapped_key, &body)?
     } else {
         body
     };
@@ -105,7 +105,7 @@ mod tests {
         m.members
             .iter()
             .next()
-            .expect("file key in members").wrapped_file_key.clone()
+            .expect("file key in members").wrapped_key.clone()
     }
 
     fn put_via_cmd(td: &TempDir, arg: &str, plaintext: &[u8], cwd_subpath: &str) -> PathBuf {
@@ -165,7 +165,7 @@ mod tests {
         let input = td.0.join("input.bin");
         fs::write(&input, b"hello").unwrap();
         let mut preset_meta = get_default_test_metadata(&account_key, &address, b"hello");
-        preset_meta.members[0].wrapped_file_key = preset_key.to_vec();
+        preset_meta.members[0].wrapped_key = preset_key.to_vec();
         sign_metadata(&account_key, &mut preset_meta, b"hello");
         write_metadata_attributes(&input, &preset_meta).unwrap();
 
@@ -292,7 +292,7 @@ mod tests {
         let input = td.0.join("input.bin");
         fs::write(&input, &ciphertext).unwrap();
         let mut m = get_default_test_metadata(&account_key, &address, &ciphertext);
-        m.members[0].wrapped_file_key = key.to_vec();
+        m.members[0].wrapped_key = key.to_vec();
         m.encrypted = Some(true);
         sign_metadata(&account_key, &mut m, &ciphertext);
         write_metadata_attributes(&input, &m).unwrap();
@@ -363,7 +363,7 @@ mod tests {
         let input = td.0.join("input.bin");
         fs::write(&input, &ct).unwrap();
         let mut m = get_default_test_metadata(&account_key, &address, &ct);
-        m.members[0].wrapped_file_key = key.to_vec();
+        m.members[0].wrapped_key = key.to_vec();
         sign_metadata(&account_key, &mut m, &ct);
         write_metadata_attributes(&input, &m).unwrap();
 

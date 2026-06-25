@@ -6,6 +6,10 @@ use crate::util::io_err;
 
 pub const DEFAULT_SIGNING_ALGORITHM: &str = "ed25519";
 pub const DEFAULT_ENCRYPTION_ALGORITHM: &str = "aes-256-gcm";
+pub const DEFAULT_HASH_ALGORITHM: &str = "sha-256";
+
+// TODO: take Key, Signature, Hash as param and then delegate per alg, error is unsupported. No need
+// to validate alg on read
 
 pub fn to_public_key(key: &[u8]) -> Vec<u8> {
     let key_array: [u8; 32] = key.try_into().expect("32 byte key");

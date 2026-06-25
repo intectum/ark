@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, DEFAULT_SIGNING_ALGORITHM, decrypt_bytes};
 use crate::identity::read_nearest_identity;
 use crate::metadata::{get_member, read_metadata_attributes, validate_metadata, write_metadata_attributes};
-use crate::types::{Member, Metadata, Signature};
+use crate::types::{Hash, Member, Metadata, Signature};
 use crate::util::{decode_base64url, io_err, now_iso};
 
 pub struct DecryptArgs {
@@ -59,12 +59,12 @@ pub fn cmd_decrypt(args: DecryptArgs) -> std::io::Result<()> {
                 encryption: args.algorithm.clone().unwrap_or(DEFAULT_ENCRYPTION_ALGORITHM.to_string()),
                 members: vec![Member {
                     address: identity.address.clone(),
-                    identity_key: identity.key.public_key.clone(),
+                    identity_key: identity.public_key.value.clone(),
                     permission: "owner".to_string(),
-                    wrapped_file_key: file_key,
+                    wrapped_key: file_key,
                 }],
-                body_hash: Vec::new(),
-                signature: Signature { algorithm: DEFAULT_SIGNING_ALGORITHM.to_string(), signature: Vec::new() },
+                body_hash: Hash { algorithm: String::new(), value: Vec::new() },
+                signature: Signature { algorithm: DEFAULT_SIGNING_ALGORITHM.to_string(), value: Vec::new() },
                 encrypted: Some(true),
             };
 
@@ -77,16 +77,16 @@ pub fn cmd_decrypt(args: DecryptArgs) -> std::io::Result<()> {
         return Err(io_err("file is already plaintext (user.ark.encrypted=false); refusing to decrypt"));
     }
 
-    let wrapped_file_key: Vec<u8> = if let Some(k) = &args.key {
+    let wrapped_key: Vec<u8> = if let Some(k) = &args.key {
         decode_base64url(k.trim()).map_err(|e| io_err(&format!("--key decode: {}", e)))?
     } else {
         match get_member(&metadata.members, &identity.address) {
-            Some(m) => m.wrapped_file_key.clone(),
+            Some(m) => m.wrapped_key.clone(),
             None => return Err(io_err("no member entry for current account"))
         }
     };
 
-    let bytes = decrypt_bytes(&wrapped_file_key, &ciphertext).map_err(|e| {
+    let plaintext = decrypt_bytes(&wrapped_key, &ciphertext).map_err(|e| {
         io_err(&format!(
             "{} — input may already be plaintext or the key may be wrong",
             e
@@ -95,12 +95,12 @@ pub fn cmd_decrypt(args: DecryptArgs) -> std::io::Result<()> {
 
     match dest_path {
         Some(p) => {
-            fs::write(p, &bytes)?;
+            fs::write(p, &plaintext)?;
             let path = Path::new(p);
             metadata.encrypted = Some(false);
             write_metadata_attributes(path, &metadata)?;
         }
-        None => std::io::stdout().write_all(&bytes)?,
+        None => std::io::stdout().write_all(&plaintext)?,
     }
 
     Ok(())
@@ -125,7 +125,7 @@ mod tests {
         let ct = encrypt_bytes(key, plaintext).unwrap();
         fs::write(&p, &ct).unwrap();
         let mut meta = get_default_test_metadata(&[1u8; 32], TEST_ADDRESS, &ct);
-        meta.members[0].wrapped_file_key = key.to_vec();
+        meta.members[0].wrapped_key = key.to_vec();
         meta.encrypted = Some(true);
         write_metadata_attributes(&p, &meta).unwrap();
         p
@@ -174,7 +174,7 @@ mod tests {
             Some(b"aes-256-gcm".as_slice())
         );
         // per-member xattr preserved
-        assert!(xattr::get(&p, "user.ark.member_0_wrapped_file_key").unwrap().is_some());
+        assert!(xattr::get(&p, "user.ark.member_0_wrapped_key").unwrap().is_some());
     }
 
     #[test]
@@ -197,7 +197,7 @@ mod tests {
         // overwrite member with wrong key — explicit --key should still win
         let ct = fs::read(&p).unwrap();
         let mut wrong_meta = get_default_test_metadata(&[1u8; 32], TEST_ADDRESS, &ct);
-        wrong_meta.members[0].wrapped_file_key = [99u8; 32].to_vec();
+        wrong_meta.members[0].wrapped_key = [99u8; 32].to_vec();
         wrong_meta.encrypted = Some(true);
         write_metadata_attributes(&p, &wrong_meta).unwrap();
         let out = td.0.join("out.bin");
@@ -269,7 +269,7 @@ mod tests {
         let body = vec![0u8; 42];
         fs::write(&p, &body).unwrap();
         let mut m = get_default_test_metadata(&[1u8; 32], TEST_ADDRESS, &body);
-        m.members[0].wrapped_file_key = [0u8; 32].to_vec();
+        m.members[0].wrapped_key = [0u8; 32].to_vec();
         write_metadata_attributes(&p, &m).unwrap();
         // no encrypted flag → decrypt attempts and fails
         let err = with_cwd(&acc, || cmd_decrypt(DecryptArgs {

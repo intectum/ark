@@ -9,15 +9,15 @@ use crate::util::{decode_base64url, io_err, io_invalid_input, now_iso, resolve_u
 
 pub fn create_identity(key: &[u8], address: &str) -> Identity {
     let mut identity = Identity {
-        key: Key {
+        public_key: Key {
             algorithm: DEFAULT_SIGNING_ALGORITHM.to_string(),
-            public_key: to_public_key(key)
+            value: to_public_key(key)
         },
         address: address.to_string(),
         modified: now_iso(),
         signature: Signature {
             algorithm: DEFAULT_SIGNING_ALGORITHM.to_string(),
-            signature: Vec::new()
+            value: Vec::new()
         }
     };
 
@@ -57,8 +57,8 @@ pub fn write_identity(path: &Path, identity: &Identity) -> io::Result<()> {
 }
 
 pub fn validate_identity(identity: &Identity) -> io::Result<()> {
-    if identity.key.algorithm == DEFAULT_SIGNING_ALGORITHM {
-        if identity.key.public_key.len() != 32 {
+    if identity.public_key.algorithm == DEFAULT_SIGNING_ALGORITHM {
+        if identity.public_key.value.len() != 32 {
             return Err(io_invalid_input("public key wrong length"));
         }
     } else {
@@ -75,7 +75,7 @@ pub fn validate_identity(identity: &Identity) -> io::Result<()> {
         .map_err(|e| io_invalid_input(&format!("modified is not a valid RFC 3339 timestamp: {}", e)))?;
 
     if identity.signature.algorithm == DEFAULT_SIGNING_ALGORITHM {
-        if identity.signature.signature.len() != 64 {
+        if identity.signature.value.len() != 64 {
             return Err(io_invalid_input("signature wrong length"));
         }
     } else {
@@ -91,18 +91,18 @@ pub fn validate_identity(identity: &Identity) -> io::Result<()> {
 pub fn sign_identity(key: &[u8], identity: &mut Identity) {
     identity.signature.algorithm = DEFAULT_SIGNING_ALGORITHM.to_string();
     let json = serde_json::to_value(identity_for_signing(identity)).expect("serialize identity");
-    identity.signature.signature = sign_json(key, &json);
+    identity.signature.value = sign_json(key, &json);
 }
 
 pub fn verify_identity(identity: &Identity) -> io::Result<()> {
     let json = serde_json::to_value(identity_for_signing(identity)).expect("serialize identity");
-    verify_json(&identity.key.public_key, &identity.signature.signature, &json)
+    verify_json(&identity.public_key.value, &identity.signature.value, &json)
         .map_err(|_| io_err("identity signature verification failed"))
 }
 
 fn identity_for_signing(identity: &Identity) -> Identity {
     let mut clone = identity.clone();
-    clone.signature.signature = Vec::new();
+    clone.signature.value = Vec::new();
     clone
 }
 
@@ -154,7 +154,7 @@ mod tests {
     fn create_identity_has_valid_signature() {
         let identity = create_identity(&[42u8; 32], "alice@example.com");
         assert_eq!(identity.address, "alice@example.com");
-        assert_eq!(identity.key.algorithm, DEFAULT_SIGNING_ALGORITHM);
+        assert_eq!(identity.public_key.algorithm, DEFAULT_SIGNING_ALGORITHM);
         assert_eq!(identity.signature.algorithm, DEFAULT_SIGNING_ALGORITHM);
 
         assert!(verify_identity(&identity).is_ok());
@@ -164,7 +164,7 @@ mod tests {
     fn create_identity_signature_detects_tampering() {
         let identity = create_identity(&[43u8; 32], "alice@example.com");
         assert_eq!(identity.address, "alice@example.com");
-        assert_eq!(identity.key.algorithm, DEFAULT_SIGNING_ALGORITHM);
+        assert_eq!(identity.public_key.algorithm, DEFAULT_SIGNING_ALGORITHM);
         assert_eq!(identity.signature.algorithm, DEFAULT_SIGNING_ALGORITHM);
 
         let mut identity_tampered = identity.clone();
@@ -180,10 +180,10 @@ mod tests {
         let parsed: Identity = serde_json::from_str(&s).unwrap();
         assert_eq!(parsed.address, identity.address);
         assert_eq!(parsed.modified, identity.modified);
-        assert_eq!(parsed.key.algorithm, identity.key.algorithm);
-        assert_eq!(parsed.key.public_key, identity.key.public_key);
+        assert_eq!(parsed.public_key.algorithm, identity.public_key.algorithm);
+        assert_eq!(parsed.public_key.value, identity.public_key.value);
         assert_eq!(parsed.signature.algorithm, identity.signature.algorithm);
-        assert_eq!(parsed.signature.signature, identity.signature.signature);
+        assert_eq!(parsed.signature.value, identity.signature.value);
     }
 
     #[test]
@@ -195,10 +195,10 @@ mod tests {
         let loaded = read_identity(&path).unwrap();
         assert_eq!(loaded.address, identity.address);
         assert_eq!(loaded.modified, identity.modified);
-        assert_eq!(loaded.key.algorithm, identity.key.algorithm);
-        assert_eq!(loaded.key.public_key, identity.key.public_key);
+        assert_eq!(loaded.public_key.algorithm, identity.public_key.algorithm);
+        assert_eq!(loaded.public_key.value, identity.public_key.value);
         assert_eq!(loaded.signature.algorithm, identity.signature.algorithm);
-        assert_eq!(loaded.signature.signature, identity.signature.signature);
+        assert_eq!(loaded.signature.value, identity.signature.value);
     }
 
     #[test]
@@ -237,7 +237,7 @@ mod tests {
     #[test]
     fn validate_identity_rejects_unsupported_key_algorithm() {
         let mut identity = create_identity(&[61u8; 32], "alice@example.com");
-        identity.key.algorithm = "rsa".to_string();
+        identity.public_key.algorithm = "rsa".to_string();
         let err = validate_identity(&identity).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         assert!(err.to_string().contains("unsupported key algorithm"));
@@ -246,7 +246,7 @@ mod tests {
     #[test]
     fn validate_identity_rejects_wrong_public_key_length() {
         let mut identity = create_identity(&[62u8; 32], "alice@example.com");
-        identity.key.public_key = vec![0u8; 16];
+        identity.public_key.value = vec![0u8; 16];
         let err = validate_identity(&identity).unwrap_err();
         assert!(err.to_string().contains("public key wrong length"));
     }
@@ -278,7 +278,7 @@ mod tests {
     #[test]
     fn validate_identity_rejects_wrong_signature_length() {
         let mut identity = create_identity(&[66u8; 32], "alice@example.com");
-        identity.signature.signature = vec![0u8; 32];
+        identity.signature.value = vec![0u8; 32];
         let err = validate_identity(&identity).unwrap_err();
         assert!(err.to_string().contains("signature wrong length"));
     }
