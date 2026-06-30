@@ -1,3 +1,4 @@
+use std::env::current_dir;
 use std::fs;
 use std::io::Read;
 use std::path::PathBuf;
@@ -5,13 +6,17 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, DEFAULT_SIGNING_ALGORITHM, encrypt_bytes};
-use crate::identity::{read_identity_key, read_nearest_identity};
+use crate::identity::{read_identity, read_identity_key};
 use crate::metadata::{get_member, read_metadata_attributes, sign_metadata, write_metadata_attributes, write_metadata_headers};
 use crate::request::ark_request;
 use crate::types::{Hash, Member, Metadata, Signature};
-use crate::util::{io_err, now_iso};
+use crate::util::{find_root, io_err, now_iso, resolve_url};
 
-pub fn cmd_put(arg: &str, input: Option<&str>, no_encrypt: bool) -> std::io::Result<()> {
+pub fn cmd_put(path: &str, input: Option<&str>, no_encrypt: bool) -> std::io::Result<()> {
+    let root = find_root(&current_dir()?)?;
+    let identity = read_identity(&root.join(".ark").join("identity.json"))?;
+    let url = resolve_url(path, &identity.address, &root, false)?;
+
     let input_path: Option<PathBuf> = input.map(PathBuf::from);
 
     let body = match &input_path {
@@ -23,8 +28,6 @@ pub fn cmd_put(arg: &str, input: Option<&str>, no_encrypt: bool) -> std::io::Res
         }
     };
 
-    let (identity, account_dir) = read_nearest_identity()?;
-    let signing_key = read_identity_key(&account_dir.join(".ark").join("identity.key"))?;
 
     let has_existing_metadata = match input_path.as_deref() {
         Some(p) => xattr::get(p, "user.ark.encryption")?.is_some(),
@@ -43,7 +46,6 @@ pub fn cmd_put(arg: &str, input: Option<&str>, no_encrypt: bool) -> std::io::Res
             encryption: DEFAULT_ENCRYPTION_ALGORITHM.to_string(),
             members: vec![Member {
                 address: identity.address.clone(),
-                identity_key: identity.public_key.value.clone(),
                 permission: "owner".to_string(),
                 wrapped_key: random_key()?
             }],
@@ -66,12 +68,14 @@ pub fn cmd_put(arg: &str, input: Option<&str>, no_encrypt: bool) -> std::io::Res
 
     metadata.modified = now;
     metadata.modified_by = identity.address.clone();
+
+    let signing_key = read_identity_key(&root.join(".ark").join("identity.key"))?;
     sign_metadata(&signing_key, &mut metadata, &final_body);
 
     let metadata_headers = write_metadata_headers(&metadata);
-    let extra_headers: Vec<(&str, &str)> = metadata_headers.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
+    let headers: Vec<(&str, &str)> = metadata_headers.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
 
-    let (response_code, _, response_body) = ark_request("PUT", arg, &final_body, &extra_headers)?;
+    let (response_code, _, response_body) = ark_request(&root, &url, "PUT", &headers, &final_body)?;
     if response_code != 201 && response_code != 204 {
         return Err(io_err(&format!("HTTP {}: {}", response_code, String::from_utf8_lossy(&response_body))));
     }

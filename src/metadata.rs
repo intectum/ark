@@ -15,7 +15,6 @@ const FIELD_MODIFIED_BY: &str = "modified_by";
 const FIELD_ENCRYPTION: &str = "encryption";
 const FIELD_MEMBER_PREFIX: &str = "member_";
 const FIELD_MEMBER_ADDRESS: &str = "address";
-const FIELD_MEMBER_IDENTITY_KEY: &str = "identity_key";
 const FIELD_MEMBER_PERMISSION: &str = "permission";
 const FIELD_MEMBER_WRAPPED_KEY: &str = "wrapped_key";
 const FIELD_BODY_HASH_ALGORITHM: &str = "body_hash_algorithm";
@@ -71,7 +70,6 @@ pub fn write_metadata_attributes(path: &Path, metadata: &Metadata) -> io::Result
 
     for (index, member) in metadata.members.iter().enumerate() {
         xattr::set(path, &format!("{}member_{}_address", ATTRIBUTE_PREFIX, index), member.address.as_bytes())?;
-        xattr::set(path, &format!("{}member_{}_identity_key", ATTRIBUTE_PREFIX, index), encode_base64url(member.identity_key.clone()).as_bytes())?;
         xattr::set(path, &format!("{}member_{}_permission", ATTRIBUTE_PREFIX, index), member.permission.as_bytes())?;
         xattr::set(path, &format!("{}member_{}_wrapped_key", ATTRIBUTE_PREFIX, index), encode_base64url(member.wrapped_key.clone()).as_bytes())?;
     }
@@ -114,7 +112,6 @@ pub fn write_metadata_headers(metadata: &Metadata) -> Vec<(String, String)> {
 
     for (index, member) in metadata.members.iter().enumerate() {
         out.push((format!("{}Member-{}-Address", HEADER_PREFIX, index), member.address.clone()));
-        out.push((format!("{}Member-{}-Identity-Key", HEADER_PREFIX, index), encode_base64url(member.identity_key.clone())));
         out.push((format!("{}Member-{}-Permission", HEADER_PREFIX, index), member.permission.clone()));
         out.push((format!("{}Member-{}-Wrapped-Key", HEADER_PREFIX, index), encode_base64url(member.wrapped_key.clone())));
     }
@@ -186,7 +183,6 @@ struct PartialMetadata {
 #[derive(Default)]
 struct PartialMember {
     address: Option<String>,
-    identity_key: Option<Vec<u8>>,
     permission: Option<String>,
     wrapped_key: Option<Vec<u8>>,
 }
@@ -200,7 +196,6 @@ fn build_metadata(partial: PartialMetadata) -> io::Result<Metadata> {
         encryption: partial.encryption.unwrap(),
         members: partial.members.into_iter().map(|member| Member {
             address: member.address.unwrap(),
-            identity_key: member.identity_key.unwrap(),
             permission: member.permission.unwrap(),
             wrapped_key: member.wrapped_key.unwrap(),
         }).collect(),
@@ -250,8 +245,6 @@ fn apply_field(metadata: &mut PartialMetadata, key: &str, value: &str) -> io::Re
 
                 match member_field_key.as_str() {
                     FIELD_MEMBER_ADDRESS => metadata.members[index].address = Some(value.to_string()),
-                    FIELD_MEMBER_IDENTITY_KEY => metadata.members[index].identity_key = Some(decode_base64url(value)
-                        .map_err(|_| io_err("identity_key is not base64url encoded"))?),
                     FIELD_MEMBER_PERMISSION => metadata.members[index].permission = Some(value.to_string()),
                     FIELD_MEMBER_WRAPPED_KEY => metadata.members[index].wrapped_key = Some(decode_base64url(value)
                         .map_err(|_| io_err("wrapped_key is not base64url encoded"))?),
@@ -277,7 +270,6 @@ fn validate_partial_metadata(metadata: &PartialMetadata) -> io::Result<()> {
 
     for member in &metadata.members {
         if member.address.is_none() { return Err(io_err("missing member address field")); }
-        if member.identity_key.is_none() { return Err(io_err("missing member identity_key field")); }
         if member.permission.is_none() { return Err(io_err("missing member permission field")); }
         if member.wrapped_key.is_none() { return Err(io_err("missing member wrapped_key field")); }
     }
@@ -318,7 +310,6 @@ mod tests {
     fn sample_member(addr: &str, key_b: u8) -> Member {
         Member {
             address: addr.to_string(),
-            identity_key: [key_b; 32].to_vec(),
             permission: "owner".to_string(),
             wrapped_key: [key_b.wrapping_add(1); 32].to_vec(),
         }
@@ -469,7 +460,6 @@ mod tests {
         let m = get_default_test_metadata(&[26u8; 32], TEST_ADDRESS, b"x");
         let mut headers = write_metadata_headers(&m);
         headers.push(("X-Ark-Meta-Member-2-Address".to_string(), "c@z".to_string()));
-        headers.push(("X-Ark-Meta-Member-2-Identity-Key".to_string(), encode_base64url([4u8; 32])));
         headers.push(("X-Ark-Meta-Member-2-Permission".to_string(), "read".to_string()));
         headers.push(("X-Ark-Meta-Member-2-Wrapped-Key".to_string(), encode_base64url([5u8; 32])));
         let err = match read_metadata_headers(&headers) {
@@ -484,7 +474,7 @@ mod tests {
         let m = get_default_test_metadata(&[27u8; 32], TEST_ADDRESS, b"x");
         let mut headers = write_metadata_headers(&m);
         for entry in headers.iter_mut() {
-            if entry.0 == "X-Ark-Meta-Member-0-Identity-Key" {
+            if entry.0 == "X-Ark-Meta-Member-0-Wrapped-Key" {
                 entry.1 = "!!not-base64!!".to_string();
             }
         }
@@ -492,7 +482,7 @@ mod tests {
             Err(e) => e,
             Ok(_) => panic!("expected base64 error"),
         };
-        assert!(err.to_string().contains("identity_key is not base64url"), "msg was {}", err);
+        assert!(err.to_string().contains("wrapped_key is not base64url"), "msg was {}", err);
     }
 
     #[test]

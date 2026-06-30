@@ -1,30 +1,30 @@
+use std::env::current_dir;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
 
 use crate::crypto::{decrypt_bytes};
-use crate::identity::read_nearest_identity;
+use crate::identity::{read_identity, resolve_identity_client};
 use crate::metadata::{get_member, read_metadata_headers, verify_metadata, write_metadata_attributes};
 use crate::request::ark_request;
-use crate::util::io_err;
+use crate::util::{find_root, io_err, resolve_url};
 
-pub fn cmd_get(arg: &str, output: Option<&str>, decrypt: bool) -> std::io::Result<()> {
-    let (code, headers, body) = ark_request("GET", arg, &[], &[])?;
+pub fn cmd_get(path: &str, output: Option<&str>, decrypt: bool) -> std::io::Result<()> {
+    let root = find_root(&current_dir()?)?;
+    let identity = read_identity(&root.join(".ark").join("identity.json"))?;
+    let url = resolve_url(path, &identity.address, &root, false)?;
+
+    let (code, headers, body) = ark_request(&root, &url, "GET", &[], &[])?;
     if code != 200 {
         return Err(io_err(&format!("HTTP {}: {}", code, String::from_utf8_lossy(&body))));
     }
 
     let mut metadata = read_metadata_headers(&headers)?;
 
-    let modifier = match get_member(&metadata.members, &metadata.modified_by) {
-        Some(m) => m,
-        None => return Err(io_err("modifier not in member list")),
-    };
-    verify_metadata(&modifier.identity_key, &metadata, &body)?;
+    let modifier_identity = resolve_identity_client(&root, &identity, &metadata.modified_by)?;
+    verify_metadata(&modifier_identity.public_key.value, &metadata, &body)?;
 
     let final_body = if decrypt {
-        let (identity, _) = read_nearest_identity()?;
-
         let member = match get_member(&metadata.members, &identity.address) {
             Some(m) => m,
             None => return Err(io_err("no member entry for current account"))
@@ -57,6 +57,7 @@ mod tests {
     use super::*;
     use crate::create_account::create_account_with_key;
     use crate::crypto::encrypt_bytes;
+    use crate::identity::{create_identity, write_identity};
     use crate::metadata::{read_metadata_attributes, sign_metadata, write_metadata_attributes};
     use crate::server::start_test_server;
     use crate::util::test::{TempDir, get_default_test_metadata, with_cwd, write_file_with_default_test_metadata};
@@ -197,6 +198,11 @@ mod tests {
         write_file_with_default_test_metadata(&td.0.join("ark/gyan/plain"), &[99u8; 32], "other@example.com", b"raw");
 
         let account_dir = td.0.join("ark").join("gyan");
+        let other_identity = create_identity(&[99u8; 32], "other@example.com");
+        let identities_dir = account_dir.join(".ark").join("identities");
+        fs::create_dir_all(&identities_dir).unwrap();
+        write_identity(&identities_dir.join("other@example.com.json"), &other_identity).unwrap();
+
         let out = td.0.join("out.bin");
         let err = with_cwd(&account_dir, || {
             cmd_get("plain", Some(out.to_str().unwrap()), true).unwrap_err()

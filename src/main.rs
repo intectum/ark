@@ -4,6 +4,7 @@ mod decrypt;
 mod delete;
 mod get;
 mod head;
+mod http;
 mod identity;
 mod metadata;
 mod put;

@@ -1,93 +1,55 @@
-use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::time::{Duration};
+use std::path::Path;
+use std::time::Duration;
 
 use url::Url;
 
 use crate::crypto::{sign_bytes};
-use crate::identity::{read_identity_key, read_nearest_identity};
-use crate::util::{encode_base64url, io_err, now_seconds, request_to_bytes, resolve_url};
+use crate::http::{read_response, write_request};
+use crate::identity::read_identity_key;
+use crate::util::{encode_base64url, io_err, now_seconds, request_to_bytes};
 
 pub fn ark_request(
+    root: &Path,
+    url: &Url,
     method: &str,
-    arg: &str,
+    headers: &[(&str, &str)],
     body: &[u8],
-    extra_headers: &[(&str, &str)],
 ) -> std::io::Result<(u16, Vec<(String, String)>, Vec<u8>)> {
-    let (identity, account_dir) = read_nearest_identity()?;
-    let key = read_identity_key(&account_dir.join(".ark").join("identity.key"))?;
-    let url = resolve_url(arg, &identity.address, &account_dir)?;
-    request(method, &url, body, extra_headers, &key)
+    let key = read_identity_key(&root.join(".ark").join("identity.key"))?;
+    request(method, &url, headers, body, &key)
 }
 
 pub fn request(
     method: &str,
     url: &Url,
+    headers: &[(&str, &str)],
     body: &[u8],
-    extra_headers: &[(&str, &str)],
     key: &[u8],
 ) -> std::io::Result<(u16, Vec<(String, String)>, Vec<u8>)> {
-    let host = url.host_str().ok_or_else(|| io_err("URL missing host"))?;
-    let host_header = match url.port() {
-        Some(port) => format!("{}:{}", host, port),
-        None => host.to_string(),
-    };
+    let mut final_headers = headers.to_vec();
 
     let timestamp = now_seconds();
-
+    let timestamp_string = timestamp.to_string();
     let bytes = request_to_bytes(method, url.path(), timestamp, body);
-    let signature_b64 = encode_base64url(sign_bytes(key, &bytes));
+    let signature = sign_bytes(key, &bytes);
+    let authorization = format!("ArkAccount {}", encode_base64url(signature));
+    final_headers.push(("Authorization", &authorization));
+    final_headers.push(("X-Ark-Timestamp", &timestamp_string));
 
-    let mut stream = TcpStream::connect((host, url.port().unwrap()))?;
+    final_headers.push(("Connection", "close"));
+
+    let host = url.host_str().ok_or_else(|| io_err("URL missing host"))?;
+    let mut stream = TcpStream::connect((host, url.port().unwrap_or(80)))?;
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
 
-    let mut request_header = format!(
-        "{} {} HTTP/1.1\r\nHost: {}\r\nAuthorization: ArkAccount {}\r\nX-Ark-Timestamp: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
-        method, url.path(), host_header, signature_b64, timestamp, body.len()
-    );
-    for (k, v) in extra_headers {
-        request_header.push_str(&format!("{}: {}\r\n", k, v));
-    }
-    request_header.push_str("\r\n");
-    stream.write_all(request_header.as_bytes())?;
-
-    if !body.is_empty() {
-        stream.write_all(body)?;
-    }
-
-    let mut buf = Vec::new();
-    stream.read_to_end(&mut buf)?;
-
-    let split = buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or_else(|| io_err("malformed response (no header end)"))?;
-
-    let response_header = std::str::from_utf8(&buf[..split]).map_err(|_| io_err("non-utf8 headers"))?;
-    let mut response_header_lines = response_header.split("\r\n");
-
-    let response_status_line = response_header_lines.next().ok_or_else(|| io_err("empty response header"))?;
-    let response_code: u16 = response_status_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| io_err("no status code"))?
-        .parse()
-        .map_err(|_| io_err("bad status code"))?;
-
-    let mut response_headers = Vec::new();
-    for response_header_line in response_header_lines {
-        if let Some((name, value)) = response_header_line.split_once(':') {
-            response_headers.push((name.trim().to_string(), value.trim().to_string()));
-        }
-    }
-
-    let response_body = buf[split + 4..].to_vec();
-
-    Ok((response_code, response_headers, response_body))
+    write_request(&mut stream, url, method, &final_headers, body)?;
+    read_response(&mut stream, method)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
     use std::thread;
 
     use ed25519_dalek::{SigningKey};
@@ -153,7 +115,7 @@ mod tests {
         });
 
         let url = Url::parse(&format!("http://127.0.0.1:{}/x", port)).unwrap();
-        let (code, headers, body) = request("PUT", &url, b"data", &[], &[1u8; 32]).unwrap();
+        let (code, headers, body) = request("PUT", &url, &[], b"data", &[1u8; 32]).unwrap();
         assert_eq!(code, 201);
         assert_eq!(body, b"hello");
         assert!(headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("content-length") && v == "5"));
@@ -171,7 +133,7 @@ mod tests {
         });
 
         let url = Url::parse(&format!("http://127.0.0.1:{}/ark/alice/x", port)).unwrap();
-        let (code, _, _) = request("PUT", &url, b"payload", &[], &[2u8; 32]).unwrap();
+        let (code, _, _) = request("PUT", &url, &[], b"payload", &[2u8; 32]).unwrap();
         assert_eq!(code, 204);
 
         let req = captured.join().unwrap();
@@ -237,8 +199,8 @@ mod tests {
         let _ = request(
             "PUT",
             &url,
-            b"d",
             &[("X-Ark-Meta-Encryption", "aes-256-gcm"), ("X-Custom", "hi")],
+            b"d",
             &[5u8; 32],
         ).unwrap();
 

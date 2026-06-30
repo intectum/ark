@@ -1,15 +1,18 @@
 use std::env;
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::Write;
 use std::net::{TcpListener, TcpStream};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::thread;
 
+use url::Url;
+
 use crate::crypto::verify_bytes;
-use crate::identity::read_identity;
-use crate::metadata::{get_member, read_metadata_attributes, read_metadata_headers, verify_metadata, write_metadata_attributes, write_metadata_headers};
-use crate::types::{DirectoryEntry, DirectoryEntryKind};
-use crate::util::{decode_base64url, io_err, now_seconds, request_to_bytes};
+use crate::http::{read_request, write_response};
+use crate::identity::{read_identity, resolve_identity_server};
+use crate::metadata::{read_metadata_attributes, read_metadata_headers, verify_metadata, write_metadata_attributes, write_metadata_headers};
+use crate::types::{DirectoryEntry, DirectoryEntryKind, Identity};
+use crate::util::{decode_base64url, io_err, now_seconds, request_to_bytes, resolve_url};
 
 const MAX_CLOCK_SKEW_SECS: u64 = 300;
 
@@ -51,64 +54,42 @@ pub fn serve(listener: TcpListener, root: PathBuf, verbose: bool) {
 }
 
 fn handle(mut stream: TcpStream, root: &Path, verbose: bool) -> std::io::Result<()> {
-    let peer = stream.peer_addr().ok();
-    let mut reader = BufReader::new(stream.try_clone()?);
-
-    let mut request_line = String::new();
-    if reader.read_line(&mut request_line)? == 0 {
-        return Ok(());
-    }
-    let parts: Vec<&str> = request_line.trim_end().split_whitespace().collect();
-    if parts.len() != 3 {
-        return write_status(&mut stream, 400, "Bad Request", b"bad request line");
-    }
-    let method = parts[0].to_string();
-    let target = parts[1].to_string();
-
-    let mut authorization: Option<String> = None;
-    let mut content_length: Option<usize> = None;
-    let mut timestamp: Option<u64> = None;
-    let mut headers: Vec<(String, String)> = Vec::new();
-    loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 {
-            break;
-        }
-        let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
-        if trimmed.is_empty() {
-            break;
-        }
-        if let Some((name, value)) = trimmed.split_once(':') {
-            let trimmed_name = name.trim();
-            let trimmed_value = value.trim();
-            if trimmed_name.eq_ignore_ascii_case("authorization") {
-                authorization = Some(trimmed_value.to_string());
-            } else if trimmed_name.eq_ignore_ascii_case("content-length") {
-                content_length = trimmed_value.parse().ok();
-            } else if trimmed_name.eq_ignore_ascii_case("x-ark-timestamp") {
-                timestamp = trimmed_value.parse().ok();
-            }
-
-            headers.push((trimmed_name.to_string(), trimmed_value.to_string()));
-        }
-    }
+    let (method, target, headers, body) = read_request(&mut stream)?;
 
     if verbose {
-        eprintln!("{:?} {} {}", peer, method, target);
+
     }
 
-    let content_length_value = match content_length {
-        Some(v) => v,
-        None => return write_status(&mut stream, 411, "Length Required", &[])
+    let url = match resolve_url(&target, "", root, true) {
+        Ok(u) => u,
+        Err(_) => return write_status(&mut stream, 400, "Bad Request", b"bad path"),
     };
 
-    if !is_allowed(&target) {
+    let segments: Vec<&str> = url.path_segments()
+        .map(|s| s.filter(|p| !p.is_empty()).collect())
+        .unwrap_or_default();
+    if segments.first() != Some(&"ark") || segments.len() < 2 {
         return write_status(&mut stream, 403, "Forbidden", b"forbidden");
     }
+    if segments.len() == 2 && method != "GET" && method != "HEAD" {
+        return write_status(&mut stream, 405, "Method Not Allowed", b"method not allowed");
+    }
 
-    let body = read_body(&mut reader, content_length_value)?;
+    let account_name = segments[1];
+    let identity = match read_identity(&root.join("ark").join(account_name).join(".ark").join("identity.json")) {
+        Ok(i) => i,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound =>
+            return write_status(&mut stream, 403, "Forbidden", b"forbidden"),
+        Err(e) => return Err(e),
+    };
 
-    match verify_auth(root, &target, &method, authorization.as_deref(), timestamp, &body) {
+    let fs_path = root.join(url.path().trim_start_matches('/'));
+
+    if fs::symlink_metadata(&fs_path).map(|m| m.is_symlink()).unwrap_or(false) {
+        return write_status(&mut stream, 403, "Forbidden", b"symlinks not allowed");
+    }
+
+    match verify_auth(&identity, &url, &method, &headers, &body) {
         AuthResult::Ok => {}
         AuthResult::Unauthorized(msg) => {
             return write_status(&mut stream, 401, "Unauthorized", msg.as_bytes());
@@ -118,55 +99,13 @@ fn handle(mut stream: TcpStream, root: &Path, verbose: bool) -> std::io::Result<
         }
     }
 
-    if is_ark_root(&target) && method != "GET" && method != "HEAD" {
-        return write_status(&mut stream, 405, "Method Not Allowed", b"method not allowed");
-    }
-
-    let path = match resolve(root, &target) {
-        Some(p) => p,
-        None => return write_status(&mut stream, 400, "Bad Request", b"bad path"),
-    };
-
-    if fs::symlink_metadata(&path).map(|m| m.is_symlink()).unwrap_or(false) {
-        return write_status(&mut stream, 403, "Forbidden", b"symlinks not allowed");
-    }
-
     match method.as_str() {
-        "GET" => serve_get(&mut stream, &path, true),
-        "HEAD" => serve_get(&mut stream, &path, false),
-        "PUT" => serve_put(&mut stream, &path, &body, &headers),
-        "DELETE" => serve_delete(&mut stream, &path),
+        "GET" => serve_get(&fs_path, &mut stream, true),
+        "HEAD" => serve_get(&fs_path, &mut stream, false),
+        "PUT" => serve_put(root, &identity, &fs_path, &mut stream, &body, &headers),
+        "DELETE" => serve_delete(&fs_path, &mut stream),
         _ => write_status(&mut stream, 405, "Method Not Allowed", b"method not allowed"),
     }
-}
-
-fn read_body(reader: &mut BufReader<TcpStream>, len: usize) -> std::io::Result<Vec<u8>> {
-    let mut buf = vec![0u8; len];
-    if len > 0 {
-        reader.read_exact(&mut buf)?;
-    }
-    Ok(buf)
-}
-
-fn is_allowed(target: &str) -> bool {
-    let path = target.split('?').next().unwrap_or("");
-    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    parts.len() >= 2 && parts[0] == "ark"
-}
-
-fn is_ark_root(target: &str) -> bool {
-    let path = target.split('?').next().unwrap_or("");
-    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    parts.len() == 2 && parts[0] == "ark"
-}
-
-fn account_from_target(target: &str) -> Option<&str> {
-    let path = target.split('?').next()?;
-    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    if parts.len() < 2 || parts[0] != "ark" {
-        return None;
-    }
-    Some(parts[1])
 }
 
 enum AuthResult {
@@ -176,13 +115,13 @@ enum AuthResult {
 }
 
 fn verify_auth(
-    root: &Path,
-    target: &str,
+    identity: &Identity,
+    url: &Url,
     method: &str,
-    authorization: Option<&str>,
-    timestamp: Option<u64>,
+    headers: &Vec<(String, String)>,
     body: &[u8],
 ) -> AuthResult {
+    let authorization = headers.iter().find_map(|(name, value)| if name.eq_ignore_ascii_case("authorization") { Some(value) } else { None });
     let authorization_value = match authorization {
         Some(h) => h,
         None => return AuthResult::Unauthorized("missing Authorization header"),
@@ -193,25 +132,15 @@ fn verify_auth(
         None => return AuthResult::Unauthorized("unsupported Authorization scheme"),
     };
 
-    let timestamp_value = match timestamp {
-        Some(t) => t,
+    let timestamp = headers.iter().find_map(|(name, value)| if name.eq_ignore_ascii_case("x-ark-timestamp") { Some(value) } else { None });
+    let timestamp_value: u64 = match timestamp {
+        Some(t) => t.parse().unwrap_or(0),
         None => return AuthResult::Unauthorized("missing X-Ark-Timestamp header"),
     };
 
     if now_seconds().abs_diff(timestamp_value) > MAX_CLOCK_SKEW_SECS {
         return AuthResult::Unauthorized("timestamp outside allowed window");
     }
-
-    let account = match account_from_target(target) {
-        Some(a) if a != ".." && !a.is_empty() => a,
-        _ => return AuthResult::Forbidden("invalid account"),
-    };
-
-    let identity_path = root.join("ark").join(account).join(".ark").join("identity.json");
-    let identity = match read_identity(&identity_path) {
-        Ok(i) => i,
-        Err(_) => return AuthResult::Forbidden("identity not valid"),
-    };
 
     let signature = match decode_base64url(signature_b64) {
         Ok(b) => b,
@@ -222,7 +151,7 @@ fn verify_auth(
         return AuthResult::Forbidden("auth signature wrong length");
     }
 
-    let bytes = request_to_bytes(method, target, timestamp_value, body);
+    let bytes = request_to_bytes(method, url.path(), timestamp_value, body);
     if verify_bytes(&identity.public_key.value, &signature, bytes).is_ok() {
         AuthResult::Ok
     } else {
@@ -230,130 +159,85 @@ fn verify_auth(
     }
 }
 
-fn resolve(root: &Path, target: &str) -> Option<PathBuf> {
-    let raw = target.split('?').next().unwrap_or("");
-    let decoded = percent_decode(raw)?;
-    let rel = decoded.trim_start_matches('/');
-    let candidate = root.join(rel);
-    for comp in candidate.components() {
-        if matches!(comp, Component::ParentDir) {
-            return None;
-        }
-    }
-    Some(candidate)
-}
-
-fn percent_decode(s: &str) -> Option<String> {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'%' if i + 2 < bytes.len() => {
-                let hi = (bytes[i + 1] as char).to_digit(16)?;
-                let lo = (bytes[i + 2] as char).to_digit(16)?;
-                out.push(((hi << 4) | lo) as u8);
-                i += 3;
-            }
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            c => {
-                out.push(c);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8(out).ok()
-}
-
-fn serve_get(stream: &mut TcpStream, path: &Path, send_body: bool) -> std::io::Result<()> {
-    let fs_metadata = match fs::metadata(path) {
+fn serve_get(fs_path: &Path, stream: &mut TcpStream, send_body: bool) -> std::io::Result<()> {
+    let fs_metadata = match fs::metadata(fs_path) {
         Ok(m) => m,
         Err(_) => return write_status(stream, 404, "Not Found", b"not found"),
     };
 
     if fs_metadata.is_dir() {
-        let body = list_dir(path)?;
-
-        let headers = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        );
-        stream.write_all(headers.as_bytes())?;
-
-        if send_body { stream.write_all(body.as_bytes())?; }
-
-        return Ok(());
+        let body = list_dir(fs_path)?;
+        let content_length = body.len().to_string();
+        let headers = [
+            ("Content-Type", "application/json"),
+            ("Content-Length", content_length.as_str()),
+            ("Connection", "close"),
+        ];
+        return write_response(stream, 200, "OK", &headers, if send_body { body.as_bytes() } else { &[] });
     }
 
-    let metadata = match read_metadata_attributes(path) {
+    let metadata = match read_metadata_attributes(fs_path) {
         Ok(m) => m,
         Err(e) => return write_status(stream, 500, "Internal Server Error", e.to_string().as_bytes()),
     };
 
-    let mut headers = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
-        content_type(path),
-        fs_metadata.len()
-    );
-    for (name, value) in write_metadata_headers(&metadata) {
-        headers.push_str(&format!("{}: {}\r\n", name, value));
-    }
-    headers.push_str("\r\n");
-    stream.write_all(headers.as_bytes())?;
+    let metadata_headers = write_metadata_headers(&metadata);
+    let content_length = fs_metadata.len().to_string();
+    let mut headers: Vec<(&str, &str)> = metadata_headers.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
+    headers.push(("Content-Type", content_type(fs_path)));
+    headers.push(("Content-Length", &content_length));
+    headers.push(("Connection", "close"));
 
+    write_response(stream, 200, "OK", &headers, &[])?;
     if send_body {
-        let mut file = fs::File::open(path)?;
+        let mut file = fs::File::open(fs_path)?;
         std::io::copy(&mut file, stream)?;
     }
 
     Ok(())
 }
 
-fn serve_put(stream: &mut TcpStream, path: &Path, body: &[u8], headers: &[(String, String)]) -> std::io::Result<()> {
+fn serve_put(root: &Path, self_identity: &Identity, fs_path: &Path, stream: &mut TcpStream, body: &[u8], headers: &[(String, String)]) -> std::io::Result<()> {
     let metadata = match read_metadata_headers(headers) {
         Ok(m) => m,
         Err(e) => return write_status(stream, 400, "Bad Request", e.to_string().as_bytes()),
     };
 
-    let modifier = match get_member(&metadata.members, &metadata.modified_by) {
-        Some(m) => m,
-        None => return write_status(stream, 403, "Forbidden", b"modifier not in member list"),
+    let modifier_identity = match resolve_identity_server(root, self_identity, &metadata.modified_by) {
+        Ok(i) => i,
+        Err(e) => return write_status(stream, 403, "Forbidden", e.to_string().as_bytes()),
     };
 
-    if let Err(e) = verify_metadata(&modifier.identity_key, &metadata, body) {
+    if let Err(e) = verify_metadata(&modifier_identity.public_key.value, &metadata, body) {
         return write_status(stream, 403, "Forbidden", e.to_string().as_bytes());
     }
 
-    if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
+    if let Some(parent) = fs_path.parent() { fs::create_dir_all(parent)?; }
 
-    let (response_code, response_msg) = if path.exists() { (204, "No Content") } else { (201, "Created") };
+    let (status_code, status_msg) = if fs_path.exists() { (204, "No Content") } else { (201, "Created") };
 
-    let mut file = fs::File::create(path)?;
+    let mut file = fs::File::create(fs_path)?;
+    write_metadata_attributes(fs_path, &metadata)?;
     file.write_all(body)?;
     drop(file);
 
-    write_metadata_attributes(path, &metadata)?;
-    let response = format!("HTTP/1.1 {} {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", response_code, response_msg);
-    stream.write_all(response.as_bytes())?;
-
-    Ok(())
+    write_status(stream, status_code, status_msg, &[])
 }
 
-fn serve_delete(stream: &mut TcpStream, path: &Path) -> std::io::Result<()> {
-    let meta = match fs::metadata(path) {
+fn serve_delete(fs_path: &Path, stream: &mut TcpStream) -> std::io::Result<()> {
+    let fs_metadata = match fs::metadata(fs_path) {
         Ok(m) => m,
         Err(_) => return write_status(stream, 404, "Not Found", b"not found"),
     };
-    let res = if meta.is_dir() {
-        fs::remove_dir_all(path)
+
+    let result = if fs_metadata.is_dir() {
+        fs::remove_dir_all(fs_path)
     } else {
-        fs::remove_file(path)
+        fs::remove_file(fs_path)
     };
-    match res {
-        Ok(_) => stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").map(|_| ()),
+
+    match result {
+        Ok(_) => write_status(stream, 204, "No Content", &[]),
         Err(_) => write_status(stream, 500, "Internal Server Error", b"delete failed"),
     }
 }
@@ -394,25 +278,19 @@ fn content_type(path: &Path) -> &'static str {
     }
 }
 
-fn write_status(stream: &mut TcpStream, code: u16, msg: &str, body: &[u8]) -> std::io::Result<()> {
-    let headers = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        code,
-        msg,
-        body.len()
-    );
-    stream.write_all(headers.as_bytes())?;
-    stream.write_all(body)?;
-    Ok(())
+fn write_status(stream: &mut TcpStream, status_code: u16, status_msg: &str, body: &[u8]) -> std::io::Result<()> {
+    write_response(stream, status_code, status_msg, &[("Content-Type", "text/plain"), ("Connection", "close")], body)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
     use std::time::Duration;
 
     use super::*;
     use crate::create_account::create_account_with_key;
     use crate::crypto::sign_bytes;
+    use crate::identity::{create_identity, write_identity};
     use crate::metadata::sign_metadata;
     use crate::util::encode_base64url;
     use crate::util::test::{TEST_ADDRESS, TempDir, get_default_test_metadata, write_file_with_default_test_metadata};
@@ -728,7 +606,7 @@ mod tests {
         setup_account(&td.0, "test", &key);
         let port = start_test_server(td.0.clone());
         let (code, _, _) = signed_request(port, &key, "GET", "/ark/test/../../../etc/passwd", &[]);
-        assert_eq!(code, 400);
+        assert_eq!(code, 403);
     }
 
     #[test]
@@ -889,6 +767,10 @@ mod tests {
         setup_account(&td.0, "test", &key);
         let port = start_test_server(td.0.clone());
         let alice_key = [99u8; 32];
+        let alice_identity = create_identity(&alice_key, "alice@x");
+        let cache_dir = td.0.join("ark/ark/.ark/identities");
+        fs::create_dir_all(&cache_dir).unwrap();
+        write_identity(&cache_dir.join("alice@x.json"), &alice_identity).unwrap();
         let mut m = get_default_test_metadata(&alice_key, "alice@x", b"ciphertext");
         m.members[0].wrapped_key = [7u8; 32].to_vec();
         sign_metadata(&alice_key, &mut m, b"ciphertext");

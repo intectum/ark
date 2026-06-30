@@ -1,8 +1,15 @@
+use std::env::current_dir;
+
+use crate::identity::read_identity;
 use crate::request::ark_request;
-use crate::util::io_err;
+use crate::util::{find_root, io_err, resolve_url};
 
 pub fn cmd_delete(arg: &str) -> std::io::Result<()> {
-    let (code, _, body) = ark_request("DELETE", arg, &[], &[])?;
+    let root = find_root(&current_dir()?)?;
+    let identity = read_identity(&root.join(".ark").join("identity.json"))?;
+    let url = resolve_url(arg, &identity.address, &root, false)?;
+
+    let (code, _, body) = ark_request(&root, &url, "DELETE", &[], &[])?;
     if code != 204 {
         return Err(io_err(&format!("HTTP {}: {}", code, String::from_utf8_lossy(&body))));
     }

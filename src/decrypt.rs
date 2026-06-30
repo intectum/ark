@@ -1,3 +1,4 @@
+use std::env::current_dir;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -5,10 +6,10 @@ use std::path::Path;
 use uuid::Uuid;
 
 use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, DEFAULT_SIGNING_ALGORITHM, decrypt_bytes};
-use crate::identity::read_nearest_identity;
+use crate::identity::read_identity;
 use crate::metadata::{get_member, read_metadata_attributes, validate_metadata, write_metadata_attributes};
 use crate::types::{Hash, Member, Metadata, Signature};
-use crate::util::{decode_base64url, io_err, now_iso};
+use crate::util::{decode_base64url, find_root, io_err, now_iso};
 
 pub struct DecryptArgs {
     pub input: Option<String>,
@@ -23,10 +24,11 @@ pub fn cmd_decrypt(args: DecryptArgs) -> std::io::Result<()> {
         return Err(io_err("--in-place is mutually exclusive with -i/--input and -o/--output"));
     }
 
+    let root = find_root(&current_dir()?)?;
+    let identity = read_identity(&root.join(".ark").join("identity.json"))?;
+
     let source_path: Option<&str> = args.in_place.as_deref().or(args.input.as_deref());
     let dest_path: Option<&str> = args.in_place.as_deref().or(args.output.as_deref());
-
-    let (identity, _) = read_nearest_identity()?;
 
     let source_has_metadata = match source_path {
         Some(p) => xattr::get(Path::new(p), "user.ark.encryption")?.is_some(),
@@ -59,7 +61,6 @@ pub fn cmd_decrypt(args: DecryptArgs) -> std::io::Result<()> {
                 encryption: args.algorithm.clone().unwrap_or(DEFAULT_ENCRYPTION_ALGORITHM.to_string()),
                 members: vec![Member {
                     address: identity.address.clone(),
-                    identity_key: identity.public_key.value.clone(),
                     permission: "owner".to_string(),
                     wrapped_key: file_key,
                 }],

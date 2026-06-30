@@ -1,26 +1,31 @@
+use std::env::current_dir;
 use std::io::Write;
 
-use crate::metadata::{get_member, read_metadata_headers, verify_metadata_signature};
+use crate::identity::{read_identity, resolve_identity_client};
+use crate::metadata::{read_metadata_headers, verify_metadata_signature};
 use crate::request::ark_request;
-use crate::util::io_err;
+use crate::util::{find_root, io_err, resolve_url};
 
-pub fn cmd_head(arg: &str) -> std::io::Result<()> {
-    let (code, headers, body) = ark_request("HEAD", arg, &[], &[])?;
+pub fn cmd_head(path: &str) -> std::io::Result<()> {
+    let root = find_root(&current_dir()?)?;
+    let identity = read_identity(&root.join(".ark").join("identity.json"))?;
+    let url = resolve_url(path, &identity.address, &root, false)?;
+
+    let (code, headers, body) = ark_request(&root, &url, "HEAD", &[], &[])?;
     if code != 200 {
         return Err(io_err(&format!("HTTP {}: {}", code, String::from_utf8_lossy(&body))));
     }
 
     let metadata = read_metadata_headers(&headers)?;
-    let modifier = match get_member(&metadata.members, &metadata.modified_by) {
-        Some(m) => m,
-        None => return Err(io_err("modifier not in member list")),
-    };
-    verify_metadata_signature(&modifier.identity_key, &metadata)?;
+
+    let modifier_identity = resolve_identity_client(&root, &identity, &metadata.modified_by)?;
+    verify_metadata_signature(&modifier_identity.public_key.value, &metadata)?;
 
     let mut stdout = std::io::stdout().lock();
     for (name, value) in &headers {
         writeln!(stdout, "{}: {}", name, value)?;
     }
+
     Ok(())
 }
 
@@ -45,7 +50,9 @@ mod tests {
 
         let account_dir = td.0.join("ark/gyan");
         let (code, headers, body) = with_cwd(&account_dir, || {
-            ark_request("HEAD", "file.bin", &[], &[]).unwrap()
+            let identity = read_identity(&account_dir.join(".ark").join("identity.json")).unwrap();
+            let url = resolve_url("file.bin", &identity.address, &account_dir, false).unwrap();
+            ark_request(&account_dir, &url, "HEAD", &[], &[]).unwrap()
         });
         assert_eq!(code, 200);
         assert!(body.is_empty());
@@ -73,7 +80,9 @@ mod tests {
 
         let account_dir = td.0.join("ark/gyan");
         let (code, headers, body) = with_cwd(&account_dir, || {
-            ark_request("HEAD", "secret", &[], &[]).unwrap()
+            let identity = read_identity(&account_dir.join(".ark").join("identity.json")).unwrap();
+            let url = resolve_url("secret", &identity.address, &account_dir, false).unwrap();
+            ark_request(&account_dir, &url, "HEAD", &[], &[]).unwrap()
         });
         assert_eq!(code, 200);
         assert!(body.is_empty());

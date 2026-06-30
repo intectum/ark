@@ -305,7 +305,7 @@ The identity file is self-signed. The server hosts this document but cannot tamp
 
 See [TODO] for the full format of identity files.
 
-The identity files of other accounts are cached in the `/ark/<account>/.ark/identities/` directory. If verification of an account fails with the cached identity file, it is re-fetched (the key may have changed via transition) and verification is retried once with the new file.
+The identity files of other accounts are cached in the `/ark/<account>/.ark/identities/` directory. If verification of an account fails with the cached identity file, it is re-fetched (the key may have changed via transition) and verification is retried once with the new file. [TODO cache lifetime - should be shorter than key rotation lifetime?]
 
 ### 4.2 Groups
 

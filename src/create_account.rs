@@ -1,9 +1,9 @@
 use std::env;
 use std::fs;
-use std::path::{Path};
+use std::path::Path;
 
 use crate::identity::{create_identity, validate_identity, write_identity, write_identity_key};
-use crate::util::resolve_url;
+use crate::util::io_invalid_input;
 
 pub fn cmd_create_account(address: &str) -> std::io::Result<()> {
     let root = env::current_dir()?;
@@ -21,8 +21,11 @@ pub fn create_account(root: &Path, address: &str) -> std::io::Result<Vec<u8>> {
 }
 
 pub fn create_account_with_key(root: &Path, address: &str, key: &[u8]) -> std::io::Result<()> {
-    let url = resolve_url("", address, Path::new(""))?;
-    let dot_ark_dir = root.join("ark").join(&url.username()).join(".ark");
+    let username = address.split_once('@')
+        .map(|(u, _)| u)
+        .filter(|u| !u.is_empty())
+        .ok_or_else(|| io_invalid_input("address must be <name>@<host>"))?;
+    let dot_ark_dir = root.join("ark").join(username).join(".ark");
     let identity_path = dot_ark_dir.join("identity.json");
     let identity_key_path = dot_ark_dir.join("identity.key");
     if identity_path.exists() {

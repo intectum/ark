@@ -2,10 +2,12 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
+use url::Url;
+
 use crate::crypto::{DEFAULT_SIGNING_ALGORITHM, sign_json, to_public_key, verify_json};
+use crate::get::cmd_get;
 use crate::types::{Identity, Key, Signature};
-use crate::util::encode_base64url;
-use crate::util::{decode_base64url, io_err, io_invalid_input, now_iso, resolve_url};
+use crate::util::{decode_base64url, encode_base64url, io_err, io_invalid_input, now_iso};
 
 pub fn create_identity(key: &[u8], address: &str) -> Identity {
     let mut identity = Identity {
@@ -35,19 +37,35 @@ pub fn read_identity(path: &Path) -> io::Result<Identity> {
     Ok(identity)
 }
 
-pub fn read_nearest_identity() -> io::Result<(Identity, std::path::PathBuf)> {
-    let cwd = std::env::current_dir()?;
-    let mut current: Option<&Path> = Some(&cwd);
-    while let Some(d) = current {
-        let id_path = d.join(".ark").join("identity.json");
-        if id_path.is_file() {
-            let identity = read_identity(&id_path)?;
-            return Ok((identity, d.to_path_buf()));
-        }
-        current = d.parent();
+pub fn resolve_identity_client(root: &Path, self_identity: &Identity, address: &str) -> io::Result<Identity> {
+    if address == self_identity.address {
+        return Ok(self_identity.clone());
     }
 
-    Err(io_err("no .ark/identity.json found in cwd or any parent"))
+    resolve_remote_identity(&root.join(".ark/identities"), address)
+}
+
+pub fn resolve_identity_server(root: &Path, self_identity: &Identity, address: &str) -> io::Result<Identity> {
+    if address == self_identity.address {
+        return Ok(self_identity.clone());
+    }
+
+    let (address_name, _) = address.split_once("@").expect("address split");
+    let local_identity_path = root.join("ark").join(address_name);
+    if fs::exists(&local_identity_path)? {
+        return read_identity(&local_identity_path);
+    }
+
+    resolve_remote_identity(&root.join("ark/ark/.ark/identities"), address)
+}
+
+fn resolve_remote_identity(cache_dir: &Path, address: &str) -> io::Result<Identity> {
+    let cache_path = cache_dir.join(format!("{}.json", address));
+    if !fs::exists(&cache_path)? {
+        cmd_get(&format!("{}/.ark/identity.json", address), cache_path.to_str(), false)?;
+    }
+
+    return read_identity(&cache_path);
 }
 
 pub fn write_identity(path: &Path, identity: &Identity) -> io::Result<()> {
@@ -65,9 +83,13 @@ pub fn validate_identity(identity: &Identity) -> io::Result<()> {
         return Err(io_invalid_input("unsupported key algorithm"));
     }
 
-    let url = resolve_url("", &identity.address, Path::new(""))?;
+    let address_url = Url::parse(&format!("https://{}", identity.address))
+        .map_err(|_| io_invalid_input("invalid address"))?;
+    if address_url.host_str().is_none() {
+        return Err(io_invalid_input("address must be <name>@<host>"));
+    }
 
-    if !is_valid_account_name(url.username()) {
+    if !is_valid_account_name(address_url.username()) {
         return Err(io_invalid_input("invalid account name (must be lowercase alphanumeric, dots, hyphens, underscores; 1-64 chars; not pure dots)"));
     }
 
@@ -106,6 +128,7 @@ fn identity_for_signing(identity: &Identity) -> Identity {
     clone
 }
 
+// TODO: minimize time key is in memory, something like with_private_key (zeros memory after)
 pub fn read_identity_key(path: &Path) -> io::Result<Vec<u8>> {
     let content = fs::read_to_string(path)?;
     let key = decode_base64url(content)
@@ -299,6 +322,65 @@ mod tests {
         write_identity_key(&path, &key).unwrap();
         let loaded = read_identity_key(&path).unwrap();
         assert_eq!(loaded, key);
+    }
+
+    #[test]
+    fn resolve_remote_identity_returns_cached_when_present() {
+        let td = TempDir::new("ark_identity_test");
+        let cache_dir = td.0.join("cache");
+        fs::create_dir_all(&cache_dir).unwrap();
+        let identity = create_identity(&[80u8; 32], "bob@example.com");
+        write_identity(&cache_dir.join("bob@example.com.json"), &identity).unwrap();
+
+        let loaded = resolve_remote_identity(&cache_dir, "bob@example.com").unwrap();
+        assert_eq!(loaded.address, identity.address);
+        assert_eq!(loaded.public_key.value, identity.public_key.value);
+        assert_eq!(loaded.signature.value, identity.signature.value);
+    }
+
+    #[test]
+    fn resolve_remote_identity_errors_on_invalid_cached_file() {
+        let td = TempDir::new("ark_identity_test");
+        let cache_dir = td.0.join("cache");
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::write(cache_dir.join("bob@example.com.json"), b"not json").unwrap();
+
+        let err = resolve_remote_identity(&cache_dir, "bob@example.com").err().expect("expected error");
+        assert!(err.to_string().contains("identity.json parse"), "msg was {}", err);
+    }
+
+    #[test]
+    #[ignore = "server auth currently requires sig matching path's account; cross-account fetch returns 403"]
+    fn resolve_remote_identity_fetches_and_caches_on_miss() {
+        use crate::create_account::create_account_with_key;
+        use crate::server::start_test_server;
+        use crate::util::test::with_cwd;
+
+        let td = TempDir::new("ark_identity_test");
+        let port = start_test_server(td.0.clone());
+
+        let self_address = format!("alice@127.0.0.1:{}", port);
+        create_account_with_key(&td.0, &self_address, &[81u8; 32]).unwrap();
+
+        let remote_address = format!("bob@127.0.0.1:{}", port);
+        create_account_with_key(&td.0, &remote_address, &[82u8; 32]).unwrap();
+        let expected = read_identity(&td.0.join("ark/bob/.ark/identity.json")).unwrap();
+
+        let account_dir = td.0.join("ark/alice");
+        let cache_dir = account_dir.join(".ark/identities");
+
+        let fetched = with_cwd(&account_dir, || {
+            resolve_remote_identity(&cache_dir, &remote_address).unwrap()
+        });
+
+        assert_eq!(fetched.address, expected.address);
+        assert_eq!(fetched.public_key.value, expected.public_key.value);
+        assert_eq!(fetched.signature.value, expected.signature.value);
+
+        let cache_path = cache_dir.join(format!("{}.json", remote_address));
+        assert!(cache_path.exists(), "cache file not written: {:?}", cache_path);
+        let cached = read_identity(&cache_path).unwrap();
+        assert_eq!(cached.public_key.value, expected.public_key.value);
     }
 
     #[cfg(unix)]

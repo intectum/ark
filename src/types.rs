@@ -41,8 +41,6 @@ pub struct Key {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Member {
     pub address: String,
-    #[serde(with = "base64url")]
-    pub identity_key: Vec<u8>,
     pub permission: String,
     #[serde(with = "base64url")]
     pub wrapped_key: Vec<u8>,
