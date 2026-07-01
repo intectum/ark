@@ -87,9 +87,9 @@ enum Cmd {
         /// Read body from FILE instead of stdin.
         #[arg(short, long, value_name = "FILE")]
         input: Option<String>,
-        /// Skip encryption; send body as-is.
-        #[arg(long)]
-        no_encrypt: bool,
+        /// Encryption algorithm; "none" to send body as-is.
+        #[arg(short, long, value_name = "NAME")]
+        algorithm: Option<String>,
         /// Ark URL or path.
         path: String,
     },
@@ -105,10 +105,10 @@ enum Cmd {
         #[arg(long, value_name = "FILE")]
         in_place: Option<String>,
         /// Base64url-encoded 32-byte file key (required for stdin).
-        #[arg(long, value_name = "B64")]
+        #[arg(short, long, value_name = "B64")]
         key: Option<String>,
-        /// Override algorithm (default from metadata or aes-256-gcm).
-        #[arg(long, value_name = "NAME")]
+        /// Override encryption algorithm (default from metadata or aes-256-gcm).
+        #[arg(short, long, value_name = "NAME")]
         algorithm: Option<String>,
     },
 }
@@ -125,7 +125,7 @@ fn main() {
         Cmd::Head { path } => cmd_head(&path),
         Cmd::Delete { path } => cmd_delete(&path),
         Cmd::Get { output, decrypt, path } => cmd_get(&path, output.as_deref(), decrypt),
-        Cmd::Put { input, no_encrypt, path } => cmd_put(&path, input.as_deref(), no_encrypt),
+        Cmd::Put { input, algorithm, path } => cmd_put(&path, input.as_deref(), algorithm.as_deref()),
         Cmd::Decrypt { input, output, in_place, key, algorithm } => {
             cmd_decrypt(DecryptArgs { input, output, in_place, key, algorithm })
         }

@@ -772,7 +772,7 @@ mod tests {
         fs::create_dir_all(&cache_dir).unwrap();
         write_identity(&cache_dir.join("alice@x.json"), &alice_identity).unwrap();
         let mut m = get_default_test_metadata(&alice_key, "alice@x", b"ciphertext");
-        m.members[0].wrapped_key = [7u8; 32].to_vec();
+        m.members[0].wrapped_key = Some([7u8; 32].to_vec());
         sign_metadata(&alice_key, &mut m, b"ciphertext");
         let headers = write_metadata_headers(&m);
         let extra: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
@@ -786,7 +786,7 @@ mod tests {
         let loaded = read_metadata_attributes(&p).unwrap();
         assert_eq!(loaded.members.len(), 1);
         assert_eq!(loaded.members[0].address, "alice@x");
-        assert_eq!(loaded.members[0].wrapped_key, [7u8; 32]);
+        assert_eq!(loaded.members[0].wrapped_key.as_deref(), Some(&[7u8; 32][..]));
     }
 
     #[test]

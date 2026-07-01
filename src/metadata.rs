@@ -71,7 +71,9 @@ pub fn write_metadata_attributes(path: &Path, metadata: &Metadata) -> io::Result
     for (index, member) in metadata.members.iter().enumerate() {
         xattr::set(path, &format!("{}member_{}_address", ATTRIBUTE_PREFIX, index), member.address.as_bytes())?;
         xattr::set(path, &format!("{}member_{}_permission", ATTRIBUTE_PREFIX, index), member.permission.as_bytes())?;
-        xattr::set(path, &format!("{}member_{}_wrapped_key", ATTRIBUTE_PREFIX, index), encode_base64url(member.wrapped_key.clone()).as_bytes())?;
+        if let Some(key) = &member.wrapped_key {
+            xattr::set(path, &format!("{}member_{}_wrapped_key", ATTRIBUTE_PREFIX, index), encode_base64url(key).as_bytes())?;
+        }
     }
 
     if let Some(encrypted) = metadata.encrypted {
@@ -113,7 +115,9 @@ pub fn write_metadata_headers(metadata: &Metadata) -> Vec<(String, String)> {
     for (index, member) in metadata.members.iter().enumerate() {
         out.push((format!("{}Member-{}-Address", HEADER_PREFIX, index), member.address.clone()));
         out.push((format!("{}Member-{}-Permission", HEADER_PREFIX, index), member.permission.clone()));
-        out.push((format!("{}Member-{}-Wrapped-Key", HEADER_PREFIX, index), encode_base64url(member.wrapped_key.clone())));
+        if let Some(key) = &member.wrapped_key {
+            out.push((format!("{}Member-{}-Wrapped-Key", HEADER_PREFIX, index), encode_base64url(key)));
+        }
     }
 
     out
@@ -126,6 +130,14 @@ pub fn validate_metadata(metadata: &Metadata) -> io::Result<()> {
 
     if !metadata.members.iter().any(|m| m.permission == "owner") {
         return Err(io_err("metadata must contain at least one owner"));
+    }
+
+    if metadata.encryption != "none" {
+        for member in &metadata.members {
+            if member.wrapped_key.is_none() {
+                return Err(io_err("missing member wrapped_key field"));
+            }
+        }
     }
 
     Ok(())
@@ -197,7 +209,7 @@ fn build_metadata(partial: PartialMetadata) -> io::Result<Metadata> {
         members: partial.members.into_iter().map(|member| Member {
             address: member.address.unwrap(),
             permission: member.permission.unwrap(),
-            wrapped_key: member.wrapped_key.unwrap(),
+            wrapped_key: member.wrapped_key,
         }).collect(),
         body_hash: Hash {
             algorithm: partial.body_hash_algorithm.unwrap(),
@@ -271,7 +283,6 @@ fn validate_partial_metadata(metadata: &PartialMetadata) -> io::Result<()> {
     for member in &metadata.members {
         if member.address.is_none() { return Err(io_err("missing member address field")); }
         if member.permission.is_none() { return Err(io_err("missing member permission field")); }
-        if member.wrapped_key.is_none() { return Err(io_err("missing member wrapped_key field")); }
     }
 
     Ok(())
@@ -311,7 +322,7 @@ mod tests {
         Member {
             address: addr.to_string(),
             permission: "owner".to_string(),
-            wrapped_key: [key_b.wrapping_add(1); 32].to_vec(),
+            wrapped_key: Some([key_b.wrapping_add(1); 32].to_vec()),
         }
     }
 

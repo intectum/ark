@@ -172,7 +172,7 @@ pub mod test {
             members: vec![Member {
                 address: address.to_string(),
                 permission: "owner".to_string(),
-                wrapped_key: [2u8; 32].to_vec(),
+                wrapped_key: Some([2u8; 32].to_vec()),
             }],
             body_hash: Hash { algorithm: String::new(), value: Vec::new() },
             signature: Signature { algorithm: String::new(), value: Vec::new() },

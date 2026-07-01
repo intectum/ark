@@ -29,8 +29,10 @@ pub fn cmd_get(path: &str, output: Option<&str>, decrypt: bool) -> std::io::Resu
             Some(m) => m,
             None => return Err(io_err("no member entry for current account"))
         };
+        let key = member.wrapped_key.as_deref()
+            .ok_or_else(|| io_err("no wrapped key for current account"))?;
 
-        decrypt_bytes(&member.wrapped_key, &body).map_err(|e| {
+        decrypt_bytes(key, &body).map_err(|e| {
             io_err(&format!(
                 "{} — server data may not be encrypted or the key may be wrong",
                 e
@@ -143,7 +145,7 @@ mod tests {
         fs::write(&server_file, b"ciphertext").unwrap();
         let key = [11u8; 32];
         let mut m = get_default_test_metadata(&account_key, &address, b"ciphertext");
-        m.members[0].wrapped_key = key.to_vec();
+        m.members[0].wrapped_key = Some(key.to_vec());
         sign_metadata(&account_key, &mut m, b"ciphertext");
         write_metadata_attributes(&server_file, &m).unwrap();
 
@@ -156,7 +158,7 @@ mod tests {
         assert_eq!(fs::read(&out).unwrap(), b"ciphertext");
         let m = read_metadata_attributes(&out).unwrap();
         assert_eq!(m.encryption,"aes-256-gcm");
-        assert_eq!(m.members.iter().next().unwrap().wrapped_key, key);
+        assert_eq!(m.members.iter().next().unwrap().wrapped_key.as_deref(), Some(&key[..]));
     }
 
     #[test]
@@ -172,7 +174,7 @@ mod tests {
         let server_file = td.0.join("ark/gyan/secret");
         fs::write(&server_file, &ct).unwrap();
         let mut m = get_default_test_metadata(&account_key, &address, &ct);
-        m.members[0].wrapped_key = key.to_vec();
+        m.members[0].wrapped_key = Some(key.to_vec());
         sign_metadata(&account_key, &mut m, &ct);
         write_metadata_attributes(&server_file, &m).unwrap();
 

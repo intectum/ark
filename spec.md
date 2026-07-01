@@ -402,6 +402,8 @@ Every file's body is encrypted with a **symmetric file key** (AES-256-GCM). The 
 - Adding a member only requires wrapping the existing file key — no re-encryption of content.
 - Removing a member requires generating a new file key and re-encrypting content (since the removed member knew the old key).
 
+**A fresh file key is generated on every modification.** Each `put` of an encrypted body mints a new random file key, re-encrypts the body under it, and re-wraps it for every member. This means a file key never protects more than one version of the body, so leaking one version's key does not compromise other versions.
+
 ### 4.2 Encryption modes
 
 The file metadata's `algorithm` field specifies whether and how the body is encrypted:
@@ -410,11 +412,11 @@ The file metadata's `algorithm` field specifies whether and how the body is encr
 |---|---|---|---|
 | `aes-256-gcm` (default) | Encrypted | Yes — ECIES-wrapped per member | Private files, messages, shared documents |
 | `chacha20-poly1305` | Encrypted | Yes — ECIES-wrapped per member | Same, for devices without AES hardware acceleration |
-| `none` | Unencrypted (raw bytes) | No — `wrapped_key` fields are empty | Public content, websites, published documents |
+| `none` | Unencrypted (raw bytes) | No — `wrapped_key` fields are omitted | Public content, websites, published documents |
 
 When `algorithm = "none"`:
 - The body is stored as raw bytes (no nonce, no AEAD tag).
-- Member entries have empty `ephemeral_key`, `key_nonce`, and `wrapped_key` fields.
+- Member entries omit `ephemeral_key`, `key_nonce`, and `wrapped_key` fields.
 - The file signature still covers the body hash, providing integrity and authenticity (Section 5.2). This is the **only** integrity guarantee for unencrypted files — there is no AEAD tag to catch tampering.
 
 ### 4.3 File key generation
@@ -1459,7 +1461,7 @@ Like an identity document, but identifies a set of members instead of a single a
 | `address` | string | Yes | Member's full address. |
 | `identity_key` | string | Yes | Base64url-encoded member identity public key bytes. |
 | `permission` | string | Yes | `"owner"`, `"write"`, or `"read"`. |
-| `wrapped_key` | string | Yes | Base64url-encoded file key wrapped to this member. Empty for `algorithm = "none"` files. |
+| `wrapped_key` | string | No | Base64url-encoded file key wrapped to this member. Omitted for `algorithm = "none"` files. |
 
 ### C.12 Identity key file (`identity.key`, Section 2.11)
 

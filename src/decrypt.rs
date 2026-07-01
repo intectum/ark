@@ -62,7 +62,7 @@ pub fn cmd_decrypt(args: DecryptArgs) -> std::io::Result<()> {
                 members: vec![Member {
                     address: identity.address.clone(),
                     permission: "owner".to_string(),
-                    wrapped_key: file_key,
+                    wrapped_key: Some(file_key),
                 }],
                 body_hash: Hash { algorithm: String::new(), value: Vec::new() },
                 signature: Signature { algorithm: DEFAULT_SIGNING_ALGORITHM.to_string(), value: Vec::new() },
@@ -82,7 +82,8 @@ pub fn cmd_decrypt(args: DecryptArgs) -> std::io::Result<()> {
         decode_base64url(k.trim()).map_err(|e| io_err(&format!("--key decode: {}", e)))?
     } else {
         match get_member(&metadata.members, &identity.address) {
-            Some(m) => m.wrapped_key.clone(),
+            Some(m) => m.wrapped_key.clone()
+                .ok_or_else(|| io_err("no wrapped key for current account"))?,
             None => return Err(io_err("no member entry for current account"))
         }
     };
@@ -126,7 +127,7 @@ mod tests {
         let ct = encrypt_bytes(key, plaintext).unwrap();
         fs::write(&p, &ct).unwrap();
         let mut meta = get_default_test_metadata(&[1u8; 32], TEST_ADDRESS, &ct);
-        meta.members[0].wrapped_key = key.to_vec();
+        meta.members[0].wrapped_key = Some(key.to_vec());
         meta.encrypted = Some(true);
         write_metadata_attributes(&p, &meta).unwrap();
         p
@@ -198,7 +199,7 @@ mod tests {
         // overwrite member with wrong key — explicit --key should still win
         let ct = fs::read(&p).unwrap();
         let mut wrong_meta = get_default_test_metadata(&[1u8; 32], TEST_ADDRESS, &ct);
-        wrong_meta.members[0].wrapped_key = [99u8; 32].to_vec();
+        wrong_meta.members[0].wrapped_key = Some([99u8; 32].to_vec());
         wrong_meta.encrypted = Some(true);
         write_metadata_attributes(&p, &wrong_meta).unwrap();
         let out = td.0.join("out.bin");
@@ -270,7 +271,7 @@ mod tests {
         let body = vec![0u8; 42];
         fs::write(&p, &body).unwrap();
         let mut m = get_default_test_metadata(&[1u8; 32], TEST_ADDRESS, &body);
-        m.members[0].wrapped_key = [0u8; 32].to_vec();
+        m.members[0].wrapped_key = Some([0u8; 32].to_vec());
         write_metadata_attributes(&p, &m).unwrap();
         // no encrypted flag → decrypt attempts and fails
         let err = with_cwd(&acc, || cmd_decrypt(DecryptArgs {

@@ -74,7 +74,7 @@ mod tests {
         let key = [6u8; 32];
         let key_b64 = encode_base64url(key);
         let mut m = get_default_test_metadata(&account_key, &address, b"ciphertext");
-        m.members[0].wrapped_key = key.to_vec();
+        m.members[0].wrapped_key = Some(key.to_vec());
         sign_metadata(&account_key, &mut m, b"ciphertext");
         write_metadata_attributes(&f, &m).unwrap();
 

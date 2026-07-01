@@ -42,8 +42,8 @@ pub struct Key {
 pub struct Member {
     pub address: String,
     pub permission: String,
-    #[serde(with = "base64url")]
-    pub wrapped_key: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "base64url_opt")]
+    pub wrapped_key: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -81,6 +81,25 @@ mod base64url {
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
         let s = String::deserialize(d)?;
         URL_SAFE_NO_PAD.decode(s).map_err(serde::de::Error::custom)
+    }
+}
+
+mod base64url_opt {
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    use super::*;
+
+    pub fn serialize<S: Serializer>(bytes: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
+        match bytes {
+            Some(v) => s.serialize_str(&URL_SAFE_NO_PAD.encode(v)),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
+        let opt = Option::<String>::deserialize(d)?;
+        opt.map(|s| URL_SAFE_NO_PAD.decode(s).map_err(serde::de::Error::custom)).transpose()
     }
 }
 

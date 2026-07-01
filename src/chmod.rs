@@ -33,15 +33,13 @@ pub fn cmd_chmod(
     let template_wrapped_key = metadata
         .members
         .iter()
-        .find(|m| !m.wrapped_key.is_empty())
-        .map(|m| m.wrapped_key.clone())
-        .unwrap_or_default();
+        .find_map(|m| m.wrapped_key.clone());
 
     let encrypted = metadata.encryption != "none";
 
-    apply_changes(&mut metadata.members, owners, "owner", &template_wrapped_key, encrypted)?;
-    apply_changes(&mut metadata.members, writers, "write", &template_wrapped_key, encrypted)?;
-    apply_changes(&mut metadata.members, readers, "read", &template_wrapped_key, encrypted)?;
+    apply_changes(&mut metadata.members, owners, "owner", template_wrapped_key.as_deref(), encrypted)?;
+    apply_changes(&mut metadata.members, writers, "write", template_wrapped_key.as_deref(), encrypted)?;
+    apply_changes(&mut metadata.members, readers, "read", template_wrapped_key.as_deref(), encrypted)?;
 
     for addr in drops {
         let wire = cli_address_to_wire(addr);
@@ -68,7 +66,7 @@ fn apply_changes(
     members: &mut Vec<Member>,
     addresses: &[String],
     permission: &str,
-    template_wrapped_key: &[u8],
+    template_wrapped_key: Option<&[u8]>,
     encrypted: bool,
 ) -> std::io::Result<()> {
     for addr in addresses {
@@ -78,9 +76,9 @@ fn apply_changes(
         }
 
         let wrapped_key = if wire == PUBLIC_WIRE {
-            Vec::new()
+            None
         } else {
-            template_wrapped_key.to_vec()
+            template_wrapped_key.map(|k| k.to_vec())
         };
 
         match members.iter_mut().find(|m| m.address == wire) {
@@ -154,7 +152,7 @@ mod tests {
         let m = read_metadata_attributes(&path).unwrap();
         let pub_member = m.members.iter().find(|m| m.address == "*").unwrap();
         assert_eq!(pub_member.permission, "read");
-        assert!(pub_member.wrapped_key.is_empty());
+        assert!(pub_member.wrapped_key.is_none());
     }
 
     #[test]
