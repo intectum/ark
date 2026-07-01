@@ -120,7 +120,7 @@ pub fn write_metadata_headers(metadata: &Metadata) -> Vec<(String, String)> {
 }
 
 pub fn validate_metadata(metadata: &Metadata) -> io::Result<()> {
-    if metadata.encryption != DEFAULT_ENCRYPTION_ALGORITHM.to_string() {
+    if metadata.encryption != DEFAULT_ENCRYPTION_ALGORITHM.to_string() && metadata.encryption != "none" {
         return Err(io_err(&format!("unsupported encryption algorithm: {}", metadata.encryption.clone())));
     }
 

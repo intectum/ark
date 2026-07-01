@@ -1,3 +1,4 @@
+mod chmod;
 mod create_account;
 mod crypto;
 mod decrypt;
@@ -15,6 +16,7 @@ mod util;
 
 use clap::{Parser, Subcommand};
 
+use crate::chmod::cmd_chmod;
 use crate::create_account::cmd_create_account;
 use crate::decrypt::{DecryptArgs, cmd_decrypt};
 use crate::delete::cmd_delete;
@@ -46,6 +48,23 @@ enum Cmd {
     Head {
         /// Ark URL or path.
         path: String,
+    },
+    /// Change members and permissions on a local file's metadata. Use `put` to sync.
+    Chmod {
+        /// Add or promote an owner (repeatable). Use "public" for wildcard `*`.
+        #[arg(short = 'o', long = "owner", value_name = "ADDR")]
+        owner: Vec<String>,
+        /// Add or promote a writer (repeatable). Use "public" for wildcard `*`.
+        #[arg(short = 'w', long = "write", value_name = "ADDR")]
+        write: Vec<String>,
+        /// Add or promote a reader (repeatable). Use "public" for wildcard `*`.
+        #[arg(short = 'r', long = "read", value_name = "ADDR")]
+        read: Vec<String>,
+        /// Drop a member (repeatable).
+        #[arg(short = 'd', long = "drop", value_name = "ADDR")]
+        drop: Vec<String>,
+        /// Local file path.
+        file: String,
     },
     /// Delete a file or directory.
     Delete {
@@ -102,6 +121,7 @@ fn main() {
             Ok(())
         }
         Cmd::CreateAccount { address } => cmd_create_account(&address),
+        Cmd::Chmod { owner, write, read, drop, file } => cmd_chmod(&file, &owner, &write, &read, &drop),
         Cmd::Head { path } => cmd_head(&path),
         Cmd::Delete { path } => cmd_delete(&path),
         Cmd::Get { output, decrypt, path } => cmd_get(&path, output.as_deref(), decrypt),

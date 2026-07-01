@@ -57,7 +57,7 @@ fn handle(mut stream: TcpStream, root: &Path, verbose: bool) -> std::io::Result<
     let (method, target, headers, body) = read_request(&mut stream)?;
 
     if verbose {
-
+        println!("{} {}", method, target)
     }
 
     let url = match resolve_url(&target, "", root, true) {
