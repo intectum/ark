@@ -465,8 +465,7 @@ When receiving a request for a file, the server performs several authentication 
 
 The Authorization header can be one of:
 
-[TODO unique signature - with recent timestamp?]
-- `ArkAccount <signature>`
+- `ArkAccount address="<address>", timestamp="<unix-seconds>", signature="<base64url>"` — an ed25519 signature over `method \n path \n timestamp \n body`, produced with the requestor's identity key. `address` identifies the requestor (so the server can look up the verifying key directly). `timestamp` is unix seconds; requests outside a ±5 minute window are rejected to prevent replay. Params follow RFC 7235 auth-param syntax; order is not significant.
 - `ArkPasskey <WebAuthn public key>`
 - `ArkPassword <auth secret>`
 

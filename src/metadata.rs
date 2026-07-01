@@ -2,7 +2,7 @@ use std::io;
 use std::path::Path;
 
 use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, DEFAULT_HASH_ALGORITHM, DEFAULT_SIGNING_ALGORITHM, sign_json, verify_json};
-use crate::types::{Hash, Member, Metadata, Signature};
+use crate::types::{Hash, Member, Metadata, Permission, Signature};
 use crate::util::{decode_base64url, encode_base64url, io_err, sha256};
 
 const ATTRIBUTE_PREFIX: &str = "user.ark.";
@@ -70,7 +70,7 @@ pub fn write_metadata_attributes(path: &Path, metadata: &Metadata) -> io::Result
 
     for (index, member) in metadata.members.iter().enumerate() {
         xattr::set(path, &format!("{}member_{}_address", ATTRIBUTE_PREFIX, index), member.address.as_bytes())?;
-        xattr::set(path, &format!("{}member_{}_permission", ATTRIBUTE_PREFIX, index), member.permission.as_bytes())?;
+        xattr::set(path, &format!("{}member_{}_permission", ATTRIBUTE_PREFIX, index), member.permission.as_str().as_bytes())?;
         if let Some(key) = &member.wrapped_key {
             xattr::set(path, &format!("{}member_{}_wrapped_key", ATTRIBUTE_PREFIX, index), encode_base64url(key).as_bytes())?;
         }
@@ -114,7 +114,7 @@ pub fn write_metadata_headers(metadata: &Metadata) -> Vec<(String, String)> {
 
     for (index, member) in metadata.members.iter().enumerate() {
         out.push((format!("{}Member-{}-Address", HEADER_PREFIX, index), member.address.clone()));
-        out.push((format!("{}Member-{}-Permission", HEADER_PREFIX, index), member.permission.clone()));
+        out.push((format!("{}Member-{}-Permission", HEADER_PREFIX, index), member.permission.as_str().to_string()));
         if let Some(key) = &member.wrapped_key {
             out.push((format!("{}Member-{}-Wrapped-Key", HEADER_PREFIX, index), encode_base64url(key)));
         }
@@ -128,7 +128,7 @@ pub fn validate_metadata(metadata: &Metadata) -> io::Result<()> {
         return Err(io_err(&format!("unsupported encryption algorithm: {}", metadata.encryption.clone())));
     }
 
-    if !metadata.members.iter().any(|m| m.permission == "owner") {
+    if !metadata.members.iter().any(|m| m.permission == Permission::Owner) {
         return Err(io_err("metadata must contain at least one owner"));
     }
 
@@ -195,7 +195,7 @@ struct PartialMetadata {
 #[derive(Default)]
 struct PartialMember {
     address: Option<String>,
-    permission: Option<String>,
+    permission: Option<Permission>,
     wrapped_key: Option<Vec<u8>>,
 }
 
@@ -257,7 +257,9 @@ fn apply_field(metadata: &mut PartialMetadata, key: &str, value: &str) -> io::Re
 
                 match member_field_key.as_str() {
                     FIELD_MEMBER_ADDRESS => metadata.members[index].address = Some(value.to_string()),
-                    FIELD_MEMBER_PERMISSION => metadata.members[index].permission = Some(value.to_string()),
+                    FIELD_MEMBER_PERMISSION => metadata.members[index].permission = Some(
+                        Permission::parse(value).ok_or_else(|| io_err(&format!("unknown permission: {}", value)))?
+                    ),
                     FIELD_MEMBER_WRAPPED_KEY => metadata.members[index].wrapped_key = Some(decode_base64url(value)
                         .map_err(|_| io_err("wrapped_key is not base64url encoded"))?),
                     _ => {}
@@ -321,7 +323,7 @@ mod tests {
     fn sample_member(addr: &str, key_b: u8) -> Member {
         Member {
             address: addr.to_string(),
-            permission: "owner".to_string(),
+            permission: Permission::Owner,
             wrapped_key: Some([key_b.wrapping_add(1); 32].to_vec()),
         }
     }
@@ -447,7 +449,7 @@ mod tests {
     #[test]
     fn validate_metadata_rejects_no_owner() {
         let mut m = get_default_test_metadata(&[24u8; 32], TEST_ADDRESS, b"x");
-        m.members[0].permission = "read".to_string();
+        m.members[0].permission = Permission::Read;
         let err = match validate_metadata(&m) {
             Err(e) => e,
             Ok(_) => panic!("expected owner-missing error"),

@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, DEFAULT_SIGNING_ALGORITHM, decrypt_bytes};
 use crate::identity::read_identity;
 use crate::metadata::{get_member, read_metadata_attributes, validate_metadata, write_metadata_attributes};
-use crate::types::{Hash, Member, Metadata, Signature};
+use crate::types::{Hash, Member, Metadata, Permission, Signature};
 use crate::util::{decode_base64url, find_root, io_err, now_iso};
 
 pub struct DecryptArgs {
@@ -61,7 +61,7 @@ pub fn cmd_decrypt(args: DecryptArgs) -> std::io::Result<()> {
                 encryption: args.algorithm.clone().unwrap_or(DEFAULT_ENCRYPTION_ALGORITHM.to_string()),
                 members: vec![Member {
                     address: identity.address.clone(),
-                    permission: "owner".to_string(),
+                    permission: Permission::Owner,
                     wrapped_key: Some(file_key),
                 }],
                 body_hash: Hash { algorithm: String::new(), value: Vec::new() },

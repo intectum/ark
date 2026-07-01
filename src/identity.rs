@@ -51,7 +51,7 @@ pub fn resolve_identity_server(root: &Path, self_identity: &Identity, address: &
     }
 
     let (address_name, _) = address.split_once("@").expect("address split");
-    let local_identity_path = root.join("ark").join(address_name);
+    let local_identity_path = root.join("ark").join(address_name).join(".ark").join("identity.json");
     if fs::exists(&local_identity_path)? {
         return read_identity(&local_identity_path);
     }

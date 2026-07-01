@@ -6,7 +6,7 @@ use url::Url;
 
 use crate::crypto::{sign_bytes};
 use crate::http::{read_response, write_request};
-use crate::identity::read_identity_key;
+use crate::identity::{read_identity, read_identity_key};
 use crate::util::{encode_base64url, io_err, now_seconds, request_to_bytes};
 
 pub fn ark_request(
@@ -16,8 +16,9 @@ pub fn ark_request(
     headers: &[(&str, &str)],
     body: &[u8],
 ) -> std::io::Result<(u16, Vec<(String, String)>, Vec<u8>)> {
+    let identity = read_identity(&root.join(".ark").join("identity.json"))?;
     let key = read_identity_key(&root.join(".ark").join("identity.key"))?;
-    request(method, &url, headers, body, &key)
+    request(method, &url, headers, body, &identity.address, &key)
 }
 
 pub fn request(
@@ -25,17 +26,21 @@ pub fn request(
     url: &Url,
     headers: &[(&str, &str)],
     body: &[u8],
+    address: &str,
     key: &[u8],
 ) -> std::io::Result<(u16, Vec<(String, String)>, Vec<u8>)> {
     let mut final_headers = headers.to_vec();
 
     let timestamp = now_seconds();
-    let timestamp_string = timestamp.to_string();
     let bytes = request_to_bytes(method, url.path(), timestamp, body);
     let signature = sign_bytes(key, &bytes);
-    let authorization = format!("ArkAccount {}", encode_base64url(signature));
+    let authorization = format!(
+        "ArkAccount address=\"{}\", timestamp=\"{}\", signature=\"{}\"",
+        address,
+        timestamp,
+        encode_base64url(signature),
+    );
     final_headers.push(("Authorization", &authorization));
-    final_headers.push(("X-Ark-Timestamp", &timestamp_string));
 
     final_headers.push(("Connection", "close"));
 
@@ -115,7 +120,7 @@ mod tests {
         });
 
         let url = Url::parse(&format!("http://127.0.0.1:{}/x", port)).unwrap();
-        let (code, headers, body) = request("PUT", &url, &[], b"data", &[1u8; 32]).unwrap();
+        let (code, headers, body) = request("PUT", &url, &[], b"data", "alice@x", &[1u8; 32]).unwrap();
         assert_eq!(code, 201);
         assert_eq!(body, b"hello");
         assert!(headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("content-length") && v == "5"));
@@ -133,7 +138,7 @@ mod tests {
         });
 
         let url = Url::parse(&format!("http://127.0.0.1:{}/ark/alice/x", port)).unwrap();
-        let (code, _, _) = request("PUT", &url, &[], b"payload", &[2u8; 32]).unwrap();
+        let (code, _, _) = request("PUT", &url, &[], b"payload", "alice@x", &[2u8; 32]).unwrap();
         assert_eq!(code, 204);
 
         let req = captured.join().unwrap();
@@ -156,18 +161,28 @@ mod tests {
 
         let url = Url::parse(&format!("http://127.0.0.1:{}/x", port)).unwrap();
         let key = [3u8; 32];
-        let _ = request("GET", &url, &[], &[], &key).unwrap();
+        let _ = request("GET", &url, &[], &[], "alice@x", &key).unwrap();
 
         let req = captured.join().unwrap();
         let auth = parse_header(&req, "Authorization").unwrap();
-        let ts = parse_header(&req, "X-Ark-Timestamp").unwrap();
-        let sig_b64 = auth.strip_prefix("ArkAccount ").unwrap();
-        let sig_bytes: [u8; 64] = decode_base64url(sig_b64).unwrap().try_into().unwrap();
+        let params = parse_auth_params(auth).unwrap();
+        assert_eq!(params.get("address").map(String::as_str), Some("alice@x"));
+        let ts_n: u64 = params.get("timestamp").unwrap().parse().unwrap();
+        let sig_bytes: [u8; 64] = decode_base64url(params.get("signature").unwrap()).unwrap().try_into().unwrap();
 
-        let ts_n: u64 = ts.parse().unwrap();
         let msg = request_to_bytes("GET", "/x", ts_n, &[]);
         let public_key = SigningKey::from_bytes(&key).verifying_key().to_bytes();
         assert!(verify_bytes(&public_key, &sig_bytes, msg).is_ok());
+    }
+
+    fn parse_auth_params(value: &str) -> Option<std::collections::HashMap<String, String>> {
+        let rest = value.strip_prefix("ArkAccount ")?.trim();
+        let mut out = std::collections::HashMap::new();
+        for part in rest.split(',') {
+            let (k, v) = part.trim().split_once('=')?;
+            out.insert(k.trim().to_ascii_lowercase(), v.trim().trim_matches('"').to_string());
+        }
+        Some(out)
     }
 
     #[test]
@@ -180,7 +195,7 @@ mod tests {
         });
 
         let url = Url::parse(&format!("http://127.0.0.1:{}/ark/x", port)).unwrap();
-        let (code, _, body) = request("GET", &url, &[], &[], &[4u8; 32]).unwrap();
+        let (code, _, body) = request("GET", &url, &[], &[], "alice@x", &[4u8; 32]).unwrap();
         assert_eq!(code, 403);
         assert_eq!(body, b"denied!");
     }
@@ -201,6 +216,7 @@ mod tests {
             &url,
             &[("X-Ark-Meta-Encryption", "aes-256-gcm"), ("X-Custom", "hi")],
             b"d",
+            "alice@x",
             &[5u8; 32],
         ).unwrap();
 

@@ -116,7 +116,7 @@ pub mod test {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::metadata::{sign_metadata, write_metadata_attributes};
-    use crate::types::{Hash, Member, Metadata, Signature};
+    use crate::types::{Hash, Member, Metadata, Permission, Signature};
 
     static CWD_LOCK: Mutex<()> = Mutex::new(());
 
@@ -171,7 +171,7 @@ pub mod test {
             encrypted: None,
             members: vec![Member {
                 address: address.to_string(),
-                permission: "owner".to_string(),
+                permission: Permission::Owner,
                 wrapped_key: Some([2u8; 32].to_vec()),
             }],
             body_hash: Hash { algorithm: String::new(), value: Vec::new() },

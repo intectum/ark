@@ -41,7 +41,7 @@ pub struct Key {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Member {
     pub address: String,
-    pub permission: String,
+    pub permission: Permission,
     #[serde(default, skip_serializing_if = "Option::is_none", with = "base64url_opt")]
     pub wrapped_key: Option<Vec<u8>>,
 }
@@ -59,6 +59,33 @@ pub struct Metadata {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encrypted: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Permission {
+    Owner,
+    Write,
+    Read,
+}
+
+impl Permission {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Permission::Owner => "owner",
+            Permission::Write => "write",
+            Permission::Read => "read",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "owner" => Some(Permission::Owner),
+            "write" => Some(Permission::Write),
+            "read" => Some(Permission::Read),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]

@@ -9,7 +9,7 @@ use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, DEFAULT_SIGNING_ALGORITHM, enc
 use crate::identity::{read_identity, read_identity_key};
 use crate::metadata::{get_member, read_metadata_attributes, sign_metadata, write_metadata_attributes, write_metadata_headers};
 use crate::request::ark_request;
-use crate::types::{Hash, Member, Metadata, Signature};
+use crate::types::{Hash, Member, Metadata, Permission, Signature};
 use crate::util::{find_root, io_err, now_iso, resolve_url};
 
 pub fn cmd_put(path: &str, input: Option<&str>, algorithm: Option<&str>) -> std::io::Result<()> {
@@ -50,7 +50,7 @@ pub fn cmd_put(path: &str, input: Option<&str>, algorithm: Option<&str>) -> std:
             encryption: algorithm.unwrap_or(DEFAULT_ENCRYPTION_ALGORITHM).to_string(),
             members: vec![Member {
                 address: identity.address.clone(),
-                permission: "owner".to_string(),
+                permission: Permission::Owner,
                 wrapped_key: None,
             }],
             body_hash: Hash { algorithm: String::new(), value: Vec::new() },

@@ -3,7 +3,7 @@ use std::path::Path;
 
 use crate::identity::{read_identity, read_identity_key, resolve_identity_client};
 use crate::metadata::{get_member, read_metadata_attributes, sign_metadata, verify_metadata_signature, write_metadata_attributes};
-use crate::types::Member;
+use crate::types::{Member, Permission};
 use crate::util::{find_root, io_err, io_invalid_input, now_iso};
 
 const PUBLIC_CLI: &str = "public";
@@ -26,7 +26,7 @@ pub fn cmd_chmod(
     verify_metadata_signature(&modifier_identity.public_key.value, &metadata)?;
 
     match get_member(&metadata.members, &identity.address) {
-        Some(m) if m.permission == "owner" => {}
+        Some(m) if m.permission == Permission::Owner => {}
         _ => return Err(io_err("only an owner can change permissions")),
     }
 
@@ -37,16 +37,16 @@ pub fn cmd_chmod(
 
     let encrypted = metadata.encryption != "none";
 
-    apply_changes(&mut metadata.members, owners, "owner", template_wrapped_key.as_deref(), encrypted)?;
-    apply_changes(&mut metadata.members, writers, "write", template_wrapped_key.as_deref(), encrypted)?;
-    apply_changes(&mut metadata.members, readers, "read", template_wrapped_key.as_deref(), encrypted)?;
+    apply_changes(&mut metadata.members, owners, Permission::Owner, template_wrapped_key.as_deref(), encrypted)?;
+    apply_changes(&mut metadata.members, writers, Permission::Write, template_wrapped_key.as_deref(), encrypted)?;
+    apply_changes(&mut metadata.members, readers, Permission::Read, template_wrapped_key.as_deref(), encrypted)?;
 
     for addr in drops {
         let wire = cli_address_to_wire(addr);
         metadata.members.retain(|m| m.address != wire);
     }
 
-    if !metadata.members.iter().any(|m| m.permission == "owner") {
+    if !metadata.members.iter().any(|m| m.permission == Permission::Owner) {
         return Err(io_invalid_input("at least one owner must remain"));
     }
 
@@ -65,7 +65,7 @@ pub fn cmd_chmod(
 fn apply_changes(
     members: &mut Vec<Member>,
     addresses: &[String],
-    permission: &str,
+    permission: Permission,
     template_wrapped_key: Option<&[u8]>,
     encrypted: bool,
 ) -> std::io::Result<()> {
@@ -82,10 +82,10 @@ fn apply_changes(
         };
 
         match members.iter_mut().find(|m| m.address == wire) {
-            Some(existing) => existing.permission = permission.to_string(),
+            Some(existing) => existing.permission = permission,
             None => members.push(Member {
                 address: wire,
-                permission: permission.to_string(),
+                permission,
                 wrapped_key,
             }),
         }
@@ -132,8 +132,8 @@ mod tests {
 
         let m = read_metadata_attributes(&path).unwrap();
         let john = m.members.iter().find(|m| m.address == "john@example.com").unwrap();
-        assert_eq!(john.permission, "read");
-        assert!(m.members.iter().any(|m| m.address == address && m.permission == "owner"));
+        assert_eq!(john.permission, Permission::Read);
+        assert!(m.members.iter().any(|m| m.address == address && m.permission == Permission::Owner));
     }
 
     #[test]
@@ -151,7 +151,7 @@ mod tests {
 
         let m = read_metadata_attributes(&path).unwrap();
         let pub_member = m.members.iter().find(|m| m.address == "*").unwrap();
-        assert_eq!(pub_member.permission, "read");
+        assert_eq!(pub_member.permission, Permission::Read);
         assert!(pub_member.wrapped_key.is_none());
     }
 
@@ -184,7 +184,7 @@ mod tests {
         m.encryption = "none".to_string();
         m.members.push(Member {
             address: "sam@example.com".to_string(),
-            permission: "read".to_string(),
+            permission: Permission::Read,
             wrapped_key: m.members[0].wrapped_key.clone(),
         });
         sign_metadata(&key, &mut m, b"body");
@@ -197,7 +197,7 @@ mod tests {
 
         let m2 = read_metadata_attributes(&path).unwrap();
         let sam = m2.members.iter().find(|m| m.address == "sam@example.com").unwrap();
-        assert_eq!(sam.permission, "write");
+        assert_eq!(sam.permission, Permission::Write);
     }
 
     #[test]
@@ -214,7 +214,7 @@ mod tests {
         m.encryption = "none".to_string();
         m.members.push(Member {
             address: "sam@example.com".to_string(),
-            permission: "read".to_string(),
+            permission: Permission::Read,
             wrapped_key: m.members[0].wrapped_key.clone(),
         });
         sign_metadata(&key, &mut m, b"body");
@@ -256,10 +256,10 @@ mod tests {
         fs::write(&path, b"body").unwrap();
         let mut m = get_default_test_metadata(&key, &address, b"body");
         m.encryption = "none".to_string();
-        m.members[0].permission = "write".to_string();
+        m.members[0].permission = Permission::Write;
         m.members.push(Member {
             address: "boss@example.com".to_string(),
-            permission: "owner".to_string(),
+            permission: Permission::Owner,
             wrapped_key: m.members[0].wrapped_key.clone(),
         });
         sign_metadata(&key, &mut m, b"body");
