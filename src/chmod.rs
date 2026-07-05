@@ -1,9 +1,10 @@
 use std::env::current_dir;
 use std::path::Path;
 
-use crate::identity::{read_identity, read_identity_key, resolve_identity_client};
+use crate::crypto::{decrypt_bytes, encrypt_bytes};
+use crate::identity::{read_identity, read_identity_key, resolve_identity};
 use crate::metadata::{get_member, read_metadata_attributes, sign_metadata, verify_metadata_signature, write_metadata_attributes};
-use crate::types::{Member, Permission};
+use crate::types::{Key, Member, Permission};
 use crate::util::{find_root, io_err, io_invalid_input, now_iso};
 
 const PUBLIC_CLI: &str = "public";
@@ -22,24 +23,34 @@ pub fn cmd_chmod(
     let path = Path::new(file);
     let mut metadata = read_metadata_attributes(path)?;
 
-    let modifier_identity = resolve_identity_client(&root, &identity, &metadata.modified_by)?;
-    verify_metadata_signature(&modifier_identity.public_key.value, &metadata)?;
+    let modifier_identity = resolve_identity(&metadata.modified_by)?;
+    verify_metadata_signature(&modifier_identity.public_key, &metadata)?;
 
     match get_member(&metadata.members, &identity.address) {
         Some(m) if m.permission == Permission::Owner => {}
         _ => return Err(io_err("only an owner can change permissions")),
     }
 
-    let template_wrapped_key = metadata
-        .members
-        .iter()
-        .find_map(|m| m.wrapped_key.clone());
-
     let encrypted = metadata.encryption != "none";
 
-    apply_changes(&mut metadata.members, owners, Permission::Owner, template_wrapped_key.as_deref(), encrypted)?;
-    apply_changes(&mut metadata.members, writers, Permission::Write, template_wrapped_key.as_deref(), encrypted)?;
-    apply_changes(&mut metadata.members, readers, Permission::Read, template_wrapped_key.as_deref(), encrypted)?;
+    let identity_key = read_identity_key(&root.join(".ark").join("identity.key"))?;
+
+    let file_key = if encrypted {
+        let member = get_member(&metadata.members, &identity.address)
+            .ok_or_else(|| io_err("no member entry for current account"))?;
+        let encrypted_file_key = member.key.as_ref()
+            .ok_or_else(|| io_err("no file key for current account"))?;
+        Some(decrypt_bytes(
+            &Key { algorithm: encrypted_file_key.algorithm.clone(), value: identity_key.clone() },
+            &encrypted_file_key.value,
+        )?)
+    } else {
+        None
+    };
+
+    apply_changes(&mut metadata.members, owners, Permission::Owner, file_key.as_deref())?;
+    apply_changes(&mut metadata.members, writers, Permission::Write, file_key.as_deref())?;
+    apply_changes(&mut metadata.members, readers, Permission::Read, file_key.as_deref())?;
 
     for addr in drops {
         let wire = cli_address_to_wire(addr);
@@ -54,8 +65,7 @@ pub fn cmd_chmod(
     metadata.modified_by = identity.address.clone();
 
     let body = std::fs::read(path)?;
-    let signing_key = read_identity_key(&root.join(".ark").join("identity.key"))?;
-    sign_metadata(&signing_key, &mut metadata, &body);
+    sign_metadata(&Key { algorithm: identity.public_key.algorithm, value: identity_key }, &mut metadata, &body)?;
 
     write_metadata_attributes(path, &metadata)?;
 
@@ -66,28 +76,32 @@ fn apply_changes(
     members: &mut Vec<Member>,
     addresses: &[String],
     permission: Permission,
-    template_wrapped_key: Option<&[u8]>,
-    encrypted: bool,
+    file_key: Option<&[u8]>,
 ) -> std::io::Result<()> {
+    let encrypted = file_key.is_some();
     for addr in addresses {
         let wire = cli_address_to_wire(addr);
         if wire == PUBLIC_WIRE && encrypted {
             return Err(io_invalid_input("cannot add public member to encrypted file"));
         }
 
-        let wrapped_key = if wire == PUBLIC_WIRE {
-            None
-        } else {
-            template_wrapped_key.map(|k| k.to_vec())
-        };
-
         match members.iter_mut().find(|m| m.address == wire) {
             Some(existing) => existing.permission = permission,
-            None => members.push(Member {
-                address: wire,
-                permission,
-                wrapped_key,
-            }),
+            None => {
+                let key = match (file_key, wire.as_str()) {
+                    (Some(fk), w) if w != PUBLIC_WIRE => {
+                        let new_identity = resolve_identity(&wire)?;
+                        let (algorithm, value) = encrypt_bytes(&new_identity.public_key, fk)?;
+                        Some(Key { algorithm, value })
+                    }
+                    _ => None,
+                };
+                members.push(Member {
+                    address: wire,
+                    permission,
+                    key,
+                });
+            }
         }
     }
     Ok(())
@@ -99,196 +113,205 @@ fn cli_address_to_wire(addr: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::env;
     use std::fs;
+    use std::path::{Path, PathBuf};
 
     use super::*;
-    use crate::create_account::create_account_with_key;
-    use crate::metadata::{sign_metadata, write_metadata_attributes};
-    use crate::util::test::{TempDir, get_default_test_metadata, with_cwd};
+    use crate::identity::write_identity;
+    use crate::metadata::{create_metadata, sign_metadata, verify_metadata, write_metadata_attributes};
+    use crate::types::{Identity, Key};
+    use crate::util::test::{create_test_account, in_test_dir, write_encrypted_test_file, write_plain_test_file, TEST_ADDRESS};
 
-    fn seed_local_file(td: &TempDir, address: &str, key: &[u8; 32], name: &str, body: &[u8], encryption: &str) -> std::path::PathBuf {
-        let path = td.0.join(format!("ark/gyan/{}", name));
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, body).unwrap();
-        let mut m = get_default_test_metadata(key, address, body);
-        m.encryption = encryption.to_string();
-        sign_metadata(key, &mut m, body);
-        write_metadata_attributes(&path, &m).unwrap();
-        path
+    fn setup(temp_dir: &Path) -> (Identity, Key, PathBuf) {
+        let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
+        let cache_dir = account_dir.join(".ark").join("identities");
+        fs::create_dir_all(&cache_dir).unwrap();
+        write_identity(&cache_dir.join(format!("{}.json", TEST_ADDRESS)), &identity).unwrap();
+        (identity, secret_key, account_dir)
     }
 
     #[test]
     fn adds_reader_to_local_file() {
-        let td = TempDir::new("ark_chmod_test");
-        let address = "gyan@127.0.0.1:8080".to_string();
-        let key = [90u8; 32];
-        create_account_with_key(&td.0, &address, &key).unwrap();
-        let path = seed_local_file(&td, &address, &key, "notes.txt", b"hello", "none");
+        in_test_dir("ark_chmod_test", |temp_dir| {
+            let (identity, secret_key, account_dir) = setup(temp_dir);
+            let path = account_dir.join("notes.txt");
+            write_plain_test_file(&path, &identity, &secret_key, b"hello");
 
-        let account_dir = td.0.join("ark/gyan");
-        with_cwd(&account_dir, || {
+            env::set_current_dir(&account_dir).unwrap();
             cmd_chmod(path.to_str().unwrap(), &[], &[], &["john@example.com".to_string()], &[]).unwrap();
-        });
 
-        let m = read_metadata_attributes(&path).unwrap();
-        let john = m.members.iter().find(|m| m.address == "john@example.com").unwrap();
-        assert_eq!(john.permission, Permission::Read);
-        assert!(m.members.iter().any(|m| m.address == address && m.permission == Permission::Owner));
+            let m = read_metadata_attributes(&path).unwrap();
+            let john = m.members.iter().find(|m| m.address == "john@example.com").unwrap();
+            assert_eq!(john.permission, Permission::Read);
+            assert!(m.members.iter().any(|m| m.address == TEST_ADDRESS && m.permission == Permission::Owner));
+        });
     }
 
     #[test]
     fn adds_public_reader_when_unencrypted() {
-        let td = TempDir::new("ark_chmod_test");
-        let address = "gyan@127.0.0.1:8080".to_string();
-        let key = [91u8; 32];
-        create_account_with_key(&td.0, &address, &key).unwrap();
-        let path = seed_local_file(&td, &address, &key, "public.txt", b"open", "none");
+        in_test_dir("ark_chmod_test", |temp_dir| {
+            let (identity, secret_key, account_dir) = setup(temp_dir);
+            let path = account_dir.join("public.txt");
+            write_plain_test_file(&path, &identity, &secret_key, b"open");
 
-        let account_dir = td.0.join("ark/gyan");
-        with_cwd(&account_dir, || {
+            env::set_current_dir(&account_dir).unwrap();
             cmd_chmod(path.to_str().unwrap(), &[], &[], &["public".to_string()], &[]).unwrap();
-        });
 
-        let m = read_metadata_attributes(&path).unwrap();
-        let pub_member = m.members.iter().find(|m| m.address == "*").unwrap();
-        assert_eq!(pub_member.permission, Permission::Read);
-        assert!(pub_member.wrapped_key.is_none());
+            let m = read_metadata_attributes(&path).unwrap();
+            let pub_member = m.members.iter().find(|m| m.address == "*").unwrap();
+            assert_eq!(pub_member.permission, Permission::Read);
+            assert!(pub_member.key.is_none());
+        });
     }
 
     #[test]
     fn rejects_public_on_encrypted_file() {
-        let td = TempDir::new("ark_chmod_test");
-        let address = "gyan@127.0.0.1:8080".to_string();
-        let key = [92u8; 32];
-        create_account_with_key(&td.0, &address, &key).unwrap();
-        let path = seed_local_file(&td, &address, &key, "enc.bin", b"ciphertext", "aes-256-gcm");
+        in_test_dir("ark_chmod_test", |temp_dir| {
+            let (identity, secret_key, account_dir) = setup(temp_dir);
+            let path = account_dir.join("enc.bin");
+            write_encrypted_test_file(&path, &identity, &secret_key, b"plaintext");
 
-        let account_dir = td.0.join("ark/gyan");
-        let err = with_cwd(&account_dir, || {
-            cmd_chmod(path.to_str().unwrap(), &[], &[], &["public".to_string()], &[]).unwrap_err()
+            env::set_current_dir(&account_dir).unwrap();
+            let err = cmd_chmod(path.to_str().unwrap(), &[], &[], &["public".to_string()], &[]).unwrap_err();
+            assert!(err.to_string().contains("public member to encrypted"), "msg was {}", err);
         });
-        assert!(err.to_string().contains("public member to encrypted"), "msg was {}", err);
+    }
+
+    #[test]
+    fn adds_reader_to_encrypted_file() {
+        in_test_dir("ark_chmod_test", |temp_dir| {
+            let (identity, secret_key, account_dir) = setup(temp_dir);
+            let cache_dir = account_dir.join(".ark").join("identities");
+
+            let (bob_identity, bob_secret_key) = crate::identity::create_identity("bob@example.com").unwrap();
+            write_identity(&cache_dir.join("bob@example.com.json"), &bob_identity).unwrap();
+
+            let path = account_dir.join("enc.bin");
+            write_encrypted_test_file(&path, &identity, &secret_key, b"plaintext");
+
+            let owner_wrapped = read_metadata_attributes(&path).unwrap().members[0].key.clone().unwrap();
+            let file_key = crate::crypto::decrypt_bytes(
+                &Key { algorithm: owner_wrapped.algorithm.clone(), value: secret_key.value.clone() },
+                &owner_wrapped.value,
+            ).unwrap();
+
+            env::set_current_dir(&account_dir).unwrap();
+            cmd_chmod(path.to_str().unwrap(), &[], &[], &["bob@example.com".to_string()], &[]).unwrap();
+
+            let m = read_metadata_attributes(&path).unwrap();
+            let bob = m.members.iter().find(|m| m.address == "bob@example.com").unwrap();
+            assert_eq!(bob.permission, Permission::Read);
+            let bob_wrapped = bob.key.as_ref().expect("bob's wrapped key");
+            let recovered = crate::crypto::decrypt_bytes(
+                &Key { algorithm: bob_wrapped.algorithm.clone(), value: bob_secret_key.value.clone() },
+                &bob_wrapped.value,
+            ).unwrap();
+            assert_eq!(recovered, file_key, "bob unwraps to same file key");
+        });
     }
 
     #[test]
     fn upgrades_existing_member_permission() {
-        let td = TempDir::new("ark_chmod_test");
-        let address = "gyan@127.0.0.1:8080".to_string();
-        let key = [93u8; 32];
-        create_account_with_key(&td.0, &address, &key).unwrap();
+        in_test_dir("ark_chmod_test", |temp_dir| {
+            let (identity, secret_key, account_dir) = setup(temp_dir);
 
-        let path = td.0.join("ark/gyan/doc.txt");
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, b"body").unwrap();
-        let mut m = get_default_test_metadata(&key, &address, b"body");
-        m.encryption = "none".to_string();
-        m.members.push(Member {
-            address: "sam@example.com".to_string(),
-            permission: Permission::Read,
-            wrapped_key: m.members[0].wrapped_key.clone(),
-        });
-        sign_metadata(&key, &mut m, b"body");
-        write_metadata_attributes(&path, &m).unwrap();
+            let path = account_dir.join("doc.txt");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, b"body").unwrap();
+            let mut m = create_metadata(&identity.address, "none");
+            m.members.push(Member {
+                address: "sam@example.com".to_string(),
+                permission: Permission::Read,
+                key: None,
+            });
+            sign_metadata(&secret_key, &mut m, b"body").unwrap();
+            write_metadata_attributes(&path, &m).unwrap();
 
-        let account_dir = td.0.join("ark/gyan");
-        with_cwd(&account_dir, || {
+            env::set_current_dir(&account_dir).unwrap();
             cmd_chmod(path.to_str().unwrap(), &[], &["sam@example.com".to_string()], &[], &[]).unwrap();
-        });
 
-        let m2 = read_metadata_attributes(&path).unwrap();
-        let sam = m2.members.iter().find(|m| m.address == "sam@example.com").unwrap();
-        assert_eq!(sam.permission, Permission::Write);
+            let m2 = read_metadata_attributes(&path).unwrap();
+            let sam = m2.members.iter().find(|m| m.address == "sam@example.com").unwrap();
+            assert_eq!(sam.permission, Permission::Write);
+        });
     }
 
     #[test]
     fn drops_member() {
-        let td = TempDir::new("ark_chmod_test");
-        let address = "gyan@127.0.0.1:8080".to_string();
-        let key = [94u8; 32];
-        create_account_with_key(&td.0, &address, &key).unwrap();
+        in_test_dir("ark_chmod_test", |temp_dir| {
+            let (identity, secret_key, account_dir) = setup(temp_dir);
 
-        let path = td.0.join("ark/gyan/doc.txt");
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, b"body").unwrap();
-        let mut m = get_default_test_metadata(&key, &address, b"body");
-        m.encryption = "none".to_string();
-        m.members.push(Member {
-            address: "sam@example.com".to_string(),
-            permission: Permission::Read,
-            wrapped_key: m.members[0].wrapped_key.clone(),
-        });
-        sign_metadata(&key, &mut m, b"body");
-        write_metadata_attributes(&path, &m).unwrap();
+            let path = account_dir.join("doc.txt");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, b"body").unwrap();
+            let mut m = create_metadata(&identity.address, "none");
+            m.members.push(Member {
+                address: "sam@example.com".to_string(),
+                permission: Permission::Read,
+                key: None,
+            });
+            sign_metadata(&secret_key, &mut m, b"body").unwrap();
+            write_metadata_attributes(&path, &m).unwrap();
 
-        let account_dir = td.0.join("ark/gyan");
-        with_cwd(&account_dir, || {
+            env::set_current_dir(&account_dir).unwrap();
             cmd_chmod(path.to_str().unwrap(), &[], &[], &[], &["sam@example.com".to_string()]).unwrap();
-        });
 
-        let m2 = read_metadata_attributes(&path).unwrap();
-        assert!(!m2.members.iter().any(|m| m.address == "sam@example.com"));
+            let m2 = read_metadata_attributes(&path).unwrap();
+            assert!(!m2.members.iter().any(|m| m.address == "sam@example.com"));
+        });
     }
 
     #[test]
     fn rejects_dropping_last_owner() {
-        let td = TempDir::new("ark_chmod_test");
-        let address = "gyan@127.0.0.1:8080".to_string();
-        let key = [95u8; 32];
-        create_account_with_key(&td.0, &address, &key).unwrap();
-        let path = seed_local_file(&td, &address, &key, "doc.txt", b"body", "none");
+        in_test_dir("ark_chmod_test", |temp_dir| {
+            let (identity, secret_key, account_dir) = setup(temp_dir);
+            let path = account_dir.join("doc.txt");
+            write_plain_test_file(&path, &identity, &secret_key, b"body");
 
-        let account_dir = td.0.join("ark/gyan");
-        let err = with_cwd(&account_dir, || {
-            cmd_chmod(path.to_str().unwrap(), &[], &[], &[], &[address.clone()]).unwrap_err()
+            env::set_current_dir(&account_dir).unwrap();
+            let err = cmd_chmod(path.to_str().unwrap(), &[], &[], &[], &[TEST_ADDRESS.to_string()]).unwrap_err();
+            assert!(err.to_string().contains("at least one owner"), "msg was {}", err);
         });
-        assert!(err.to_string().contains("at least one owner"), "msg was {}", err);
     }
 
     #[test]
     fn rejects_non_owner_caller() {
-        let td = TempDir::new("ark_chmod_test");
-        let address = "gyan@127.0.0.1:8080".to_string();
-        let key = [96u8; 32];
-        create_account_with_key(&td.0, &address, &key).unwrap();
+        in_test_dir("ark_chmod_test", |temp_dir| {
+            let (identity, secret_key, account_dir) = setup(temp_dir);
 
-        let path = td.0.join("ark/gyan/doc.txt");
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, b"body").unwrap();
-        let mut m = get_default_test_metadata(&key, &address, b"body");
-        m.encryption = "none".to_string();
-        m.members[0].permission = Permission::Write;
-        m.members.push(Member {
-            address: "boss@example.com".to_string(),
-            permission: Permission::Owner,
-            wrapped_key: m.members[0].wrapped_key.clone(),
-        });
-        sign_metadata(&key, &mut m, b"body");
-        write_metadata_attributes(&path, &m).unwrap();
+            let path = account_dir.join("doc.txt");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, b"body").unwrap();
+            let mut m = create_metadata(&identity.address, "none");
+            m.members[0].permission = Permission::Write;
+            m.members.push(Member {
+                address: "boss@example.com".to_string(),
+                permission: Permission::Owner,
+                key: None,
+            });
+            sign_metadata(&secret_key, &mut m, b"body").unwrap();
+            write_metadata_attributes(&path, &m).unwrap();
 
-        let account_dir = td.0.join("ark/gyan");
-        let err = with_cwd(&account_dir, || {
-            cmd_chmod(path.to_str().unwrap(), &[], &[], &["john@example.com".to_string()], &[]).unwrap_err()
+            env::set_current_dir(&account_dir).unwrap();
+            let err = cmd_chmod(path.to_str().unwrap(), &[], &[], &["john@example.com".to_string()], &[]).unwrap_err();
+            assert!(err.to_string().contains("only an owner"), "msg was {}", err);
         });
-        assert!(err.to_string().contains("only an owner"), "msg was {}", err);
     }
 
     #[test]
     fn re_signs_metadata_so_body_hash_matches() {
-        let td = TempDir::new("ark_chmod_test");
-        let address = "gyan@127.0.0.1:8080".to_string();
-        let key = [97u8; 32];
-        create_account_with_key(&td.0, &address, &key).unwrap();
-        let path = seed_local_file(&td, &address, &key, "doc.txt", b"body", "none");
+        in_test_dir("ark_chmod_test", |temp_dir| {
+            let (identity, secret_key, account_dir) = setup(temp_dir);
+            let path = account_dir.join("doc.txt");
+            write_plain_test_file(&path, &identity, &secret_key, b"body");
 
-        let account_dir = td.0.join("ark/gyan");
-        with_cwd(&account_dir, || {
+            env::set_current_dir(&account_dir).unwrap();
             cmd_chmod(path.to_str().unwrap(), &[], &[], &["john@example.com".to_string()], &[]).unwrap();
-        });
 
-        let m = read_metadata_attributes(&path).unwrap();
-        let body = fs::read(&path).unwrap();
-        let identity_key = read_identity_key(&td.0.join("ark/gyan/.ark/identity.key")).unwrap();
-        let public_key = crate::crypto::to_public_key(&identity_key);
-        crate::metadata::verify_metadata(&public_key, &m, &body).unwrap();
+            let m = read_metadata_attributes(&path).unwrap();
+            let body = fs::read(&path).unwrap();
+            verify_metadata(&identity.public_key, &m, &body).unwrap();
+        });
     }
 }

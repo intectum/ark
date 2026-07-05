@@ -110,80 +110,71 @@ pub fn io_invalid_input(msg: &str) -> Error {
 pub mod test {
     use std::env;
     use std::fs;
-    use std::net::TcpListener;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crate::metadata::{sign_metadata, write_metadata_attributes};
-    use crate::types::{Hash, Member, Metadata, Permission, Signature};
+    use crate::create_account::create_account;
+    use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, create_key, encrypt_bytes};
+    use crate::metadata::{apply_key_to_metadata, create_metadata, sign_metadata, write_metadata_attributes};
+    use crate::types::{Identity, Key, Metadata};
 
     static CWD_LOCK: Mutex<()> = Mutex::new(());
+    pub const TEST_ADDRESS: &str = "test@example.com";
 
-    pub fn with_cwd<R>(dir: &Path, f: impl FnOnce() -> R) -> R {
+    pub fn in_test_dir<R>(prefix: &str, f: impl FnOnce(&Path) -> R) -> R {
         let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = env::current_dir().unwrap_or_else(|_| env::temp_dir());
 
-        struct Restore(PathBuf);
-        impl Drop for Restore {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir = env::temp_dir().join(format!("{}_{}_{}", prefix, std::process::id(), nanos));
+        fs::create_dir_all(&dir).unwrap();
+
+        struct Cleanup(PathBuf, PathBuf);
+        impl Drop for Cleanup {
             fn drop(&mut self) {
                 let _ = env::set_current_dir(&self.0);
+                let _ = fs::remove_dir_all(&self.1);
             }
         }
-        let _restore = Restore(prev);
+        let _cleanup = Cleanup(prev, dir.clone());
 
-        env::set_current_dir(dir).unwrap();
-        f()
+        env::set_current_dir(&dir).unwrap();
+        f(&dir)
     }
 
-    pub struct TempDir(pub PathBuf);
-
-    impl TempDir {
-        pub fn new(prefix: &str) -> Self {
-            let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-            let p = env::temp_dir().join(format!("{}_{}_{}", prefix, std::process::id(), nanos));
-            fs::create_dir_all(&p).unwrap();
-            TempDir(p)
-        }
+    pub fn create_test_account(temp_dir: &Path, address: &str) -> (Identity, Key, PathBuf) {
+        let (identity, secret_key) = create_account(temp_dir, address).unwrap();
+        let name = address.split_once('@').unwrap().0;
+        (identity, secret_key, temp_dir.join("ark").join(name))
     }
 
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
+    pub fn create_plain_test_metadata(owner: &Identity, owner_key: &Key, body: &[u8]) -> Metadata {
+        let mut metadata = create_metadata(&owner.address, "none");
+        sign_metadata(owner_key, &mut metadata, body).unwrap();
+
+        metadata
     }
 
-    pub fn bind_local() -> (TcpListener, u16) {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        (listener, port)
-    }
-
-    pub const TEST_ADDRESS: &str = "test@example.com";
-
-    pub fn get_default_test_metadata(key: &[u8], address: &str, body: &[u8]) -> crate::types::Metadata {
-        let mut m = Metadata {
-            id: "00000000-0000-0000-0000-000000000001".to_string(),
-            modified_by: address.to_string(),
-            created: "2026-01-01T00:00:00Z".to_string(),
-            modified: "2026-01-01T00:00:00Z".to_string(),
-            encryption: "aes-256-gcm".to_string(),
-            encrypted: None,
-            members: vec![Member {
-                address: address.to_string(),
-                permission: Permission::Owner,
-                wrapped_key: Some([2u8; 32].to_vec()),
-            }],
-            body_hash: Hash { algorithm: String::new(), value: Vec::new() },
-            signature: Signature { algorithm: String::new(), value: Vec::new() },
-        };
-        sign_metadata(key, &mut m, body);
-        m
-    }
-
-    pub fn write_file_with_default_test_metadata(path: &Path, key: &[u8], address: &str, body: &[u8]) {
+    pub fn write_plain_test_file(path: &Path, owner: &Identity, owner_key: &Key, body: &[u8]) {
+        let metadata = create_plain_test_metadata(owner, owner_key, body);
         fs::write(path, body).unwrap();
-        write_metadata_attributes(path, &get_default_test_metadata(key, address, body)).unwrap();
+        write_metadata_attributes(path, &metadata).unwrap();
+    }
+
+    pub fn create_encrypted_test_metadata(owner: &Identity, owner_key: &Key, plaintext: &[u8]) -> (Metadata, Vec<u8>) {
+        let mut metadata = create_metadata(&owner.address, DEFAULT_ENCRYPTION_ALGORITHM);
+        let file_key = create_key(DEFAULT_ENCRYPTION_ALGORITHM).unwrap();
+        let (_, ciphertext) = encrypt_bytes(&file_key, plaintext).unwrap();
+        apply_key_to_metadata(&mut metadata, &file_key).unwrap();
+        sign_metadata(owner_key, &mut metadata, &ciphertext).unwrap();
+        (metadata, ciphertext)
+    }
+
+    pub fn write_encrypted_test_file(path: &Path, owner: &Identity, owner_key: &Key, plaintext: &[u8]) {
+        let (metadata, ciphertext) = create_encrypted_test_metadata(owner, owner_key, plaintext);
+        fs::write(path, ciphertext).unwrap();
+        write_metadata_attributes(path, &metadata).unwrap();
     }
 }
 

@@ -1,9 +1,12 @@
 use std::io;
 use std::path::Path;
 
-use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, DEFAULT_HASH_ALGORITHM, DEFAULT_SIGNING_ALGORITHM, sign_json, verify_json};
-use crate::types::{Hash, Member, Metadata, Permission, Signature};
-use crate::util::{decode_base64url, encode_base64url, io_err, sha256};
+use uuid::Uuid;
+
+use crate::crypto::{DEFAULT_HASH_ALGORITHM, encrypt_bytes, sign_json, verify_json};
+use crate::identity::resolve_identity;
+use crate::types::{Hash, Key, Member, Metadata, Permission, Signature};
+use crate::util::{decode_base64url, encode_base64url, io_err, now_iso, sha256};
 
 const ATTRIBUTE_PREFIX: &str = "user.ark.";
 const HEADER_PREFIX: &str = "X-Ark-Meta-";
@@ -16,7 +19,8 @@ const FIELD_ENCRYPTION: &str = "encryption";
 const FIELD_MEMBER_PREFIX: &str = "member_";
 const FIELD_MEMBER_ADDRESS: &str = "address";
 const FIELD_MEMBER_PERMISSION: &str = "permission";
-const FIELD_MEMBER_WRAPPED_KEY: &str = "wrapped_key";
+const FIELD_MEMBER_KEY_ALGORITHM: &str = "key_algorithm";
+const FIELD_MEMBER_KEY_VALUE: &str = "key_value";
 const FIELD_BODY_HASH_ALGORITHM: &str = "body_hash_algorithm";
 const FIELD_BODY_HASH_VALUE: &str = "body_hash_value";
 const FIELD_SIGNATURE_ALGORITHM: &str = "signature_algorithm";
@@ -25,6 +29,32 @@ const FIELD_ENCRYPTED: &str = "encrypted";
 
 pub fn get_member<'a>(members: &'a [Member], address: &str) -> Option<&'a Member> {
     members.iter().find(|m| m.address == address)
+}
+
+pub fn create_metadata(owner_address: &str, encryption: &str) -> Metadata {
+    let now = now_iso();
+
+    Metadata {
+        id: Uuid::new_v4().to_string(),
+        created: now.clone(),
+        modified: now.clone(),
+        modified_by: owner_address.to_string(),
+        encryption: encryption.to_string(),
+        members: vec![Member {
+            address: owner_address.to_string(),
+            permission: Permission::Owner,
+            key: None
+        }],
+        body_hash: Hash {
+            algorithm: String::new(),
+            value: Vec::new()
+        },
+        signature: Signature {
+            algorithm: String::new(),
+            value: Vec::new()
+        },
+        encrypted: None,
+    }
 }
 
 pub fn read_metadata_attributes(path: &Path) -> io::Result<Metadata> {
@@ -44,7 +74,7 @@ pub fn read_metadata_attributes(path: &Path) -> io::Result<Metadata> {
 
     validate_partial_metadata(&partial_metadata)?;
 
-    let metadata = build_metadata(partial_metadata)?;
+    let metadata = metadata_from_partial(partial_metadata)?;
     validate_metadata(&metadata)?;
 
     Ok(metadata)
@@ -71,8 +101,9 @@ pub fn write_metadata_attributes(path: &Path, metadata: &Metadata) -> io::Result
     for (index, member) in metadata.members.iter().enumerate() {
         xattr::set(path, &format!("{}member_{}_address", ATTRIBUTE_PREFIX, index), member.address.as_bytes())?;
         xattr::set(path, &format!("{}member_{}_permission", ATTRIBUTE_PREFIX, index), member.permission.as_str().as_bytes())?;
-        if let Some(key) = &member.wrapped_key {
-            xattr::set(path, &format!("{}member_{}_wrapped_key", ATTRIBUTE_PREFIX, index), encode_base64url(key).as_bytes())?;
+        if let Some(key) = &member.key {
+            xattr::set(path, &format!("{}member_{}_key_algorithm", ATTRIBUTE_PREFIX, index), key.algorithm.as_bytes())?;
+            xattr::set(path, &format!("{}member_{}_key_value", ATTRIBUTE_PREFIX, index), encode_base64url(&key.value).as_bytes())?;
         }
     }
 
@@ -92,7 +123,7 @@ pub fn read_metadata_headers(headers: &[(String, String)]) -> io::Result<Metadat
 
     validate_partial_metadata(&partial_metadata)?;
 
-    let mut metadata = build_metadata(partial_metadata)?;
+    let mut metadata = metadata_from_partial(partial_metadata)?;
     metadata.encrypted = None;
     validate_metadata(&metadata)?;
 
@@ -115,8 +146,9 @@ pub fn write_metadata_headers(metadata: &Metadata) -> Vec<(String, String)> {
     for (index, member) in metadata.members.iter().enumerate() {
         out.push((format!("{}Member-{}-Address", HEADER_PREFIX, index), member.address.clone()));
         out.push((format!("{}Member-{}-Permission", HEADER_PREFIX, index), member.permission.as_str().to_string()));
-        if let Some(key) = &member.wrapped_key {
-            out.push((format!("{}Member-{}-Wrapped-Key", HEADER_PREFIX, index), encode_base64url(key)));
+        if let Some(key) = &member.key {
+            out.push((format!("{}Member-{}-Key-Algorithm", HEADER_PREFIX, index), key.algorithm.clone()));
+            out.push((format!("{}Member-{}-Key-Value", HEADER_PREFIX, index), encode_base64url(&key.value)));
         }
     }
 
@@ -124,18 +156,14 @@ pub fn write_metadata_headers(metadata: &Metadata) -> Vec<(String, String)> {
 }
 
 pub fn validate_metadata(metadata: &Metadata) -> io::Result<()> {
-    if metadata.encryption != DEFAULT_ENCRYPTION_ALGORITHM.to_string() && metadata.encryption != "none" {
-        return Err(io_err(&format!("unsupported encryption algorithm: {}", metadata.encryption.clone())));
-    }
-
     if !metadata.members.iter().any(|m| m.permission == Permission::Owner) {
         return Err(io_err("metadata must contain at least one owner"));
     }
 
     if metadata.encryption != "none" {
         for member in &metadata.members {
-            if member.wrapped_key.is_none() {
-                return Err(io_err("missing member wrapped_key field"));
+            if member.key.is_none() {
+                return Err(io_err("missing member key field"));
             }
         }
     }
@@ -143,23 +171,41 @@ pub fn validate_metadata(metadata: &Metadata) -> io::Result<()> {
     Ok(())
 }
 
-pub fn sign_metadata(key: &[u8], metadata: &mut Metadata, body: &[u8]) {
+pub fn apply_key_to_metadata(
+    metadata: &mut Metadata,
+    secret_key: &Key,
+) -> std::io::Result<()> {
+    for member in metadata.members.iter_mut() {
+        let recipient_identity = resolve_identity(&member.address)?;
+        let (algorithm, value) = encrypt_bytes(&recipient_identity.public_key, &secret_key.value)?;
+        member.key = Some(Key {
+            algorithm,
+            value
+        });
+    }
+
+    Ok(())
+}
+
+pub fn sign_metadata(secret_key: &Key, metadata: &mut Metadata, body: &[u8]) -> io::Result<()> {
     metadata.body_hash = Hash {
         algorithm: DEFAULT_HASH_ALGORITHM.to_string(),
         value: sha256(body),
     };
-    metadata.signature.algorithm = DEFAULT_SIGNING_ALGORITHM.to_string();
+
     let json = serde_json::to_value(metadata_for_signing(metadata)).expect("serialize metadata");
-    metadata.signature.value = sign_json(key, &json);
+    metadata.signature = sign_json(secret_key, &json)?;
+
+    Ok(())
 }
 
-pub fn verify_metadata_signature(public_key: &[u8], metadata: &Metadata) -> io::Result<()> {
+pub fn verify_metadata_signature(public_key: &Key, metadata: &Metadata) -> io::Result<()> {
     let json = serde_json::to_value(metadata_for_signing(metadata)).expect("serialize metadata");
-    verify_json(public_key, &metadata.signature.value, &json)
+    verify_json(public_key, &metadata.signature, &json)
         .map_err(|_| io_err("metadata signature verification failed"))
 }
 
-pub fn verify_metadata(public_key: &[u8], metadata: &Metadata, body: &[u8]) -> io::Result<()> {
+pub fn verify_metadata(public_key: &Key, metadata: &Metadata, body: &[u8]) -> io::Result<()> {
     verify_metadata_signature(public_key, metadata)?;
 
     if metadata.body_hash.value != sha256(body) {
@@ -172,6 +218,7 @@ pub fn verify_metadata(public_key: &[u8], metadata: &Metadata, body: &[u8]) -> i
 fn metadata_for_signing(metadata: &Metadata) -> Metadata {
     let mut clone = metadata.clone();
     clone.encrypted = None;
+    clone.signature.algorithm = String::new();
     clone.signature.value = Vec::new();
     clone
 }
@@ -196,10 +243,11 @@ struct PartialMetadata {
 struct PartialMember {
     address: Option<String>,
     permission: Option<Permission>,
-    wrapped_key: Option<Vec<u8>>,
+    key_algorithm: Option<String>,
+    key_value: Option<Vec<u8>>,
 }
 
-fn build_metadata(partial: PartialMetadata) -> io::Result<Metadata> {
+fn metadata_from_partial(partial: PartialMetadata) -> io::Result<Metadata> {
     Ok(Metadata {
         id: partial.id.unwrap(),
         created: partial.created.unwrap(),
@@ -209,7 +257,10 @@ fn build_metadata(partial: PartialMetadata) -> io::Result<Metadata> {
         members: partial.members.into_iter().map(|member| Member {
             address: member.address.unwrap(),
             permission: member.permission.unwrap(),
-            wrapped_key: member.wrapped_key,
+            key: match (member.key_algorithm, member.key_value) {
+                (Some(algorithm), Some(value)) => Some(Key { algorithm, value }),
+                _ => None,
+            },
         }).collect(),
         body_hash: Hash {
             algorithm: partial.body_hash_algorithm.unwrap(),
@@ -260,8 +311,9 @@ fn apply_field(metadata: &mut PartialMetadata, key: &str, value: &str) -> io::Re
                     FIELD_MEMBER_PERMISSION => metadata.members[index].permission = Some(
                         Permission::parse(value).ok_or_else(|| io_err(&format!("unknown permission: {}", value)))?
                     ),
-                    FIELD_MEMBER_WRAPPED_KEY => metadata.members[index].wrapped_key = Some(decode_base64url(value)
-                        .map_err(|_| io_err("wrapped_key is not base64url encoded"))?),
+                    FIELD_MEMBER_KEY_ALGORITHM => metadata.members[index].key_algorithm = Some(value.to_string()),
+                    FIELD_MEMBER_KEY_VALUE => metadata.members[index].key_value = Some(decode_base64url(value)
+                        .map_err(|_| io_err("key_value is not base64url encoded"))?),
                     _ => {}
                 }
             }
@@ -317,16 +369,8 @@ mod tests {
     use std::fs;
 
     use super::*;
-    use crate::crypto::to_public_key;
-    use crate::util::test::{TEST_ADDRESS, TempDir, get_default_test_metadata};
-
-    fn sample_member(addr: &str, key_b: u8) -> Member {
-        Member {
-            address: addr.to_string(),
-            permission: Permission::Owner,
-            wrapped_key: Some([key_b.wrapping_add(1); 32].to_vec()),
-        }
-    }
+    use crate::identity::create_identity;
+    use crate::util::test::{TEST_ADDRESS, create_plain_test_metadata, in_test_dir};
 
     #[test]
     fn get_metadata_key_case_insensitive() {
@@ -339,7 +383,7 @@ mod tests {
 
     #[test]
     fn write_headers_emits_all_fields() {
-        let m = get_default_test_metadata(&[10u8; 32], TEST_ADDRESS, b"body");
+        let m = create_metadata(TEST_ADDRESS, "none");
         let headers = write_metadata_headers(&m);
         assert!(headers.iter().any(|(k, _)| k == "X-Ark-Meta-Id"));
         assert!(headers.iter().any(|(k, _)| k == "X-Ark-Meta-Created"));
@@ -355,7 +399,7 @@ mod tests {
 
     #[test]
     fn header_round_trip_preserves_all_fields() {
-        let m = get_default_test_metadata(&[11u8; 32], TEST_ADDRESS, b"hello");
+        let m = create_metadata(TEST_ADDRESS, "none");
         let headers = write_metadata_headers(&m);
         let back = read_metadata_headers(&headers).unwrap();
         assert_eq!(back.id, m.id);
@@ -371,35 +415,42 @@ mod tests {
 
     #[test]
     fn attribute_round_trip_preserves_all_fields_and_encrypted() {
-        let td = TempDir::new("ark_metadata_test");
-        let p = td.0.join("file");
-        fs::write(&p, b"x").unwrap();
-        let mut m = get_default_test_metadata(&[12u8; 32], TEST_ADDRESS, b"x");
-        m.encrypted = Some(true);
-        write_metadata_attributes(&p, &m).unwrap();
-        let back = read_metadata_attributes(&p).unwrap();
-        assert_eq!(back.id, m.id);
-        assert_eq!(back.signature.value, m.signature.value);
-        assert_eq!(back.encrypted, Some(true));
+        in_test_dir("ark_metadata_test", |temp_dir| {
+            let p = temp_dir.join("file");
+            fs::write(&p, b"x").unwrap();
+            let (owner, owner_key) = create_identity(TEST_ADDRESS).unwrap();
+            let mut m = create_plain_test_metadata(&owner, &owner_key, b"x");
+            m.encrypted = Some(true);
+            write_metadata_attributes(&p, &m).unwrap();
+            let back = read_metadata_attributes(&p).unwrap();
+            assert_eq!(back.id, m.id);
+            assert_eq!(back.signature.value, m.signature.value);
+            assert_eq!(back.encrypted, Some(true));
+        });
     }
 
     #[test]
     fn attributes_to_headers_round_trip_drops_encrypted() {
-        let td = TempDir::new("ark_metadata_test");
-        let p = td.0.join("file");
-        fs::write(&p, b"x").unwrap();
-        let mut m = get_default_test_metadata(&[13u8; 32], TEST_ADDRESS, b"x");
-        m.encrypted = Some(true);
-        write_metadata_attributes(&p, &m).unwrap();
-        let attrs = read_metadata_attributes(&p).unwrap();
-        let headers = write_metadata_headers(&attrs);
-        let back = read_metadata_headers(&headers).unwrap();
-        assert_eq!(back.encrypted, None, "encrypted is client-only");
+        in_test_dir("ark_metadata_test", |temp_dir| {
+            let p = temp_dir.join("file");
+            fs::write(&p, b"x").unwrap();
+            let (owner, owner_key) = create_identity(TEST_ADDRESS).unwrap();
+            let mut m = create_plain_test_metadata(&owner, &owner_key, b"x");
+            m.encrypted = Some(true);
+            write_metadata_attributes(&p, &m).unwrap();
+            let attrs = read_metadata_attributes(&p).unwrap();
+            let headers = write_metadata_headers(&attrs);
+            let back = read_metadata_headers(&headers).unwrap();
+            assert_eq!(back.encrypted, None, "encrypted is client-only");
+        });
     }
 
     #[test]
     fn get_member_filters_by_address() {
-        let members = [sample_member("a@x", 4), sample_member("b@y", 9)];
+        let members = [
+            Member { address: "a@x".to_string(), permission: Permission::Owner, key: None },
+            Member { address: "b@y".to_string(), permission: Permission::Owner, key: None },
+        ];
         let got = get_member(&members, "b@y").unwrap();
         assert_eq!(got.address, "b@y");
         assert!(get_member(&members, "nope@z").is_none());
@@ -407,48 +458,44 @@ mod tests {
 
     #[test]
     fn sign_and_verify_metadata_round_trip() {
-        let key = [20u8; 32];
+        let (owner, owner_key) = create_identity(TEST_ADDRESS).unwrap();
         let body = b"signed payload";
-        let m = get_default_test_metadata(&key, TEST_ADDRESS, body);
-        let public_key = to_public_key(&key);
-        verify_metadata(&public_key, &m, body).unwrap();
+        let m = create_plain_test_metadata(&owner, &owner_key, body);
+        verify_metadata(&owner.public_key, &m, body).unwrap();
     }
 
     #[test]
     fn verify_metadata_detects_body_tampering() {
-        let key = [21u8; 32];
-        let m = get_default_test_metadata(&key, TEST_ADDRESS, b"original");
-        let public_key = to_public_key(&key);
-        let err = verify_metadata(&public_key, &m, b"tampered").unwrap_err();
+        let (owner, owner_key) = create_identity(TEST_ADDRESS).unwrap();
+        let m = create_plain_test_metadata(&owner, &owner_key, b"original");
+        let err = verify_metadata(&owner.public_key, &m, b"tampered").unwrap_err();
         assert!(err.to_string().contains("body hash mismatch"));
     }
 
     #[test]
     fn verify_metadata_detects_metadata_tampering() {
-        let key = [22u8; 32];
+        let (owner, owner_key) = create_identity(TEST_ADDRESS).unwrap();
         let body = b"body";
-        let mut m = get_default_test_metadata(&key, TEST_ADDRESS, body);
+        let mut m = create_plain_test_metadata(&owner, &owner_key, body);
         m.modified_by = "attacker@evil".to_string();
-        let public_key = to_public_key(&key);
-        let err = verify_metadata(&public_key, &m, body).unwrap_err();
+        let err = verify_metadata(&owner.public_key, &m, body).unwrap_err();
         assert!(err.to_string().contains("signature verification failed"));
     }
 
     #[test]
     fn verify_metadata_ignores_encrypted_flag_changes() {
-        let key = [23u8; 32];
+        let (owner, owner_key) = create_identity(TEST_ADDRESS).unwrap();
         let body = b"x";
-        let mut m = get_default_test_metadata(&key, TEST_ADDRESS, body);
+        let mut m = create_plain_test_metadata(&owner, &owner_key, body);
         m.encrypted = Some(true);
-        let public_key = to_public_key(&key);
-        verify_metadata(&public_key, &m, body).unwrap();
+        verify_metadata(&owner.public_key, &m, body).unwrap();
         m.encrypted = Some(false);
-        verify_metadata(&public_key, &m, body).unwrap();
+        verify_metadata(&owner.public_key, &m, body).unwrap();
     }
 
     #[test]
     fn validate_metadata_rejects_no_owner() {
-        let mut m = get_default_test_metadata(&[24u8; 32], TEST_ADDRESS, b"x");
+        let mut m = create_metadata(TEST_ADDRESS, "none");
         m.members[0].permission = Permission::Read;
         let err = match validate_metadata(&m) {
             Err(e) => e,
@@ -459,7 +506,7 @@ mod tests {
 
     #[test]
     fn validate_metadata_rejects_empty_members() {
-        let mut m = get_default_test_metadata(&[25u8; 32], TEST_ADDRESS, b"x");
+        let mut m = create_metadata(TEST_ADDRESS, "none");
         m.members = vec![];
         let err = match validate_metadata(&m) {
             Err(e) => e,
@@ -470,11 +517,12 @@ mod tests {
 
     #[test]
     fn read_headers_rejects_sparse_member_indexes() {
-        let m = get_default_test_metadata(&[26u8; 32], TEST_ADDRESS, b"x");
+        let m = create_metadata(TEST_ADDRESS, "none");
         let mut headers = write_metadata_headers(&m);
         headers.push(("X-Ark-Meta-Member-2-Address".to_string(), "c@z".to_string()));
         headers.push(("X-Ark-Meta-Member-2-Permission".to_string(), "read".to_string()));
-        headers.push(("X-Ark-Meta-Member-2-Wrapped-Key".to_string(), encode_base64url([5u8; 32])));
+        headers.push(("X-Ark-Meta-Member-2-Key-Algorithm".to_string(), "x25519".to_string()));
+        headers.push(("X-Ark-Meta-Member-2-Key-Value".to_string(), encode_base64url([5u8; 32])));
         let err = match read_metadata_headers(&headers) {
             Err(e) => e,
             Ok(_) => panic!("expected sparse member error"),
@@ -484,10 +532,14 @@ mod tests {
 
     #[test]
     fn read_headers_rejects_invalid_base64_in_member_field() {
-        let m = get_default_test_metadata(&[27u8; 32], TEST_ADDRESS, b"x");
+        let mut m = create_metadata(TEST_ADDRESS, "none");
+        m.members[0].key = Some(Key {
+            algorithm: "hpke-x25519-hkdf-sha256-aes256gcm".to_string(),
+            value: vec![0u8; 32],
+        });
         let mut headers = write_metadata_headers(&m);
         for entry in headers.iter_mut() {
-            if entry.0 == "X-Ark-Meta-Member-0-Wrapped-Key" {
+            if entry.0 == "X-Ark-Meta-Member-0-Key-Value" {
                 entry.1 = "!!not-base64!!".to_string();
             }
         }
@@ -495,42 +547,45 @@ mod tests {
             Err(e) => e,
             Ok(_) => panic!("expected base64 error"),
         };
-        assert!(err.to_string().contains("wrapped_key is not base64url"), "msg was {}", err);
+        assert!(err.to_string().contains("key_value is not base64url"), "msg was {}", err);
     }
 
     #[test]
     fn write_metadata_attributes_removes_stale_member_xattrs() {
-        let td = TempDir::new("ark_metadata_test");
-        let p = td.0.join("file");
-        fs::write(&p, b"x").unwrap();
-        let key = [28u8; 32];
-        let mut two = get_default_test_metadata(&key, TEST_ADDRESS, b"x");
-        two.members.push(sample_member("b@y", 2));
-        sign_metadata(&key, &mut two, b"x");
-        write_metadata_attributes(&p, &two).unwrap();
-        assert!(xattr::get(&p, "user.ark.member_1_address").unwrap().is_some());
+        in_test_dir("ark_metadata_test", |temp_dir| {
+            let p = temp_dir.join("file");
+            fs::write(&p, b"x").unwrap();
+            let (owner, owner_key) = create_identity(TEST_ADDRESS).unwrap();
+            let mut two = create_plain_test_metadata(&owner, &owner_key, b"x");
+            two.members.push(Member { address: "b@y".to_string(), permission: Permission::Owner, key: None });
+            sign_metadata(&owner_key, &mut two, b"x").unwrap();
+            write_metadata_attributes(&p, &two).unwrap();
+            assert!(xattr::get(&p, "user.ark.member_1_address").unwrap().is_some());
 
-        let one = get_default_test_metadata(&key, TEST_ADDRESS, b"x");
-        write_metadata_attributes(&p, &one).unwrap();
-        assert_eq!(xattr::get(&p, "user.ark.member_1_address").unwrap(), None);
+            let one = create_plain_test_metadata(&owner, &owner_key, b"x");
+            write_metadata_attributes(&p, &one).unwrap();
+            assert_eq!(xattr::get(&p, "user.ark.member_1_address").unwrap(), None);
 
-        let loaded = read_metadata_attributes(&p).unwrap();
-        assert_eq!(loaded.members.len(), 1);
+            let loaded = read_metadata_attributes(&p).unwrap();
+            assert_eq!(loaded.members.len(), 1);
+        });
     }
 
     #[test]
     fn write_metadata_attributes_clears_old_encrypted_flag() {
-        let td = TempDir::new("ark_metadata_test");
-        let p = td.0.join("file");
-        fs::write(&p, b"x").unwrap();
-        let key = [29u8; 32];
-        let mut with_flag = get_default_test_metadata(&key, TEST_ADDRESS, b"x");
-        with_flag.encrypted = Some(true);
-        write_metadata_attributes(&p, &with_flag).unwrap();
-        assert!(xattr::get(&p, "user.ark.encrypted").unwrap().is_some());
+        in_test_dir("ark_metadata_test", |temp_dir| {
+            let p = temp_dir.join("file");
+            fs::write(&p, b"x").unwrap();
+            let (owner, owner_key) = create_identity(TEST_ADDRESS).unwrap();
+            let mut with_flag = create_plain_test_metadata(&owner, &owner_key, b"x");
+            with_flag.encrypted = Some(true);
+            write_metadata_attributes(&p, &with_flag).unwrap();
+            assert!(xattr::get(&p, "user.ark.encrypted").unwrap().is_some());
 
-        let without_flag = get_default_test_metadata(&key, TEST_ADDRESS, b"x");
-        write_metadata_attributes(&p, &without_flag).unwrap();
-        assert_eq!(xattr::get(&p, "user.ark.encrypted").unwrap(), None);
+            let mut without_flag = create_plain_test_metadata(&owner, &owner_key, b"x");
+            without_flag.encrypted = None;
+            write_metadata_attributes(&p, &without_flag).unwrap();
+            assert_eq!(xattr::get(&p, "user.ark.encrypted").unwrap(), None);
+        });
     }
 }
