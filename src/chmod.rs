@@ -31,7 +31,7 @@ pub fn cmd_chmod(
         _ => return Err(io_err("only an owner can change permissions")),
     }
 
-    let encrypted = metadata.encryption != "none";
+    let encrypted = metadata.encryption_algorithm.is_some();
 
     let identity_key = read_identity_key(&root.join(".ark").join("identity.key"))?;
 
@@ -219,7 +219,7 @@ mod tests {
             let path = account_dir.join("doc.txt");
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(&path, b"body").unwrap();
-            let mut m = create_metadata(&identity.address, "none");
+            let mut m = create_metadata(&identity.address, None);
             m.members.push(Member {
                 address: "sam@example.com".to_string(),
                 permission: Permission::Read,
@@ -245,7 +245,7 @@ mod tests {
             let path = account_dir.join("doc.txt");
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(&path, b"body").unwrap();
-            let mut m = create_metadata(&identity.address, "none");
+            let mut m = create_metadata(&identity.address, None);
             m.members.push(Member {
                 address: "sam@example.com".to_string(),
                 permission: Permission::Read,
@@ -283,7 +283,7 @@ mod tests {
             let path = account_dir.join("doc.txt");
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(&path, b"body").unwrap();
-            let mut m = create_metadata(&identity.address, "none");
+            let mut m = create_metadata(&identity.address, None);
             m.members[0].permission = Permission::Write;
             m.members.push(Member {
                 address: "boss@example.com".to_string(),

@@ -80,7 +80,7 @@ mod tests {
             let (code, headers, body) = ark_request(&account_dir, &url, "HEAD", &[], &[]).unwrap();
             assert_eq!(code, 200);
             assert!(body.is_empty());
-            assert!(headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("x-ark-meta-encryption") && v == "aes-256-gcm"));
+            assert!(headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("x-ark-meta-encryption-algorithm") && v == "aes-256-gcm"));
             assert!(headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("x-ark-meta-member-0-permission") && v == "owner"));
             assert!(headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("x-ark-meta-member-0-key-value") && v == &expected_key_b64));
         });

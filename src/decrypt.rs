@@ -14,7 +14,7 @@ pub struct DecryptArgs {
     pub output: Option<String>,
     pub in_place: Option<String>,
     pub key: Option<String>,
-    pub algorithm: Option<String>,
+    pub encryption_algorithm: Option<String>,
 }
 
 pub fn cmd_decrypt(args: DecryptArgs) -> std::io::Result<()> {
@@ -48,13 +48,13 @@ pub fn cmd_decrypt(args: DecryptArgs) -> std::io::Result<()> {
         _ => {
             let key = match &args.key {
                 Some(k) => Key {
-                    algorithm: args.algorithm.unwrap_or(DEFAULT_ENCRYPTION_ALGORITHM.to_string()),
+                    algorithm: args.encryption_algorithm.clone().unwrap_or(DEFAULT_ENCRYPTION_ALGORITHM.to_string()),
                     value: decode_base64url(k.trim()).map_err(|e| io_err(&format!("--key decode: {}", e)))?
                 },
                 None => return Err(io_err("no file key available: pass --key or use -i/--in-place on a file with metadata"))
             };
 
-            let mut metadata = create_metadata(&identity.address, &key.algorithm);
+            let mut metadata = create_metadata(&identity.address, Some(&key.algorithm));
             apply_key_to_metadata(&mut metadata, &key)?;
 
             validate_metadata(&metadata)?;
@@ -77,7 +77,9 @@ pub fn cmd_decrypt(args: DecryptArgs) -> std::io::Result<()> {
         decrypt_bytes(&Key { algorithm: encrypted_file_key.algorithm.clone(), value: identity_key }, &encrypted_file_key.value)?
     };
 
-    let plaintext = decrypt_bytes(&Key { algorithm: metadata.encryption.clone(), value: file_key }, &ciphertext)
+    let encryption_algorithm = metadata.encryption_algorithm.clone()
+        .ok_or_else(|| io_err("file is not encrypted"))?;
+    let plaintext = decrypt_bytes(&Key { algorithm: encryption_algorithm, value: file_key }, &ciphertext)
         .map_err(|e| io_err(&format!("{} — input may already be plaintext or the key may be wrong", e)))?;
 
     match dest_path {
@@ -107,7 +109,7 @@ mod tests {
     }
 
     fn args() -> DecryptArgs {
-        DecryptArgs { input: None, output: None, in_place: None, key: None, algorithm: None }
+        DecryptArgs { input: None, output: None, in_place: None, key: None, encryption_algorithm: None }
     }
 
     #[test]
@@ -144,7 +146,7 @@ mod tests {
                 Some(b"false".as_slice())
             );
             assert_eq!(
-                xattr::get(&p, "user.ark.encryption").unwrap().as_deref(),
+                xattr::get(&p, "user.ark.encryption_algorithm").unwrap().as_deref(),
                 Some(b"aes-256-gcm".as_slice())
             );
             assert!(xattr::get(&p, "user.ark.member_0_key_value").unwrap().is_some());
@@ -171,7 +173,7 @@ mod tests {
             let p = temp_dir.join("in.bin");
             let ct = aes_encrypt(&real_key, b"x");
             fs::write(&p, &ct).unwrap();
-            let mut wrong_meta = create_metadata(&identity.address, DEFAULT_ENCRYPTION_ALGORITHM);
+            let mut wrong_meta = create_metadata(&identity.address, Some(DEFAULT_ENCRYPTION_ALGORITHM));
             let (wrap_alg, wrong_wrap) = encrypt_bytes(&identity.public_key, &[99u8; 32]).unwrap();
             wrong_meta.members[0].key = Some(Key { algorithm: wrap_alg, value: wrong_wrap });
             wrong_meta.encrypted = Some(true);
@@ -272,7 +274,7 @@ mod tests {
             let p = temp_dir.join("plain.bin");
             let body = vec![0u8; 42];
             fs::write(&p, &body).unwrap();
-            let mut m = create_metadata(&identity.address, DEFAULT_ENCRYPTION_ALGORITHM);
+            let mut m = create_metadata(&identity.address, Some(DEFAULT_ENCRYPTION_ALGORITHM));
             let (wrap_alg, wrapped) = encrypt_bytes(&identity.public_key, &[0u8; 32]).unwrap();
             m.members[0].key = Some(Key { algorithm: wrap_alg, value: wrapped });
             m.encrypted = Some(true);
@@ -315,7 +317,7 @@ mod tests {
             let err = cmd_decrypt(DecryptArgs {
                 input: Some(p.to_string_lossy().into_owned()),
                 key: Some(encode_base64url(key)),
-                algorithm: Some("chacha20-poly1305".to_string()),
+                encryption_algorithm: Some("chacha20-poly1305".to_string()),
                 ..args()
             }).unwrap_err();
             assert!(err.to_string().contains("unsupported encryption algorithm"), "msg was {}", err);

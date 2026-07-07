@@ -10,7 +10,7 @@ use crate::request::ark_request;
 use crate::types::Key;
 use crate::util::{find_root, io_err, now_iso, resolve_url};
 
-pub fn cmd_put(path: &str, input: Option<&str>, algorithm: Option<&str>) -> std::io::Result<()> {
+pub fn cmd_put(path: &str, input: Option<&str>, encryption_algorithm: Option<&str>) -> std::io::Result<()> {
     let root = find_root(&current_dir()?)?;
     let identity = read_identity(&root.join(".ark").join("identity.json"))?;
     let url = resolve_url(path, &identity.address, &root, false)?;
@@ -34,19 +34,19 @@ pub fn cmd_put(path: &str, input: Option<&str>, algorithm: Option<&str>) -> std:
 
     let mut metadata = if has_existing_metadata {
         let mut m = read_metadata_attributes(input_path.as_deref().unwrap())?;
-        if let Some(alg) = algorithm {
-            m.encryption = alg.to_string();
+        if let Some(alg) = encryption_algorithm {
+            m.encryption_algorithm = Some(alg.to_string());
         }
         m
     } else {
-        create_metadata(&identity.address, algorithm.unwrap_or(DEFAULT_ENCRYPTION_ALGORITHM))
+        create_metadata(&identity.address, Some(encryption_algorithm.unwrap_or(DEFAULT_ENCRYPTION_ALGORITHM)))
     };
 
     if get_member(&metadata.members, &identity.address).is_none() {
         return Err(io_err("no member entry for current account"));
     }
 
-    let skip_encrypt = metadata.encryption == "none";
+    let skip_encrypt = metadata.encryption_algorithm.is_none();
     let already_encrypted = metadata.encrypted == Some(true);
 
     let final_body = if already_encrypted || skip_encrypt {
@@ -57,7 +57,8 @@ pub fn cmd_put(path: &str, input: Option<&str>, algorithm: Option<&str>) -> std:
         }
         body
     } else {
-        let file_key = create_key(&metadata.encryption)?;
+        let encryption_algorithm = metadata.encryption_algorithm.as_deref().unwrap();
+        let file_key = create_key(encryption_algorithm)?;
         let (_, ciphertext) = encrypt_bytes(&file_key, &body)?;
         apply_key_to_metadata(&mut metadata, &file_key)?;
         metadata.encrypted = Some(false);
@@ -129,7 +130,7 @@ mod tests {
             let on_disk = fs::read(&server_path).unwrap();
             assert_ne!(on_disk, b"plaintext");
 
-            let alg = xattr::get(&server_path, "user.ark.encryption").unwrap();
+            let alg = xattr::get(&server_path, "user.ark.encryption_algorithm").unwrap();
             assert_eq!(alg.as_deref(), Some(b"aes-256-gcm".as_slice()));
             let identity_seed = read_identity_key(&temp_dir.join("ark/gyan/.ark/identity.key")).unwrap();
             let file_key = unwrap_first_member_key(&server_path, &identity_seed);
@@ -147,7 +148,7 @@ mod tests {
 
             let input = put_via_cmd(temp_dir, "out.bin", b"hello", "ark/gyan");
             assert_eq!(
-                xattr::get(&input, "user.ark.encryption").unwrap().as_deref(),
+                xattr::get(&input, "user.ark.encryption_algorithm").unwrap().as_deref(),
                 Some(b"aes-256-gcm".as_slice())
             );
             let identity_seed = read_identity_key(&temp_dir.join("ark/gyan/.ark/identity.key")).unwrap();
@@ -164,7 +165,7 @@ mod tests {
 
             let input = temp_dir.join("input.bin");
             write_plain_test_file(&input, &identity, &secret_key, b"hello");
-            let mut preset_meta = create_metadata(&identity.address, DEFAULT_ENCRYPTION_ALGORITHM);
+            let mut preset_meta = create_metadata(&identity.address, Some(DEFAULT_ENCRYPTION_ALGORITHM));
             let preset_file_key = create_key(DEFAULT_ENCRYPTION_ALGORITHM).unwrap();
             apply_key_to_metadata(&mut preset_meta, &preset_file_key).unwrap();
             sign_metadata(&secret_key, &mut preset_meta, b"hello").unwrap();
@@ -294,7 +295,7 @@ mod tests {
             let ciphertext = encrypt_bytes(&file_key, b"hidden").unwrap().1;
             let input = temp_dir.join("input.bin");
             fs::write(&input, &ciphertext).unwrap();
-            let mut m = create_metadata(&identity.address, DEFAULT_ENCRYPTION_ALGORITHM);
+            let mut m = create_metadata(&identity.address, Some(DEFAULT_ENCRYPTION_ALGORITHM));
             apply_key_to_metadata(&mut m, &file_key).unwrap();
             m.encrypted = Some(true);
             sign_metadata(&secret_key, &mut m, &ciphertext).unwrap();
@@ -336,52 +337,23 @@ mod tests {
         in_test_dir("ark_put_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
-            create_account(temp_dir, &address).unwrap();
+            let (identity, secret_key) = create_account(temp_dir, &address).unwrap();
 
             let input = temp_dir.join("input.bin");
             fs::write(&input, b"plain bytes").unwrap();
-
-            let account_dir = temp_dir.join("ark/gyan");
-            std::env::set_current_dir(&account_dir).unwrap();
-            cmd_put("raw.bin", Some(input.to_str().unwrap()), Some("none")).unwrap();
-
-            let server_path = temp_dir.join("ark/gyan/raw.bin");
-            assert_eq!(fs::read(&server_path).unwrap(), b"plain bytes");
-            // server metadata records encryption="none"; input file left untouched
-            assert_eq!(
-                xattr::get(&server_path, "user.ark.encryption").unwrap().as_deref(),
-                Some(b"none".as_slice())
-            );
-            assert_eq!(xattr::get(&input, "user.ark.member_0_address").unwrap(), None);
-        });
-    }
-
-    #[test]
-    fn cmd_put_encryption_none_passes_through_existing_metadata() {
-        in_test_dir("ark_put_test", |temp_dir| {
-            let port = start_test_server(temp_dir.to_path_buf());
-            let address = format!("gyan@127.0.0.1:{}", port);
-            let (identity, secret_key) = create_account(temp_dir, &address).unwrap();
-
-            let ct = b"secret bytes".to_vec();
-            let input = temp_dir.join("input.bin");
-            fs::write(&input, &ct).unwrap();
-            let mut m = create_metadata(&identity.address, DEFAULT_ENCRYPTION_ALGORITHM);
-            let file_key = create_key(DEFAULT_ENCRYPTION_ALGORITHM).unwrap();
-            apply_key_to_metadata(&mut m, &file_key).unwrap();
-            sign_metadata(&secret_key, &mut m, &ct).unwrap();
+            let mut m = create_metadata(&identity.address, None);
+            sign_metadata(&secret_key, &mut m, b"plain bytes").unwrap();
             write_metadata_attributes(&input, &m).unwrap();
 
             let account_dir = temp_dir.join("ark/gyan");
             std::env::set_current_dir(&account_dir).unwrap();
-            cmd_put("file.bin", Some(input.to_str().unwrap()), Some("none")).unwrap();
+            cmd_put("raw.bin", Some(input.to_str().unwrap()), None).unwrap();
 
-            let server_path = temp_dir.join("ark/gyan/file.bin");
-            assert_eq!(fs::read(&server_path).unwrap(), ct);
-            // encryption=none override drops the wrapped key
-            let m = read_metadata_attributes(&server_path).unwrap();
-            assert_eq!(m.encryption, "none");
-            assert!(m.members[0].key.is_none());
+            let server_path = temp_dir.join("ark/gyan/raw.bin");
+            assert_eq!(fs::read(&server_path).unwrap(), b"plain bytes");
+            // metadata records no encryption_algorithm; wrapped keys dropped
+            assert_eq!(xattr::get(&server_path, "user.ark.encryption_algorithm").unwrap(), None);
+            assert_eq!(xattr::get(&input, "user.ark.member_0_key_value").unwrap(), None);
         });
     }
 

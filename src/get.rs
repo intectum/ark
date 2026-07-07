@@ -35,7 +35,9 @@ pub fn cmd_get(path: &str, output: Option<&str>, decrypt: bool) -> std::io::Resu
         let identity_key = read_identity_key(&root.join(".ark").join("identity.key"))?;
         let file_key = decrypt_bytes(&Key { algorithm: encrypted_file_key.algorithm.clone(), value: identity_key }, &encrypted_file_key.value)?;
 
-        decrypt_bytes(&Key { algorithm: metadata.encryption.clone(), value: file_key }, &body).map_err(|e| {
+        let encryption_algorithm = metadata.encryption_algorithm.clone()
+            .ok_or_else(|| io_err("file is not encrypted"))?;
+        decrypt_bytes(&Key { algorithm: encryption_algorithm, value: file_key }, &body).map_err(|e| {
             io_err(&format!(
                 "{} — server data may not be encrypted or the key may be wrong",
                 e
@@ -154,7 +156,7 @@ mod tests {
 
             assert_eq!(fs::read(&out).unwrap(), expected_ciphertext);
             let m = read_metadata_attributes(&out).unwrap();
-            assert_eq!(m.encryption, "aes-256-gcm");
+            assert_eq!(m.encryption_algorithm.as_deref(), Some("aes-256-gcm"));
             assert_eq!(m.members.iter().next().unwrap().key.as_ref().unwrap().value, expected_key_value);
         });
     }
@@ -170,7 +172,7 @@ mod tests {
             let (_, ct) = encrypt_bytes(&file_key, b"clear text").unwrap();
             let server_file = temp_dir.join("ark/gyan/secret");
             fs::write(&server_file, &ct).unwrap();
-            let mut m = create_metadata(&address, DEFAULT_ENCRYPTION_ALGORITHM);
+            let mut m = create_metadata(&address, Some(DEFAULT_ENCRYPTION_ALGORITHM));
             let (wrap_alg, wrapped) = encrypt_bytes(&identity.public_key, &file_key.value).unwrap();
             m.members[0].key = Some(Key {
                 algorithm: wrap_alg,

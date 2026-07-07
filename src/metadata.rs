@@ -15,7 +15,7 @@ const FIELD_ID: &str = "id";
 const FIELD_CREATED: &str = "created";
 const FIELD_MODIFIED: &str = "modified";
 const FIELD_MODIFIED_BY: &str = "modified_by";
-const FIELD_ENCRYPTION: &str = "encryption";
+const FIELD_ENCRYPTION_ALGORITHM: &str = "encryption_algorithm";
 const FIELD_MEMBER_PREFIX: &str = "member_";
 const FIELD_MEMBER_ADDRESS: &str = "address";
 const FIELD_MEMBER_PERMISSION: &str = "permission";
@@ -31,7 +31,7 @@ pub fn get_member<'a>(members: &'a [Member], address: &str) -> Option<&'a Member
     members.iter().find(|m| m.address == address)
 }
 
-pub fn create_metadata(owner_address: &str, encryption: &str) -> Metadata {
+pub fn create_metadata(owner_address: &str, encryption_algorithm: Option<&str>) -> Metadata {
     let now = now_iso();
 
     Metadata {
@@ -39,7 +39,7 @@ pub fn create_metadata(owner_address: &str, encryption: &str) -> Metadata {
         created: now.clone(),
         modified: now.clone(),
         modified_by: owner_address.to_string(),
-        encryption: encryption.to_string(),
+        encryption_algorithm: encryption_algorithm.map(|s| s.to_string()),
         members: vec![Member {
             address: owner_address.to_string(),
             permission: Permission::Owner,
@@ -92,7 +92,9 @@ pub fn write_metadata_attributes(path: &Path, metadata: &Metadata) -> io::Result
     xattr::set(path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_CREATED), metadata.created.as_bytes())?;
     xattr::set(path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_MODIFIED), metadata.modified.as_bytes())?;
     xattr::set(path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_MODIFIED_BY), metadata.modified_by.as_bytes())?;
-    xattr::set(path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_ENCRYPTION), metadata.encryption.as_bytes())?;
+    if let Some(alg) = &metadata.encryption_algorithm {
+        xattr::set(path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_ENCRYPTION_ALGORITHM), alg.as_bytes())?;
+    }
     xattr::set(path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_BODY_HASH_ALGORITHM), metadata.body_hash.algorithm.as_bytes())?;
     xattr::set(path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_BODY_HASH_VALUE), encode_base64url(&metadata.body_hash.value).as_bytes())?;
     xattr::set(path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_SIGNATURE_ALGORITHM), metadata.signature.algorithm.as_bytes())?;
@@ -137,7 +139,9 @@ pub fn write_metadata_headers(metadata: &Metadata) -> Vec<(String, String)> {
     out.push((format!("{}Created", HEADER_PREFIX), metadata.created.clone()));
     out.push((format!("{}Modified", HEADER_PREFIX), metadata.modified.clone()));
     out.push((format!("{}Modified-By", HEADER_PREFIX), metadata.modified_by.clone()));
-    out.push((format!("{}Encryption", HEADER_PREFIX), metadata.encryption.clone()));
+    if let Some(alg) = &metadata.encryption_algorithm {
+        out.push((format!("{}Encryption-Algorithm", HEADER_PREFIX), alg.clone()));
+    }
     out.push((format!("{}Body-Hash-Algorithm", HEADER_PREFIX), metadata.body_hash.algorithm.clone()));
     out.push((format!("{}Body-Hash-Value", HEADER_PREFIX), encode_base64url(&metadata.body_hash.value)));
     out.push((format!("{}Signature-Algorithm", HEADER_PREFIX), metadata.signature.algorithm.clone()));
@@ -160,7 +164,7 @@ pub fn validate_metadata(metadata: &Metadata) -> io::Result<()> {
         return Err(io_err("metadata must contain at least one owner"));
     }
 
-    if metadata.encryption != "none" {
+    if metadata.encryption_algorithm.is_some() {
         for member in &metadata.members {
             if member.key.is_none() {
                 return Err(io_err("missing member key field"));
@@ -229,7 +233,7 @@ struct PartialMetadata {
     modified_by: Option<String>,
     created: Option<String>,
     modified: Option<String>,
-    encryption: Option<String>,
+    encryption_algorithm: Option<String>,
     members: Vec<PartialMember>,
     body_hash_algorithm: Option<String>,
     body_hash_value: Option<Vec<u8>>,
@@ -253,7 +257,7 @@ fn metadata_from_partial(partial: PartialMetadata) -> io::Result<Metadata> {
         created: partial.created.unwrap(),
         modified: partial.modified.unwrap(),
         modified_by: partial.modified_by.unwrap(),
-        encryption: partial.encryption.unwrap(),
+        encryption_algorithm: partial.encryption_algorithm,
         members: partial.members.into_iter().map(|member| Member {
             address: member.address.unwrap(),
             permission: member.permission.unwrap(),
@@ -286,7 +290,7 @@ fn apply_field(metadata: &mut PartialMetadata, key: &str, value: &str) -> io::Re
         FIELD_CREATED => metadata.created = Some(value.to_string()),
         FIELD_MODIFIED => metadata.modified = Some(value.to_string()),
         FIELD_MODIFIED_BY => metadata.modified_by = Some(value.to_string()),
-        FIELD_ENCRYPTION => metadata.encryption = Some(value.to_string()),
+        FIELD_ENCRYPTION_ALGORITHM => metadata.encryption_algorithm = Some(value.to_string()),
         FIELD_BODY_HASH_ALGORITHM => metadata.body_hash_algorithm = Some(value.to_string()),
         FIELD_BODY_HASH_VALUE => metadata.body_hash_value = Some(decode_base64url(value)
             .map_err(|_| io_err("body_hash_value is not base64url encoded"))?),
@@ -328,7 +332,6 @@ fn validate_partial_metadata(metadata: &PartialMetadata) -> io::Result<()> {
     if metadata.created.is_none() { return Err(io_err("missing created field")); }
     if metadata.modified.is_none() { return Err(io_err("missing modified field")); }
     if metadata.modified_by.is_none() { return Err(io_err("missing modified_by field")); }
-    if metadata.encryption.is_none() { return Err(io_err("missing encryption field")); }
     if metadata.body_hash_algorithm.is_none() { return Err(io_err("missing body_hash_algorithm field")); }
     if metadata.body_hash_value.is_none() { return Err(io_err("missing body_hash_value field")); }
     if metadata.signature_algorithm.is_none() { return Err(io_err("missing signature_algorithm field")); }
@@ -374,7 +377,7 @@ mod tests {
 
     #[test]
     fn get_metadata_key_case_insensitive() {
-        assert_eq!(get_metadata_key("X-Ark-Meta-Encryption"), Some("encryption".to_string()));
+        assert_eq!(get_metadata_key("X-Ark-Meta-Encryption-Algorithm"), Some("encryption_algorithm".to_string()));
         assert_eq!(get_metadata_key("x-ark-meta-foo"), Some("foo".to_string()));
         assert_eq!(get_metadata_key("X-Custom-Foo"), None);
         assert_eq!(get_metadata_key("X-Ark-Meta-"), None);
@@ -383,13 +386,13 @@ mod tests {
 
     #[test]
     fn write_headers_emits_all_fields() {
-        let m = create_metadata(TEST_ADDRESS, "none");
+        let m = create_metadata(TEST_ADDRESS, Some("aes-256-gcm"));
         let headers = write_metadata_headers(&m);
         assert!(headers.iter().any(|(k, _)| k == "X-Ark-Meta-Id"));
         assert!(headers.iter().any(|(k, _)| k == "X-Ark-Meta-Created"));
         assert!(headers.iter().any(|(k, _)| k == "X-Ark-Meta-Modified"));
         assert!(headers.iter().any(|(k, _)| k == "X-Ark-Meta-Modified-By"));
-        assert!(headers.iter().any(|(k, _)| k == "X-Ark-Meta-Encryption"));
+        assert!(headers.iter().any(|(k, _)| k == "X-Ark-Meta-Encryption-Algorithm"));
         assert!(headers.iter().any(|(k, _)| k == "X-Ark-Meta-Member-0-Address"));
         assert!(headers.iter().any(|(k, _)| k == "X-Ark-Meta-Body-Hash-Algorithm"));
         assert!(headers.iter().any(|(k, _)| k == "X-Ark-Meta-Body-Hash-Value"));
@@ -399,14 +402,18 @@ mod tests {
 
     #[test]
     fn header_round_trip_preserves_all_fields() {
-        let m = create_metadata(TEST_ADDRESS, "none");
+        let mut m = create_metadata(TEST_ADDRESS, Some("aes-256-gcm"));
+        m.members[0].key = Some(Key {
+            algorithm: "hpke-x25519-hkdf-sha256-aes256gcm".to_string(),
+            value: vec![0u8; 32],
+        });
         let headers = write_metadata_headers(&m);
         let back = read_metadata_headers(&headers).unwrap();
         assert_eq!(back.id, m.id);
         assert_eq!(back.created, m.created);
         assert_eq!(back.modified, m.modified);
         assert_eq!(back.modified_by, m.modified_by);
-        assert_eq!(back.encryption, m.encryption);
+        assert_eq!(back.encryption_algorithm, m.encryption_algorithm);
         assert_eq!(back.members[0].address, m.members[0].address);
         assert_eq!(back.body_hash.algorithm, m.body_hash.algorithm);
         assert_eq!(back.body_hash.value, m.body_hash.value);
@@ -495,7 +502,7 @@ mod tests {
 
     #[test]
     fn validate_metadata_rejects_no_owner() {
-        let mut m = create_metadata(TEST_ADDRESS, "none");
+        let mut m = create_metadata(TEST_ADDRESS, None);
         m.members[0].permission = Permission::Read;
         let err = match validate_metadata(&m) {
             Err(e) => e,
@@ -506,7 +513,7 @@ mod tests {
 
     #[test]
     fn validate_metadata_rejects_empty_members() {
-        let mut m = create_metadata(TEST_ADDRESS, "none");
+        let mut m = create_metadata(TEST_ADDRESS, None);
         m.members = vec![];
         let err = match validate_metadata(&m) {
             Err(e) => e,
@@ -517,7 +524,7 @@ mod tests {
 
     #[test]
     fn read_headers_rejects_sparse_member_indexes() {
-        let m = create_metadata(TEST_ADDRESS, "none");
+        let m = create_metadata(TEST_ADDRESS, None);
         let mut headers = write_metadata_headers(&m);
         headers.push(("X-Ark-Meta-Member-2-Address".to_string(), "c@z".to_string()));
         headers.push(("X-Ark-Meta-Member-2-Permission".to_string(), "read".to_string()));
@@ -532,7 +539,7 @@ mod tests {
 
     #[test]
     fn read_headers_rejects_invalid_base64_in_member_field() {
-        let mut m = create_metadata(TEST_ADDRESS, "none");
+        let mut m = create_metadata(TEST_ADDRESS, None);
         m.members[0].key = Some(Key {
             algorithm: "hpke-x25519-hkdf-sha256-aes256gcm".to_string(),
             value: vec![0u8; 32],

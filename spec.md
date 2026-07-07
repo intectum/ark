@@ -207,7 +207,7 @@ The `ark` account is a special account created when the server is first started.
 
 ## 3 Files & Directories
 
-Ark is - at it's core - a file server. All files and directories managed by Ark are given additional metadata. This metadata is not encrypted but is signed by the last modifier of the file or directory to prevent tampering. File content is encrypted by default but can be unencrypted with `algorithm = "none"` [move alg into wrapped key?]. The [TODO] algorithm must be supported for encryption by all clients. Since the file metadata declares the encryption algorithm, any algorithm can be used, however clients may not support other algorithms (and will therefore be unable to decrypt the file).
+Ark is - at it's core - a file server. All files and directories managed by Ark are given additional metadata. This metadata is not encrypted but is signed by the last modifier of the file or directory to prevent tampering. File content is encrypted by default but can be unencrypted by omitting the `encryption_algorithm` field [move alg into wrapped key?]. The [TODO] algorithm must be supported for encryption by all clients. Since the file metadata declares the encryption algorithm, any algorithm can be used, however clients may not support other algorithms (and will therefore be unable to decrypt the file).
 
 ### 3.1 ID
 
@@ -406,15 +406,15 @@ Every file's body is encrypted with a **symmetric file key** (AES-256-GCM). The 
 
 ### 4.2 Encryption modes
 
-The file metadata's `algorithm` field specifies whether and how the body is encrypted:
+The file metadata's `encryption_algorithm` field specifies whether and how the body is encrypted:
 
-| Algorithm | Body | Wrapped keys | Use case |
+| `encryption_algorithm` | Body | Wrapped keys | Use case |
 |---|---|---|---|
 | `aes-256-gcm` (default) | Encrypted | Yes — ECIES-wrapped per member | Private files, messages, shared documents |
 | `chacha20-poly1305` | Encrypted | Yes — ECIES-wrapped per member | Same, for devices without AES hardware acceleration |
-| `none` | Unencrypted (raw bytes) | No — `wrapped_key` fields are omitted | Public content, websites, published documents |
+| _omitted_ | Unencrypted (raw bytes) | No — `wrapped_key` fields are omitted | Public content, websites, published documents |
 
-When `algorithm = "none"`:
+When `encryption_algorithm` is omitted:
 - The body is stored as raw bytes (no nonce, no AEAD tag).
 - Member entries omit `ephemeral_key`, `key_nonce`, and `wrapped_key` fields.
 - The file signature still covers the body hash, providing integrity and authenticity (Section 5.2). This is the **only** integrity guarantee for unencrypted files — there is no AEAD tag to catch tampering.
@@ -560,7 +560,7 @@ The server verifies the proof against the file's credential members before servi
 
 **GET response:**
 
-The raw body as the entity body (`Content-Type: application/x-ark`), with the metadata blob in the `X-Ark-Metadata` header (Section 8.3). The body is the file content itself — ciphertext for encrypted files, raw bytes for `algorithm = "none"` — so non-Ark clients can use it directly and ignore the header.
+The raw body as the entity body (`Content-Type: application/x-ark`), with the metadata blob in the `X-Ark-Metadata` header (Section 8.3). The body is the file content itself — ciphertext for encrypted files, raw bytes when `encryption_algorithm` is omitted — so non-Ark clients can use it directly and ignore the header.
 
 **HEAD response:**
 
@@ -791,7 +791,7 @@ tls = false  # reverse proxy handles TLS
 An Ark file is split into two parts that live and travel separately:
 
 - **Body** — the file content itself, stored as the file's bytes on disk:
-  - `algorithm = "none"`: the raw file bytes (a public `.html` is stored and served verbatim).
+  - `encryption_algorithm` omitted: the raw file bytes (a public `.html` is stored and served verbatim).
   - encrypted (`aes-256-gcm` / `chacha20-poly1305`): `nonce (12 bytes) ‖ ciphertext + tag`.
 - **Metadata** — a signed Protocol Buffers blob (Section 8.2) holding everything else: `file_id`, members + wrapped keys, permissions, timestamps, algorithm, signature. It is **not** part of the body; it is stored and carried out-of-band (Section 8.3).
 
@@ -900,7 +900,7 @@ Identity documents and contacts are JSON (human-readable, easy to debug with cur
 | **Password member brute force** | `identity.key` (and any password-gated file) is served only after the server verifies the credential, so it is not freely downloadable — online attempts are rate-limited. A *compromised* server holding the `verifier` can still brute-force a password member offline (Sections 2.11, 3.10). Passkey members are hardware-bound and resist even that. |
 | **Removed member's existing copy** | When a member is removed from a shared file, they retain any copy they already downloaded. Re-keying prevents access to future edits, not past content. |
 | **Path metadata** | File paths are unencrypted (the server needs them for routing). Path names like `/mail/inbox/` or `/notes/secret-project` are visible to the server. For maximum privacy, use opaque paths. |
-| **Unencrypted files** | Files with `algorithm = "none"` have no confidentiality protection. The body is readable by the server, network observers (if TLS is broken), and anyone with read access. Integrity and authenticity are still provided by the file signature. |
+| **Unencrypted files** | Files with no `encryption_algorithm` have no confidentiality protection. The body is readable by the server, network observers (if TLS is broken), and anyone with read access. Integrity and authenticity are still provided by the file signature. |
 
 ### 9.3 Compromise scenarios
 
@@ -1460,7 +1460,7 @@ Like an identity document, but identifies a set of members instead of a single a
 | `address` | string | Yes | Member's full address. |
 | `identity_key` | string | Yes | Base64url-encoded member identity public key bytes. |
 | `permission` | string | Yes | `"owner"`, `"write"`, or `"read"`. |
-| `wrapped_key` | string | No | Base64url-encoded file key wrapped to this member. Omitted for `algorithm = "none"` files. |
+| `wrapped_key` | string | No | Base64url-encoded file key wrapped to this member. Omitted for files with no `encryption_algorithm`. |
 
 ### C.12 Identity key file (`identity.key`, Section 2.11)
 

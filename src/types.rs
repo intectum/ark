@@ -52,7 +52,8 @@ pub struct Metadata {
     pub created: String,
     pub modified: String,
     pub modified_by: String,
-    pub encryption: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption_algorithm: Option<String>,
     pub members: Vec<Member>,
     pub body_hash: Hash,
     pub signature: Signature,

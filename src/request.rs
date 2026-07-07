@@ -225,14 +225,14 @@ mod tests {
         let _ = request(
             "PUT",
             &url,
-            &[("X-Ark-Meta-Encryption", "aes-256-gcm"), ("X-Custom", "hi")],
+            &[("X-Ark-Meta-Encryption-Algorithm", "aes-256-gcm"), ("X-Custom", "hi")],
             b"d",
             &identity,
             &secret_key.value,
         ).unwrap();
 
         let req = captured.join().unwrap();
-        assert_eq!(parse_header(&req, "X-Ark-Meta-Encryption"), Some("aes-256-gcm"));
+        assert_eq!(parse_header(&req, "X-Ark-Meta-Encryption-Algorithm"), Some("aes-256-gcm"));
         assert_eq!(parse_header(&req, "X-Custom"), Some("hi"));
     }
 }

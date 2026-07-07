@@ -840,7 +840,7 @@ mod tests {
             assert_eq!(code, 201);
             let p = temp_dir.join("ark/test/secret");
             assert_eq!(
-                xattr::get(&p, "user.ark.encryption").unwrap().as_deref(),
+                xattr::get(&p, "user.ark.encryption_algorithm").unwrap().as_deref(),
                 Some(b"aes-256-gcm".as_slice())
             );
             let loaded = read_metadata_attributes(&p).unwrap();
@@ -875,7 +875,7 @@ mod tests {
 
             let (code, _body, headers) = signed_request(port, &identity, &secret_key, "GET", "/ark/test/secret", &[]);
             assert_eq!(code, 200);
-            assert_eq!(header(&headers, "x-ark-meta-encryption"), Some("aes-256-gcm"));
+            assert_eq!(header(&headers, "x-ark-meta-encryption-algorithm"), Some("aes-256-gcm"));
             assert_eq!(header(&headers, "x-ark-meta-member-0-address"), Some(TEST_ADDRESS));
         });
     }
@@ -945,7 +945,7 @@ mod tests {
         let file = td.join(rel_path);
         fs::create_dir_all(file.parent().unwrap()).unwrap();
         let mut m = create_plain_test_metadata(owner, owner_secret_key, body);
-        m.encryption = "none".to_string();
+        m.encryption_algorithm = None;
         m.members[0].key = None;
         for member in extra_members {
             m.members.push(member);
@@ -982,7 +982,7 @@ mod tests {
             let port = start_test_server(temp_dir.to_path_buf());
 
             let mut new_meta = create_plain_test_metadata(&writer_identity, &writer_key, b"v2");
-            new_meta.encryption = "none".to_string();
+            new_meta.encryption_algorithm = None;
             new_meta.members = vec![
                 Member { address: owner_identity.address.clone(), permission: Permission::Owner, key: None },
                 Member { address: writer_identity.address.clone(), permission: Permission::Write, key: None },
@@ -1008,7 +1008,7 @@ mod tests {
             let port = start_test_server(temp_dir.to_path_buf());
 
             let mut new_meta = create_plain_test_metadata(&reader_identity, &reader_key, b"v2");
-            new_meta.encryption = "none".to_string();
+            new_meta.encryption_algorithm = None;
             new_meta.members = vec![
                 Member { address: owner_identity.address.clone(), permission: Permission::Owner, key: None },
                 Member { address: reader_identity.address.clone(), permission: Permission::Read, key: None },
@@ -1032,7 +1032,7 @@ mod tests {
             let port = start_test_server(temp_dir.to_path_buf());
 
             let mut new_meta = create_plain_test_metadata(&stranger_identity, &stranger_key, b"v2");
-            new_meta.encryption = "none".to_string();
+            new_meta.encryption_algorithm = None;
             new_meta.members = vec![
                 Member { address: owner_identity.address.clone(), permission: Permission::Owner, key: None },
             ];
@@ -1058,7 +1058,7 @@ mod tests {
             let port = start_test_server(temp_dir.to_path_buf());
 
             let mut new_meta = create_plain_test_metadata(&writer_identity, &writer_key, b"v2");
-            new_meta.encryption = "none".to_string();
+            new_meta.encryption_algorithm = None;
             new_meta.members = vec![
                 Member { address: owner_identity.address.clone(), permission: Permission::Owner, key: None },
                 Member { address: writer_identity.address.clone(), permission: Permission::Write, key: None },
@@ -1086,7 +1086,7 @@ mod tests {
             let port = start_test_server(temp_dir.to_path_buf());
 
             let mut new_meta = create_plain_test_metadata(&co_owner_identity, &co_owner_key, b"v2");
-            new_meta.encryption = "none".to_string();
+            new_meta.encryption_algorithm = None;
             new_meta.members = vec![
                 Member { address: owner_identity.address.clone(), permission: Permission::Owner, key: None },
                 Member { address: co_owner_identity.address.clone(), permission: Permission::Owner, key: None },

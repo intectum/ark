@@ -87,9 +87,9 @@ enum Cmd {
         /// Read body from FILE instead of stdin.
         #[arg(short, long, value_name = "FILE")]
         input: Option<String>,
-        /// Encryption algorithm; "none" to send body as-is.
+        /// Encryption algorithm; omit to send body as-is.
         #[arg(short, long, value_name = "NAME")]
-        algorithm: Option<String>,
+        encryption_algorithm: Option<String>,
         /// Ark URL or path.
         path: String,
     },
@@ -109,7 +109,7 @@ enum Cmd {
         key: Option<String>,
         /// Override encryption algorithm (default from metadata or aes-256-gcm).
         #[arg(short, long, value_name = "NAME")]
-        algorithm: Option<String>,
+        encryption_algorithm: Option<String>,
     },
 }
 
@@ -125,9 +125,9 @@ fn main() {
         Cmd::Head { path } => cmd_head(&path),
         Cmd::Delete { path } => cmd_delete(&path),
         Cmd::Get { output, decrypt, path } => cmd_get(&path, output.as_deref(), decrypt),
-        Cmd::Put { input, algorithm, path } => cmd_put(&path, input.as_deref(), algorithm.as_deref()),
-        Cmd::Decrypt { input, output, in_place, key, algorithm } => {
-            cmd_decrypt(DecryptArgs { input, output, in_place, key, algorithm })
+        Cmd::Put { input, encryption_algorithm, path } => cmd_put(&path, input.as_deref(), encryption_algorithm.as_deref()),
+        Cmd::Decrypt { input, output, in_place, key, encryption_algorithm } => {
+            cmd_decrypt(DecryptArgs { input, output, in_place, key, encryption_algorithm })
         }
     };
     if let Err(e) = result {
