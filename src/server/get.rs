@@ -18,11 +18,13 @@ pub fn serve_get(fs_path: &Path, stream: &mut TcpStream, send_body: bool) -> std
     if fs_metadata.is_dir() {
         let body = list_dir(fs_path)?;
         let content_length = body.len().to_string();
-        let headers = [
-            ("Content-Type", "application/json"),
-            ("Content-Length", content_length.as_str()),
-            ("Connection", "close"),
-        ];
+        let metadata_headers = read_metadata_attributes(fs_path).ok()
+            .map(|m| write_metadata_headers(&m))
+            .unwrap_or_default();
+        let mut headers: Vec<(&str, &str)> = metadata_headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        headers.push(("Content-Type", "application/json"));
+        headers.push(("Content-Length", content_length.as_str()));
+        headers.push(("Connection", "close"));
         return write_response(stream, 200, "OK", &headers, if send_body { body.as_bytes() } else { &[] });
     }
 
@@ -174,6 +176,33 @@ mod tests {
             assert_eq!(code, 200);
             assert!(body.is_empty());
             assert_eq!(header(&headers, "content-length"), Some("5"));
+        });
+    }
+
+    #[test]
+    fn get_dir_returns_metadata_headers_when_present() {
+        in_test_dir("ark_server_test", |temp_dir| {
+            let (identity, secret_key, _) = create_test_account(temp_dir, TEST_ADDRESS);
+            seed_shared_dir(temp_dir, &identity, &secret_key, "ark/test/shared", vec![
+                Member { address: "friend@example.com".to_string(), permission: Permission::Write, key: None },
+            ]);
+            let port = start_test_server(temp_dir.to_path_buf());
+            let (code, _, headers) = signed_request(port, &identity, &secret_key, "GET", "/ark/test/shared/", &[]);
+            assert_eq!(code, 200);
+            assert_eq!(header(&headers, "x-ark-meta-member-0-address"), Some(TEST_ADDRESS));
+            assert_eq!(header(&headers, "x-ark-meta-member-1-address"), Some("friend@example.com"));
+        });
+    }
+
+    #[test]
+    fn get_dir_no_metadata_headers_when_absent() {
+        in_test_dir("ark_server_test", |temp_dir| {
+            let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
+            fs::create_dir(account_dir.join("bare")).unwrap();
+            let port = start_test_server(temp_dir.to_path_buf());
+            let (code, _, headers) = signed_request(port, &identity, &secret_key, "GET", "/ark/test/bare/", &[]);
+            assert_eq!(code, 200);
+            assert_eq!(header(&headers, "x-ark-meta-id"), None);
         });
     }
 

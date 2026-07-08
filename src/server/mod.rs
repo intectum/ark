@@ -14,7 +14,7 @@ use std::thread;
 use crate::http::{read_request, write_response};
 use crate::identity::read_identity;
 use crate::metadata::read_metadata_attributes;
-use crate::types::Permission;
+use crate::types::{Member, Permission};
 use crate::util::resolve_url;
 
 use self::auth::{authenticate, authorize};
@@ -92,17 +92,29 @@ fn handle(mut stream: TcpStream, root: &Path, verbose: bool) -> std::io::Result<
     };
 
     let fs_path = root.join(url.path().trim_start_matches('/'));
+    let fs_account_path = root.join("ark").join(account_name);
 
     if fs::symlink_metadata(&fs_path).map(|m| m.is_symlink()).unwrap_or(false) {
         return write_status(&mut stream, 403, "Forbidden", b"symlinks not allowed");
     }
 
+    let target_is_dir = url.path().ends_with('/') || fs_path.is_dir();
+
     let existing_members = read_metadata_attributes(&fs_path).ok().map(|metadata| metadata.members);
-    let existing_public_member = existing_members
+    if fs_path.is_file() && existing_members.is_none() {
+        return write_status(&mut stream, 500, "Internal Server Error", b"file missing metadata");
+    }
+
+    let effective_members = match existing_members.clone() {
+        Some(m) => Some(m),
+        None => find_ancestor_members(&fs_path, &fs_account_path),
+    };
+
+    let public_member = effective_members
         .as_deref()
         .and_then(|members| members.iter().find(|member| member.address == "*"));
 
-    if existing_public_member.is_some() && (method == "GET" || method == "HEAD") {
+    if public_member.is_some() && (method == "GET" || method == "HEAD") {
         return serve_get(&fs_path, &mut stream, method == "GET");
     }
 
@@ -111,7 +123,7 @@ fn handle(mut stream: TcpStream, root: &Path, verbose: bool) -> std::io::Result<
         Err(e) => return write_status(&mut stream, 401, "Unauthorized", e.to_string().as_bytes())
     };
 
-    let permission = match authorize(&target_identity, &&requestor_identity, existing_members.as_deref()) {
+    let permission = match authorize(&target_identity, &&requestor_identity, effective_members.as_deref()) {
         Ok(p) => p,
         Err(e) => return write_status(&mut stream, 403, "Forbidden", e.to_string().as_bytes())
     };
@@ -126,10 +138,21 @@ fn handle(mut stream: TcpStream, root: &Path, verbose: bool) -> std::io::Result<
     match method.as_str() {
         "GET" => serve_get(&fs_path, &mut stream, true),
         "HEAD" => serve_get(&fs_path, &mut stream, false),
-        "PUT" => serve_put(&fs_path, &mut stream, &body, &headers, existing_members, permission),
+        "PUT" => serve_put(&fs_path, &mut stream, &body, &headers, existing_members, permission, target_is_dir),
         "DELETE" => serve_delete(&fs_path, &mut stream),
         _ => write_status(&mut stream, 405, "Method Not Allowed", b"method not allowed"),
     }
+}
+
+fn find_ancestor_members(fs_path: &Path, fs_account_path: &Path) -> Option<Vec<Member>> {
+    let mut current = fs_path.parent()?;
+    while current.starts_with(fs_account_path) {
+        if let Ok(m) = read_metadata_attributes(current) {
+            return Some(m.members);
+        }
+        current = current.parent()?;
+    }
+    None
 }
 
 pub fn write_status(stream: &mut TcpStream, status_code: u16, status_msg: &str, body: &[u8]) -> std::io::Result<()> {

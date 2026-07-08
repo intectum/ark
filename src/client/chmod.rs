@@ -11,7 +11,7 @@ const PUBLIC_CLI: &str = "public";
 const PUBLIC_WIRE: &str = "*";
 
 pub fn cmd_chmod(
-    file: &str,
+    path: &str,
     owners: &[String],
     writers: &[String],
     readers: &[String],
@@ -20,8 +20,12 @@ pub fn cmd_chmod(
     let root = find_root(&current_dir()?)?;
     let identity = read_identity(&root.join(".ark").join("identity.json"))?;
 
-    let path = Path::new(file);
-    let mut metadata = read_metadata_attributes(path)?;
+    let input_path = Path::new(path);
+    if !std::fs::exists(input_path)? {
+        return Err(io_invalid_input("input does not exist"));
+    }
+
+    let mut metadata = read_metadata_attributes(input_path)?;
 
     let modifier_identity = resolve_identity(&metadata.modified_by)?;
     verify_metadata_signature(&modifier_identity.public_key, &metadata)?;
@@ -64,10 +68,11 @@ pub fn cmd_chmod(
     metadata.modified = now_iso();
     metadata.modified_by = identity.address.clone();
 
-    let body = std::fs::read(path)?;
-    sign_metadata(&Key { algorithm: identity.public_key.algorithm, value: identity_key }, &mut metadata, &body)?;
+    let body = if input_path.is_dir() { Vec::new() } else { std::fs::read(input_path)? };
+    let sign_body = if input_path.is_dir() { None } else { Some(body.as_slice()) };
+    sign_metadata(&Key { algorithm: identity.public_key.algorithm, value: identity_key }, &mut metadata, sign_body)?;
 
-    write_metadata_attributes(path, &metadata)?;
+    write_metadata_attributes(input_path, &metadata)?;
 
     Ok(())
 }
@@ -225,7 +230,7 @@ mod tests {
                 permission: Permission::Read,
                 key: None,
             });
-            sign_metadata(&secret_key, &mut m, b"body").unwrap();
+            sign_metadata(&secret_key, &mut m, Some(b"body")).unwrap();
             write_metadata_attributes(&path, &m).unwrap();
 
             env::set_current_dir(&account_dir).unwrap();
@@ -251,7 +256,7 @@ mod tests {
                 permission: Permission::Read,
                 key: None,
             });
-            sign_metadata(&secret_key, &mut m, b"body").unwrap();
+            sign_metadata(&secret_key, &mut m, Some(b"body")).unwrap();
             write_metadata_attributes(&path, &m).unwrap();
 
             env::set_current_dir(&account_dir).unwrap();
@@ -290,12 +295,24 @@ mod tests {
                 permission: Permission::Owner,
                 key: None,
             });
-            sign_metadata(&secret_key, &mut m, b"body").unwrap();
+            sign_metadata(&secret_key, &mut m, Some(b"body")).unwrap();
             write_metadata_attributes(&path, &m).unwrap();
 
             env::set_current_dir(&account_dir).unwrap();
             let err = cmd_chmod(path.to_str().unwrap(), &[], &[], &["john@example.com".to_string()], &[]).unwrap_err();
             assert!(err.to_string().contains("only an owner"), "msg was {}", err);
+        });
+    }
+
+    #[test]
+    fn cmd_chmod_missing_input_errors() {
+        in_test_dir("ark_chmod_test", |temp_dir| {
+            let (_identity, _secret_key, account_dir) = setup(temp_dir);
+            env::set_current_dir(&account_dir).unwrap();
+            let missing = account_dir.join("nope.txt");
+            let err = cmd_chmod(missing.to_str().unwrap(), &[], &[], &["john@example.com".to_string()], &[]).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(format!("{}", err).contains("input does not exist"));
         });
     }
 
@@ -311,7 +328,7 @@ mod tests {
 
             let m = read_metadata_attributes(&path).unwrap();
             let body = fs::read(&path).unwrap();
-            verify_metadata(&identity.public_key, &m, &body).unwrap();
+            verify_metadata(&identity.public_key, &m, Some(&body)).unwrap();
         });
     }
 }

@@ -8,7 +8,7 @@ use crate::identity::{read_identity, read_identity_key};
 use crate::metadata::{apply_key_to_metadata, create_metadata, get_member, read_metadata_attributes, sign_metadata, write_metadata_attributes, write_metadata_headers};
 use crate::client::ark_request;
 use crate::types::Key;
-use crate::util::{find_root, io_err, now_iso, resolve_url};
+use crate::util::{find_root, io_err, io_invalid_input, now_iso, resolve_url};
 
 pub fn cmd_put(path: &str, input: Option<&str>, encryption_algorithm: Option<&str>) -> std::io::Result<()> {
     let root = find_root(&current_dir()?)?;
@@ -16,16 +16,37 @@ pub fn cmd_put(path: &str, input: Option<&str>, encryption_algorithm: Option<&st
     let url = resolve_url(path, &identity.address, &root, false)?;
 
     let input_path: Option<PathBuf> = input.map(PathBuf::from);
+    if let Some(p) = input_path.as_deref() {
+        if !fs::exists(p)? {
+            return Err(io_invalid_input("input does not exist"));
+        }
+    }
 
-    let body = match &input_path {
-        Some(p) => fs::read(p)?,
-        None => {
-            let mut buf = Vec::new();
-            std::io::stdin().read_to_end(&mut buf)?;
-            buf
+    let target_is_dir = url.path().ends_with('/');
+    let input_is_dir = input_path.clone().map(|p| p.is_dir()).unwrap_or(false);
+    let input_is_file = input_path.clone().map(|p| p.is_file()).unwrap_or(false);
+    let is_dir = target_is_dir || input_is_dir;
+
+    if target_is_dir && input_is_file {
+        return Err(io_invalid_input("directory path but input is a file"));
+    }
+
+    if is_dir && encryption_algorithm.is_some() {
+        return Err(io_invalid_input("--encryption-algorithm not supported for directories"));
+    }
+
+    let body = if is_dir {
+        Vec::new()
+    } else {
+        match &input_path {
+            Some(p) => fs::read(p)?,
+            None => {
+                let mut buf = Vec::new();
+                std::io::stdin().read_to_end(&mut buf)?;
+                buf
+            }
         }
     };
-
 
     let has_existing_metadata = match input_path.as_deref() {
         Some(p) => xattr::get(p, "user.ark.id")?.is_some(),
@@ -34,8 +55,8 @@ pub fn cmd_put(path: &str, input: Option<&str>, encryption_algorithm: Option<&st
 
     let mut metadata = if has_existing_metadata {
         let mut m = read_metadata_attributes(input_path.as_deref().unwrap())?;
-        if let Some(alg) = encryption_algorithm {
-            m.encryption_algorithm = Some(alg.to_string());
+        if let Some(a) = encryption_algorithm {
+            m.encryption_algorithm = Some(a.to_string());
         }
         m
     } else {
@@ -44,6 +65,10 @@ pub fn cmd_put(path: &str, input: Option<&str>, encryption_algorithm: Option<&st
 
     if get_member(&metadata.members, &identity.address).is_none() {
         return Err(io_err("no member entry for current account"));
+    }
+
+    if is_dir || encryption_algorithm == Some("none") {
+        metadata.encryption_algorithm = None;
     }
 
     let skip_encrypt = metadata.encryption_algorithm.is_none();
@@ -69,7 +94,12 @@ pub fn cmd_put(path: &str, input: Option<&str>, encryption_algorithm: Option<&st
     metadata.modified_by = identity.address.clone();
 
     let signing_key = read_identity_key(&root.join(".ark").join("identity.key"))?;
-    sign_metadata(&Key { algorithm: identity.public_key.algorithm, value: signing_key }, &mut metadata, &final_body)?;
+    let sign_body = if is_dir { None } else { Some(final_body.as_slice()) };
+    sign_metadata(&Key { algorithm: identity.public_key.algorithm.clone(), value: signing_key }, &mut metadata, sign_body)?;
+
+    if let Some(p) = input_path.as_deref() {
+        write_metadata_attributes(p, &metadata)?;
+    }
 
     let metadata_headers = write_metadata_headers(&metadata);
     let headers: Vec<(&str, &str)> = metadata_headers.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
@@ -77,12 +107,6 @@ pub fn cmd_put(path: &str, input: Option<&str>, encryption_algorithm: Option<&st
     let (response_code, _, response_body) = ark_request(&root, &url, "PUT", &headers, &final_body)?;
     if response_code != 201 && response_code != 204 {
         return Err(io_err(&format!("HTTP {}: {}", response_code, String::from_utf8_lossy(&response_body))));
-    }
-
-    if let Some(p) = input_path.as_deref() {
-        if !skip_encrypt || has_existing_metadata {
-            write_metadata_attributes(p, &metadata)?;
-        }
     }
 
     Ok(())
@@ -168,7 +192,7 @@ mod tests {
             let mut preset_meta = create_metadata(&identity.address, Some(DEFAULT_ENCRYPTION_ALGORITHM));
             let preset_file_key = create_key(DEFAULT_ENCRYPTION_ALGORITHM).unwrap();
             apply_key_to_metadata(&mut preset_meta, &preset_file_key).unwrap();
-            sign_metadata(&secret_key, &mut preset_meta, b"hello").unwrap();
+            sign_metadata(&secret_key, &mut preset_meta, Some(b"hello")).unwrap();
             write_metadata_attributes(&input, &preset_meta).unwrap();
 
             let account_dir = temp_dir.join("ark/gyan");
@@ -231,8 +255,8 @@ mod tests {
         in_test_dir("ark_put_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
-            create_account(temp_dir, &address).unwrap();
-            fs::write(temp_dir.join("ark/gyan/x.txt"), b"old").unwrap();
+            let (identity, secret_key) = create_account(temp_dir, &address).unwrap();
+            write_plain_test_file(&temp_dir.join("ark/gyan/x.txt"), &identity, &secret_key, b"old");
 
             put_via_cmd(temp_dir, "x.txt", b"new plaintext", "ark/gyan");
 
@@ -298,7 +322,7 @@ mod tests {
             let mut m = create_metadata(&identity.address, Some(DEFAULT_ENCRYPTION_ALGORITHM));
             apply_key_to_metadata(&mut m, &file_key).unwrap();
             m.encrypted = Some(true);
-            sign_metadata(&secret_key, &mut m, &ciphertext).unwrap();
+            sign_metadata(&secret_key, &mut m, Some(&ciphertext)).unwrap();
             write_metadata_attributes(&input, &m).unwrap();
 
             let account_dir = temp_dir.join("ark/gyan");
@@ -342,7 +366,7 @@ mod tests {
             let input = temp_dir.join("input.bin");
             fs::write(&input, b"plain bytes").unwrap();
             let mut m = create_metadata(&identity.address, None);
-            sign_metadata(&secret_key, &mut m, b"plain bytes").unwrap();
+            sign_metadata(&secret_key, &mut m, Some(b"plain bytes")).unwrap();
             write_metadata_attributes(&input, &m).unwrap();
 
             let account_dir = temp_dir.join("ark/gyan");
@@ -354,6 +378,102 @@ mod tests {
             // metadata records no encryption_algorithm; wrapped keys dropped
             assert_eq!(xattr::get(&server_path, "user.ark.encryption_algorithm").unwrap(), None);
             assert_eq!(xattr::get(&input, "user.ark.member_0_key_value").unwrap(), None);
+        });
+    }
+
+    #[test]
+    fn cmd_put_trailing_slash_creates_dir_with_metadata() {
+        in_test_dir("ark_put_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let address = format!("gyan@127.0.0.1:{}", port);
+            create_account(temp_dir, &address).unwrap();
+
+            std::env::set_current_dir(temp_dir.join("ark/gyan")).unwrap();
+            cmd_put("shared/", None, None).unwrap();
+
+            let dir = temp_dir.join("ark/gyan/shared");
+            assert!(dir.is_dir());
+            let meta = read_metadata_attributes(&dir).unwrap();
+            assert_eq!(meta.modified_by, address);
+            assert_eq!(meta.encryption_algorithm, None);
+            assert!(meta.members[0].key.is_none());
+        });
+    }
+
+    #[test]
+    fn cmd_put_trailing_slash_rejects_encryption_algorithm() {
+        in_test_dir("ark_put_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let address = format!("gyan@127.0.0.1:{}", port);
+            create_account(temp_dir, &address).unwrap();
+
+            std::env::set_current_dir(temp_dir.join("ark/gyan")).unwrap();
+            let err = cmd_put("shared/", None, Some("aes-256-gcm")).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        });
+    }
+
+    #[test]
+    fn cmd_put_encryption_none_arg_sends_raw_body() {
+        in_test_dir("ark_put_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let address = format!("gyan@127.0.0.1:{}", port);
+            create_account(temp_dir, &address).unwrap();
+
+            let input = temp_dir.join("input.bin");
+            fs::write(&input, b"plain bytes").unwrap();
+            std::env::set_current_dir(temp_dir.join("ark/gyan")).unwrap();
+            cmd_put("raw.bin", Some(input.to_str().unwrap()), Some("none")).unwrap();
+
+            let server_path = temp_dir.join("ark/gyan/raw.bin");
+            assert_eq!(fs::read(&server_path).unwrap(), b"plain bytes");
+            assert_eq!(xattr::get(&server_path, "user.ark.encryption_algorithm").unwrap(), None);
+        });
+    }
+
+    #[test]
+    fn cmd_put_missing_input_errors() {
+        in_test_dir("ark_put_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let address = format!("gyan@127.0.0.1:{}", port);
+            create_account(temp_dir, &address).unwrap();
+
+            std::env::set_current_dir(temp_dir.join("ark/gyan")).unwrap();
+            let missing = temp_dir.join("does_not_exist.bin");
+            let err = cmd_put("notes.txt", Some(missing.to_str().unwrap()), None).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(format!("{}", err).contains("input does not exist"));
+        });
+    }
+
+    #[test]
+    fn cmd_put_trailing_slash_with_file_input_errors() {
+        in_test_dir("ark_put_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let address = format!("gyan@127.0.0.1:{}", port);
+            create_account(temp_dir, &address).unwrap();
+
+            let input = temp_dir.join("input.bin");
+            fs::write(&input, b"hi").unwrap();
+            std::env::set_current_dir(temp_dir.join("ark/gyan")).unwrap();
+            let err = cmd_put("shared/", Some(input.to_str().unwrap()), None).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(format!("{}", err).contains("directory path but input is a file"));
+        });
+    }
+
+    #[test]
+    fn cmd_put_dir_input_rejects_encryption_algorithm() {
+        in_test_dir("ark_put_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let address = format!("gyan@127.0.0.1:{}", port);
+            create_account(temp_dir, &address).unwrap();
+
+            let input_dir = temp_dir.join("input_dir");
+            fs::create_dir_all(&input_dir).unwrap();
+            std::env::set_current_dir(temp_dir.join("ark/gyan")).unwrap();
+            let err = cmd_put("shared", Some(input_dir.to_str().unwrap()), Some("aes-256-gcm")).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         });
     }
 

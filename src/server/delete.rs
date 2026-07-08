@@ -35,7 +35,7 @@ mod tests {
         in_test_dir("ark_server_test", |temp_dir| {
             let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
             let p = account_dir.join("d.txt");
-            fs::write(&p, b"bye").unwrap();
+            write_plain_test_file(&p, &identity, &secret_key, b"bye");
             let port = start_test_server(temp_dir.to_path_buf());
             let (code, _, _) = signed_request(port, &identity, &secret_key, "DELETE", "/ark/test/d.txt", &[]);
             assert_eq!(code, 204);

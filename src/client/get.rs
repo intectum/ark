@@ -23,7 +23,7 @@ pub fn cmd_get(path: &str, output: Option<&str>, decrypt: bool) -> std::io::Resu
     let mut metadata = read_metadata_headers(&headers)?;
 
     let modifier_identity = resolve_identity(&metadata.modified_by)?;
-    verify_metadata(&modifier_identity.public_key, &metadata, &body)?;
+    verify_metadata(&modifier_identity.public_key, &metadata, Some(&body))?;
 
     let final_body = if decrypt {
         let member = match get_member(&metadata.members, &identity.address) {
@@ -178,7 +178,7 @@ mod tests {
                 algorithm: wrap_alg,
                 value: wrapped,
             });
-            sign_metadata(&secret_key, &mut m, &ct).unwrap();
+            sign_metadata(&secret_key, &mut m, Some(&ct)).unwrap();
             write_metadata_attributes(&server_file, &m).unwrap();
 
             let out = temp_dir.join("out.bin");

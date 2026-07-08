@@ -207,7 +207,9 @@ The `ark` account is a special account created when the server is first started.
 
 ## 3 Files & Directories
 
-Ark is - at it's core - a file server. All files and directories managed by Ark are given additional metadata. This metadata is not encrypted but is signed by the last modifier of the file or directory to prevent tampering. File content is encrypted by default but can be unencrypted by omitting the `encryption_algorithm` field [move alg into wrapped key?]. The [TODO] algorithm must be supported for encryption by all clients. Since the file metadata declares the encryption algorithm, any algorithm can be used, however clients may not support other algorithms (and will therefore be unable to decrypt the file).
+Ark is - at it's core - a file server. Files managed by Ark are given additional metadata. Directories may optionally be given metadata (see 3.6 Directories). This metadata is not encrypted but is signed by the last modifier of the file or directory to prevent tampering. File content is encrypted by default but can be unencrypted by omitting the `encryption_algorithm` field. The [TODO] algorithm must be supported for encryption by all clients. Since the file metadata declares the encryption algorithm, any algorithm can be used, however clients may not support other algorithms (and will therefore be unable to decrypt the file).
+
+Directory metadata never includes `encryption_algorithm` as directories have no body to encrypt. Directory metadata also omits `body_hash` entirely; the signature covers the metadata without it.
 
 ### 3.1 ID
 
@@ -244,6 +246,8 @@ Public members are denoted by the wildcard address (`*`) and require identity ve
 | `owner` | Yes | Yes | Yes |
 | `write` | Yes | Yes | No |
 | `read` | Yes | No | No |
+
+To determine directory membership, the ancestors of the directory will be traversed until a directory with metadata is found. Creating a new file is considered a `write` operation for the containing directory.
 
 **Adding or removing a member:**
 
@@ -556,7 +560,9 @@ The server verifies the proof against the file's credential members before servi
 | `HEAD` | `/ark/alice/path/to/file` | Fetch `X-Ark-Metadata` only |
 | `PUT` | `/ark/alice/path/to/file` | Create or update a file |
 | `DELETE` | `/ark/alice/path/to/file` | Delete a file |
-| `GET` | `/ark/alice/path/to/dir` | List directory contents |
+| `GET` | `/ark/alice/path/to/dir/` | List directory contents; also returns directory `X-Ark-Metadata` if present |
+| `PUT` | `/ark/alice/path/to/dir/` | Create or update directory metadata (empty body, trailing slash required for a directory that does not yet exist) |
+| `DELETE` | `/ark/alice/path/to/dir/` | Delete a directory recursively |
 
 **GET response:**
 
@@ -1218,8 +1224,11 @@ Most endpoints are standard file resource requests:
 
 | Endpoint | Body | Response | Purpose |
 |---|---|---|---|
-| `GET    /ark/<user>/<dir_path>` | - | `DirectoryEntry[]` | List directory entries |
-| `HEAD   /ark/<user>/<file_path>` | - | - | Fetch metadata (`X-Ark-Metadata`) |
+| `GET    /ark/<user>/<dir_path>/` | - | `DirectoryEntry[]` | List directory entries |
+| `HEAD   /ark/<user>/<dir_path>/` | - | - | Fetch metadata (`X-Ark-Meta-*`) |
+| `PUT    /ark/<user>/<dir_path>/` | - | - | Create or update directory metadata |
+| `DELETE /ark/<user>/<dir_path>/` | - | - | Delete directory recursively |
+| `HEAD   /ark/<user>/<file_path>` | - | - | Fetch metadata (`X-Ark-Meta-*`) |
 | `GET    /ark/<user>/<file_path>` | - | `File` | Fetch file |
 | `PUT    /ark/<user>/<file_path>` | `File` | - | Create or update file |
 | `DELETE /ark/<user>/<file_path>` | - | - | Delete file |

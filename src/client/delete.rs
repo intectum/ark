@@ -25,16 +25,16 @@ mod tests {
     use super::*;
     use crate::client::create_account;
     use crate::server::start_test_server;
-    use crate::util::test::in_test_dir;
+    use crate::util::test::{in_test_dir, write_plain_test_file};
 
     #[test]
     fn cmd_delete_removes_file() {
         in_test_dir("ark_delete_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
-            create_account(temp_dir, &address).unwrap();
+            let (identity, secret_key) = create_account(temp_dir, &address).unwrap();
             let f = temp_dir.join("ark/gyan/x.txt");
-            fs::write(&f, b"bye").unwrap();
+            write_plain_test_file(&f, &identity, &secret_key, b"bye");
 
             env::set_current_dir(temp_dir.join("ark/gyan")).unwrap();
             cmd_delete("x.txt").unwrap();
@@ -78,9 +78,9 @@ mod tests {
         in_test_dir("ark_delete_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
-            create_account(temp_dir, &address).unwrap();
+            let (identity, secret_key) = create_account(temp_dir, &address).unwrap();
             let f = temp_dir.join("ark/gyan/explicit.txt");
-            fs::write(&f, b"gone").unwrap();
+            write_plain_test_file(&f, &identity, &secret_key, b"gone");
 
             env::set_current_dir(temp_dir.join("ark/gyan")).unwrap();
             let arg = format!("gyan@127.0.0.1:{}/explicit.txt", port);

@@ -151,7 +151,7 @@ pub mod test {
 
     pub fn create_plain_test_metadata(owner: &Identity, owner_key: &Key, body: &[u8]) -> Metadata {
         let mut metadata = create_metadata(&owner.address, None);
-        sign_metadata(owner_key, &mut metadata, body).unwrap();
+        sign_metadata(owner_key, &mut metadata, Some(body)).unwrap();
 
         metadata
     }
@@ -167,7 +167,7 @@ pub mod test {
         let file_key = create_key(DEFAULT_ENCRYPTION_ALGORITHM).unwrap();
         let (_, ciphertext) = encrypt_bytes(&file_key, plaintext).unwrap();
         apply_key_to_metadata(&mut metadata, &file_key).unwrap();
-        sign_metadata(owner_key, &mut metadata, &ciphertext).unwrap();
+        sign_metadata(owner_key, &mut metadata, Some(&ciphertext)).unwrap();
         (metadata, ciphertext)
     }
 

@@ -45,10 +45,7 @@ pub fn create_metadata(owner_address: &str, encryption_algorithm: Option<&str>) 
             permission: Permission::Owner,
             key: None
         }],
-        body_hash: Hash {
-            algorithm: String::new(),
-            value: Vec::new()
-        },
+        body_hash: None,
         signature: Signature {
             algorithm: String::new(),
             value: Vec::new()
@@ -95,8 +92,10 @@ pub fn write_metadata_attributes(path: &Path, metadata: &Metadata) -> io::Result
     if let Some(alg) = &metadata.encryption_algorithm {
         xattr::set(path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_ENCRYPTION_ALGORITHM), alg.as_bytes())?;
     }
-    xattr::set(path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_BODY_HASH_ALGORITHM), metadata.body_hash.algorithm.as_bytes())?;
-    xattr::set(path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_BODY_HASH_VALUE), encode_base64url(&metadata.body_hash.value).as_bytes())?;
+    if let Some(body_hash) = &metadata.body_hash {
+        xattr::set(path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_BODY_HASH_ALGORITHM), body_hash.algorithm.as_bytes())?;
+        xattr::set(path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_BODY_HASH_VALUE), encode_base64url(&body_hash.value).as_bytes())?;
+    }
     xattr::set(path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_SIGNATURE_ALGORITHM), metadata.signature.algorithm.as_bytes())?;
     xattr::set(path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_SIGNATURE_VALUE), encode_base64url(&metadata.signature.value).as_bytes())?;
 
@@ -142,8 +141,10 @@ pub fn write_metadata_headers(metadata: &Metadata) -> Vec<(String, String)> {
     if let Some(alg) = &metadata.encryption_algorithm {
         out.push((format!("{}Encryption-Algorithm", HEADER_PREFIX), alg.clone()));
     }
-    out.push((format!("{}Body-Hash-Algorithm", HEADER_PREFIX), metadata.body_hash.algorithm.clone()));
-    out.push((format!("{}Body-Hash-Value", HEADER_PREFIX), encode_base64url(&metadata.body_hash.value)));
+    if let Some(body_hash) = &metadata.body_hash {
+        out.push((format!("{}Body-Hash-Algorithm", HEADER_PREFIX), body_hash.algorithm.clone()));
+        out.push((format!("{}Body-Hash-Value", HEADER_PREFIX), encode_base64url(&body_hash.value)));
+    }
     out.push((format!("{}Signature-Algorithm", HEADER_PREFIX), metadata.signature.algorithm.clone()));
     out.push((format!("{}Signature-Value", HEADER_PREFIX), encode_base64url(&metadata.signature.value)));
 
@@ -191,11 +192,11 @@ pub fn apply_key_to_metadata(
     Ok(())
 }
 
-pub fn sign_metadata(secret_key: &Key, metadata: &mut Metadata, body: &[u8]) -> io::Result<()> {
-    metadata.body_hash = Hash {
+pub fn sign_metadata(secret_key: &Key, metadata: &mut Metadata, body: Option<&[u8]>) -> io::Result<()> {
+    metadata.body_hash = body.map(|b| Hash {
         algorithm: DEFAULT_HASH_ALGORITHM.to_string(),
-        value: sha256(body),
-    };
+        value: sha256(b),
+    });
 
     let json = serde_json::to_value(metadata_for_signing(metadata)).expect("serialize metadata");
     metadata.signature = sign_json(secret_key, &json)?;
@@ -209,11 +210,18 @@ pub fn verify_metadata_signature(public_key: &Key, metadata: &Metadata) -> io::R
         .map_err(|_| io_err("metadata signature verification failed"))
 }
 
-pub fn verify_metadata(public_key: &Key, metadata: &Metadata, body: &[u8]) -> io::Result<()> {
+pub fn verify_metadata(public_key: &Key, metadata: &Metadata, body: Option<&[u8]>) -> io::Result<()> {
     verify_metadata_signature(public_key, metadata)?;
 
-    if metadata.body_hash.value != sha256(body) {
-        return Err(io_err("body hash mismatch"));
+    match (body, &metadata.body_hash) {
+        (Some(b), Some(hash)) => {
+            if hash.value != sha256(b) {
+                return Err(io_err("body hash mismatch"));
+            }
+        }
+        (Some(_), None) => return Err(io_err("file metadata must contain body_hash")),
+        (None, Some(_)) => return Err(io_err("dir metadata must not contain body_hash")),
+        (None, None) => {}
     }
 
     Ok(())
@@ -266,9 +274,9 @@ fn metadata_from_partial(partial: PartialMetadata) -> io::Result<Metadata> {
                 _ => None,
             },
         }).collect(),
-        body_hash: Hash {
-            algorithm: partial.body_hash_algorithm.unwrap(),
-            value: partial.body_hash_value.unwrap(),
+        body_hash: match (partial.body_hash_algorithm, partial.body_hash_value) {
+            (Some(algorithm), Some(value)) => Some(Hash { algorithm, value }),
+            _ => None,
         },
         signature: Signature {
             algorithm: partial.signature_algorithm.unwrap(),
@@ -332,8 +340,6 @@ fn validate_partial_metadata(metadata: &PartialMetadata) -> io::Result<()> {
     if metadata.created.is_none() { return Err(io_err("missing created field")); }
     if metadata.modified.is_none() { return Err(io_err("missing modified field")); }
     if metadata.modified_by.is_none() { return Err(io_err("missing modified_by field")); }
-    if metadata.body_hash_algorithm.is_none() { return Err(io_err("missing body_hash_algorithm field")); }
-    if metadata.body_hash_value.is_none() { return Err(io_err("missing body_hash_value field")); }
     if metadata.signature_algorithm.is_none() { return Err(io_err("missing signature_algorithm field")); }
     if metadata.signature_value.is_none() { return Err(io_err("missing signature field")); }
 
@@ -386,7 +392,9 @@ mod tests {
 
     #[test]
     fn write_headers_emits_all_fields() {
-        let m = create_metadata(TEST_ADDRESS, Some("aes-256-gcm"));
+        let (owner, owner_key) = create_identity(TEST_ADDRESS).unwrap();
+        let mut m = create_metadata(&owner.address, Some("aes-256-gcm"));
+        sign_metadata(&owner_key, &mut m, Some(b"body")).unwrap();
         let headers = write_metadata_headers(&m);
         assert!(headers.iter().any(|(k, _)| k == "X-Ark-Meta-Id"));
         assert!(headers.iter().any(|(k, _)| k == "X-Ark-Meta-Created"));
@@ -402,11 +410,13 @@ mod tests {
 
     #[test]
     fn header_round_trip_preserves_all_fields() {
-        let mut m = create_metadata(TEST_ADDRESS, Some("aes-256-gcm"));
+        let (owner, owner_key) = create_identity(TEST_ADDRESS).unwrap();
+        let mut m = create_metadata(&owner.address, Some("aes-256-gcm"));
         m.members[0].key = Some(Key {
             algorithm: "hpke-x25519-hkdf-sha256-aes256gcm".to_string(),
             value: vec![0u8; 32],
         });
+        sign_metadata(&owner_key, &mut m, Some(b"body")).unwrap();
         let headers = write_metadata_headers(&m);
         let back = read_metadata_headers(&headers).unwrap();
         assert_eq!(back.id, m.id);
@@ -415,8 +425,9 @@ mod tests {
         assert_eq!(back.modified_by, m.modified_by);
         assert_eq!(back.encryption_algorithm, m.encryption_algorithm);
         assert_eq!(back.members[0].address, m.members[0].address);
-        assert_eq!(back.body_hash.algorithm, m.body_hash.algorithm);
-        assert_eq!(back.body_hash.value, m.body_hash.value);
+        let (back_hash, m_hash) = (back.body_hash.as_ref().unwrap(), m.body_hash.as_ref().unwrap());
+        assert_eq!(back_hash.algorithm, m_hash.algorithm);
+        assert_eq!(back_hash.value, m_hash.value);
         assert_eq!(back.signature.value, m.signature.value);
     }
 
@@ -468,14 +479,14 @@ mod tests {
         let (owner, owner_key) = create_identity(TEST_ADDRESS).unwrap();
         let body = b"signed payload";
         let m = create_plain_test_metadata(&owner, &owner_key, body);
-        verify_metadata(&owner.public_key, &m, body).unwrap();
+        verify_metadata(&owner.public_key, &m, Some(body)).unwrap();
     }
 
     #[test]
     fn verify_metadata_detects_body_tampering() {
         let (owner, owner_key) = create_identity(TEST_ADDRESS).unwrap();
         let m = create_plain_test_metadata(&owner, &owner_key, b"original");
-        let err = verify_metadata(&owner.public_key, &m, b"tampered").unwrap_err();
+        let err = verify_metadata(&owner.public_key, &m, Some(b"tampered")).unwrap_err();
         assert!(err.to_string().contains("body hash mismatch"));
     }
 
@@ -485,7 +496,7 @@ mod tests {
         let body = b"body";
         let mut m = create_plain_test_metadata(&owner, &owner_key, body);
         m.modified_by = "attacker@evil".to_string();
-        let err = verify_metadata(&owner.public_key, &m, body).unwrap_err();
+        let err = verify_metadata(&owner.public_key, &m, Some(body)).unwrap_err();
         assert!(err.to_string().contains("signature verification failed"));
     }
 
@@ -495,9 +506,9 @@ mod tests {
         let body = b"x";
         let mut m = create_plain_test_metadata(&owner, &owner_key, body);
         m.encrypted = Some(true);
-        verify_metadata(&owner.public_key, &m, body).unwrap();
+        verify_metadata(&owner.public_key, &m, Some(body)).unwrap();
         m.encrypted = Some(false);
-        verify_metadata(&owner.public_key, &m, body).unwrap();
+        verify_metadata(&owner.public_key, &m, Some(body)).unwrap();
     }
 
     #[test]
@@ -565,7 +576,7 @@ mod tests {
             let (owner, owner_key) = create_identity(TEST_ADDRESS).unwrap();
             let mut two = create_plain_test_metadata(&owner, &owner_key, b"x");
             two.members.push(Member { address: "b@y".to_string(), permission: Permission::Owner, key: None });
-            sign_metadata(&owner_key, &mut two, b"x").unwrap();
+            sign_metadata(&owner_key, &mut two, Some(b"x")).unwrap();
             write_metadata_attributes(&p, &two).unwrap();
             assert!(xattr::get(&p, "user.ark.member_1_address").unwrap().is_some());
 

@@ -7,7 +7,7 @@ use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, decrypt_bytes};
 use crate::identity::{read_identity, read_identity_key};
 use crate::metadata::{apply_key_to_metadata, create_metadata, get_member, read_metadata_attributes, validate_metadata, write_metadata_attributes};
 use crate::types::Key;
-use crate::util::{decode_base64url, find_root, io_err};
+use crate::util::{decode_base64url, find_root, io_err, io_invalid_input};
 
 pub struct DecryptArgs {
     pub input: Option<String>,
@@ -27,6 +27,11 @@ pub fn cmd_decrypt(args: DecryptArgs) -> std::io::Result<()> {
 
     let source_path: Option<&str> = args.in_place.as_deref().or(args.input.as_deref());
     let dest_path: Option<&str> = args.in_place.as_deref().or(args.output.as_deref());
+    if let Some(p) = source_path {
+        if !fs::exists(Path::new(p))? {
+            return Err(io_invalid_input("input does not exist"));
+        }
+    }
 
     let source_has_metadata = match source_path {
         Some(p) => xattr::get(Path::new(p), "user.ark.id")?.is_some(),
@@ -177,7 +182,7 @@ mod tests {
             let (wrap_alg, wrong_wrap) = encrypt_bytes(&identity.public_key, &[99u8; 32]).unwrap();
             wrong_meta.members[0].key = Some(Key { algorithm: wrap_alg, value: wrong_wrap });
             wrong_meta.encrypted = Some(true);
-            sign_metadata(&secret_key, &mut wrong_meta, &ct).unwrap();
+            sign_metadata(&secret_key, &mut wrong_meta, Some(&ct)).unwrap();
             write_metadata_attributes(&p, &wrong_meta).unwrap();
             let out = temp_dir.join("out.bin");
             env::set_current_dir(&acc).unwrap();
@@ -278,7 +283,7 @@ mod tests {
             let (wrap_alg, wrapped) = encrypt_bytes(&identity.public_key, &[0u8; 32]).unwrap();
             m.members[0].key = Some(Key { algorithm: wrap_alg, value: wrapped });
             m.encrypted = Some(true);
-            sign_metadata(&secret_key, &mut m, &body).unwrap();
+            sign_metadata(&secret_key, &mut m, Some(&body)).unwrap();
             write_metadata_attributes(&p, &m).unwrap();
             env::set_current_dir(&acc).unwrap();
             let err = cmd_decrypt(DecryptArgs {
@@ -302,6 +307,36 @@ mod tests {
                 input: Some(p.to_string_lossy().into_owned()),
                 ..args()
             }).unwrap();
+        });
+    }
+
+    #[test]
+    fn decrypt_missing_input_errors() {
+        in_test_dir("ark_decrypt_test", |temp_dir| {
+            let (_identity, _secret_key, acc) = create_test_account(temp_dir, TEST_ADDRESS);
+            env::set_current_dir(&acc).unwrap();
+            let missing = temp_dir.join("nope.bin");
+            let err = cmd_decrypt(DecryptArgs {
+                input: Some(missing.to_string_lossy().into_owned()),
+                ..args()
+            }).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(format!("{}", err).contains("input does not exist"));
+        });
+    }
+
+    #[test]
+    fn decrypt_missing_in_place_errors() {
+        in_test_dir("ark_decrypt_test", |temp_dir| {
+            let (_identity, _secret_key, acc) = create_test_account(temp_dir, TEST_ADDRESS);
+            env::set_current_dir(&acc).unwrap();
+            let missing = temp_dir.join("nope.bin");
+            let err = cmd_decrypt(DecryptArgs {
+                in_place: Some(missing.to_string_lossy().into_owned()),
+                ..args()
+            }).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(format!("{}", err).contains("input does not exist"));
         });
     }
 

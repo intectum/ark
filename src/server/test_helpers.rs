@@ -90,10 +90,42 @@ pub fn seed_shared_file(
     for member in extra_members {
         m.members.push(member);
     }
-    sign_metadata(owner_secret_key, &mut m, body).unwrap();
+    sign_metadata(owner_secret_key, &mut m, Some(body)).unwrap();
     fs::write(&file, body).unwrap();
     write_metadata_attributes(&file, &m).unwrap();
     file
+}
+
+pub fn seed_shared_dir(
+    td: &Path,
+    owner: &Identity,
+    owner_secret_key: &Key,
+    rel_path: &str,
+    extra_members: Vec<Member>,
+) -> PathBuf {
+    let dir = td.join(rel_path);
+    fs::create_dir_all(&dir).unwrap();
+    let mut m = create_plain_test_metadata(owner, owner_secret_key, b"");
+    m.encryption_algorithm = None;
+    m.members[0].key = None;
+    for member in extra_members {
+        m.members.push(member);
+    }
+    sign_metadata(owner_secret_key, &mut m, None).unwrap();
+    write_metadata_attributes(&dir, &m).unwrap();
+    dir
+}
+
+pub fn signed_put_dir_metadata(
+    port: u16,
+    signer: &Identity,
+    signer_key: &Key,
+    path: &str,
+    metadata: &Metadata,
+) -> u16 {
+    let headers = write_metadata_headers(metadata);
+    let extra: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    signed_request_with_headers(port, signer, signer_key, "PUT", path, b"", &extra).0
 }
 
 pub fn signed_put_metadata(

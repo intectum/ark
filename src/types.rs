@@ -55,7 +55,8 @@ pub struct Metadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption_algorithm: Option<String>,
     pub members: Vec<Member>,
-    pub body_hash: Hash,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_hash: Option<Hash>,
     pub signature: Signature,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]

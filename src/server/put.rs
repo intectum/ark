@@ -9,18 +9,28 @@ use crate::types::{Member, Permission};
 
 use super::write_status;
 
-pub fn serve_put(fs_path: &Path, stream: &mut TcpStream, body: &[u8], headers: &[(String, String)], existing_members: Option<Vec<Member>>, permission: Permission) -> std::io::Result<()> {
+pub fn serve_put(fs_path: &Path, stream: &mut TcpStream, body: &[u8], headers: &[(String, String)], existing_members: Option<Vec<Member>>, permission: Permission, target_is_dir: bool) -> std::io::Result<()> {
     let metadata = match read_metadata_headers(headers) {
         Ok(m) => m,
         Err(e) => return write_status(stream, 400, "Bad Request", e.to_string().as_bytes()),
     };
+
+    if target_is_dir {
+        if !body.is_empty() {
+            return write_status(stream, 400, "Bad Request", b"dir put must have empty body");
+        }
+        if metadata.encryption_algorithm.is_some() {
+            return write_status(stream, 400, "Bad Request", b"dir metadata must not set encryption_algorithm");
+        }
+    }
 
     let modifier_identity = match resolve_identity(&metadata.modified_by) {
         Ok(i) => i,
         Err(e) => return write_status(stream, 403, "Forbidden", e.to_string().as_bytes()),
     };
 
-    if let Err(e) = verify_metadata(&modifier_identity.public_key, &metadata, body) {
+    let verify_body = if target_is_dir { None } else { Some(body) };
+    if let Err(e) = verify_metadata(&modifier_identity.public_key, &metadata, verify_body) {
         return write_status(stream, 403, "Forbidden", e.to_string().as_bytes());
     }
 
@@ -30,14 +40,18 @@ pub fn serve_put(fs_path: &Path, stream: &mut TcpStream, body: &[u8], headers: &
         }
     }
 
-    if let Some(parent) = fs_path.parent() { fs::create_dir_all(parent)?; }
-
     let (status_code, status_msg) = if fs_path.exists() { (204, "No Content") } else { (201, "Created") };
 
-    let mut file = fs::File::create(fs_path)?;
-    write_metadata_attributes(fs_path, &metadata)?;
-    file.write_all(body)?;
-    drop(file);
+    if target_is_dir {
+        fs::create_dir_all(fs_path)?;
+        write_metadata_attributes(fs_path, &metadata)?;
+    } else {
+        if let Some(parent) = fs_path.parent() { fs::create_dir_all(parent)?; }
+        let mut file = fs::File::create(fs_path)?;
+        write_metadata_attributes(fs_path, &metadata)?;
+        file.write_all(body)?;
+        drop(file);
+    }
 
     write_status(stream, status_code, status_msg, &[])
 }
@@ -229,7 +243,7 @@ mod tests {
                 Member { address: owner_identity.address.clone(), permission: Permission::Owner, key: None },
                 Member { address: writer_identity.address.clone(), permission: Permission::Write, key: None },
             ];
-            sign_metadata(&writer_key, &mut new_meta, b"v2").unwrap();
+            sign_metadata(&writer_key, &mut new_meta, Some(b"v2")).unwrap();
 
             let code = signed_put_metadata(port, &writer_identity, &writer_key, "/ark/owner/file.txt", b"v2", &new_meta);
             assert_eq!(code, 204);
@@ -255,7 +269,7 @@ mod tests {
                 Member { address: owner_identity.address.clone(), permission: Permission::Owner, key: None },
                 Member { address: reader_identity.address.clone(), permission: Permission::Read, key: None },
             ];
-            sign_metadata(&reader_key, &mut new_meta, b"v2").unwrap();
+            sign_metadata(&reader_key, &mut new_meta, Some(b"v2")).unwrap();
 
             let code = signed_put_metadata(port, &reader_identity, &reader_key, "/ark/owner/file.txt", b"v2", &new_meta);
             assert_eq!(code, 403);
@@ -278,7 +292,7 @@ mod tests {
             new_meta.members = vec![
                 Member { address: owner_identity.address.clone(), permission: Permission::Owner, key: None },
             ];
-            sign_metadata(&stranger_key, &mut new_meta, b"v2").unwrap();
+            sign_metadata(&stranger_key, &mut new_meta, Some(b"v2")).unwrap();
 
             let code = signed_put_metadata(port, &stranger_identity, &stranger_key, "/ark/owner/file.txt", b"v2", &new_meta);
             assert_eq!(code, 403);
@@ -306,7 +320,7 @@ mod tests {
                 Member { address: writer_identity.address.clone(), permission: Permission::Write, key: None },
                 Member { address: outsider_identity.address.clone(), permission: Permission::Read, key: None },
             ];
-            sign_metadata(&writer_key, &mut new_meta, b"v2").unwrap();
+            sign_metadata(&writer_key, &mut new_meta, Some(b"v2")).unwrap();
 
             let code = signed_put_metadata(port, &writer_identity, &writer_key, "/ark/owner/file.txt", b"v2", &new_meta);
             assert_eq!(code, 403);
@@ -334,11 +348,142 @@ mod tests {
                 Member { address: co_owner_identity.address.clone(), permission: Permission::Owner, key: None },
                 Member { address: newbie_identity.address.clone(), permission: Permission::Read, key: None },
             ];
-            sign_metadata(&co_owner_key, &mut new_meta, b"v2").unwrap();
+            sign_metadata(&co_owner_key, &mut new_meta, Some(b"v2")).unwrap();
 
             let code = signed_put_metadata(port, &co_owner_identity, &co_owner_key, "/ark/owner/file.txt", b"v2", &new_meta);
             assert_eq!(code, 204);
             assert_eq!(fs::read(temp_dir.join("ark/owner/file.txt")).unwrap(), b"v2");
+        });
+    }
+
+    #[test]
+    fn put_dir_writes_metadata_xattr() {
+        in_test_dir("ark_server_test", |temp_dir| {
+            let (identity, secret_key, _) = create_test_account(temp_dir, TEST_ADDRESS);
+            let port = start_test_server(temp_dir.to_path_buf());
+            let mut meta = create_plain_test_metadata(&identity, &secret_key, b"");
+            meta.encryption_algorithm = None;
+            meta.members[0].key = None;
+            sign_metadata(&secret_key, &mut meta, None).unwrap();
+            let code = signed_put_dir_metadata(port, &identity, &secret_key, "/ark/test/notes/", &meta);
+            assert_eq!(code, 201);
+            let dir = temp_dir.join("ark/test/notes");
+            assert!(dir.is_dir());
+            let back = crate::metadata::read_metadata_attributes(&dir).unwrap();
+            assert_eq!(back.id, meta.id);
+        });
+    }
+
+    #[test]
+    fn put_dir_with_body_returns_400() {
+        in_test_dir("ark_server_test", |temp_dir| {
+            let (identity, secret_key, _) = create_test_account(temp_dir, TEST_ADDRESS);
+            let port = start_test_server(temp_dir.to_path_buf());
+            let mut meta = create_plain_test_metadata(&identity, &secret_key, b"nonempty");
+            meta.encryption_algorithm = None;
+            meta.members[0].key = None;
+            sign_metadata(&secret_key, &mut meta, Some(b"nonempty")).unwrap();
+            let headers = write_metadata_headers(&meta);
+            let extra: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            let (code, _, _) = signed_request_with_headers(port, &identity, &secret_key, "PUT", "/ark/test/notes/", b"nonempty", &extra);
+            assert_eq!(code, 400);
+            assert!(!temp_dir.join("ark/test/notes").exists());
+        });
+    }
+
+    #[test]
+    fn put_file_by_dir_write_member_succeeds() {
+        in_test_dir("ark_server_test", |temp_dir| {
+            let (owner_identity, owner_key, _) = create_test_account(temp_dir, "owner@example.com");
+            let (writer_identity, writer_key, _) = create_test_account(temp_dir, "writer@example.com");
+
+            seed_shared_dir(temp_dir, &owner_identity, &owner_key, "ark/owner/shared", vec![
+                Member { address: writer_identity.address.clone(), permission: Permission::Write, key: None },
+            ]);
+
+            let port = start_test_server(temp_dir.to_path_buf());
+            let (code, _, _) = signed_put_with_default_metadata(port, &writer_identity, &writer_key, "/ark/owner/shared/new.txt", b"hi");
+            assert_eq!(code, 201);
+            assert!(temp_dir.join("ark/owner/shared/new.txt").exists());
+        });
+    }
+
+    #[test]
+    fn put_file_by_dir_read_member_forbidden() {
+        in_test_dir("ark_server_test", |temp_dir| {
+            let (owner_identity, owner_key, _) = create_test_account(temp_dir, "owner@example.com");
+            let (reader_identity, reader_key, _) = create_test_account(temp_dir, "reader@example.com");
+
+            seed_shared_dir(temp_dir, &owner_identity, &owner_key, "ark/owner/shared", vec![
+                Member { address: reader_identity.address.clone(), permission: Permission::Read, key: None },
+            ]);
+
+            let port = start_test_server(temp_dir.to_path_buf());
+            let (code, _, _) = signed_put_with_default_metadata(port, &reader_identity, &reader_key, "/ark/owner/shared/new.txt", b"hi");
+            assert_eq!(code, 403);
+            assert!(!temp_dir.join("ark/owner/shared/new.txt").exists());
+        });
+    }
+
+    #[test]
+    fn put_file_in_bare_dir_by_non_owner_forbidden() {
+        in_test_dir("ark_server_test", |temp_dir| {
+            let (owner_identity, owner_key, _) = create_test_account(temp_dir, "owner@example.com");
+            let (stranger_identity, stranger_key, _) = create_test_account(temp_dir, "stranger@example.com");
+
+            let bare_dir = temp_dir.join("ark/owner/bare");
+            fs::create_dir_all(&bare_dir).unwrap();
+
+            let port = start_test_server(temp_dir.to_path_buf());
+            let (code, _, _) = signed_put_with_default_metadata(port, &stranger_identity, &stranger_key, "/ark/owner/bare/x.txt", b"hi");
+            assert_eq!(code, 403);
+            assert!(!bare_dir.join("x.txt").exists());
+
+            let (code2, _, _) = signed_put_with_default_metadata(port, &owner_identity, &owner_key, "/ark/owner/bare/x.txt", b"hi");
+            assert_eq!(code2, 201);
+        });
+    }
+
+    #[test]
+    fn put_dir_member_change_by_non_owner_forbidden() {
+        in_test_dir("ark_server_test", |temp_dir| {
+            let (owner_identity, owner_key, _) = create_test_account(temp_dir, "owner@example.com");
+            let (writer_identity, writer_key, _) = create_test_account(temp_dir, "writer@example.com");
+            let (outsider_identity, _, _) = create_test_account(temp_dir, "outsider@example.com");
+
+            seed_shared_dir(temp_dir, &owner_identity, &owner_key, "ark/owner/shared", vec![
+                Member { address: writer_identity.address.clone(), permission: Permission::Write, key: None },
+            ]);
+
+            let port = start_test_server(temp_dir.to_path_buf());
+            let mut new_meta = create_plain_test_metadata(&writer_identity, &writer_key, b"");
+            new_meta.encryption_algorithm = None;
+            new_meta.members = vec![
+                Member { address: owner_identity.address.clone(), permission: Permission::Owner, key: None },
+                Member { address: writer_identity.address.clone(), permission: Permission::Write, key: None },
+                Member { address: outsider_identity.address.clone(), permission: Permission::Read, key: None },
+            ];
+            sign_metadata(&writer_key, &mut new_meta, None).unwrap();
+            let code = signed_put_dir_metadata(port, &writer_identity, &writer_key, "/ark/owner/shared/", &new_meta);
+            assert_eq!(code, 403);
+        });
+    }
+
+    #[test]
+    fn put_file_in_ancestor_dir_walks_up_for_authz() {
+        in_test_dir("ark_server_test", |temp_dir| {
+            let (owner_identity, owner_key, _) = create_test_account(temp_dir, "owner@example.com");
+            let (writer_identity, writer_key, _) = create_test_account(temp_dir, "writer@example.com");
+
+            seed_shared_dir(temp_dir, &owner_identity, &owner_key, "ark/owner/shared", vec![
+                Member { address: writer_identity.address.clone(), permission: Permission::Write, key: None },
+            ]);
+            fs::create_dir_all(temp_dir.join("ark/owner/shared/sub")).unwrap();
+
+            let port = start_test_server(temp_dir.to_path_buf());
+            let (code, _, _) = signed_put_with_default_metadata(port, &writer_identity, &writer_key, "/ark/owner/shared/sub/x.txt", b"hi");
+            assert_eq!(code, 201);
+            assert!(temp_dir.join("ark/owner/shared/sub/x.txt").exists());
         });
     }
 
