@@ -1,28 +1,15 @@
-mod chmod;
-mod create_account;
+mod client;
 mod crypto;
-mod decrypt;
-mod delete;
-mod get;
-mod head;
 mod http;
 mod identity;
 mod metadata;
-mod put;
-mod request;
 mod server;
 mod types;
 mod util;
 
 use clap::{Parser, Subcommand};
 
-use crate::chmod::cmd_chmod;
-use crate::create_account::cmd_create_account;
-use crate::decrypt::{DecryptArgs, cmd_decrypt};
-use crate::delete::cmd_delete;
-use crate::get::cmd_get;
-use crate::head::cmd_head;
-use crate::put::cmd_put;
+use crate::client::{DecryptArgs, cmd_chmod, cmd_create_account, cmd_decrypt, cmd_delete, cmd_get, cmd_head, cmd_put};
 use crate::server::cmd_server;
 
 #[derive(Parser)]

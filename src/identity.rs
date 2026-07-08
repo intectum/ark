@@ -7,7 +7,7 @@ use getrandom::getrandom;
 use url::Url;
 
 use crate::crypto::{DEFAULT_SIGNING_ALGORITHM, create_key, sign_json, to_public_key, verify_json};
-use crate::get::cmd_get;
+use crate::client::cmd_get;
 use crate::types::{Identity, Key, Signature};
 use crate::util::{decode_base64url, encode_base64url, io_err, io_invalid_input, now_iso};
 
@@ -181,7 +181,7 @@ fn is_valid_account_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::create_account::create_account;
+    use crate::client::create_account;
     use crate::server::start_test_server;
     use crate::util::test::in_test_dir;
 

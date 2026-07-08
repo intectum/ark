@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, create_key, encrypt_bytes};
 use crate::identity::{read_identity, read_identity_key};
 use crate::metadata::{apply_key_to_metadata, create_metadata, get_member, read_metadata_attributes, sign_metadata, write_metadata_attributes, write_metadata_headers};
-use crate::request::ark_request;
+use crate::client::ark_request;
 use crate::types::Key;
 use crate::util::{find_root, io_err, now_iso, resolve_url};
 
@@ -93,7 +93,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::create_account::create_account;
+    use crate::client::create_account;
     use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, decrypt_bytes};
     use crate::identity::read_identity_key;
     use crate::server::start_test_server;

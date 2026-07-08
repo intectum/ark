@@ -114,7 +114,7 @@ pub mod test {
     use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crate::create_account::create_account;
+    use crate::client::create_account;
     use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, create_key, encrypt_bytes};
     use crate::metadata::{apply_key_to_metadata, create_metadata, sign_metadata, write_metadata_attributes};
     use crate::types::{Identity, Key, Metadata};

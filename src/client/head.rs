@@ -3,7 +3,7 @@ use std::io::Write;
 
 use crate::identity::{read_identity, resolve_identity};
 use crate::metadata::{read_metadata_headers, verify_metadata_signature};
-use crate::request::ark_request;
+use crate::client::ark_request;
 use crate::util::{find_root, io_err, resolve_url};
 
 pub fn cmd_head(path: &str) -> std::io::Result<()> {
@@ -34,7 +34,7 @@ mod tests {
     use std::env;
 
     use super::*;
-    use crate::create_account::create_account;
+    use crate::client::create_account;
     use crate::metadata::read_metadata_attributes;
     use crate::server::start_test_server;
     use crate::util::encode_base64url;

@@ -1,7 +1,7 @@
 use std::env::current_dir;
 
 use crate::identity::read_identity;
-use crate::request::ark_request;
+use crate::client::ark_request;
 use crate::util::{find_root, io_err, resolve_url};
 
 pub fn cmd_delete(arg: &str) -> std::io::Result<()> {
@@ -23,7 +23,7 @@ mod tests {
     use std::fs;
 
     use super::*;
-    use crate::create_account::create_account;
+    use crate::client::create_account;
     use crate::server::start_test_server;
     use crate::util::test::in_test_dir;
 
