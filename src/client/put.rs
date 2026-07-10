@@ -117,11 +117,10 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::client::create_account;
     use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, decrypt_bytes};
     use crate::identity::read_identity_key;
     use crate::server::start_test_server;
-    use crate::util::test::{in_test_dir, write_plain_test_file};
+    use crate::util::test::{in_test_dir, init_with_server, write_plain_test_file};
 
     fn aes_decrypt(key: &[u8], ciphertext: &[u8]) -> std::io::Result<Vec<u8>> {
         decrypt_bytes(&Key { algorithm: DEFAULT_ENCRYPTION_ALGORITHM.to_string(), value: key.to_vec() }, ciphertext)
@@ -130,7 +129,9 @@ mod tests {
     fn put_via_cmd(temp_dir: &Path, arg: &str, plaintext: &[u8], cwd_subpath: &str) -> PathBuf {
         let input = temp_dir.join("input.bin");
         fs::write(&input, plaintext).unwrap();
-        std::env::set_current_dir(temp_dir.join(cwd_subpath)).unwrap();
+        let cwd = temp_dir.join(cwd_subpath);
+        fs::create_dir_all(&cwd).unwrap();
+        std::env::set_current_dir(&cwd).unwrap();
         cmd_put(arg, Some(input.to_str().unwrap()), None).unwrap();
         input
     }
@@ -146,9 +147,9 @@ mod tests {
         in_test_dir("ark_put_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
-            create_account(temp_dir, &address).unwrap();
+            init_with_server(temp_dir, &address);
 
-            put_via_cmd(temp_dir, "notes.txt", b"plaintext", "ark/gyan");
+            put_via_cmd(temp_dir, "notes.txt", b"plaintext", "");
 
             let server_path = temp_dir.join("ark/gyan/notes.txt");
             let on_disk = fs::read(&server_path).unwrap();
@@ -156,7 +157,7 @@ mod tests {
 
             let alg = xattr::get(&server_path, "user.ark.encryption_algorithm").unwrap();
             assert_eq!(alg.as_deref(), Some(b"aes-256-gcm".as_slice()));
-            let identity_seed = read_identity_key(&temp_dir.join("ark/gyan/.ark/identity.key")).unwrap();
+            let identity_seed = read_identity_key(&temp_dir.join(".ark/identity.key")).unwrap();
             let file_key = unwrap_first_member_key(&server_path, &identity_seed);
             let decrypted = aes_decrypt(&file_key, &on_disk).unwrap();
             assert_eq!(decrypted, b"plaintext");
@@ -168,14 +169,14 @@ mod tests {
         in_test_dir("ark_put_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
-            create_account(temp_dir, &address).unwrap();
+            init_with_server(temp_dir, &address);
 
-            let input = put_via_cmd(temp_dir, "out.bin", b"hello", "ark/gyan");
+            let input = put_via_cmd(temp_dir, "out.bin", b"hello", "");
             assert_eq!(
                 xattr::get(&input, "user.ark.encryption_algorithm").unwrap().as_deref(),
                 Some(b"aes-256-gcm".as_slice())
             );
-            let identity_seed = read_identity_key(&temp_dir.join("ark/gyan/.ark/identity.key")).unwrap();
+            let identity_seed = read_identity_key(&temp_dir.join(".ark/identity.key")).unwrap();
             let _file_key = unwrap_first_member_key(&input, &identity_seed);
         });
     }
@@ -185,7 +186,7 @@ mod tests {
         in_test_dir("ark_put_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
-            let (identity, secret_key) = create_account(temp_dir, &address).unwrap();
+            let (identity, secret_key) = init_with_server(temp_dir, &address);
 
             let input = temp_dir.join("input.bin");
             write_plain_test_file(&input, &identity, &secret_key, b"hello");
@@ -195,8 +196,6 @@ mod tests {
             sign_metadata(&secret_key, &mut preset_meta, Some(b"hello")).unwrap();
             write_metadata_attributes(&input, &preset_meta).unwrap();
 
-            let account_dir = temp_dir.join("ark/gyan");
-            std::env::set_current_dir(&account_dir).unwrap();
             cmd_put("notes.txt", Some(input.to_str().unwrap()), None).unwrap();
 
             let server_path = temp_dir.join("ark/gyan/notes.txt");
@@ -214,17 +213,15 @@ mod tests {
         in_test_dir("ark_put_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
-            let account_key = create_account(temp_dir, &address).unwrap().1.value;
+            let (_, secret_key) = init_with_server(temp_dir, &address);
+            let account_key = secret_key.value;
 
             let input = temp_dir.join("input.bin");
             fs::write(&input, b"v1").unwrap();
-            let account_dir = temp_dir.join("ark/gyan");
-            std::env::set_current_dir(&account_dir).unwrap();
             cmd_put("notes.txt", Some(input.to_str().unwrap()), None).unwrap();
             let key1 = unwrap_first_member_key(&input, &account_key);
 
             fs::write(&input, b"v2").unwrap();
-            std::env::set_current_dir(&account_dir).unwrap();
             cmd_put("notes.txt", Some(input.to_str().unwrap()), None).unwrap();
             let key2 = unwrap_first_member_key(&input, &account_key);
 
@@ -242,9 +239,9 @@ mod tests {
         in_test_dir("ark_put_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
-            create_account(temp_dir, &address).unwrap();
+            init_with_server(temp_dir, &address);
 
-            put_via_cmd(temp_dir, "notes.txt", b"hello", "ark/gyan");
+            put_via_cmd(temp_dir, "notes.txt", b"hello", "");
 
             assert!(temp_dir.join("ark/gyan/notes.txt").exists());
         });
@@ -255,10 +252,10 @@ mod tests {
         in_test_dir("ark_put_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
-            let (identity, secret_key) = create_account(temp_dir, &address).unwrap();
+            let (identity, secret_key) = init_with_server(temp_dir, &address);
             write_plain_test_file(&temp_dir.join("ark/gyan/x.txt"), &identity, &secret_key, b"old");
 
-            put_via_cmd(temp_dir, "x.txt", b"new plaintext", "ark/gyan");
+            put_via_cmd(temp_dir, "x.txt", b"new plaintext", "");
 
             let on_disk = fs::read(temp_dir.join("ark/gyan/x.txt")).unwrap();
             assert_ne!(on_disk, b"old");
@@ -271,11 +268,11 @@ mod tests {
         in_test_dir("ark_put_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
-            create_account(temp_dir, &address).unwrap();
-            let notes = temp_dir.join("ark/gyan/notes");
-            fs::create_dir_all(&notes).unwrap();
+            init_with_server(temp_dir, &address);
+            let server_notes = temp_dir.join("ark/gyan/notes");
+            fs::create_dir_all(&server_notes).unwrap();
 
-            put_via_cmd(temp_dir, "todo.txt", b"buy milk", "ark/gyan/notes");
+            put_via_cmd(temp_dir, "todo.txt", b"buy milk", "notes");
 
             assert!(temp_dir.join("ark/gyan/notes/todo.txt").exists());
         });
@@ -286,9 +283,9 @@ mod tests {
         in_test_dir("ark_put_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
-            create_account(temp_dir, &address).unwrap();
+            init_with_server(temp_dir, &address);
 
-            put_via_cmd(temp_dir, "/sub/file.txt", b"absolute", "ark/gyan");
+            put_via_cmd(temp_dir, "/sub/file.txt", b"absolute", "");
 
             assert!(temp_dir.join("ark/gyan/sub/file.txt").exists());
         });
@@ -299,10 +296,10 @@ mod tests {
         in_test_dir("ark_put_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
-            create_account(temp_dir, &address).unwrap();
+            init_with_server(temp_dir, &address);
 
             let arg = format!("gyan@127.0.0.1:{}/explicit.txt", port);
-            put_via_cmd(temp_dir, &arg, b"via address", "ark/gyan");
+            put_via_cmd(temp_dir, &arg, b"via address", "");
 
             assert!(temp_dir.join("ark/gyan/explicit.txt").exists());
         });
@@ -313,7 +310,7 @@ mod tests {
         in_test_dir("ark_put_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
-            let (identity, secret_key) = create_account(temp_dir, &address).unwrap();
+            let (identity, secret_key) = init_with_server(temp_dir, &address);
 
             let file_key = create_key(DEFAULT_ENCRYPTION_ALGORITHM).unwrap();
             let ciphertext = encrypt_bytes(&file_key, b"hidden").unwrap().1;
@@ -325,8 +322,6 @@ mod tests {
             sign_metadata(&secret_key, &mut m, Some(&ciphertext)).unwrap();
             write_metadata_attributes(&input, &m).unwrap();
 
-            let account_dir = temp_dir.join("ark/gyan");
-            std::env::set_current_dir(&account_dir).unwrap();
             cmd_put("file.bin", Some(input.to_str().unwrap()), None).unwrap();
 
             let server_path = temp_dir.join("ark/gyan/file.bin");
@@ -346,9 +341,9 @@ mod tests {
         in_test_dir("ark_put_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
-            create_account(temp_dir, &address).unwrap();
+            init_with_server(temp_dir, &address);
 
-            let input = put_via_cmd(temp_dir, "out.bin", b"plain", "ark/gyan");
+            let input = put_via_cmd(temp_dir, "out.bin", b"plain", "");
             assert_eq!(
                 xattr::get(&input, "user.ark.encrypted").unwrap().as_deref(),
                 Some(b"false".as_slice())
@@ -361,7 +356,7 @@ mod tests {
         in_test_dir("ark_put_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
-            let (identity, secret_key) = create_account(temp_dir, &address).unwrap();
+            let (identity, secret_key) = init_with_server(temp_dir, &address);
 
             let input = temp_dir.join("input.bin");
             fs::write(&input, b"plain bytes").unwrap();
@@ -369,8 +364,6 @@ mod tests {
             sign_metadata(&secret_key, &mut m, Some(b"plain bytes")).unwrap();
             write_metadata_attributes(&input, &m).unwrap();
 
-            let account_dir = temp_dir.join("ark/gyan");
-            std::env::set_current_dir(&account_dir).unwrap();
             cmd_put("raw.bin", Some(input.to_str().unwrap()), None).unwrap();
 
             let server_path = temp_dir.join("ark/gyan/raw.bin");
@@ -386,9 +379,8 @@ mod tests {
         in_test_dir("ark_put_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
-            create_account(temp_dir, &address).unwrap();
+            init_with_server(temp_dir, &address);
 
-            std::env::set_current_dir(temp_dir.join("ark/gyan")).unwrap();
             cmd_put("shared/", None, None).unwrap();
 
             let dir = temp_dir.join("ark/gyan/shared");
@@ -405,9 +397,8 @@ mod tests {
         in_test_dir("ark_put_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
-            create_account(temp_dir, &address).unwrap();
+            init_with_server(temp_dir, &address);
 
-            std::env::set_current_dir(temp_dir.join("ark/gyan")).unwrap();
             let err = cmd_put("shared/", None, Some("aes-256-gcm")).unwrap_err();
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         });
@@ -418,11 +409,10 @@ mod tests {
         in_test_dir("ark_put_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
-            create_account(temp_dir, &address).unwrap();
+            init_with_server(temp_dir, &address);
 
             let input = temp_dir.join("input.bin");
             fs::write(&input, b"plain bytes").unwrap();
-            std::env::set_current_dir(temp_dir.join("ark/gyan")).unwrap();
             cmd_put("raw.bin", Some(input.to_str().unwrap()), Some("none")).unwrap();
 
             let server_path = temp_dir.join("ark/gyan/raw.bin");
@@ -436,9 +426,8 @@ mod tests {
         in_test_dir("ark_put_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
-            create_account(temp_dir, &address).unwrap();
+            init_with_server(temp_dir, &address);
 
-            std::env::set_current_dir(temp_dir.join("ark/gyan")).unwrap();
             let missing = temp_dir.join("does_not_exist.bin");
             let err = cmd_put("notes.txt", Some(missing.to_str().unwrap()), None).unwrap_err();
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
@@ -451,11 +440,10 @@ mod tests {
         in_test_dir("ark_put_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
-            create_account(temp_dir, &address).unwrap();
+            init_with_server(temp_dir, &address);
 
             let input = temp_dir.join("input.bin");
             fs::write(&input, b"hi").unwrap();
-            std::env::set_current_dir(temp_dir.join("ark/gyan")).unwrap();
             let err = cmd_put("shared/", Some(input.to_str().unwrap()), None).unwrap_err();
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
             assert!(format!("{}", err).contains("directory path but input is a file"));
@@ -467,11 +455,10 @@ mod tests {
         in_test_dir("ark_put_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
-            create_account(temp_dir, &address).unwrap();
+            init_with_server(temp_dir, &address);
 
             let input_dir = temp_dir.join("input_dir");
             fs::create_dir_all(&input_dir).unwrap();
-            std::env::set_current_dir(temp_dir.join("ark/gyan")).unwrap();
             let err = cmd_put("shared", Some(input_dir.to_str().unwrap()), Some("aes-256-gcm")).unwrap_err();
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         });
@@ -482,7 +469,6 @@ mod tests {
         in_test_dir("ark_put_test", |temp_dir| {
             let input = temp_dir.join("input.bin");
             fs::write(&input, b"x").unwrap();
-            std::env::set_current_dir(temp_dir).unwrap();
             let err = cmd_put("anything", Some(input.to_str().unwrap()), None).unwrap_err();
             let msg = format!("{}", err);
             assert!(msg.contains("no .ark"), "msg was {}", msg);

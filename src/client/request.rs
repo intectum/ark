@@ -19,7 +19,7 @@ pub fn ark_request(
 ) -> std::io::Result<(u16, Vec<(String, String)>, Vec<u8>)> {
     let identity = read_identity(&root.join(".ark").join("identity.json"))?;
     let key = read_identity_key(&root.join(".ark").join("identity.key"))?;
-    request(method, &url, headers, body, &identity, &key)
+    request(method, &url, headers, body, Some((&identity, &key)))
 }
 
 pub fn request(
@@ -27,21 +27,27 @@ pub fn request(
     url: &Url,
     headers: &[(&str, &str)],
     body: &[u8],
-    identity: &Identity,
-    key: &[u8],
+    auth: Option<(&Identity, &[u8])>,
 ) -> std::io::Result<(u16, Vec<(String, String)>, Vec<u8>)> {
     let mut final_headers = headers.to_vec();
 
-    let timestamp = now_seconds();
-    let bytes = request_to_bytes(method, url.path(), timestamp, body);
-    let signature = sign_bytes(&Key { algorithm: identity.public_key.algorithm.clone(), value: key.to_vec() }, &bytes)?;
-    let authorization = format!(
-        "ArkAccount address=\"{}\", timestamp=\"{}\", signature=\"{}\"",
-        identity.address,
-        timestamp,
-        encode_base64url(signature.value),
-    );
-    final_headers.push(("Authorization", &authorization));
+    let authorization = if let Some((identity, key)) = auth {
+        let timestamp = now_seconds();
+        let bytes = request_to_bytes(method, url.path(), timestamp, body);
+        let signature = sign_bytes(&Key { algorithm: identity.public_key.algorithm.clone(), value: key.to_vec() }, &bytes)?;
+        Some(format!(
+            "ArkAccount address=\"{}\", timestamp=\"{}\", signature=\"{}\"",
+            identity.address,
+            timestamp,
+            encode_base64url(signature.value),
+        ))
+    } else {
+        None
+    };
+
+    if let Some(ref a) = authorization {
+        final_headers.push(("Authorization", a));
+    }
 
     final_headers.push(("Connection", "close"));
 
@@ -128,7 +134,7 @@ mod tests {
 
         let url = Url::parse(&format!("http://127.0.0.1:{}/x", port)).unwrap();
         let (identity, secret_key) = create_identity("alice@example.com").unwrap();
-        let (code, headers, body) = request("PUT", &url, &[], b"data", &identity, &secret_key.value).unwrap();
+        let (code, headers, body) = request("PUT", &url, &[], b"data", Some((&identity, &secret_key.value))).unwrap();
         assert_eq!(code, 201);
         assert_eq!(body, b"hello");
         assert!(headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("content-length") && v == "5"));
@@ -147,7 +153,7 @@ mod tests {
 
         let url = Url::parse(&format!("http://127.0.0.1:{}/ark/alice/x", port)).unwrap();
         let (identity, secret_key) = create_identity("alice@example.com").unwrap();
-        let (code, _, _) = request("PUT", &url, &[], b"payload", &identity, &secret_key.value).unwrap();
+        let (code, _, _) = request("PUT", &url, &[], b"payload", Some((&identity, &secret_key.value))).unwrap();
         assert_eq!(code, 204);
 
         let req = captured.join().unwrap();
@@ -170,7 +176,7 @@ mod tests {
 
         let url = Url::parse(&format!("http://127.0.0.1:{}/x", port)).unwrap();
         let (identity, secret_key) = create_identity("alice@example.com").unwrap();
-        let _ = request("GET", &url, &[], &[], &identity, &secret_key.value).unwrap();
+        let _ = request("GET", &url, &[], &[], Some((&identity, &secret_key.value))).unwrap();
 
         let req = captured.join().unwrap();
         let auth = parse_header(&req, "Authorization").unwrap();
@@ -205,7 +211,7 @@ mod tests {
 
         let url = Url::parse(&format!("http://127.0.0.1:{}/ark/x", port)).unwrap();
         let (identity, secret_key) = create_identity("alice@example.com").unwrap();
-        let (code, _, body) = request("GET", &url, &[], &[], &identity, &secret_key.value).unwrap();
+        let (code, _, body) = request("GET", &url, &[], &[], Some((&identity, &secret_key.value))).unwrap();
         assert_eq!(code, 403);
         assert_eq!(body, b"denied!");
     }
@@ -227,8 +233,7 @@ mod tests {
             &url,
             &[("X-Ark-Meta-Encryption-Algorithm", "aes-256-gcm"), ("X-Custom", "hi")],
             b"d",
-            &identity,
-            &secret_key.value,
+            Some((&identity, &secret_key.value)),
         ).unwrap();
 
         let req = captured.join().unwrap();

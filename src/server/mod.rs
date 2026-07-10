@@ -20,7 +20,7 @@ use crate::util::resolve_url;
 use self::auth::{authenticate, authorize};
 use self::delete::serve_delete;
 use self::get::serve_get;
-use self::put::serve_put;
+use self::put::{serve_put, serve_put_init};
 
 pub const MAX_CLOCK_SKEW_SECS: u64 = 300;
 
@@ -83,8 +83,14 @@ fn handle(mut stream: TcpStream, root: &Path, verbose: bool) -> std::io::Result<
         return write_status(&mut stream, 405, "Method Not Allowed", b"method not allowed");
     }
 
-    let account_name = segments[1];
-    let target_identity = match read_identity(&root.join("ark").join(account_name).join(".ark").join("identity.json")) {
+    let name = segments[1];
+    let target_identity_path = root.join("ark").join(name).join(".ark").join("identity.json");
+
+    if method == "PUT" && url.path() == format!("/ark/{}/.ark/identity.json", name) && !target_identity_path.exists() {
+        return serve_put_init(&mut stream, &headers, &body, &target_identity_path);
+    }
+
+    let target_identity = match read_identity(&target_identity_path) {
         Ok(i) => i,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound =>
             return write_status(&mut stream, 403, "Forbidden", b"forbidden"),
@@ -92,7 +98,7 @@ fn handle(mut stream: TcpStream, root: &Path, verbose: bool) -> std::io::Result<
     };
 
     let fs_path = root.join(url.path().trim_start_matches('/'));
-    let fs_account_path = root.join("ark").join(account_name);
+    let fs_account_path = root.join("ark").join(name);
 
     if fs::symlink_metadata(&fs_path).map(|m| m.is_symlink()).unwrap_or(false) {
         return write_status(&mut stream, 403, "Forbidden", b"symlinks not allowed");
@@ -138,7 +144,7 @@ fn handle(mut stream: TcpStream, root: &Path, verbose: bool) -> std::io::Result<
     match method.as_str() {
         "GET" => serve_get(&fs_path, &mut stream, true),
         "HEAD" => serve_get(&fs_path, &mut stream, false),
-        "PUT" => serve_put(&fs_path, &mut stream, &body, &headers, existing_members, permission, target_is_dir),
+        "PUT" => serve_put(&fs_path, &mut stream, &body, &headers, existing_members, permission, target_is_dir, None),
         "DELETE" => serve_delete(&fs_path, &mut stream),
         _ => write_status(&mut stream, 405, "Method Not Allowed", b"method not allowed"),
     }

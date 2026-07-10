@@ -114,8 +114,9 @@ pub mod test {
     use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crate::client::create_account;
+    use crate::client::init;
     use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, create_key, encrypt_bytes};
+    use crate::identity::write_identity;
     use crate::metadata::{apply_key_to_metadata, create_metadata, sign_metadata, write_metadata_attributes};
     use crate::types::{Identity, Key, Metadata};
 
@@ -144,9 +145,20 @@ pub mod test {
     }
 
     pub fn create_test_account(temp_dir: &Path, address: &str) -> (Identity, Key, PathBuf) {
-        let (identity, secret_key) = create_account(temp_dir, address).unwrap();
         let name = address.split_once('@').unwrap().0;
-        (identity, secret_key, temp_dir.join("ark").join(name))
+        let account_dir = temp_dir.join("ark").join(name);
+        fs::create_dir_all(&account_dir).unwrap();
+        let (identity, secret_key) = init(&account_dir, address).unwrap();
+        (identity, secret_key, account_dir)
+    }
+
+    pub fn init_with_server(temp_dir: &Path, address: &str) -> (Identity, Key) {
+        let (identity, secret_key) = init(temp_dir, address).unwrap();
+        let name = address.split_once('@').unwrap().0;
+        let server_dot_ark = temp_dir.join("ark").join(name).join(".ark");
+        fs::create_dir_all(&server_dot_ark).unwrap();
+        write_identity(&server_dot_ark.join("identity.json"), &identity).unwrap();
+        (identity, secret_key)
     }
 
     pub fn create_plain_test_metadata(owner: &Identity, owner_key: &Key, body: &[u8]) -> Metadata {

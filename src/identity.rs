@@ -181,9 +181,8 @@ fn is_valid_account_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::create_account;
     use crate::server::start_test_server;
-    use crate::util::test::in_test_dir;
+    use crate::util::test::{create_test_account, in_test_dir};
 
 
     #[test]
@@ -340,13 +339,12 @@ mod tests {
             let port = start_test_server(temp_dir.to_path_buf());
 
             let self_address = format!("alice@127.0.0.1:{}", port);
-            create_account(temp_dir, &self_address).unwrap();
+            let (_, _, account_dir) = create_test_account(temp_dir, &self_address);
 
             let remote_address = format!("bob@127.0.0.1:{}", port);
-            create_account(temp_dir, &remote_address).unwrap();
-            let expected = read_identity(&temp_dir.join("ark/bob/.ark/identity.json")).unwrap();
+            let (_, _, bob_dir) = create_test_account(temp_dir, &remote_address);
+            let expected = read_identity(&bob_dir.join(".ark/identity.json")).unwrap();
 
-            let account_dir = temp_dir.join("ark/alice");
             let cache_dir = account_dir.join(".ark/identities");
 
             std::env::set_current_dir(&account_dir).unwrap();

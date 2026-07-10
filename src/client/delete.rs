@@ -19,24 +19,21 @@ pub fn cmd_delete(arg: &str) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::env;
     use std::fs;
 
     use super::*;
-    use crate::client::create_account;
     use crate::server::start_test_server;
-    use crate::util::test::{in_test_dir, write_plain_test_file};
+    use crate::util::test::{in_test_dir, init_with_server, write_plain_test_file};
 
     #[test]
     fn cmd_delete_removes_file() {
         in_test_dir("ark_delete_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
-            let (identity, secret_key) = create_account(temp_dir, &address).unwrap();
+            let (identity, secret_key) = init_with_server(temp_dir, &address);
             let f = temp_dir.join("ark/gyan/x.txt");
             write_plain_test_file(&f, &identity, &secret_key, b"bye");
 
-            env::set_current_dir(temp_dir.join("ark/gyan")).unwrap();
             cmd_delete("x.txt").unwrap();
 
             assert!(!f.exists());
@@ -48,12 +45,11 @@ mod tests {
         in_test_dir("ark_delete_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
-            create_account(temp_dir, &address).unwrap();
+            init_with_server(temp_dir, &address);
             let d = temp_dir.join("ark/gyan/sub");
             fs::create_dir_all(&d).unwrap();
             fs::write(d.join("inner"), b"data").unwrap();
 
-            env::set_current_dir(temp_dir.join("ark/gyan")).unwrap();
             cmd_delete("sub").unwrap();
 
             assert!(!d.exists());
@@ -65,9 +61,8 @@ mod tests {
         in_test_dir("ark_delete_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
-            create_account(temp_dir, &address).unwrap();
+            init_with_server(temp_dir, &address);
 
-            env::set_current_dir(temp_dir.join("ark/gyan")).unwrap();
             let err = cmd_delete("nope").unwrap_err();
             assert!(err.to_string().contains("HTTP 404"), "msg was {}", err);
         });
@@ -78,11 +73,10 @@ mod tests {
         in_test_dir("ark_delete_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
-            let (identity, secret_key) = create_account(temp_dir, &address).unwrap();
+            let (identity, secret_key) = init_with_server(temp_dir, &address);
             let f = temp_dir.join("ark/gyan/explicit.txt");
             write_plain_test_file(&f, &identity, &secret_key, b"gone");
 
-            env::set_current_dir(temp_dir.join("ark/gyan")).unwrap();
             let arg = format!("gyan@127.0.0.1:{}/explicit.txt", port);
             cmd_delete(&arg).unwrap();
 

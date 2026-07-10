@@ -9,7 +9,7 @@ mod util;
 
 use clap::{Parser, Subcommand};
 
-use crate::client::{DecryptArgs, cmd_chmod, cmd_create_account, cmd_decrypt, cmd_delete, cmd_get, cmd_head, cmd_put};
+use crate::client::{DecryptArgs, cmd_chmod, cmd_decrypt, cmd_delete, cmd_get, cmd_head, cmd_init, cmd_put};
 use crate::server::cmd_server;
 
 #[derive(Parser)]
@@ -26,8 +26,8 @@ enum Cmd {
         #[arg(default_value_t = 8080)]
         port: u16,
     },
-    /// Create a new account.
-    CreateAccount {
+    /// Initialise an account in the current directory.
+    Init {
         /// Address in the form <name>@<host>[:<port>].
         address: String,
     },
@@ -107,7 +107,7 @@ fn main() {
             cmd_server(port);
             Ok(())
         }
-        Cmd::CreateAccount { address } => cmd_create_account(&address),
+        Cmd::Init { address } => cmd_init(&address),
         Cmd::Chmod { owner, write, read, drop, file } => cmd_chmod(&file, &owner, &write, &read, &drop),
         Cmd::Head { path } => cmd_head(&path),
         Cmd::Delete { path } => cmd_delete(&path),
