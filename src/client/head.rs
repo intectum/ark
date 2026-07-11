@@ -1,24 +1,22 @@
-use std::env::current_dir;
 use std::io::Write;
 
-use crate::identity::{read_identity, resolve_identity};
-use crate::metadata::{read_metadata_headers, verify_metadata_signature};
 use crate::client::ark_request;
-use crate::util::{find_root, io_err, resolve_url};
+use crate::types::IdentityContext;
+use crate::identity::resolve_identity;
+use crate::metadata::{read_metadata_headers, verify_metadata_signature};
+use crate::util::{io_err, resolve_client_url};
 
-pub fn cmd_head(path: &str) -> std::io::Result<()> {
-    let root = find_root(&current_dir()?)?;
-    let identity = read_identity(&root.join(".ark").join("identity.json"))?;
-    let url = resolve_url(path, &identity.address, &root, false)?;
+pub fn cmd_head(ctx: &IdentityContext, path: &str) -> std::io::Result<()> {
+    let url = resolve_client_url(ctx, path)?;
 
-    let (code, headers, body) = ark_request(&root, &url, "HEAD", &[], &[])?;
+    let (code, headers, body) = ark_request(Some(ctx), "HEAD", &url, &[], &[])?;
     if code != 200 {
         return Err(io_err(&format!("HTTP {}: {}", code, String::from_utf8_lossy(&body))));
     }
 
     let metadata = read_metadata_headers(&headers)?;
 
-    let modifier_identity = resolve_identity(&metadata.modified_by)?;
+    let modifier_identity = resolve_identity(ctx, &metadata.modified_by)?;
     verify_metadata_signature(&modifier_identity.public_key, &metadata)?;
 
     let mut stdout = std::io::stdout().lock();
@@ -32,9 +30,10 @@ pub fn cmd_head(path: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::read_identity;
     use crate::metadata::read_metadata_attributes;
     use crate::server::start_test_server;
-    use crate::util::encode_base64url;
+    use crate::util::{encode_base64url, resolve_client_url_raw};
     use crate::util::test::{in_test_dir, init_with_server, write_encrypted_test_file, write_plain_test_file};
 
     #[test]
@@ -42,12 +41,12 @@ mod tests {
         in_test_dir("ark_head_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
-            let (identity, secret_key) = init_with_server(temp_dir, &address);
-            write_plain_test_file(&temp_dir.join("ark/gyan/file.bin"), &identity, &secret_key, b"hello world");
+            let ctx = init_with_server(temp_dir, &address);
+            write_plain_test_file(&temp_dir.join("ark/gyan/file.bin"), &ctx.identity, ctx.identity_key.as_ref().unwrap(), b"hello world");
 
             let identity = read_identity(&temp_dir.join(".ark").join("identity.json")).unwrap();
-            let url = resolve_url("file.bin", &identity.address, temp_dir, false).unwrap();
-            let (code, headers, body) = ark_request(temp_dir, &url, "HEAD", &[], &[]).unwrap();
+            let url = resolve_client_url_raw(temp_dir, "file.bin", &identity.address).unwrap();
+            let (code, headers, body) = ark_request(Some(&ctx), "HEAD", &url, &[], &[]).unwrap();
             assert_eq!(code, 200);
             assert!(body.is_empty());
             assert!(
@@ -62,15 +61,15 @@ mod tests {
         in_test_dir("ark_head_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
-            let (identity, secret_key) = init_with_server(temp_dir, &address);
+            let ctx = init_with_server(temp_dir, &address);
             let f = temp_dir.join("ark/gyan/secret");
-            write_encrypted_test_file(&f, &identity, &secret_key, b"plaintext");
+            write_encrypted_test_file(&f, &ctx.identity, ctx.identity_key.as_ref().unwrap(), b"plaintext");
             let expected_key_b64 = encode_base64url(&read_metadata_attributes(&f).unwrap()
                 .members[0].key.as_ref().unwrap().value);
 
             let identity = read_identity(&temp_dir.join(".ark").join("identity.json")).unwrap();
-            let url = resolve_url("secret", &identity.address, temp_dir, false).unwrap();
-            let (code, headers, body) = ark_request(temp_dir, &url, "HEAD", &[], &[]).unwrap();
+            let url = resolve_client_url_raw(temp_dir, "secret", &identity.address).unwrap();
+            let (code, headers, body) = ark_request(Some(&ctx), "HEAD", &url, &[], &[]).unwrap();
             assert_eq!(code, 200);
             assert!(body.is_empty());
             assert!(headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("x-ark-meta-encryption-algorithm") && v == "aes-256-gcm"));
@@ -84,10 +83,10 @@ mod tests {
         in_test_dir("ark_head_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
-            let (identity, secret_key) = init_with_server(temp_dir, &address);
-            write_plain_test_file(&temp_dir.join("ark/gyan/x"), &identity, &secret_key, b"abc");
+            let ctx = init_with_server(temp_dir, &address);
+            write_plain_test_file(&temp_dir.join("ark/gyan/x"), &ctx.identity, ctx.identity_key.as_ref().unwrap(), b"abc");
 
-            cmd_head("x").unwrap();
+            cmd_head(&ctx, "x").unwrap();
         });
     }
 
@@ -96,9 +95,9 @@ mod tests {
         in_test_dir("ark_head_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
-            init_with_server(temp_dir, &address);
+            let ctx = init_with_server(temp_dir, &address);
 
-            let err = cmd_head("nope").unwrap_err();
+            let err = cmd_head(&ctx, "nope").unwrap_err();
             assert!(err.to_string().contains("HTTP 404"), "msg was {}", err);
         });
     }

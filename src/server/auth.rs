@@ -5,12 +5,13 @@ use url::Url;
 use crate::crypto::verify_bytes;
 use crate::identity::resolve_identity;
 use crate::metadata::get_member;
-use crate::types::{Identity, Member, Permission, Signature};
+use crate::types::{Identity, IdentityContext, Member, Permission, Signature};
 use crate::util::{decode_base64url, io_err, now_seconds, request_to_bytes};
 
 use super::MAX_CLOCK_SKEW_SECS;
 
 pub fn authenticate(
+    server_ctx: &IdentityContext,
     url: &Url,
     method: &str,
     headers: &Vec<(String, String)>,
@@ -31,7 +32,7 @@ pub fn authenticate(
     let signature_b64 = params.get("signature").ok_or_else(|| io_err("missing signature in Authorization"))?;
     let timestamp_str = params.get("timestamp").ok_or_else(|| io_err("missing timestamp in Authorization"))?;
 
-    let requestor_identity = resolve_identity(address)?;
+    let requestor_identity = resolve_identity(server_ctx, address)?;
 
     let signature = decode_base64url(signature_b64).map_err(|_| io_err("auth signature not base64url encoded"))?;
 
@@ -47,11 +48,11 @@ pub fn authenticate(
 }
 
 pub fn authorize(
-    target_identity: &Identity,
+    target_ctx: &IdentityContext,
     requestor_identity: &Identity,
     existing_members: Option<&[Member]>,
 ) -> Result<Permission> {
-    if requestor_identity.address == target_identity.address {
+    if requestor_identity.address == target_ctx.identity.address {
         return Ok(Permission::Owner);
     }
 

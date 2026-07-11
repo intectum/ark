@@ -1,13 +1,12 @@
-use std::env::current_dir;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
 
 use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, decrypt_bytes};
-use crate::identity::{read_identity, read_identity_key};
+use crate::types::IdentityContext;
 use crate::metadata::{apply_key_to_metadata, create_metadata, get_member, read_metadata_attributes, validate_metadata, write_metadata_attributes};
 use crate::types::Key;
-use crate::util::{decode_base64url, find_root, io_err, io_invalid_input};
+use crate::util::{decode_base64url, io_err, io_invalid_input};
 
 pub struct DecryptArgs {
     pub input: Option<String>,
@@ -17,13 +16,10 @@ pub struct DecryptArgs {
     pub encryption_algorithm: Option<String>,
 }
 
-pub fn cmd_decrypt(args: DecryptArgs) -> std::io::Result<()> {
+pub fn cmd_decrypt(ctx: &IdentityContext, args: DecryptArgs) -> std::io::Result<()> {
     if args.in_place.is_some() && (args.input.is_some() || args.output.is_some()) {
         return Err(io_err("--in-place is mutually exclusive with -i/--input and -o/--output"));
     }
-
-    let root = find_root(&current_dir()?)?;
-    let identity = read_identity(&root.join(".ark").join("identity.json"))?;
 
     let source_path: Option<&str> = args.in_place.as_deref().or(args.input.as_deref());
     let dest_path: Option<&str> = args.in_place.as_deref().or(args.output.as_deref());
@@ -59,8 +55,8 @@ pub fn cmd_decrypt(args: DecryptArgs) -> std::io::Result<()> {
                 None => return Err(io_err("no file key available: pass --key or use -i/--in-place on a file with metadata"))
             };
 
-            let mut metadata = create_metadata(&identity.address, Some(&key.algorithm));
-            apply_key_to_metadata(&mut metadata, &key)?;
+            let mut metadata = create_metadata(&ctx.identity.address, Some(&key.algorithm));
+            apply_key_to_metadata(ctx, &mut metadata, &key)?;
 
             validate_metadata(&metadata)?;
             metadata
@@ -74,12 +70,17 @@ pub fn cmd_decrypt(args: DecryptArgs) -> std::io::Result<()> {
     let file_key: Vec<u8> = if let Some(k) = &args.key {
         decode_base64url(k.trim()).map_err(|e| io_err(&format!("--key decode: {}", e)))?
     } else {
-        let member = get_member(&metadata.members, &identity.address)
+        let member = get_member(&metadata.members, &ctx.identity.address)
             .ok_or_else(|| io_err("no member entry for current account"))?;
         let encrypted_file_key = member.key.as_ref()
             .ok_or_else(|| io_err("no file key for current account"))?;
-        let identity_key = read_identity_key(&root.join(".ark").join("identity.key"))?;
-        decrypt_bytes(&Key { algorithm: encrypted_file_key.algorithm.clone(), value: identity_key }, &encrypted_file_key.value)?
+        decrypt_bytes(
+            &Key {
+                algorithm: encrypted_file_key.algorithm.clone(),
+                value: ctx.identity_key.as_ref().expect("client context missing identity_key").value.clone()
+            },
+            &encrypted_file_key.value,
+        )?
     };
 
     let encryption_algorithm = metadata.encryption_algorithm.clone()
@@ -105,6 +106,7 @@ mod tests {
 
     use super::*;
     use crate::crypto::{decrypt_bytes, encrypt_bytes};
+    use crate::context::create_client_context;
     use crate::metadata::{create_metadata, sign_metadata, write_metadata_attributes};
     use crate::util::encode_base64url;
     use crate::util::test::{TEST_ADDRESS, create_test_account, in_test_dir, write_encrypted_test_file};
@@ -125,7 +127,8 @@ mod tests {
             write_encrypted_test_file(&in_path, &identity, &secret_key, b"hello world");
             let out_path = temp_dir.join("out.bin");
             env::set_current_dir(&acc).unwrap();
-            cmd_decrypt(DecryptArgs {
+            let ctx = create_client_context().unwrap();
+            cmd_decrypt(&ctx, DecryptArgs {
                 input: Some(in_path.to_string_lossy().into_owned()),
                 output: Some(out_path.to_string_lossy().into_owned()),
                 ..args()
@@ -141,7 +144,8 @@ mod tests {
             let p = temp_dir.join("file.bin");
             write_encrypted_test_file(&p, &identity, &secret_key, b"data");
             env::set_current_dir(&acc).unwrap();
-            cmd_decrypt(DecryptArgs {
+            let ctx = create_client_context().unwrap();
+            cmd_decrypt(&ctx, DecryptArgs {
                 in_place: Some(p.to_string_lossy().into_owned()),
                 ..args()
             }).unwrap();
@@ -161,7 +165,10 @@ mod tests {
     #[test]
     fn decrypt_in_place_conflicts_with_input() {
         in_test_dir("ark_decrypt_test", |temp_dir| {
-            let err = cmd_decrypt(DecryptArgs {
+            let (_identity, _secret_key, acc) = create_test_account(temp_dir, TEST_ADDRESS);
+            env::set_current_dir(&acc).unwrap();
+            let ctx = create_client_context().unwrap();
+            let err = cmd_decrypt(&ctx, DecryptArgs {
                 input: Some("a".to_string()),
                 in_place: Some(temp_dir.join("x").to_string_lossy().into_owned()),
                 ..args()
@@ -186,7 +193,8 @@ mod tests {
             write_metadata_attributes(&p, &wrong_meta).unwrap();
             let out = temp_dir.join("out.bin");
             env::set_current_dir(&acc).unwrap();
-            cmd_decrypt(DecryptArgs {
+            let ctx = create_client_context().unwrap();
+            cmd_decrypt(&ctx, DecryptArgs {
                 input: Some(p.to_string_lossy().into_owned()),
                 output: Some(out.to_string_lossy().into_owned()),
                 key: Some(encode_base64url(real_key)),
@@ -204,7 +212,8 @@ mod tests {
             let ct = aes_encrypt(&[1u8; 32], b"x");
             fs::write(&p, &ct).unwrap();
             env::set_current_dir(&acc).unwrap();
-            let err = cmd_decrypt(DecryptArgs {
+            let ctx = create_client_context().unwrap();
+            let err = cmd_decrypt(&ctx, DecryptArgs {
                 input: Some(p.to_string_lossy().into_owned()),
                 ..args()
             }).unwrap_err();
@@ -223,7 +232,8 @@ mod tests {
             let out = temp_dir.join("out.bin");
 
             env::set_current_dir(&acc).unwrap();
-            cmd_decrypt(DecryptArgs {
+            let ctx = create_client_context().unwrap();
+            cmd_decrypt(&ctx, DecryptArgs {
                 input: Some(p.to_string_lossy().into_owned()),
                 output: Some(out.to_string_lossy().into_owned()),
                 key: Some(encode_base64url(file_key)),
@@ -247,7 +257,8 @@ mod tests {
             write_encrypted_test_file(&p, &identity, &secret_key, b"x");
             xattr::set(&p, "user.ark.encrypted", b"false").unwrap();
             env::set_current_dir(&acc).unwrap();
-            let err = cmd_decrypt(DecryptArgs {
+            let ctx = create_client_context().unwrap();
+            let err = cmd_decrypt(&ctx, DecryptArgs {
                 input: Some(p.to_string_lossy().into_owned()),
                 ..args()
             }).unwrap_err();
@@ -263,7 +274,8 @@ mod tests {
             write_encrypted_test_file(&p, &identity, &secret_key, b"hi");
             let out = temp_dir.join("out.bin");
             env::set_current_dir(&acc).unwrap();
-            cmd_decrypt(DecryptArgs {
+            let ctx = create_client_context().unwrap();
+            cmd_decrypt(&ctx, DecryptArgs {
                 input: Some(p.to_string_lossy().into_owned()),
                 output: Some(out.to_string_lossy().into_owned()),
                 ..args()
@@ -286,7 +298,8 @@ mod tests {
             sign_metadata(&secret_key, &mut m, Some(&body)).unwrap();
             write_metadata_attributes(&p, &m).unwrap();
             env::set_current_dir(&acc).unwrap();
-            let err = cmd_decrypt(DecryptArgs {
+            let ctx = create_client_context().unwrap();
+            let err = cmd_decrypt(&ctx, DecryptArgs {
                 input: Some(p.to_string_lossy().into_owned()),
                 ..args()
             }).unwrap_err();
@@ -303,7 +316,8 @@ mod tests {
             let p = temp_dir.join("in.bin");
             write_encrypted_test_file(&p, &identity, &secret_key, b"plain");
             env::set_current_dir(&acc).unwrap();
-            cmd_decrypt(DecryptArgs {
+            let ctx = create_client_context().unwrap();
+            cmd_decrypt(&ctx, DecryptArgs {
                 input: Some(p.to_string_lossy().into_owned()),
                 ..args()
             }).unwrap();
@@ -315,8 +329,9 @@ mod tests {
         in_test_dir("ark_decrypt_test", |temp_dir| {
             let (_identity, _secret_key, acc) = create_test_account(temp_dir, TEST_ADDRESS);
             env::set_current_dir(&acc).unwrap();
+            let ctx = create_client_context().unwrap();
             let missing = temp_dir.join("nope.bin");
-            let err = cmd_decrypt(DecryptArgs {
+            let err = cmd_decrypt(&ctx, DecryptArgs {
                 input: Some(missing.to_string_lossy().into_owned()),
                 ..args()
             }).unwrap_err();
@@ -330,8 +345,9 @@ mod tests {
         in_test_dir("ark_decrypt_test", |temp_dir| {
             let (_identity, _secret_key, acc) = create_test_account(temp_dir, TEST_ADDRESS);
             env::set_current_dir(&acc).unwrap();
+            let ctx = create_client_context().unwrap();
             let missing = temp_dir.join("nope.bin");
-            let err = cmd_decrypt(DecryptArgs {
+            let err = cmd_decrypt(&ctx, DecryptArgs {
                 in_place: Some(missing.to_string_lossy().into_owned()),
                 ..args()
             }).unwrap_err();
@@ -349,7 +365,8 @@ mod tests {
             let ct = aes_encrypt(&key, b"x");
             fs::write(&p, &ct).unwrap();
             env::set_current_dir(&acc).unwrap();
-            let err = cmd_decrypt(DecryptArgs {
+            let ctx = create_client_context().unwrap();
+            let err = cmd_decrypt(&ctx, DecryptArgs {
                 input: Some(p.to_string_lossy().into_owned()),
                 key: Some(encode_base64url(key)),
                 encryption_algorithm: Some("chacha20-poly1305".to_string()),

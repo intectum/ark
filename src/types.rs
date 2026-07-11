@@ -1,4 +1,12 @@
+use std::path::PathBuf;
+
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+pub struct IdentityContext {
+    pub root: PathBuf,
+    pub identity: Identity,
+    pub identity_key: Option<Key>,
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct DirectoryEntry {

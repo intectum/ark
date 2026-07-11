@@ -1,20 +1,21 @@
-use std::env;
+use std::env::current_dir;
 use std::fs;
 #[cfg(test)]
 use std::path::Path;
 
 use crate::client::put::cmd_put;
-use crate::client::request::request;
+use crate::client::request::ark_request;
+use crate::context::create_client_context;
 use crate::identity::{create_identity, validate_identity, write_identity, write_identity_key};
 use crate::metadata::{create_metadata, sign_metadata, write_metadata_attributes};
 #[cfg(test)]
 use crate::types::Key;
 use crate::types::{Identity, Member, Permission};
-use crate::util::{io_err, resolve_url};
+use crate::util::{io_err, resolve_client_url_raw};
 
 pub fn cmd_init(address: &str) -> std::io::Result<()> {
-    let root = env::current_dir()?;
-    let url = resolve_url("/.ark/identity.json", address, &root, false)?;
+    let root = current_dir()?;
+    let url = resolve_client_url_raw(&root, "/.ark/identity.json", address)?;
     let dot_ark_dir = root.join(".ark");
 
     let identity_path = dot_ark_dir.join("identity.json");
@@ -27,7 +28,7 @@ pub fn cmd_init(address: &str) -> std::io::Result<()> {
         return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, format!("{} already exists", identity_key_path.display())));
     }
 
-    let (code, _, body) = request("GET", &url, &[], &[], None)?;
+    let (code, _, body) = ark_request(None, "GET", &url, &[], &[])?;
     match code {
         200 => {
             let identity: Identity = serde_json::from_slice(&body)
@@ -57,7 +58,8 @@ pub fn cmd_init(address: &str) -> std::io::Result<()> {
             sign_metadata(&secret_key, &mut metadata, Some(&body))?;
             write_metadata_attributes(&identity_path, &metadata)?;
 
-            cmd_put("/.ark/identity.json", identity_path.to_str(), None)?;
+            let ctx = create_client_context()?;
+            cmd_put(&ctx, "/.ark/identity.json", identity_path.to_str(), None)?;
         }
         _ => return Err(io_err(&format!("HTTP {}: {}", code, String::from_utf8_lossy(&body)))),
     }
@@ -79,6 +81,8 @@ pub fn init(root: &Path, address: &str) -> std::io::Result<(Identity, Key)> {
 
 #[cfg(test)]
 mod tests {
+    use std::env::set_current_dir;
+
     use ed25519_dalek::SigningKey;
 
     use super::*;
@@ -149,7 +153,7 @@ mod tests {
 
             let client_dir = temp_dir.join("client");
             fs::create_dir_all(&client_dir).unwrap();
-            env::set_current_dir(&client_dir).unwrap();
+            set_current_dir(&client_dir).unwrap();
 
             cmd_init(&address).unwrap();
 
@@ -219,7 +223,7 @@ mod tests {
 
             let second_client = temp_dir.join("second");
             fs::create_dir_all(&second_client).unwrap();
-            env::set_current_dir(&second_client).unwrap();
+            set_current_dir(&second_client).unwrap();
 
             cmd_init(&address).unwrap();
 

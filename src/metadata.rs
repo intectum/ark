@@ -4,6 +4,7 @@ use std::path::Path;
 use uuid::Uuid;
 
 use crate::crypto::{DEFAULT_HASH_ALGORITHM, encrypt_bytes, sign_json, verify_json};
+use crate::types::IdentityContext;
 use crate::identity::resolve_identity;
 use crate::types::{Hash, Key, Member, Metadata, Permission, Signature};
 use crate::util::{decode_base64url, encode_base64url, io_err, now_iso, sha256};
@@ -177,11 +178,12 @@ pub fn validate_metadata(metadata: &Metadata) -> io::Result<()> {
 }
 
 pub fn apply_key_to_metadata(
+    ctx: &IdentityContext,
     metadata: &mut Metadata,
     secret_key: &Key,
 ) -> std::io::Result<()> {
     for member in metadata.members.iter_mut() {
-        let recipient_identity = resolve_identity(&member.address)?;
+        let recipient_identity = resolve_identity(ctx, &member.address)?;
         let (algorithm, value) = encrypt_bytes(&recipient_identity.public_key, &secret_key.value)?;
         member.key = Some(Key {
             algorithm,

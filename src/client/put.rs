@@ -1,19 +1,15 @@
-use std::env::current_dir;
 use std::fs;
 use std::io::Read;
 use std::path::PathBuf;
 
-use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, create_key, encrypt_bytes};
-use crate::identity::{read_identity, read_identity_key};
-use crate::metadata::{apply_key_to_metadata, create_metadata, get_member, read_metadata_attributes, sign_metadata, write_metadata_attributes, write_metadata_headers};
 use crate::client::ark_request;
-use crate::types::Key;
-use crate::util::{find_root, io_err, io_invalid_input, now_iso, resolve_url};
+use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, create_key, encrypt_bytes};
+use crate::types::IdentityContext;
+use crate::metadata::{apply_key_to_metadata, create_metadata, get_member, read_metadata_attributes, sign_metadata, write_metadata_attributes, write_metadata_headers};
+use crate::util::{io_err, io_invalid_input, now_iso, resolve_client_url};
 
-pub fn cmd_put(path: &str, input: Option<&str>, encryption_algorithm: Option<&str>) -> std::io::Result<()> {
-    let root = find_root(&current_dir()?)?;
-    let identity = read_identity(&root.join(".ark").join("identity.json"))?;
-    let url = resolve_url(path, &identity.address, &root, false)?;
+pub fn cmd_put(ctx: &IdentityContext, path: &str, input: Option<&str>, encryption_algorithm: Option<&str>) -> std::io::Result<()> {
+    let url = resolve_client_url(ctx, path)?;
 
     let input_path: Option<PathBuf> = input.map(PathBuf::from);
     if let Some(p) = input_path.as_deref() {
@@ -60,10 +56,10 @@ pub fn cmd_put(path: &str, input: Option<&str>, encryption_algorithm: Option<&st
         }
         m
     } else {
-        create_metadata(&identity.address, Some(encryption_algorithm.unwrap_or(DEFAULT_ENCRYPTION_ALGORITHM)))
+        create_metadata(&ctx.identity.address, Some(encryption_algorithm.unwrap_or(DEFAULT_ENCRYPTION_ALGORITHM)))
     };
 
-    if get_member(&metadata.members, &identity.address).is_none() {
+    if get_member(&metadata.members, &ctx.identity.address).is_none() {
         return Err(io_err("no member entry for current account"));
     }
 
@@ -85,17 +81,16 @@ pub fn cmd_put(path: &str, input: Option<&str>, encryption_algorithm: Option<&st
         let encryption_algorithm = metadata.encryption_algorithm.as_deref().unwrap();
         let file_key = create_key(encryption_algorithm)?;
         let (_, ciphertext) = encrypt_bytes(&file_key, &body)?;
-        apply_key_to_metadata(&mut metadata, &file_key)?;
+        apply_key_to_metadata(ctx, &mut metadata, &file_key)?;
         metadata.encrypted = Some(false);
         ciphertext
     };
 
     metadata.modified = now_iso();
-    metadata.modified_by = identity.address.clone();
+    metadata.modified_by = ctx.identity.address.clone();
 
-    let signing_key = read_identity_key(&root.join(".ark").join("identity.key"))?;
     let sign_body = if is_dir { None } else { Some(final_body.as_slice()) };
-    sign_metadata(&Key { algorithm: identity.public_key.algorithm.clone(), value: signing_key }, &mut metadata, sign_body)?;
+    sign_metadata(ctx.identity_key.as_ref().expect("client context missing identity_key"), &mut metadata, sign_body)?;
 
     if let Some(p) = input_path.as_deref() {
         write_metadata_attributes(p, &metadata)?;
@@ -104,7 +99,7 @@ pub fn cmd_put(path: &str, input: Option<&str>, encryption_algorithm: Option<&st
     let metadata_headers = write_metadata_headers(&metadata);
     let headers: Vec<(&str, &str)> = metadata_headers.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
 
-    let (response_code, _, response_body) = ark_request(&root, &url, "PUT", &headers, &final_body)?;
+    let (response_code, _, response_body) = ark_request(Some(ctx), "PUT", &url, &headers, &final_body)?;
     if response_code != 201 && response_code != 204 {
         return Err(io_err(&format!("HTTP {}: {}", response_code, String::from_utf8_lossy(&response_body))));
     }
@@ -118,8 +113,9 @@ mod tests {
 
     use super::*;
     use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, decrypt_bytes};
-    use crate::identity::read_identity_key;
+    use crate::context::create_client_context;
     use crate::server::start_test_server;
+    use crate::types::Key;
     use crate::util::test::{in_test_dir, init_with_server, write_plain_test_file};
 
     fn aes_decrypt(key: &[u8], ciphertext: &[u8]) -> std::io::Result<Vec<u8>> {
@@ -132,7 +128,8 @@ mod tests {
         let cwd = temp_dir.join(cwd_subpath);
         fs::create_dir_all(&cwd).unwrap();
         std::env::set_current_dir(&cwd).unwrap();
-        cmd_put(arg, Some(input.to_str().unwrap()), None).unwrap();
+        let ctx = create_client_context().unwrap();
+        cmd_put(&ctx, arg, Some(input.to_str().unwrap()), None).unwrap();
         input
     }
 
@@ -147,7 +144,7 @@ mod tests {
         in_test_dir("ark_put_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
-            init_with_server(temp_dir, &address);
+            let ctx = init_with_server(temp_dir, &address);
 
             put_via_cmd(temp_dir, "notes.txt", b"plaintext", "");
 
@@ -157,8 +154,7 @@ mod tests {
 
             let alg = xattr::get(&server_path, "user.ark.encryption_algorithm").unwrap();
             assert_eq!(alg.as_deref(), Some(b"aes-256-gcm".as_slice()));
-            let identity_seed = read_identity_key(&temp_dir.join(".ark/identity.key")).unwrap();
-            let file_key = unwrap_first_member_key(&server_path, &identity_seed);
+            let file_key = unwrap_first_member_key(&server_path, &ctx.identity_key.as_ref().unwrap().value);
             let decrypted = aes_decrypt(&file_key, &on_disk).unwrap();
             assert_eq!(decrypted, b"plaintext");
         });
@@ -169,15 +165,14 @@ mod tests {
         in_test_dir("ark_put_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
-            init_with_server(temp_dir, &address);
+            let ctx = init_with_server(temp_dir, &address);
 
             let input = put_via_cmd(temp_dir, "out.bin", b"hello", "");
             assert_eq!(
                 xattr::get(&input, "user.ark.encryption_algorithm").unwrap().as_deref(),
                 Some(b"aes-256-gcm".as_slice())
             );
-            let identity_seed = read_identity_key(&temp_dir.join(".ark/identity.key")).unwrap();
-            let _file_key = unwrap_first_member_key(&input, &identity_seed);
+            let _file_key = unwrap_first_member_key(&input, &ctx.identity_key.as_ref().unwrap().value);
         });
     }
 
@@ -186,20 +181,20 @@ mod tests {
         in_test_dir("ark_put_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
-            let (identity, secret_key) = init_with_server(temp_dir, &address);
+            let ctx = init_with_server(temp_dir, &address);
 
             let input = temp_dir.join("input.bin");
-            write_plain_test_file(&input, &identity, &secret_key, b"hello");
-            let mut preset_meta = create_metadata(&identity.address, Some(DEFAULT_ENCRYPTION_ALGORITHM));
+            write_plain_test_file(&input, &ctx.identity, ctx.identity_key.as_ref().unwrap(), b"hello");
+            let mut preset_meta = create_metadata(&ctx.identity.address, Some(DEFAULT_ENCRYPTION_ALGORITHM));
             let preset_file_key = create_key(DEFAULT_ENCRYPTION_ALGORITHM).unwrap();
-            apply_key_to_metadata(&mut preset_meta, &preset_file_key).unwrap();
-            sign_metadata(&secret_key, &mut preset_meta, Some(b"hello")).unwrap();
+            apply_key_to_metadata(&ctx, &mut preset_meta, &preset_file_key).unwrap();
+            sign_metadata(ctx.identity_key.as_ref().unwrap(), &mut preset_meta, Some(b"hello")).unwrap();
             write_metadata_attributes(&input, &preset_meta).unwrap();
 
-            cmd_put("notes.txt", Some(input.to_str().unwrap()), None).unwrap();
+            cmd_put(&ctx, "notes.txt", Some(input.to_str().unwrap()), None).unwrap();
 
             let server_path = temp_dir.join("ark/gyan/notes.txt");
-            let server_key = unwrap_first_member_key(&server_path, &secret_key.value);
+            let server_key = unwrap_first_member_key(&server_path, &ctx.identity_key.as_ref().unwrap().value);
             assert_ne!(server_key, preset_file_key.value);
 
             let ciphertext = fs::read(&server_path).unwrap();
@@ -213,16 +208,16 @@ mod tests {
         in_test_dir("ark_put_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
-            let (_, secret_key) = init_with_server(temp_dir, &address);
-            let account_key = secret_key.value;
+            let ctx = init_with_server(temp_dir, &address);
+            let account_key = ctx.identity_key.as_ref().unwrap().value.clone();
 
             let input = temp_dir.join("input.bin");
             fs::write(&input, b"v1").unwrap();
-            cmd_put("notes.txt", Some(input.to_str().unwrap()), None).unwrap();
+            cmd_put(&ctx, "notes.txt", Some(input.to_str().unwrap()), None).unwrap();
             let key1 = unwrap_first_member_key(&input, &account_key);
 
             fs::write(&input, b"v2").unwrap();
-            cmd_put("notes.txt", Some(input.to_str().unwrap()), None).unwrap();
+            cmd_put(&ctx, "notes.txt", Some(input.to_str().unwrap()), None).unwrap();
             let key2 = unwrap_first_member_key(&input, &account_key);
 
             assert_ne!(key1, key2);
@@ -252,8 +247,8 @@ mod tests {
         in_test_dir("ark_put_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
-            let (identity, secret_key) = init_with_server(temp_dir, &address);
-            write_plain_test_file(&temp_dir.join("ark/gyan/x.txt"), &identity, &secret_key, b"old");
+            let ctx = init_with_server(temp_dir, &address);
+            write_plain_test_file(&temp_dir.join("ark/gyan/x.txt"), &ctx.identity, ctx.identity_key.as_ref().unwrap(), b"old");
 
             put_via_cmd(temp_dir, "x.txt", b"new plaintext", "");
 
@@ -310,19 +305,19 @@ mod tests {
         in_test_dir("ark_put_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
-            let (identity, secret_key) = init_with_server(temp_dir, &address);
+            let ctx = init_with_server(temp_dir, &address);
 
             let file_key = create_key(DEFAULT_ENCRYPTION_ALGORITHM).unwrap();
             let ciphertext = encrypt_bytes(&file_key, b"hidden").unwrap().1;
             let input = temp_dir.join("input.bin");
             fs::write(&input, &ciphertext).unwrap();
-            let mut m = create_metadata(&identity.address, Some(DEFAULT_ENCRYPTION_ALGORITHM));
-            apply_key_to_metadata(&mut m, &file_key).unwrap();
+            let mut m = create_metadata(&ctx.identity.address, Some(DEFAULT_ENCRYPTION_ALGORITHM));
+            apply_key_to_metadata(&ctx, &mut m, &file_key).unwrap();
             m.encrypted = Some(true);
-            sign_metadata(&secret_key, &mut m, Some(&ciphertext)).unwrap();
+            sign_metadata(ctx.identity_key.as_ref().unwrap(), &mut m, Some(&ciphertext)).unwrap();
             write_metadata_attributes(&input, &m).unwrap();
 
-            cmd_put("file.bin", Some(input.to_str().unwrap()), None).unwrap();
+            cmd_put(&ctx, "file.bin", Some(input.to_str().unwrap()), None).unwrap();
 
             let server_path = temp_dir.join("ark/gyan/file.bin");
             let server_body = fs::read(&server_path).unwrap();
@@ -331,7 +326,7 @@ mod tests {
                 xattr::get(&input, "user.ark.encrypted").unwrap().as_deref(),
                 Some(b"true".as_slice())
             );
-            let unwrapped = unwrap_first_member_key(&input, &secret_key.value);
+            let unwrapped = unwrap_first_member_key(&input, &ctx.identity_key.as_ref().unwrap().value);
             assert_eq!(aes_decrypt(&unwrapped, &server_body).unwrap(), b"hidden");
         });
     }
@@ -356,19 +351,18 @@ mod tests {
         in_test_dir("ark_put_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
-            let (identity, secret_key) = init_with_server(temp_dir, &address);
+            let ctx = init_with_server(temp_dir, &address);
 
             let input = temp_dir.join("input.bin");
             fs::write(&input, b"plain bytes").unwrap();
-            let mut m = create_metadata(&identity.address, None);
-            sign_metadata(&secret_key, &mut m, Some(b"plain bytes")).unwrap();
+            let mut m = create_metadata(&ctx.identity.address, None);
+            sign_metadata(ctx.identity_key.as_ref().unwrap(), &mut m, Some(b"plain bytes")).unwrap();
             write_metadata_attributes(&input, &m).unwrap();
 
-            cmd_put("raw.bin", Some(input.to_str().unwrap()), None).unwrap();
+            cmd_put(&ctx, "raw.bin", Some(input.to_str().unwrap()), None).unwrap();
 
             let server_path = temp_dir.join("ark/gyan/raw.bin");
             assert_eq!(fs::read(&server_path).unwrap(), b"plain bytes");
-            // metadata records no encryption_algorithm; wrapped keys dropped
             assert_eq!(xattr::get(&server_path, "user.ark.encryption_algorithm").unwrap(), None);
             assert_eq!(xattr::get(&input, "user.ark.member_0_key_value").unwrap(), None);
         });
@@ -379,9 +373,9 @@ mod tests {
         in_test_dir("ark_put_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
-            init_with_server(temp_dir, &address);
+            let ctx = init_with_server(temp_dir, &address);
 
-            cmd_put("shared/", None, None).unwrap();
+            cmd_put(&ctx, "shared/", None, None).unwrap();
 
             let dir = temp_dir.join("ark/gyan/shared");
             assert!(dir.is_dir());
@@ -397,9 +391,9 @@ mod tests {
         in_test_dir("ark_put_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
-            init_with_server(temp_dir, &address);
+            let ctx = init_with_server(temp_dir, &address);
 
-            let err = cmd_put("shared/", None, Some("aes-256-gcm")).unwrap_err();
+            let err = cmd_put(&ctx, "shared/", None, Some("aes-256-gcm")).unwrap_err();
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         });
     }
@@ -409,11 +403,11 @@ mod tests {
         in_test_dir("ark_put_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
-            init_with_server(temp_dir, &address);
+            let ctx = init_with_server(temp_dir, &address);
 
             let input = temp_dir.join("input.bin");
             fs::write(&input, b"plain bytes").unwrap();
-            cmd_put("raw.bin", Some(input.to_str().unwrap()), Some("none")).unwrap();
+            cmd_put(&ctx, "raw.bin", Some(input.to_str().unwrap()), Some("none")).unwrap();
 
             let server_path = temp_dir.join("ark/gyan/raw.bin");
             assert_eq!(fs::read(&server_path).unwrap(), b"plain bytes");
@@ -426,10 +420,10 @@ mod tests {
         in_test_dir("ark_put_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
-            init_with_server(temp_dir, &address);
+            let ctx = init_with_server(temp_dir, &address);
 
             let missing = temp_dir.join("does_not_exist.bin");
-            let err = cmd_put("notes.txt", Some(missing.to_str().unwrap()), None).unwrap_err();
+            let err = cmd_put(&ctx, "notes.txt", Some(missing.to_str().unwrap()), None).unwrap_err();
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
             assert!(format!("{}", err).contains("input does not exist"));
         });
@@ -440,11 +434,11 @@ mod tests {
         in_test_dir("ark_put_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
-            init_with_server(temp_dir, &address);
+            let ctx = init_with_server(temp_dir, &address);
 
             let input = temp_dir.join("input.bin");
             fs::write(&input, b"hi").unwrap();
-            let err = cmd_put("shared/", Some(input.to_str().unwrap()), None).unwrap_err();
+            let err = cmd_put(&ctx, "shared/", Some(input.to_str().unwrap()), None).unwrap_err();
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
             assert!(format!("{}", err).contains("directory path but input is a file"));
         });
@@ -455,21 +449,19 @@ mod tests {
         in_test_dir("ark_put_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
-            init_with_server(temp_dir, &address);
+            let ctx = init_with_server(temp_dir, &address);
 
             let input_dir = temp_dir.join("input_dir");
             fs::create_dir_all(&input_dir).unwrap();
-            let err = cmd_put("shared", Some(input_dir.to_str().unwrap()), Some("aes-256-gcm")).unwrap_err();
+            let err = cmd_put(&ctx, "shared", Some(input_dir.to_str().unwrap()), Some("aes-256-gcm")).unwrap_err();
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         });
     }
 
     #[test]
     fn cmd_put_missing_identity_errors() {
-        in_test_dir("ark_put_test", |temp_dir| {
-            let input = temp_dir.join("input.bin");
-            fs::write(&input, b"x").unwrap();
-            let err = cmd_put("anything", Some(input.to_str().unwrap()), None).unwrap_err();
+        in_test_dir("ark_put_test", |_temp_dir| {
+            let err = create_client_context().err().expect("expected error");
             let msg = format!("{}", err);
             assert!(msg.contains("no .ark"), "msg was {}", msg);
         });

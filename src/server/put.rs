@@ -5,11 +5,12 @@ use std::path::Path;
 
 use crate::identity::{resolve_identity, validate_identity};
 use crate::metadata::{read_metadata_headers, verify_metadata, write_metadata_attributes};
-use crate::types::{Identity, Member, Permission};
+use crate::types::{Identity, IdentityContext, Member, Permission};
 
 use super::write_status;
 
 pub fn serve_put_init(
+    server_ctx: &IdentityContext,
     stream: &mut TcpStream,
     headers: &Vec<(String, String)>,
     body: &[u8],
@@ -24,10 +25,10 @@ pub fn serve_put_init(
         return write_status(stream, 400, "Bad Request", e.to_string().as_bytes());
     }
 
-    serve_put(target_path, stream, body, headers, None, Permission::Owner, false, Some(&body_identity))
+    serve_put(server_ctx, target_path, stream, body, headers, None, Permission::Owner, false, Some(&body_identity))
 }
 
-pub fn serve_put(fs_path: &Path, stream: &mut TcpStream, body: &[u8], headers: &[(String, String)], existing_members: Option<Vec<Member>>, permission: Permission, target_is_dir: bool, modifier_identity_override: Option<&Identity>) -> std::io::Result<()> {
+pub fn serve_put(server_ctx: &IdentityContext, fs_path: &Path, stream: &mut TcpStream, body: &[u8], headers: &[(String, String)], existing_members: Option<Vec<Member>>, permission: Permission, target_is_dir: bool, modifier_identity_override: Option<&Identity>) -> std::io::Result<()> {
     let metadata = match read_metadata_headers(headers) {
         Ok(m) => m,
         Err(e) => return write_status(stream, 400, "Bad Request", e.to_string().as_bytes()),
@@ -44,7 +45,7 @@ pub fn serve_put(fs_path: &Path, stream: &mut TcpStream, body: &[u8], headers: &
 
     let modifier_identity = match modifier_identity_override {
         Some(i) => i.clone(),
-        None => match resolve_identity(&metadata.modified_by) {
+        None => match resolve_identity(server_ctx, &metadata.modified_by) {
             Ok(i) => i,
             Err(e) => return write_status(stream, 403, "Forbidden", e.to_string().as_bytes()),
         },

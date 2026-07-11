@@ -1,4 +1,5 @@
 mod client;
+mod context;
 mod crypto;
 mod http;
 mod identity;
@@ -10,6 +11,7 @@ mod util;
 use clap::{Parser, Subcommand};
 
 use crate::client::{DecryptArgs, cmd_chmod, cmd_decrypt, cmd_delete, cmd_get, cmd_head, cmd_init, cmd_put};
+use crate::context::create_client_context;
 use crate::server::cmd_server;
 
 #[derive(Parser)]
@@ -106,15 +108,15 @@ fn main() {
         Cmd::Server { port } => {
             cmd_server(port);
             Ok(())
-        }
+        },
         Cmd::Init { address } => cmd_init(&address),
-        Cmd::Chmod { owner, write, read, drop, file } => cmd_chmod(&file, &owner, &write, &read, &drop),
-        Cmd::Head { path } => cmd_head(&path),
-        Cmd::Delete { path } => cmd_delete(&path),
-        Cmd::Get { output, decrypt, path } => cmd_get(&path, output.as_deref(), decrypt),
-        Cmd::Put { input, encryption_algorithm, path } => cmd_put(&path, input.as_deref(), encryption_algorithm.as_deref()),
+        Cmd::Chmod { owner, write, read, drop, file } => create_client_context().and_then(|c| cmd_chmod(&c, &file, &owner, &write, &read, &drop)),
+        Cmd::Head { path } => create_client_context().and_then(|c| cmd_head(&c, &path)),
+        Cmd::Delete { path } => create_client_context().and_then(|c| cmd_delete(&c, &path)),
+        Cmd::Get { output, decrypt, path } => create_client_context().and_then(|c| cmd_get(&c, &path, output.as_deref(), decrypt)),
+        Cmd::Put { input, encryption_algorithm, path } => create_client_context().and_then(|c| cmd_put(&c, &path, input.as_deref(), encryption_algorithm.as_deref())),
         Cmd::Decrypt { input, output, in_place, key, encryption_algorithm } => {
-            cmd_decrypt(DecryptArgs { input, output, in_place, key, encryption_algorithm })
+            create_client_context().and_then(|c| cmd_decrypt(&c, DecryptArgs { input, output, in_place, key, encryption_algorithm }))
         }
     };
     if let Err(e) = result {

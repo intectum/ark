@@ -1,4 +1,4 @@
-use std::env;
+use std::env::current_dir;
 use std::io::{Error, ErrorKind};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -8,57 +8,69 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sha2::{Digest, Sha256};
 use url::Url;
 
-pub fn find_root(cwd: &Path) -> std::io::Result<PathBuf> {
-    let mut root = cwd;
+use crate::types::IdentityContext;
+
+pub fn find_account_root() -> std::io::Result<PathBuf> {
+    let current = current_dir()?;
+
+    let mut root = current.as_path();
     while !std::fs::exists(root.join(".ark"))? {
         root = root
             .parent()
             .ok_or_else(|| Error::new(ErrorKind::NotFound, "no .ark dir found"))?;
     }
+
     Ok(root.to_path_buf())
 }
 
-pub fn resolve_url(
-    input: &str,
-    address: &str,
-    account_dir: &Path,
-    is_server: bool,
-) -> std::io::Result<Url> {
-    let raw = if is_server {
-        format!("http://localhost{}", input)
-    } else {
-        let mut s = input.to_string();
-        if !s.contains('@') {
-            if !s.starts_with('/') {
-                let cwd = env::current_dir()?;
-                let rel = cwd.strip_prefix(account_dir).unwrap_or(Path::new("")).to_string_lossy();
-                s = match rel.as_ref() {
-                    "" => format!("/{}", s),
-                    _ => format!("/{}/{}", rel, s),
-                };
-            }
-            s = format!("{}{}", address, s);
-        }
-        if !s.contains("://") {
-            s = format!("https://{}", s);
-        }
-        s
-    };
+pub fn resolve_client_url(ctx: &IdentityContext, path: &str) -> std::io::Result<Url> {
+    resolve_client_url_raw(&ctx.root, path, &ctx.identity.address)
+}
 
-    let mut url = Url::parse(&raw)
-        .map_err(|e| io_invalid_input(&format!("invalid URL {}: {}", input, e)))?;
-
-    if !is_server {
-        url.set_path(&format!("/ark/{}{}", url.username(), url.path()));
+pub fn resolve_client_url_raw(root: &Path, path: &str, address: &str) -> std::io::Result<Url> {
+    let mut s = path.to_string();
+    if !s.contains('@') {
+        if !s.starts_with('/') {
+            let cwd = current_dir()?;
+            let rel = cwd.strip_prefix(root).unwrap_or(Path::new("")).to_string_lossy();
+            s = match rel.as_ref() {
+                "" => format!("/{}", s),
+                _ => format!("/{}/{}", rel, s),
+            };
+        }
+        s = format!("{}{}", address, s);
+    }
+    if !s.contains("://") {
+        s = format!("https://{}", s);
     }
 
+    let mut url = Url::parse(&s)
+        .map_err(|e| io_invalid_input(&format!("invalid URL {}: {}", path, e)))?;
+
+    url.set_path(&format!("/ark/{}{}", url.username(), url.path()));
+
+    reject_path_traversal(&url)?;
+
+    Ok(url)
+}
+
+pub fn resolve_server_url(path: &str) -> std::io::Result<Url> {
+    let url = Url::parse(&format!("http://localhost{}", path))
+        .map_err(|e| io_invalid_input(&format!("invalid URL {}: {}", path, e)))?;
+
+    reject_path_traversal(&url)?;
+
+    Ok(url)
+}
+
+fn reject_path_traversal(url: &Url) -> std::io::Result<()> {
     for component in Path::new(url.path()).components() {
         if matches!(component, Component::ParentDir) {
             return Err(io_invalid_input("path traversal not allowed"));
         }
     }
 
-    Ok(url)
+    Ok(())
 }
 
 pub fn request_to_bytes(method: &str, path: &str, timestamp: u64, body: &[u8]) -> Vec<u8> {
@@ -116,9 +128,10 @@ pub mod test {
 
     use crate::client::init;
     use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, create_key, encrypt_bytes};
+    use crate::context::create_client_context;
     use crate::identity::write_identity;
-    use crate::metadata::{apply_key_to_metadata, create_metadata, sign_metadata, write_metadata_attributes};
-    use crate::types::{Identity, Key, Metadata};
+    use crate::metadata::{create_metadata, sign_metadata, write_metadata_attributes};
+    use crate::types::{IdentityContext, Identity, Key, Metadata};
 
     static CWD_LOCK: Mutex<()> = Mutex::new(());
     pub const TEST_ADDRESS: &str = "test@example.com";
@@ -152,13 +165,13 @@ pub mod test {
         (identity, secret_key, account_dir)
     }
 
-    pub fn init_with_server(temp_dir: &Path, address: &str) -> (Identity, Key) {
-        let (identity, secret_key) = init(temp_dir, address).unwrap();
+    pub fn init_with_server(temp_dir: &Path, address: &str) -> IdentityContext {
+        let (identity, _) = init(temp_dir, address).unwrap();
         let name = address.split_once('@').unwrap().0;
         let server_dot_ark = temp_dir.join("ark").join(name).join(".ark");
         fs::create_dir_all(&server_dot_ark).unwrap();
         write_identity(&server_dot_ark.join("identity.json"), &identity).unwrap();
-        (identity, secret_key)
+        create_client_context().unwrap()
     }
 
     pub fn create_plain_test_metadata(owner: &Identity, owner_key: &Key, body: &[u8]) -> Metadata {
@@ -178,7 +191,8 @@ pub mod test {
         let mut metadata = create_metadata(&owner.address, Some(DEFAULT_ENCRYPTION_ALGORITHM));
         let file_key = create_key(DEFAULT_ENCRYPTION_ALGORITHM).unwrap();
         let (_, ciphertext) = encrypt_bytes(&file_key, plaintext).unwrap();
-        apply_key_to_metadata(&mut metadata, &file_key).unwrap();
+        let (wrap_alg, wrapped) = encrypt_bytes(&owner.public_key, &file_key.value).unwrap();
+        metadata.members[0].key = Some(Key { algorithm: wrap_alg, value: wrapped });
         sign_metadata(owner_key, &mut metadata, Some(&ciphertext)).unwrap();
         (metadata, ciphertext)
     }
@@ -192,13 +206,15 @@ pub mod test {
 
 #[cfg(test)]
 mod tests {
+    use std::env;
+
     use super::*;
 
     #[test]
     fn resolve_url_absolute() {
         let cwd = env::current_dir().unwrap();
         let account_dir = cwd.parent().unwrap();
-        let url = resolve_url("/path/to/file.txt", "gyan@127.0.0.1:8080", Path::new(account_dir), false).unwrap();
+        let url = resolve_client_url_raw(Path::new(account_dir), "/path/to/file.txt", "gyan@127.0.0.1:8080").unwrap();
         assert_eq!(url.scheme(), "https");
         assert_eq!(url.host_str(), Some("127.0.0.1"));
         assert_eq!(url.port(), Some(8080));
@@ -208,7 +224,7 @@ mod tests {
     #[test]
     fn resolve_url_relative_at_account_root() {
         let account_dir = env::current_dir().unwrap();
-        let url = resolve_url("path/to/file.txt", "gyan@127.0.0.1:8080", &account_dir, false).unwrap();
+        let url = resolve_client_url_raw(&account_dir, "path/to/file.txt", "gyan@127.0.0.1:8080").unwrap();
         assert_eq!(url.scheme(), "https");
         assert_eq!(url.host_str(), Some("127.0.0.1"));
         assert_eq!(url.port(), Some(8080));
@@ -220,7 +236,7 @@ mod tests {
         let cwd = env::current_dir().unwrap();
         let account_dir = cwd.parent().unwrap();
         let dir = cwd.file_name().unwrap();
-        let url = resolve_url("path/to/file.txt", "gyan@127.0.0.1:8080", account_dir, false).unwrap();
+        let url = resolve_client_url_raw(account_dir, "path/to/file.txt", "gyan@127.0.0.1:8080").unwrap();
         assert_eq!(url.scheme(), "https");
         assert_eq!(url.host_str(), Some("127.0.0.1"));
         assert_eq!(url.port(), Some(8080));
@@ -231,7 +247,7 @@ mod tests {
     fn resolve_url_address_with_path() {
         let cwd = env::current_dir().unwrap();
         let account_dir = cwd.parent().unwrap();
-        let url = resolve_url("alice@example.com/path/to/file.txt", "gyan@127.0.0.1:8080", account_dir, false).unwrap();
+        let url = resolve_client_url_raw(account_dir, "alice@example.com/path/to/file.txt", "gyan@127.0.0.1:8080").unwrap();
         assert_eq!(url.scheme(), "https");
         assert_eq!(url.host_str(), Some("example.com"));
         assert_eq!(url.port(), None);
@@ -242,7 +258,7 @@ mod tests {
     fn resolve_url_address_with_scheme_and_port_and_path() {
         let cwd = env::current_dir().unwrap();
         let account_dir = cwd.parent().unwrap();
-        let url = resolve_url("http://alice@example.com:9000/path/to/file.txt", "gyan@127.0.0.1:8080", account_dir, false).unwrap();
+        let url = resolve_client_url_raw(account_dir, "http://alice@example.com:9000/path/to/file.txt", "gyan@127.0.0.1:8080").unwrap();
         assert_eq!(url.scheme(), "http");
         assert_eq!(url.host_str(), Some("example.com"));
         assert_eq!(url.port(), Some(9000));
@@ -253,7 +269,7 @@ mod tests {
     fn resolve_url_address_only() {
         let cwd = env::current_dir().unwrap();
         let account_dir = cwd.parent().unwrap();
-        let url = resolve_url("alice@example.com", "gyan@127.0.0.1:8080", account_dir, false).unwrap();
+        let url = resolve_client_url_raw(account_dir, "alice@example.com", "gyan@127.0.0.1:8080").unwrap();
         assert_eq!(url.scheme(), "https");
         assert_eq!(url.host_str(), Some("example.com"));
         assert_eq!(url.port(), None);
@@ -262,7 +278,7 @@ mod tests {
 
     #[test]
     fn resolve_url_server_localhost() {
-        let url = resolve_url("/ark/gyan/notes.txt", "", Path::new(""), true).unwrap();
+        let url = resolve_server_url("/ark/gyan/notes.txt").unwrap();
         assert_eq!(url.scheme(), "http");
         assert_eq!(url.host_str(), Some("localhost"));
         assert_eq!(url.path(), "/ark/gyan/notes.txt");
@@ -270,7 +286,7 @@ mod tests {
 
     #[test]
     fn resolve_url_server_strips_query() {
-        let url = resolve_url("/ark/gyan/notes.txt?x=1", "", Path::new(""), true).unwrap();
+        let url = resolve_server_url("/ark/gyan/notes.txt?x=1").unwrap();
         assert_eq!(url.path(), "/ark/gyan/notes.txt");
     }
 }

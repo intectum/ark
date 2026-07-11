@@ -1,25 +1,23 @@
-use std::env::current_dir;
 use std::path::Path;
 
 use crate::crypto::{decrypt_bytes, encrypt_bytes};
-use crate::identity::{read_identity, read_identity_key, resolve_identity};
+use crate::types::IdentityContext;
+use crate::identity::resolve_identity;
 use crate::metadata::{get_member, read_metadata_attributes, sign_metadata, verify_metadata_signature, write_metadata_attributes};
 use crate::types::{Key, Member, Permission};
-use crate::util::{find_root, io_err, io_invalid_input, now_iso};
+use crate::util::{io_err, io_invalid_input, now_iso};
 
 const PUBLIC_CLI: &str = "public";
 const PUBLIC_WIRE: &str = "*";
 
 pub fn cmd_chmod(
+    ctx: &IdentityContext,
     path: &str,
     owners: &[String],
     writers: &[String],
     readers: &[String],
     drops: &[String],
 ) -> std::io::Result<()> {
-    let root = find_root(&current_dir()?)?;
-    let identity = read_identity(&root.join(".ark").join("identity.json"))?;
-
     let input_path = Path::new(path);
     if !std::fs::exists(input_path)? {
         return Err(io_invalid_input("input does not exist"));
@@ -27,34 +25,35 @@ pub fn cmd_chmod(
 
     let mut metadata = read_metadata_attributes(input_path)?;
 
-    let modifier_identity = resolve_identity(&metadata.modified_by)?;
+    let modifier_identity = resolve_identity(ctx, &metadata.modified_by)?;
     verify_metadata_signature(&modifier_identity.public_key, &metadata)?;
 
-    match get_member(&metadata.members, &identity.address) {
+    match get_member(&metadata.members, &ctx.identity.address) {
         Some(m) if m.permission == Permission::Owner => {}
         _ => return Err(io_err("only an owner can change permissions")),
     }
 
     let encrypted = metadata.encryption_algorithm.is_some();
 
-    let identity_key = read_identity_key(&root.join(".ark").join("identity.key"))?;
-
     let file_key = if encrypted {
-        let member = get_member(&metadata.members, &identity.address)
+        let member = get_member(&metadata.members, &ctx.identity.address)
             .ok_or_else(|| io_err("no member entry for current account"))?;
         let encrypted_file_key = member.key.as_ref()
             .ok_or_else(|| io_err("no file key for current account"))?;
         Some(decrypt_bytes(
-            &Key { algorithm: encrypted_file_key.algorithm.clone(), value: identity_key.clone() },
+            &Key {
+                algorithm: encrypted_file_key.algorithm.clone(),
+                value: ctx.identity_key.as_ref().expect("client context missing identity_key").value.clone()
+            },
             &encrypted_file_key.value,
         )?)
     } else {
         None
     };
 
-    apply_changes(&mut metadata.members, owners, Permission::Owner, file_key.as_deref())?;
-    apply_changes(&mut metadata.members, writers, Permission::Write, file_key.as_deref())?;
-    apply_changes(&mut metadata.members, readers, Permission::Read, file_key.as_deref())?;
+    apply_changes(ctx, &mut metadata.members, owners, Permission::Owner, file_key.as_deref())?;
+    apply_changes(ctx, &mut metadata.members, writers, Permission::Write, file_key.as_deref())?;
+    apply_changes(ctx, &mut metadata.members, readers, Permission::Read, file_key.as_deref())?;
 
     for addr in drops {
         let wire = cli_address_to_wire(addr);
@@ -66,11 +65,11 @@ pub fn cmd_chmod(
     }
 
     metadata.modified = now_iso();
-    metadata.modified_by = identity.address.clone();
+    metadata.modified_by = ctx.identity.address.clone();
 
     let body = if input_path.is_dir() { Vec::new() } else { std::fs::read(input_path)? };
     let sign_body = if input_path.is_dir() { None } else { Some(body.as_slice()) };
-    sign_metadata(&Key { algorithm: identity.public_key.algorithm, value: identity_key }, &mut metadata, sign_body)?;
+    sign_metadata(ctx.identity_key.as_ref().expect("client context missing identity_key"), &mut metadata, sign_body)?;
 
     write_metadata_attributes(input_path, &metadata)?;
 
@@ -78,6 +77,7 @@ pub fn cmd_chmod(
 }
 
 fn apply_changes(
+    ctx: &IdentityContext,
     members: &mut Vec<Member>,
     addresses: &[String],
     permission: Permission,
@@ -95,7 +95,7 @@ fn apply_changes(
             None => {
                 let key = match (file_key, wire.as_str()) {
                     (Some(fk), w) if w != PUBLIC_WIRE => {
-                        let new_identity = resolve_identity(&wire)?;
+                        let new_identity = resolve_identity(ctx, &wire)?;
                         let (algorithm, value) = encrypt_bytes(&new_identity.public_key, fk)?;
                         Some(Key { algorithm, value })
                     }
@@ -123,6 +123,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::*;
+    use crate::context::create_client_context;
     use crate::identity::write_identity;
     use crate::metadata::{create_metadata, sign_metadata, verify_metadata, write_metadata_attributes};
     use crate::types::{Identity, Key};
@@ -144,7 +145,8 @@ mod tests {
             write_plain_test_file(&path, &identity, &secret_key, b"hello");
 
             env::set_current_dir(&account_dir).unwrap();
-            cmd_chmod(path.to_str().unwrap(), &[], &[], &["john@example.com".to_string()], &[]).unwrap();
+            let ctx = create_client_context().unwrap();
+            cmd_chmod(&ctx, path.to_str().unwrap(), &[], &[], &["john@example.com".to_string()], &[]).unwrap();
 
             let m = read_metadata_attributes(&path).unwrap();
             let john = m.members.iter().find(|m| m.address == "john@example.com").unwrap();
@@ -161,7 +163,8 @@ mod tests {
             write_plain_test_file(&path, &identity, &secret_key, b"open");
 
             env::set_current_dir(&account_dir).unwrap();
-            cmd_chmod(path.to_str().unwrap(), &[], &[], &["public".to_string()], &[]).unwrap();
+            let ctx = create_client_context().unwrap();
+            cmd_chmod(&ctx, path.to_str().unwrap(), &[], &[], &["public".to_string()], &[]).unwrap();
 
             let m = read_metadata_attributes(&path).unwrap();
             let pub_member = m.members.iter().find(|m| m.address == "*").unwrap();
@@ -178,7 +181,8 @@ mod tests {
             write_encrypted_test_file(&path, &identity, &secret_key, b"plaintext");
 
             env::set_current_dir(&account_dir).unwrap();
-            let err = cmd_chmod(path.to_str().unwrap(), &[], &[], &["public".to_string()], &[]).unwrap_err();
+            let ctx = create_client_context().unwrap();
+            let err = cmd_chmod(&ctx, path.to_str().unwrap(), &[], &[], &["public".to_string()], &[]).unwrap_err();
             assert!(err.to_string().contains("public member to encrypted"), "msg was {}", err);
         });
     }
@@ -202,7 +206,8 @@ mod tests {
             ).unwrap();
 
             env::set_current_dir(&account_dir).unwrap();
-            cmd_chmod(path.to_str().unwrap(), &[], &[], &["bob@example.com".to_string()], &[]).unwrap();
+            let ctx = create_client_context().unwrap();
+            cmd_chmod(&ctx, path.to_str().unwrap(), &[], &[], &["bob@example.com".to_string()], &[]).unwrap();
 
             let m = read_metadata_attributes(&path).unwrap();
             let bob = m.members.iter().find(|m| m.address == "bob@example.com").unwrap();
@@ -234,7 +239,8 @@ mod tests {
             write_metadata_attributes(&path, &m).unwrap();
 
             env::set_current_dir(&account_dir).unwrap();
-            cmd_chmod(path.to_str().unwrap(), &[], &["sam@example.com".to_string()], &[], &[]).unwrap();
+            let ctx = create_client_context().unwrap();
+            cmd_chmod(&ctx, path.to_str().unwrap(), &[], &["sam@example.com".to_string()], &[], &[]).unwrap();
 
             let m2 = read_metadata_attributes(&path).unwrap();
             let sam = m2.members.iter().find(|m| m.address == "sam@example.com").unwrap();
@@ -260,7 +266,8 @@ mod tests {
             write_metadata_attributes(&path, &m).unwrap();
 
             env::set_current_dir(&account_dir).unwrap();
-            cmd_chmod(path.to_str().unwrap(), &[], &[], &[], &["sam@example.com".to_string()]).unwrap();
+            let ctx = create_client_context().unwrap();
+            cmd_chmod(&ctx, path.to_str().unwrap(), &[], &[], &[], &["sam@example.com".to_string()]).unwrap();
 
             let m2 = read_metadata_attributes(&path).unwrap();
             assert!(!m2.members.iter().any(|m| m.address == "sam@example.com"));
@@ -275,7 +282,8 @@ mod tests {
             write_plain_test_file(&path, &identity, &secret_key, b"body");
 
             env::set_current_dir(&account_dir).unwrap();
-            let err = cmd_chmod(path.to_str().unwrap(), &[], &[], &[], &[TEST_ADDRESS.to_string()]).unwrap_err();
+            let ctx = create_client_context().unwrap();
+            let err = cmd_chmod(&ctx, path.to_str().unwrap(), &[], &[], &[], &[TEST_ADDRESS.to_string()]).unwrap_err();
             assert!(err.to_string().contains("at least one owner"), "msg was {}", err);
         });
     }
@@ -299,7 +307,8 @@ mod tests {
             write_metadata_attributes(&path, &m).unwrap();
 
             env::set_current_dir(&account_dir).unwrap();
-            let err = cmd_chmod(path.to_str().unwrap(), &[], &[], &["john@example.com".to_string()], &[]).unwrap_err();
+            let ctx = create_client_context().unwrap();
+            let err = cmd_chmod(&ctx, path.to_str().unwrap(), &[], &[], &["john@example.com".to_string()], &[]).unwrap_err();
             assert!(err.to_string().contains("only an owner"), "msg was {}", err);
         });
     }
@@ -309,8 +318,9 @@ mod tests {
         in_test_dir("ark_chmod_test", |temp_dir| {
             let (_identity, _secret_key, account_dir) = setup(temp_dir);
             env::set_current_dir(&account_dir).unwrap();
+            let ctx = create_client_context().unwrap();
             let missing = account_dir.join("nope.txt");
-            let err = cmd_chmod(missing.to_str().unwrap(), &[], &[], &["john@example.com".to_string()], &[]).unwrap_err();
+            let err = cmd_chmod(&ctx, missing.to_str().unwrap(), &[], &[], &["john@example.com".to_string()], &[]).unwrap_err();
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
             assert!(format!("{}", err).contains("input does not exist"));
         });
@@ -324,7 +334,8 @@ mod tests {
             write_plain_test_file(&path, &identity, &secret_key, b"body");
 
             env::set_current_dir(&account_dir).unwrap();
-            cmd_chmod(path.to_str().unwrap(), &[], &[], &["john@example.com".to_string()], &[]).unwrap();
+            let ctx = create_client_context().unwrap();
+            cmd_chmod(&ctx, path.to_str().unwrap(), &[], &[], &["john@example.com".to_string()], &[]).unwrap();
 
             let m = read_metadata_attributes(&path).unwrap();
             let body = fs::read(&path).unwrap();

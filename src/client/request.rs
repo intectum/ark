@@ -1,48 +1,29 @@
 use std::net::TcpStream;
-use std::path::Path;
 use std::time::Duration;
 
 use url::Url;
 
-use crate::crypto::{sign_bytes};
+use crate::crypto::sign_bytes;
+use crate::types::IdentityContext;
 use crate::http::{read_response, write_request};
-use crate::identity::{read_identity, read_identity_key};
-use crate::types::{Identity, Key};
 use crate::util::{encode_base64url, io_err, now_seconds, request_to_bytes};
 
-pub fn ark_request(
-    root: &Path,
-    url: &Url,
-    method: &str,
-    headers: &[(&str, &str)],
-    body: &[u8],
-) -> std::io::Result<(u16, Vec<(String, String)>, Vec<u8>)> {
-    let identity = read_identity(&root.join(".ark").join("identity.json"))?;
-    let key = read_identity_key(&root.join(".ark").join("identity.key"))?;
-    request(method, &url, headers, body, Some((&identity, &key)))
-}
-
-pub fn request(
-    method: &str,
-    url: &Url,
-    headers: &[(&str, &str)],
-    body: &[u8],
-    auth: Option<(&Identity, &[u8])>,
-) -> std::io::Result<(u16, Vec<(String, String)>, Vec<u8>)> {
+pub fn ark_request(ctx: Option<&IdentityContext>, method: &str, url: &Url, headers: &[(&str, &str)], body: &[u8]) -> std::io::Result<(u16, Vec<(String, String)>, Vec<u8>)> {
     let mut final_headers = headers.to_vec();
 
-    let authorization = if let Some((identity, key)) = auth {
-        let timestamp = now_seconds();
-        let bytes = request_to_bytes(method, url.path(), timestamp, body);
-        let signature = sign_bytes(&Key { algorithm: identity.public_key.algorithm.clone(), value: key.to_vec() }, &bytes)?;
-        Some(format!(
-            "ArkAccount address=\"{}\", timestamp=\"{}\", signature=\"{}\"",
-            identity.address,
-            timestamp,
-            encode_base64url(signature.value),
-        ))
-    } else {
-        None
+    let authorization = match ctx {
+        Some(c) => {
+            let timestamp = now_seconds();
+            let request_bytes = request_to_bytes(method, url.path(), timestamp, body);
+            let signature = sign_bytes(c.identity_key.as_ref().expect("client context missing identity_key"), &request_bytes)?;
+            Some(format!(
+                "ArkAccount address=\"{}\", timestamp=\"{}\", signature=\"{}\"",
+                c.identity.address,
+                timestamp,
+                encode_base64url(signature.value),
+            ))
+        }
+        None => None,
     };
 
     if let Some(ref a) = authorization {
@@ -66,10 +47,12 @@ mod tests {
     use std::thread;
 
     use super::*;
+    use crate::client::init;
     use crate::crypto::verify_bytes;
-    use crate::identity::create_identity;
+    use crate::context::create_client_context;
     use crate::types::Signature;
     use crate::util::decode_base64url;
+    use crate::util::test::in_test_dir;
 
     pub fn bind_local() -> (TcpListener, u16) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -123,73 +106,6 @@ mod tests {
         None
     }
 
-    #[test]
-    fn request_returns_status_and_body() {
-        let (listener, port) = bind_local();
-        let handle = thread::spawn(move || {
-            let (mut s, _) = listener.accept().unwrap();
-            let _ = read_full_request(&mut s);
-            s.write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello").unwrap();
-        });
-
-        let url = Url::parse(&format!("http://127.0.0.1:{}/x", port)).unwrap();
-        let (identity, secret_key) = create_identity("alice@example.com").unwrap();
-        let (code, headers, body) = request("PUT", &url, &[], b"data", Some((&identity, &secret_key.value))).unwrap();
-        assert_eq!(code, 201);
-        assert_eq!(body, b"hello");
-        assert!(headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("content-length") && v == "5"));
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn request_sends_method_path_and_body() {
-        let (listener, port) = bind_local();
-        let captured = thread::spawn(move || {
-            let (mut s, _) = listener.accept().unwrap();
-            let req = read_full_request(&mut s);
-            s.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
-            req
-        });
-
-        let url = Url::parse(&format!("http://127.0.0.1:{}/ark/alice/x", port)).unwrap();
-        let (identity, secret_key) = create_identity("alice@example.com").unwrap();
-        let (code, _, _) = request("PUT", &url, &[], b"payload", Some((&identity, &secret_key.value))).unwrap();
-        assert_eq!(code, 204);
-
-        let req = captured.join().unwrap();
-        let req_str = String::from_utf8_lossy(&req);
-        assert!(req_str.starts_with("PUT /ark/alice/x HTTP/1.1\r\n"), "request was: {}", req_str);
-        assert_eq!(parse_header(&req, "Host"), Some(format!("127.0.0.1:{}", port).as_str()));
-        assert_eq!(parse_header(&req, "Content-Length"), Some("7"));
-        assert!(req.ends_with(b"payload"));
-    }
-
-    #[test]
-    fn request_signs_method_path_timestamp_body() {
-        let (listener, port) = bind_local();
-        let captured = thread::spawn(move || {
-            let (mut s, _) = listener.accept().unwrap();
-            let req = read_full_request(&mut s);
-            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
-            req
-        });
-
-        let url = Url::parse(&format!("http://127.0.0.1:{}/x", port)).unwrap();
-        let (identity, secret_key) = create_identity("alice@example.com").unwrap();
-        let _ = request("GET", &url, &[], &[], Some((&identity, &secret_key.value))).unwrap();
-
-        let req = captured.join().unwrap();
-        let auth = parse_header(&req, "Authorization").unwrap();
-        let params = parse_auth_params(auth).unwrap();
-        assert_eq!(params.get("address").map(String::as_str), Some(identity.address.as_str()));
-        let ts_n: u64 = params.get("timestamp").unwrap().parse().unwrap();
-        let sig_value = decode_base64url(params.get("signature").unwrap()).unwrap();
-
-        let msg = request_to_bytes("GET", "/x", ts_n, &[]);
-        let signature = Signature { algorithm: identity.public_key.algorithm.clone(), value: sig_value };
-        assert!(verify_bytes(&identity.public_key, &signature, msg).is_ok());
-    }
-
     fn parse_auth_params(value: &str) -> Option<std::collections::HashMap<String, String>> {
         let rest = value.strip_prefix("ArkAccount ")?.trim();
         let mut out = std::collections::HashMap::new();
@@ -201,43 +117,130 @@ mod tests {
     }
 
     #[test]
-    fn request_propagates_non_2xx_status() {
-        let (listener, port) = bind_local();
-        thread::spawn(move || {
-            let (mut s, _) = listener.accept().unwrap();
-            let _ = read_full_request(&mut s);
-            s.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 7\r\nConnection: close\r\n\r\ndenied!").unwrap();
-        });
+    fn ark_request_returns_status_and_body() {
+        in_test_dir("ark_request_test", |temp_dir| {
+            init(temp_dir, "alice@example.com").unwrap();
+            let ctx = create_client_context().unwrap();
 
-        let url = Url::parse(&format!("http://127.0.0.1:{}/ark/x", port)).unwrap();
-        let (identity, secret_key) = create_identity("alice@example.com").unwrap();
-        let (code, _, body) = request("GET", &url, &[], &[], Some((&identity, &secret_key.value))).unwrap();
-        assert_eq!(code, 403);
-        assert_eq!(body, b"denied!");
+            let (listener, port) = bind_local();
+            let handle = thread::spawn(move || {
+                let (mut s, _) = listener.accept().unwrap();
+                let _ = read_full_request(&mut s);
+                s.write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello").unwrap();
+            });
+
+            let url = Url::parse(&format!("http://127.0.0.1:{}/x", port)).unwrap();
+            let (code, headers, body) = ark_request(Some(&ctx), "PUT", &url, &[], b"data").unwrap();
+            assert_eq!(code, 201);
+            assert_eq!(body, b"hello");
+            assert!(headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("content-length") && v == "5"));
+            handle.join().unwrap();
+        });
     }
 
     #[test]
-    fn request_sends_extra_headers() {
-        let (listener, port) = bind_local();
-        let captured = thread::spawn(move || {
-            let (mut s, _) = listener.accept().unwrap();
-            let req = read_full_request(&mut s);
-            s.write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
-            req
+    fn ark_request_sends_method_path_and_body() {
+        in_test_dir("ark_request_test", |temp_dir| {
+            init(temp_dir, "alice@example.com").unwrap();
+            let ctx = create_client_context().unwrap();
+
+            let (listener, port) = bind_local();
+            let captured = thread::spawn(move || {
+                let (mut s, _) = listener.accept().unwrap();
+                let req = read_full_request(&mut s);
+                s.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                req
+            });
+
+            let url = Url::parse(&format!("http://127.0.0.1:{}/ark/alice/x", port)).unwrap();
+            let (code, _, _) = ark_request(Some(&ctx), "PUT", &url, &[], b"payload").unwrap();
+            assert_eq!(code, 204);
+
+            let req = captured.join().unwrap();
+            let req_str = String::from_utf8_lossy(&req);
+            assert!(req_str.starts_with("PUT /ark/alice/x HTTP/1.1\r\n"), "request was: {}", req_str);
+            assert_eq!(parse_header(&req, "Host"), Some(format!("127.0.0.1:{}", port).as_str()));
+            assert_eq!(parse_header(&req, "Content-Length"), Some("7"));
+            assert!(req.ends_with(b"payload"));
         });
+    }
 
-        let url = Url::parse(&format!("http://127.0.0.1:{}/x", port)).unwrap();
-        let (identity, secret_key) = create_identity("alice@example.com").unwrap();
-        let _ = request(
-            "PUT",
-            &url,
-            &[("X-Ark-Meta-Encryption-Algorithm", "aes-256-gcm"), ("X-Custom", "hi")],
-            b"d",
-            Some((&identity, &secret_key.value)),
-        ).unwrap();
+    #[test]
+    fn ark_request_signs_method_path_timestamp_body() {
+        in_test_dir("ark_request_test", |temp_dir| {
+            let (identity, _) = init(temp_dir, "alice@example.com").unwrap();
+            let ctx = create_client_context().unwrap();
 
-        let req = captured.join().unwrap();
-        assert_eq!(parse_header(&req, "X-Ark-Meta-Encryption-Algorithm"), Some("aes-256-gcm"));
-        assert_eq!(parse_header(&req, "X-Custom"), Some("hi"));
+            let (listener, port) = bind_local();
+            let captured = thread::spawn(move || {
+                let (mut s, _) = listener.accept().unwrap();
+                let req = read_full_request(&mut s);
+                s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                req
+            });
+
+            let url = Url::parse(&format!("http://127.0.0.1:{}/x", port)).unwrap();
+            let _ = ark_request(Some(&ctx), "GET", &url, &[], &[]).unwrap();
+
+            let req = captured.join().unwrap();
+            let auth = parse_header(&req, "Authorization").unwrap();
+            let params = parse_auth_params(auth).unwrap();
+            assert_eq!(params.get("address").map(String::as_str), Some(identity.address.as_str()));
+            let ts_n: u64 = params.get("timestamp").unwrap().parse().unwrap();
+            let sig_value = decode_base64url(params.get("signature").unwrap()).unwrap();
+
+            let msg = request_to_bytes("GET", "/x", ts_n, &[]);
+            let signature = Signature { algorithm: identity.public_key.algorithm.clone(), value: sig_value };
+            assert!(verify_bytes(&identity.public_key, &signature, msg).is_ok());
+        });
+    }
+
+    #[test]
+    fn ark_request_propagates_non_2xx_status() {
+        in_test_dir("ark_request_test", |temp_dir| {
+            init(temp_dir, "alice@example.com").unwrap();
+            let ctx = create_client_context().unwrap();
+
+            let (listener, port) = bind_local();
+            thread::spawn(move || {
+                let (mut s, _) = listener.accept().unwrap();
+                let _ = read_full_request(&mut s);
+                s.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 7\r\nConnection: close\r\n\r\ndenied!").unwrap();
+            });
+
+            let url = Url::parse(&format!("http://127.0.0.1:{}/ark/x", port)).unwrap();
+            let (code, _, body) = ark_request(Some(&ctx), "GET", &url, &[], &[]).unwrap();
+            assert_eq!(code, 403);
+            assert_eq!(body, b"denied!");
+        });
+    }
+
+    #[test]
+    fn ark_request_sends_extra_headers() {
+        in_test_dir("ark_request_test", |temp_dir| {
+            init(temp_dir, "alice@example.com").unwrap();
+            let ctx = create_client_context().unwrap();
+
+            let (listener, port) = bind_local();
+            let captured = thread::spawn(move || {
+                let (mut s, _) = listener.accept().unwrap();
+                let req = read_full_request(&mut s);
+                s.write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                req
+            });
+
+            let url = Url::parse(&format!("http://127.0.0.1:{}/x", port)).unwrap();
+            let _ = ark_request(
+                Some(&ctx),
+                "PUT",
+                &url,
+                &[("X-Ark-Meta-Encryption-Algorithm", "aes-256-gcm"), ("X-Custom", "hi")],
+                b"d",
+            ).unwrap();
+
+            let req = captured.join().unwrap();
+            assert_eq!(parse_header(&req, "X-Ark-Meta-Encryption-Algorithm"), Some("aes-256-gcm"));
+            assert_eq!(parse_header(&req, "X-Custom"), Some("hi"));
+        });
     }
 }

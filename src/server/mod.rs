@@ -8,14 +8,17 @@ mod test_helpers;
 use std::env;
 use std::fs;
 use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::thread;
 
+use crate::context::{create_server_context, create_target_context};
 use crate::http::{read_request, write_response};
-use crate::identity::read_identity;
 use crate::metadata::read_metadata_attributes;
-use crate::types::{Member, Permission};
-use crate::util::resolve_url;
+use crate::types::{IdentityContext, Member, Permission};
+use crate::util::resolve_server_url;
 
 use self::auth::{authenticate, authorize};
 use self::delete::serve_delete;
@@ -26,26 +29,29 @@ pub const MAX_CLOCK_SKEW_SECS: u64 = 300;
 
 pub fn cmd_server(port: u16) {
     let root = env::current_dir().expect("cwd");
+    let server_ctx = create_server_context(&root).expect("init server identity");
     let listener = TcpListener::bind(("0.0.0.0", port)).expect("bind");
     eprintln!("Ark serving {} on http://0.0.0.0:{}", root.display(), port);
-    serve(listener, root, true);
+    serve(listener, server_ctx, true);
 }
 
 #[cfg(test)]
 pub fn start_test_server(root: PathBuf) -> u16 {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
     let port = listener.local_addr().unwrap().port();
-    thread::spawn(move || serve(listener, root, false));
+    let server_ctx = create_server_context(&root).expect("init server identity");
+    thread::spawn(move || serve(listener, server_ctx, false));
     port
 }
 
-pub fn serve(listener: TcpListener, root: PathBuf, verbose: bool) {
+pub fn serve(listener: TcpListener, server_ctx: IdentityContext, verbose: bool) {
+    let server_ctx = Arc::new(server_ctx);
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
-                let root = root.clone();
+                let server_ctx = Arc::clone(&server_ctx);
                 thread::spawn(move || {
-                    if let Err(e) = handle(s, &root, verbose) {
+                    if let Err(e) = handle(s, &server_ctx, verbose) {
                         if verbose {
                             eprintln!("ERROR: {}", e);
                         }
@@ -61,14 +67,14 @@ pub fn serve(listener: TcpListener, root: PathBuf, verbose: bool) {
     }
 }
 
-fn handle(mut stream: TcpStream, root: &Path, verbose: bool) -> std::io::Result<()> {
+fn handle(mut stream: TcpStream, server_ctx: &IdentityContext, verbose: bool) -> std::io::Result<()> {
     let (method, target, headers, body) = read_request(&mut stream)?;
 
     if verbose {
         println!("{} {}", method, target)
     }
 
-    let url = match resolve_url(&target, "", root, true) {
+    let url = match resolve_server_url(&target) {
         Ok(u) => u,
         Err(_) => return write_status(&mut stream, 400, "Bad Request", b"bad path"),
     };
@@ -83,22 +89,22 @@ fn handle(mut stream: TcpStream, root: &Path, verbose: bool) -> std::io::Result<
         return write_status(&mut stream, 405, "Method Not Allowed", b"method not allowed");
     }
 
+    let server_root = server_ctx.root.parent().unwrap().parent().unwrap();
     let name = segments[1];
-    let target_identity_path = root.join("ark").join(name).join(".ark").join("identity.json");
+    let target_identity_path = server_root.join("ark").join(name).join(".ark").join("identity.json");
 
     if method == "PUT" && url.path() == format!("/ark/{}/.ark/identity.json", name) && !target_identity_path.exists() {
-        return serve_put_init(&mut stream, &headers, &body, &target_identity_path);
+        return serve_put_init(server_ctx, &mut stream, &headers, &body, &target_identity_path);
     }
 
-    let target_identity = match read_identity(&target_identity_path) {
-        Ok(i) => i,
+    let target_ctx = match create_target_context(server_root, name) {
+        Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound =>
             return write_status(&mut stream, 403, "Forbidden", b"forbidden"),
         Err(e) => return Err(e),
     };
 
-    let fs_path = root.join(url.path().trim_start_matches('/'));
-    let fs_account_path = root.join("ark").join(name);
+    let fs_path = server_root.join(url.path().trim_start_matches('/'));
 
     if fs::symlink_metadata(&fs_path).map(|m| m.is_symlink()).unwrap_or(false) {
         return write_status(&mut stream, 403, "Forbidden", b"symlinks not allowed");
@@ -113,7 +119,7 @@ fn handle(mut stream: TcpStream, root: &Path, verbose: bool) -> std::io::Result<
 
     let effective_members = match existing_members.clone() {
         Some(m) => Some(m),
-        None => find_ancestor_members(&fs_path, &fs_account_path),
+        None => find_ancestor_members(&fs_path, &target_ctx.root),
     };
 
     let public_member = effective_members
@@ -124,12 +130,12 @@ fn handle(mut stream: TcpStream, root: &Path, verbose: bool) -> std::io::Result<
         return serve_get(&fs_path, &mut stream, method == "GET");
     }
 
-    let requestor_identity = match authenticate(&url, &method, &headers, &body) {
+    let requestor_identity = match authenticate(server_ctx, &url, &method, &headers, &body) {
         Ok(i) => i,
         Err(e) => return write_status(&mut stream, 401, "Unauthorized", e.to_string().as_bytes())
     };
 
-    let permission = match authorize(&target_identity, &&requestor_identity, effective_members.as_deref()) {
+    let permission = match authorize(&target_ctx, &requestor_identity, effective_members.as_deref()) {
         Ok(p) => p,
         Err(e) => return write_status(&mut stream, 403, "Forbidden", e.to_string().as_bytes())
     };
@@ -144,7 +150,7 @@ fn handle(mut stream: TcpStream, root: &Path, verbose: bool) -> std::io::Result<
     match method.as_str() {
         "GET" => serve_get(&fs_path, &mut stream, true),
         "HEAD" => serve_get(&fs_path, &mut stream, false),
-        "PUT" => serve_put(&fs_path, &mut stream, &body, &headers, existing_members, permission, target_is_dir, None),
+        "PUT" => serve_put(server_ctx, &fs_path, &mut stream, &body, &headers, existing_members, permission, target_is_dir, None),
         "DELETE" => serve_delete(&fs_path, &mut stream),
         _ => write_status(&mut stream, 405, "Method Not Allowed", b"method not allowed"),
     }
