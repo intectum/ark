@@ -66,9 +66,12 @@ pub struct Metadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body_hash: Option<Hash>,
     pub signature: Signature,
+}
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+#[derive(Clone, Default)]
+pub struct LocalMetadata {
     pub encrypted: Option<bool>,
+    pub sync_hash: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

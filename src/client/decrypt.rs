@@ -3,10 +3,10 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, decrypt_bytes};
-use crate::types::IdentityContext;
-use crate::metadata::{apply_key_to_metadata, create_metadata, get_member, read_metadata_attributes, validate_metadata, write_metadata_attributes};
+use crate::types::{IdentityContext, LocalMetadata};
+use crate::metadata::{apply_key_to_metadata, create_metadata, get_member, read_local_metadata_attributes, read_metadata_attributes, validate_metadata, write_local_metadata_attributes, write_metadata_attributes};
 use crate::types::Key;
-use crate::util::{decode_base64url, io_err, io_invalid_input};
+use crate::util::{decode_base64url, io_err, io_invalid_input, sha256};
 
 pub struct DecryptArgs {
     pub input: Option<String>,
@@ -34,6 +34,15 @@ pub fn cmd_decrypt(ctx: &IdentityContext, args: DecryptArgs) -> std::io::Result<
         None => false,
     };
 
+    // TODO: probably should be possible
+    if source_has_metadata && (args.key.is_some() || args.encryption_algorithm.is_some()) {
+        return Err(io_err("-k/--key and -e/--encryption-algortihm cannot override existing metadata"));
+    }
+
+    if !source_has_metadata && args.key.is_none() {
+        return Err(io_err("no file key available: pass --key or use -i/--in-place on a file with metadata"));
+    }
+
     let ciphertext = match source_path {
         Some(p) => fs::read(p)?,
         None => {
@@ -43,16 +52,13 @@ pub fn cmd_decrypt(ctx: &IdentityContext, args: DecryptArgs) -> std::io::Result<
         }
     };
 
-    // TODO: Should key/alg override when source metadata exists? I think yes (but allow without? what if no internet? Maybe if to stdout or noew file? makes sense)
-    let mut metadata = match source_path {
+    let metadata = match source_path {
         Some(p) if source_has_metadata => read_metadata_attributes(Path::new(p))?,
         _ => {
-            let key = match &args.key {
-                Some(k) => Key {
-                    algorithm: args.encryption_algorithm.clone().unwrap_or(DEFAULT_ENCRYPTION_ALGORITHM.to_string()),
-                    value: decode_base64url(k.trim()).map_err(|e| io_err(&format!("--key decode: {}", e)))?
-                },
-                None => return Err(io_err("no file key available: pass --key or use -i/--in-place on a file with metadata"))
+            let key = Key {
+                algorithm: args.encryption_algorithm.clone().unwrap_or(DEFAULT_ENCRYPTION_ALGORITHM.to_string()),
+                value: decode_base64url(args.key.as_ref().expect("key presence checked above").trim())
+                    .map_err(|e| io_err(&format!("--key decode: {}", e)))?
             };
 
             let mut metadata = create_metadata(&ctx.identity.address, Some(&key.algorithm));
@@ -63,36 +69,41 @@ pub fn cmd_decrypt(ctx: &IdentityContext, args: DecryptArgs) -> std::io::Result<
         }
     };
 
-    if let Some(false) = metadata.encrypted {
-        return Err(io_err("file is already plaintext (user.ark.encrypted=false); refusing to decrypt"));
-    }
-
-    let file_key: Vec<u8> = if let Some(k) = &args.key {
-        decode_base64url(k.trim()).map_err(|e| io_err(&format!("--key decode: {}", e)))?
-    } else {
-        let member = get_member(&metadata.members, &ctx.identity.address)
-            .ok_or_else(|| io_err("no member entry for current account"))?;
-        let encrypted_file_key = member.key.as_ref()
-            .ok_or_else(|| io_err("no file key for current account"))?;
-        decrypt_bytes(
-            &Key {
-                algorithm: encrypted_file_key.algorithm.clone(),
-                value: ctx.identity_key.as_ref().expect("client context missing identity_key").value.clone()
-            },
-            &encrypted_file_key.value,
-        )?
+    let local_metadata = match source_path {
+        Some(p) => read_local_metadata_attributes(Path::new(p))?,
+        None => LocalMetadata::default(),
     };
 
+    if let Some(false) = local_metadata.encrypted {
+        return Err(io_err("file is already plaintext"));
+    }
+
+    let member = get_member(&metadata.members, &ctx.identity.address)
+        .ok_or_else(|| io_err("no member entry for current account"))?;
+    let encrypted_file_key = member.key.as_ref()
+        .ok_or_else(|| io_err("no file key for current account"))?;
+    let file_key = decrypt_bytes(
+        &Key {
+            algorithm: encrypted_file_key.algorithm.clone(),
+            value: ctx.identity_key.as_ref().expect("client context missing identity_key").value.clone()
+        },
+        &encrypted_file_key.value,
+    )?;
+
     let encryption_algorithm = metadata.encryption_algorithm.clone()
-        .ok_or_else(|| io_err("file is not encrypted"))?;
+        .ok_or_else(|| io_err("encryption_algorithm is missing"))?;
     let plaintext = decrypt_bytes(&Key { algorithm: encryption_algorithm, value: file_key }, &ciphertext)
         .map_err(|e| io_err(&format!("{} — input may already be plaintext or the key may be wrong", e)))?;
 
     match dest_path {
         Some(p) => {
-            fs::write(p, &plaintext)?;
-            metadata.encrypted = Some(false);
-            write_metadata_attributes(Path::new(p), &metadata)?;
+            let path = Path::new(p);
+            fs::write(path, &plaintext)?;
+            write_metadata_attributes(path, &metadata)?;
+            write_local_metadata_attributes(path, &LocalMetadata {
+                encrypted: Some(false),
+                sync_hash: Some(sha256(&plaintext)),
+            })?;
         }
         None => std::io::stdout().write_all(&plaintext)?,
     }
@@ -151,7 +162,7 @@ mod tests {
             }).unwrap();
             assert_eq!(fs::read(&p).unwrap(), b"data");
             assert_eq!(
-                xattr::get(&p, "user.ark.encrypted").unwrap().as_deref(),
+                xattr::get(&p, "user.ark_local.encrypted").unwrap().as_deref(),
                 Some(b"false".as_slice())
             );
             assert_eq!(
@@ -178,29 +189,19 @@ mod tests {
     }
 
     #[test]
-    fn decrypt_explicit_key_overrides_meta() {
+    fn decrypt_explicit_key_with_metadata_errors() {
         in_test_dir("ark_decrypt_test", |temp_dir| {
             let (identity, secret_key, acc) = create_test_account(temp_dir, TEST_ADDRESS);
-            let real_key = [13u8; 32];
             let p = temp_dir.join("in.bin");
-            let ct = aes_encrypt(&real_key, b"x");
-            fs::write(&p, &ct).unwrap();
-            let mut wrong_meta = create_metadata(&identity.address, Some(DEFAULT_ENCRYPTION_ALGORITHM));
-            let (wrap_alg, wrong_wrap) = encrypt_bytes(&identity.public_key, &[99u8; 32]).unwrap();
-            wrong_meta.members[0].key = Some(Key { algorithm: wrap_alg, value: wrong_wrap });
-            wrong_meta.encrypted = Some(true);
-            sign_metadata(&secret_key, &mut wrong_meta, Some(&ct)).unwrap();
-            write_metadata_attributes(&p, &wrong_meta).unwrap();
-            let out = temp_dir.join("out.bin");
+            write_encrypted_test_file(&p, &identity, &secret_key, b"x");
             env::set_current_dir(&acc).unwrap();
             let ctx = create_client_context().unwrap();
-            cmd_decrypt(&ctx, DecryptArgs {
+            let err = cmd_decrypt(&ctx, DecryptArgs {
                 input: Some(p.to_string_lossy().into_owned()),
-                output: Some(out.to_string_lossy().into_owned()),
-                key: Some(encode_base64url(real_key)),
+                key: Some(encode_base64url([13u8; 32])),
                 ..args()
-            }).unwrap();
-            assert_eq!(fs::read(&out).unwrap(), b"x");
+            }).unwrap_err();
+            assert!(err.to_string().contains("cannot override existing metadata"), "msg was {}", err);
         });
     }
 
@@ -255,7 +256,7 @@ mod tests {
             let (identity, secret_key, acc) = create_test_account(temp_dir, TEST_ADDRESS);
             let p = temp_dir.join("in.bin");
             write_encrypted_test_file(&p, &identity, &secret_key, b"x");
-            xattr::set(&p, "user.ark.encrypted", b"false").unwrap();
+            xattr::set(&p, "user.ark_local.encrypted", b"false").unwrap();
             env::set_current_dir(&acc).unwrap();
             let ctx = create_client_context().unwrap();
             let err = cmd_decrypt(&ctx, DecryptArgs {
@@ -294,9 +295,9 @@ mod tests {
             let mut m = create_metadata(&identity.address, Some(DEFAULT_ENCRYPTION_ALGORITHM));
             let (wrap_alg, wrapped) = encrypt_bytes(&identity.public_key, &[0u8; 32]).unwrap();
             m.members[0].key = Some(Key { algorithm: wrap_alg, value: wrapped });
-            m.encrypted = Some(true);
             sign_metadata(&secret_key, &mut m, Some(&body)).unwrap();
             write_metadata_attributes(&p, &m).unwrap();
+            write_local_metadata_attributes(&p, &LocalMetadata { encrypted: Some(true), sync_hash: None }).unwrap();
             env::set_current_dir(&acc).unwrap();
             let ctx = create_client_context().unwrap();
             let err = cmd_decrypt(&ctx, DecryptArgs {

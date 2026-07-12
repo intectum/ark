@@ -10,7 +10,7 @@ mod util;
 
 use clap::{Parser, Subcommand};
 
-use crate::client::{DecryptArgs, cmd_chmod, cmd_decrypt, cmd_delete, cmd_get, cmd_head, cmd_init, cmd_put};
+use crate::client::{DecryptArgs, EncryptArgs, cmd_chmod, cmd_decrypt, cmd_delete, cmd_encrypt, cmd_get, cmd_head, cmd_init, cmd_put, cmd_sync};
 use crate::context::create_client_context;
 use crate::server::cmd_server;
 
@@ -82,6 +82,12 @@ enum Cmd {
         /// Ark URL or path.
         path: String,
     },
+    /// Push local files to the server. One-way client-to-server.
+    Sync {
+        /// Watch for changes and re-sync continuously.
+        #[arg(short, long)]
+        watch: bool,
+    },
     /// Decrypt an encrypted file.
     Decrypt {
         /// Read ciphertext from FILE (otherwise stdin).
@@ -94,6 +100,24 @@ enum Cmd {
         #[arg(long, value_name = "FILE")]
         in_place: Option<String>,
         /// Base64url-encoded 32-byte file key (required for stdin).
+        #[arg(short, long, value_name = "B64")]
+        key: Option<String>,
+        /// Override encryption algorithm (default from metadata or aes-256-gcm).
+        #[arg(short, long, value_name = "NAME")]
+        encryption_algorithm: Option<String>,
+    },
+    /// Encrypt a plaintext file.
+    Encrypt {
+        /// Read plaintext from FILE (otherwise stdin).
+        #[arg(short, long, value_name = "FILE", conflicts_with = "in_place")]
+        input: Option<String>,
+        /// Write ciphertext to FILE (otherwise stdout).
+        #[arg(short, long, value_name = "FILE", conflicts_with = "in_place")]
+        output: Option<String>,
+        /// Encrypt the file in place (rewrites its bytes).
+        #[arg(long, value_name = "FILE")]
+        in_place: Option<String>,
+        /// Base64url-encoded 32-byte file key (reuses source metadata key if absent).
         #[arg(short, long, value_name = "B64")]
         key: Option<String>,
         /// Override encryption algorithm (default from metadata or aes-256-gcm).
@@ -115,8 +139,12 @@ fn main() {
         Cmd::Delete { path } => create_client_context().and_then(|c| cmd_delete(&c, &path)),
         Cmd::Get { output, decrypt, path } => create_client_context().and_then(|c| cmd_get(&c, &path, output.as_deref(), decrypt)),
         Cmd::Put { input, encryption_algorithm, path } => create_client_context().and_then(|c| cmd_put(&c, &path, input.as_deref(), encryption_algorithm.as_deref())),
+        Cmd::Sync { watch } => create_client_context().and_then(|c| cmd_sync(&c, watch)),
         Cmd::Decrypt { input, output, in_place, key, encryption_algorithm } => {
             create_client_context().and_then(|c| cmd_decrypt(&c, DecryptArgs { input, output, in_place, key, encryption_algorithm }))
+        }
+        Cmd::Encrypt { input, output, in_place, key, encryption_algorithm } => {
+            create_client_context().and_then(|c| cmd_encrypt(&c, EncryptArgs { input, output, in_place, key, encryption_algorithm }))
         }
     };
     if let Err(e) = result {

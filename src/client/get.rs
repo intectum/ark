@@ -4,11 +4,11 @@ use std::path::Path;
 
 use crate::client::ark_request;
 use crate::crypto::decrypt_bytes;
-use crate::types::IdentityContext;
+use crate::types::{IdentityContext, LocalMetadata};
 use crate::identity::resolve_identity;
-use crate::metadata::{get_member, read_metadata_headers, verify_metadata, write_metadata_attributes};
+use crate::metadata::{get_member, read_metadata_headers, verify_metadata, write_local_metadata_attributes, write_metadata_attributes};
 use crate::types::Key;
-use crate::util::{io_err, resolve_client_url};
+use crate::util::{io_err, resolve_client_url, sha256};
 
 pub fn cmd_get(ctx: &IdentityContext, path: &str, output: Option<&str>, decrypt: bool) -> std::io::Result<()> {
     let url = resolve_client_url(ctx, path)?;
@@ -18,7 +18,7 @@ pub fn cmd_get(ctx: &IdentityContext, path: &str, output: Option<&str>, decrypt:
         return Err(io_err(&format!("HTTP {}: {}", code, String::from_utf8_lossy(&body))));
     }
 
-    let mut metadata = read_metadata_headers(&headers)?;
+    let metadata = read_metadata_headers(&headers)?;
 
     let modifier_identity = resolve_identity(ctx, &metadata.modified_by)?;
     verify_metadata(&modifier_identity.public_key, &metadata, Some(&body))?;
@@ -53,8 +53,17 @@ pub fn cmd_get(ctx: &IdentityContext, path: &str, output: Option<&str>, decrypt:
     match output {
         Some(file) => {
             fs::write(file, &final_body)?;
-            metadata.encrypted = Some(!decrypt);
-            write_metadata_attributes(Path::new(file), &metadata)?;
+
+            let path = Path::new(file);
+            write_metadata_attributes(path, &metadata)?;
+            write_local_metadata_attributes(path, &LocalMetadata {
+                encrypted: Some(!decrypt),
+                sync_hash: if decrypt || metadata.encryption_algorithm.is_none() {
+                    Some(sha256(&final_body))
+                } else {
+                    None
+                },
+            })?;
         }
         None => std::io::stdout().write_all(&final_body)?,
     }
@@ -187,7 +196,7 @@ mod tests {
 
             assert_eq!(fs::read(&out).unwrap(), b"clear text");
             assert_eq!(
-                xattr::get(&out, "user.ark.encrypted").unwrap().as_deref(),
+                xattr::get(&out, "user.ark_local.encrypted").unwrap().as_deref(),
                 Some(b"false".as_slice())
             );
         });

@@ -6,10 +6,11 @@ use uuid::Uuid;
 use crate::crypto::{DEFAULT_HASH_ALGORITHM, encrypt_bytes, sign_json, verify_json};
 use crate::types::IdentityContext;
 use crate::identity::resolve_identity;
-use crate::types::{Hash, Key, Member, Metadata, Permission, Signature};
+use crate::types::{Hash, Key, LocalMetadata, Member, Metadata, Permission, Signature};
 use crate::util::{decode_base64url, encode_base64url, io_err, now_iso, sha256};
 
 const ATTRIBUTE_PREFIX: &str = "user.ark.";
+const LOCAL_ATTRIBUTE_PREFIX: &str = "user.ark_local.";
 const HEADER_PREFIX: &str = "X-Ark-Meta-";
 
 const FIELD_ID: &str = "id";
@@ -26,7 +27,9 @@ const FIELD_BODY_HASH_ALGORITHM: &str = "body_hash_algorithm";
 const FIELD_BODY_HASH_VALUE: &str = "body_hash_value";
 const FIELD_SIGNATURE_ALGORITHM: &str = "signature_algorithm";
 const FIELD_SIGNATURE_VALUE: &str = "signature_value";
-const FIELD_ENCRYPTED: &str = "encrypted";
+
+const LOCAL_FIELD_ENCRYPTED: &str = "encrypted";
+const LOCAL_FIELD_SYNC_HASH: &str = "sync_hash";
 
 pub fn get_member<'a>(members: &'a [Member], address: &str) -> Option<&'a Member> {
     members.iter().find(|m| m.address == address)
@@ -51,7 +54,6 @@ pub fn create_metadata(owner_address: &str, encryption_algorithm: Option<&str>) 
             algorithm: String::new(),
             value: Vec::new()
         },
-        encrypted: None,
     }
 }
 
@@ -60,6 +62,9 @@ pub fn read_metadata_attributes(path: &Path) -> io::Result<Metadata> {
 
     for attribute in xattr::list(path)? {
         let name = attribute.to_string_lossy().into_owned();
+        if !name.starts_with(ATTRIBUTE_PREFIX) {
+            continue;
+        }
 
         let value = match xattr::get(path, &name)? {
             Some(v) => String::from_utf8(v)
@@ -109,8 +114,57 @@ pub fn write_metadata_attributes(path: &Path, metadata: &Metadata) -> io::Result
         }
     }
 
-    if let Some(encrypted) = metadata.encrypted {
-        xattr::set(path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_ENCRYPTED), if encrypted { b"true" } else { b"false" })?;
+    Ok(())
+}
+
+pub fn read_local_metadata_attributes(path: &Path) -> io::Result<LocalMetadata> {
+    let mut local = LocalMetadata::default();
+
+    for attribute in xattr::list(path)? {
+        let name = attribute.to_string_lossy().into_owned();
+        let field = match name.strip_prefix(LOCAL_ATTRIBUTE_PREFIX) {
+            Some(f) => f,
+            None => continue,
+        };
+
+        let value = match xattr::get(path, &name)? {
+            Some(v) => String::from_utf8(v)
+                .map_err(|_| io_err(&format!("xattr {} not utf8", name)))?,
+            None => continue,
+        };
+
+        match field {
+            LOCAL_FIELD_ENCRYPTED => {
+                local.encrypted = match value.trim() {
+                    "true" => Some(true),
+                    "false" => Some(false),
+                    other => return Err(io_err(&format!("encrypted local attribute invalid: {}", other))),
+                };
+            }
+            LOCAL_FIELD_SYNC_HASH => {
+                local.sync_hash = Some(decode_base64url(value)
+                    .map_err(|_| io_err("sync_hash is not base64url encoded"))?);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(local)
+}
+
+pub fn write_local_metadata_attributes(path: &Path, local: &LocalMetadata) -> io::Result<()> {
+    for attribute in xattr::list(path)? {
+        let name = attribute.to_string_lossy();
+        if name.starts_with(LOCAL_ATTRIBUTE_PREFIX) {
+            xattr::remove(path, &*name)?;
+        }
+    }
+
+    if let Some(encrypted) = local.encrypted {
+        xattr::set(path, &format!("{}{}", LOCAL_ATTRIBUTE_PREFIX, LOCAL_FIELD_ENCRYPTED), if encrypted { b"true" } else { b"false" })?;
+    }
+    if let Some(sync_hash) = &local.sync_hash {
+        xattr::set(path, &format!("{}{}", LOCAL_ATTRIBUTE_PREFIX, LOCAL_FIELD_SYNC_HASH), encode_base64url(sync_hash).as_bytes())?;
     }
 
     Ok(())
@@ -125,8 +179,7 @@ pub fn read_metadata_headers(headers: &[(String, String)]) -> io::Result<Metadat
 
     validate_partial_metadata(&partial_metadata)?;
 
-    let mut metadata = metadata_from_partial(partial_metadata)?;
-    metadata.encrypted = None;
+    let metadata = metadata_from_partial(partial_metadata)?;
     validate_metadata(&metadata)?;
 
     Ok(metadata)
@@ -231,7 +284,6 @@ pub fn verify_metadata(public_key: &Key, metadata: &Metadata, body: Option<&[u8]
 
 fn metadata_for_signing(metadata: &Metadata) -> Metadata {
     let mut clone = metadata.clone();
-    clone.encrypted = None;
     clone.signature.algorithm = String::new();
     clone.signature.value = Vec::new();
     clone
@@ -249,8 +301,6 @@ struct PartialMetadata {
     body_hash_value: Option<Vec<u8>>,
     signature_algorithm: Option<String>,
     signature_value: Option<Vec<u8>>,
-
-    encrypted: Option<bool>,
 }
 
 #[derive(Default)]
@@ -284,8 +334,6 @@ fn metadata_from_partial(partial: PartialMetadata) -> io::Result<Metadata> {
             algorithm: partial.signature_algorithm.unwrap(),
             value: partial.signature_value.unwrap(),
         },
-
-        encrypted: partial.encrypted,
     })
 }
 
@@ -307,13 +355,6 @@ fn apply_field(metadata: &mut PartialMetadata, key: &str, value: &str) -> io::Re
         FIELD_SIGNATURE_ALGORITHM => metadata.signature_algorithm = Some(value.to_string()),
         FIELD_SIGNATURE_VALUE => metadata.signature_value = Some(decode_base64url(value)
             .map_err(|_| io_err("signature is not base64url encoded"))?),
-        FIELD_ENCRYPTED => {
-            metadata.encrypted = match value.trim() {
-                "true" => Some(true),
-                "false" => Some(false),
-                other => return Err(io_err(&format!("encrypted metadata invalid: {}", other))),
-            };
-        }
         _ => {
             if let Some((index, member_field_key)) = split_member_key(&metadata_key) {
                 while metadata.members.len() <= index {
@@ -434,34 +475,43 @@ mod tests {
     }
 
     #[test]
-    fn attribute_round_trip_preserves_all_fields_and_encrypted() {
+    fn attribute_round_trip_preserves_all_fields() {
         in_test_dir("ark_metadata_test", |temp_dir| {
             let p = temp_dir.join("file");
             fs::write(&p, b"x").unwrap();
             let (owner, owner_key) = create_identity(TEST_ADDRESS).unwrap();
-            let mut m = create_plain_test_metadata(&owner, &owner_key, b"x");
-            m.encrypted = Some(true);
+            let m = create_plain_test_metadata(&owner, &owner_key, b"x");
             write_metadata_attributes(&p, &m).unwrap();
             let back = read_metadata_attributes(&p).unwrap();
             assert_eq!(back.id, m.id);
             assert_eq!(back.signature.value, m.signature.value);
-            assert_eq!(back.encrypted, Some(true));
         });
     }
 
     #[test]
-    fn attributes_to_headers_round_trip_drops_encrypted() {
+    fn local_attribute_round_trip_preserves_all_fields() {
         in_test_dir("ark_metadata_test", |temp_dir| {
             let p = temp_dir.join("file");
             fs::write(&p, b"x").unwrap();
-            let (owner, owner_key) = create_identity(TEST_ADDRESS).unwrap();
-            let mut m = create_plain_test_metadata(&owner, &owner_key, b"x");
-            m.encrypted = Some(true);
-            write_metadata_attributes(&p, &m).unwrap();
-            let attrs = read_metadata_attributes(&p).unwrap();
-            let headers = write_metadata_headers(&attrs);
-            let back = read_metadata_headers(&headers).unwrap();
-            assert_eq!(back.encrypted, None, "encrypted is client-only");
+            let local = LocalMetadata { encrypted: Some(true), sync_hash: Some(vec![0xAB, 0xCD]) };
+            write_local_metadata_attributes(&p, &local).unwrap();
+            let back = read_local_metadata_attributes(&p).unwrap();
+            assert_eq!(back.encrypted, Some(true));
+            assert_eq!(back.sync_hash.as_deref(), Some(&[0xAB, 0xCD][..]));
+        });
+    }
+
+    #[test]
+    fn write_local_metadata_attributes_clears_stale_fields() {
+        in_test_dir("ark_metadata_test", |temp_dir| {
+            let p = temp_dir.join("file");
+            fs::write(&p, b"x").unwrap();
+            let full = LocalMetadata { encrypted: Some(true), sync_hash: Some(vec![1, 2, 3]) };
+            write_local_metadata_attributes(&p, &full).unwrap();
+            let cleared = LocalMetadata::default();
+            write_local_metadata_attributes(&p, &cleared).unwrap();
+            assert_eq!(xattr::get(&p, "user.ark_local.encrypted").unwrap(), None);
+            assert_eq!(xattr::get(&p, "user.ark_local.sync_hash").unwrap(), None);
         });
     }
 
@@ -500,17 +550,6 @@ mod tests {
         m.modified_by = "attacker@evil".to_string();
         let err = verify_metadata(&owner.public_key, &m, Some(body)).unwrap_err();
         assert!(err.to_string().contains("signature verification failed"));
-    }
-
-    #[test]
-    fn verify_metadata_ignores_encrypted_flag_changes() {
-        let (owner, owner_key) = create_identity(TEST_ADDRESS).unwrap();
-        let body = b"x";
-        let mut m = create_plain_test_metadata(&owner, &owner_key, body);
-        m.encrypted = Some(true);
-        verify_metadata(&owner.public_key, &m, Some(body)).unwrap();
-        m.encrypted = Some(false);
-        verify_metadata(&owner.public_key, &m, Some(body)).unwrap();
     }
 
     #[test]
@@ -591,21 +630,4 @@ mod tests {
         });
     }
 
-    #[test]
-    fn write_metadata_attributes_clears_old_encrypted_flag() {
-        in_test_dir("ark_metadata_test", |temp_dir| {
-            let p = temp_dir.join("file");
-            fs::write(&p, b"x").unwrap();
-            let (owner, owner_key) = create_identity(TEST_ADDRESS).unwrap();
-            let mut with_flag = create_plain_test_metadata(&owner, &owner_key, b"x");
-            with_flag.encrypted = Some(true);
-            write_metadata_attributes(&p, &with_flag).unwrap();
-            assert!(xattr::get(&p, "user.ark.encrypted").unwrap().is_some());
-
-            let mut without_flag = create_plain_test_metadata(&owner, &owner_key, b"x");
-            without_flag.encrypted = None;
-            write_metadata_attributes(&p, &without_flag).unwrap();
-            assert_eq!(xattr::get(&p, "user.ark.encrypted").unwrap(), None);
-        });
-    }
 }

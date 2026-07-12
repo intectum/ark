@@ -4,9 +4,9 @@ use std::path::PathBuf;
 
 use crate::client::ark_request;
 use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, create_key, encrypt_bytes};
-use crate::types::IdentityContext;
-use crate::metadata::{apply_key_to_metadata, create_metadata, get_member, read_metadata_attributes, sign_metadata, write_metadata_attributes, write_metadata_headers};
-use crate::util::{io_err, io_invalid_input, now_iso, resolve_client_url};
+use crate::types::{IdentityContext, LocalMetadata};
+use crate::metadata::{apply_key_to_metadata, create_metadata, get_member, read_local_metadata_attributes, read_metadata_attributes, sign_metadata, write_local_metadata_attributes, write_metadata_attributes, write_metadata_headers};
+use crate::util::{io_err, io_invalid_input, now_iso, resolve_client_url, sha256};
 
 pub fn cmd_put(ctx: &IdentityContext, path: &str, input: Option<&str>, encryption_algorithm: Option<&str>) -> std::io::Result<()> {
     let url = resolve_client_url(ctx, path)?;
@@ -67,8 +67,15 @@ pub fn cmd_put(ctx: &IdentityContext, path: &str, input: Option<&str>, encryptio
         metadata.encryption_algorithm = None;
     }
 
+    let mut local_metadata = match input_path.as_deref() {
+        Some(p) => read_local_metadata_attributes(p)?,
+        None => LocalMetadata::default(),
+    };
+
     let skip_encrypt = metadata.encryption_algorithm.is_none();
-    let already_encrypted = metadata.encrypted == Some(true);
+    let already_encrypted = local_metadata.encrypted == Some(true);
+
+    local_metadata.sync_hash = if !is_dir && !already_encrypted { Some(sha256(&body)) } else { None };
 
     let final_body = if already_encrypted || skip_encrypt {
         if skip_encrypt {
@@ -82,7 +89,7 @@ pub fn cmd_put(ctx: &IdentityContext, path: &str, input: Option<&str>, encryptio
         let file_key = create_key(encryption_algorithm)?;
         let (_, ciphertext) = encrypt_bytes(&file_key, &body)?;
         apply_key_to_metadata(ctx, &mut metadata, &file_key)?;
-        metadata.encrypted = Some(false);
+        local_metadata.encrypted = Some(false);
         ciphertext
     };
 
@@ -94,6 +101,7 @@ pub fn cmd_put(ctx: &IdentityContext, path: &str, input: Option<&str>, encryptio
 
     if let Some(p) = input_path.as_deref() {
         write_metadata_attributes(p, &metadata)?;
+        write_local_metadata_attributes(p, &local_metadata)?;
     }
 
     let metadata_headers = write_metadata_headers(&metadata);
@@ -313,9 +321,9 @@ mod tests {
             fs::write(&input, &ciphertext).unwrap();
             let mut m = create_metadata(&ctx.identity.address, Some(DEFAULT_ENCRYPTION_ALGORITHM));
             apply_key_to_metadata(&ctx, &mut m, &file_key).unwrap();
-            m.encrypted = Some(true);
             sign_metadata(ctx.identity_key.as_ref().unwrap(), &mut m, Some(&ciphertext)).unwrap();
             write_metadata_attributes(&input, &m).unwrap();
+            write_local_metadata_attributes(&input, &LocalMetadata { encrypted: Some(true), sync_hash: None }).unwrap();
 
             cmd_put(&ctx, "file.bin", Some(input.to_str().unwrap()), None).unwrap();
 
@@ -323,7 +331,7 @@ mod tests {
             let server_body = fs::read(&server_path).unwrap();
             assert_eq!(server_body, ciphertext, "server received raw input bytes");
             assert_eq!(
-                xattr::get(&input, "user.ark.encrypted").unwrap().as_deref(),
+                xattr::get(&input, "user.ark_local.encrypted").unwrap().as_deref(),
                 Some(b"true".as_slice())
             );
             let unwrapped = unwrap_first_member_key(&input, &ctx.identity_key.as_ref().unwrap().value);
@@ -340,7 +348,7 @@ mod tests {
 
             let input = put_via_cmd(temp_dir, "out.bin", b"plain", "");
             assert_eq!(
-                xattr::get(&input, "user.ark.encrypted").unwrap().as_deref(),
+                xattr::get(&input, "user.ark_local.encrypted").unwrap().as_deref(),
                 Some(b"false".as_slice())
             );
         });
