@@ -1,13 +1,13 @@
 use std::fs;
-use std::net::TcpStream;
+use std::io::Write;
 use std::path::Path;
 
-use super::write_status;
+use crate::http::write_text;
 
-pub fn serve_delete(fs_path: &Path, stream: &mut TcpStream) -> std::io::Result<()> {
+pub fn serve_delete(fs_path: &Path, stream: &mut dyn Write) -> std::io::Result<()> {
     let fs_metadata = match fs::metadata(fs_path) {
         Ok(m) => m,
-        Err(_) => return write_status(stream, 404, "Not Found", b"not found"),
+        Err(_) => return write_text(stream, 404, b"not found"),
     };
 
     let result = if fs_metadata.is_dir() {
@@ -17,8 +17,8 @@ pub fn serve_delete(fs_path: &Path, stream: &mut TcpStream) -> std::io::Result<(
     };
 
     match result {
-        Ok(_) => write_status(stream, 204, "No Content", &[]),
-        Err(e) => write_status(stream, 500, "Internal Server Error", e.to_string().as_bytes()),
+        Ok(_) => write_text(stream, 204, &[]),
+        Err(e) => write_text(stream, 500, e.to_string().as_bytes()),
     }
 }
 

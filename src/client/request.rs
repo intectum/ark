@@ -11,10 +11,16 @@ use crate::util::{encode_base64url, io_err, now_seconds, request_to_bytes};
 pub fn ark_request(ctx: Option<&IdentityContext>, method: &str, url: &Url, headers: &[(&str, &str)], body: &[u8]) -> std::io::Result<(u16, Vec<(String, String)>, Vec<u8>)> {
     let mut final_headers = headers.to_vec();
 
+    let host = url.host_str().ok_or_else(|| io_err("URL missing host"))?;
+    let host_header = match url.port() {
+        Some(p) => format!("{}:{}", host, p),
+        None => host.to_string(),
+    };
+
     let authorization = match ctx {
         Some(c) => {
             let timestamp = now_seconds();
-            let request_bytes = request_to_bytes(method, url.path(), timestamp, body);
+            let request_bytes = request_to_bytes(method, &host_header, url.path(), timestamp, body);
             let signature = sign_bytes(c.identity_key.as_ref().expect("client context missing identity_key"), &request_bytes)?;
             Some(format!(
                 "ArkAccount address=\"{}\", timestamp=\"{}\", signature=\"{}\"",
@@ -32,7 +38,6 @@ pub fn ark_request(ctx: Option<&IdentityContext>, method: &str, url: &Url, heade
 
     final_headers.push(("Connection", "close"));
 
-    let host = url.host_str().ok_or_else(|| io_err("URL missing host"))?;
     let mut stream = TcpStream::connect((host, url.port().unwrap_or(80)))?;
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
 
@@ -189,9 +194,9 @@ mod tests {
             let ts_n: u64 = params.get("timestamp").unwrap().parse().unwrap();
             let sig_value = decode_base64url(params.get("signature").unwrap()).unwrap();
 
-            let msg = request_to_bytes("GET", "/x", ts_n, &[]);
+            let msg = request_to_bytes("GET", &format!("127.0.0.1:{}", port), "/x", ts_n, &[]);
             let signature = Signature { algorithm: identity.public_key.algorithm.clone(), value: sig_value };
-            assert!(verify_bytes(&identity.public_key, &signature, msg).is_ok());
+            assert!(verify_bytes(&identity.public_key, &signature, &msg).is_ok());
         });
     }
 

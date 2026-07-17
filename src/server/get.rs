@@ -1,18 +1,16 @@
 use std::fs;
-use std::net::TcpStream;
+use std::io::Write;
 use std::path::Path;
 
-use crate::http::write_response;
+use crate::http::{write_response, write_text};
 use crate::metadata::{read_metadata_attributes, write_metadata_headers};
 use crate::types::{DirectoryEntry, DirectoryEntryKind};
 use crate::util::io_err;
 
-use super::write_status;
-
-pub fn serve_get(fs_path: &Path, stream: &mut TcpStream, send_body: bool) -> std::io::Result<()> {
+pub fn serve_get(fs_path: &Path, stream: &mut dyn Write, send_body: bool) -> std::io::Result<()> {
     let fs_metadata = match fs::metadata(fs_path) {
         Ok(m) => m,
-        Err(_) => return write_status(stream, 404, "Not Found", b"not found"),
+        Err(_) => return write_text(stream, 404, b"not found"),
     };
 
     if fs_metadata.is_dir() {
@@ -25,12 +23,12 @@ pub fn serve_get(fs_path: &Path, stream: &mut TcpStream, send_body: bool) -> std
         headers.push(("Content-Type", "application/json"));
         headers.push(("Content-Length", content_length.as_str()));
         headers.push(("Connection", "close"));
-        return write_response(stream, 200, "OK", &headers, if send_body { body.as_bytes() } else { &[] });
+        return write_response(stream, 200, &headers, if send_body { body.as_bytes() } else { &[] });
     }
 
     let metadata = match read_metadata_attributes(fs_path) {
         Ok(m) => m,
-        Err(e) => return write_status(stream, 500, "Internal Server Error", e.to_string().as_bytes()),
+        Err(e) => return write_text(stream, 500, e.to_string().as_bytes()),
     };
 
     let metadata_headers = write_metadata_headers(&metadata);
@@ -40,7 +38,7 @@ pub fn serve_get(fs_path: &Path, stream: &mut TcpStream, send_body: bool) -> std
     headers.push(("Content-Length", &content_length));
     headers.push(("Connection", "close"));
 
-    write_response(stream, 200, "OK", &headers, &[])?;
+    write_response(stream, 200, &headers, &[])?;
     if send_body {
         let mut file = fs::File::open(fs_path)?;
         std::io::copy(&mut file, stream)?;

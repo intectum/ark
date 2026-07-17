@@ -1,90 +1,56 @@
-use std::fs;
 use std::io::Write;
-use std::net::TcpStream;
 use std::path::Path;
 
-use crate::identity::{resolve_identity, validate_identity};
-use crate::metadata::{read_metadata_headers, verify_metadata, write_metadata_attributes};
-use crate::types::{Identity, IdentityContext, Member, Permission};
-
-use super::write_status;
+use crate::http::write_text;
+use crate::identity::validate_identity;
+use crate::metadata::verify_metadata;
+use crate::server::util::{members_changed, write_target};
+use crate::types::{Identity, Member, Metadata, Permission};
 
 pub fn serve_put_init(
-    server_ctx: &IdentityContext,
-    stream: &mut TcpStream,
-    headers: &Vec<(String, String)>,
+    stream: &mut dyn Write,
+    metadata: &Metadata,
     body: &[u8],
     target_path: &Path,
 ) -> std::io::Result<()> {
     let body_identity: Identity = match serde_json::from_slice(body) {
         Ok(i) => i,
-        Err(e) => return write_status(stream, 400, "Bad Request", format!("identity json: {}", e).as_bytes()),
+        Err(e) => return write_text(stream, 400, format!("identity json: {}", e).as_bytes()),
     };
 
     if let Err(e) = validate_identity(&body_identity) {
-        return write_status(stream, 400, "Bad Request", e.to_string().as_bytes());
+        return write_text(stream, 400, e.to_string().as_bytes());
     }
 
-    serve_put(server_ctx, target_path, stream, body, headers, None, Permission::Owner, false, Some(&body_identity))
+    serve_put(target_path, stream, body, metadata, &body_identity, None, Permission::Owner, false)
 }
 
-pub fn serve_put(server_ctx: &IdentityContext, fs_path: &Path, stream: &mut TcpStream, body: &[u8], headers: &[(String, String)], existing_members: Option<Vec<Member>>, permission: Permission, target_is_dir: bool, modifier_identity_override: Option<&Identity>) -> std::io::Result<()> {
-    let metadata = match read_metadata_headers(headers) {
-        Ok(m) => m,
-        Err(e) => return write_status(stream, 400, "Bad Request", e.to_string().as_bytes()),
-    };
-
+pub fn serve_put(fs_path: &Path, stream: &mut dyn Write, body: &[u8], metadata: &Metadata, modifier_identity: &Identity, existing_members: Option<&[Member]>, permission: Permission, target_is_dir: bool) -> std::io::Result<()> {
     if target_is_dir {
         if !body.is_empty() {
-            return write_status(stream, 400, "Bad Request", b"dir put must have empty body");
+            return write_text(stream, 400, b"dir put must have empty body");
         }
         if metadata.encryption_algorithm.is_some() {
-            return write_status(stream, 400, "Bad Request", b"dir metadata must not set encryption_algorithm");
+            return write_text(stream, 400, b"dir metadata must not set encryption_algorithm");
         }
     }
-
-    let modifier_identity = match modifier_identity_override {
-        Some(i) => i.clone(),
-        None => match resolve_identity(server_ctx, &metadata.modified_by) {
-            Ok(i) => i,
-            Err(e) => return write_status(stream, 403, "Forbidden", e.to_string().as_bytes()),
-        },
-    };
 
     let verify_body = if target_is_dir { None } else { Some(body) };
-    if let Err(e) = verify_metadata(&modifier_identity.public_key, &metadata, verify_body) {
-        return write_status(stream, 403, "Forbidden", e.to_string().as_bytes());
+    if let Err(e) = verify_metadata(&modifier_identity.public_key, metadata, verify_body) {
+        return write_text(stream, 403, e.to_string().as_bytes());
     }
 
-    if let Some(old) = existing_members.as_deref() {
+    if let Some(old) = existing_members {
         if members_changed(old, &metadata.members) && permission != Permission::Owner {
-            return write_status(stream, 403, "Forbidden", b"owner permission required to change members");
+            return write_text(stream, 403, b"owner permission required to change members");
         }
     }
 
-    let (status_code, status_msg) = if fs_path.exists() { (204, "No Content") } else { (201, "Created") };
+    let status_code = if fs_path.exists() { 204 } else { 201 };
 
-    if target_is_dir {
-        fs::create_dir_all(fs_path)?;
-        write_metadata_attributes(fs_path, &metadata)?;
-    } else {
-        if let Some(parent) = fs_path.parent() { fs::create_dir_all(parent)?; }
-        let mut file = fs::File::create(fs_path)?;
-        write_metadata_attributes(fs_path, &metadata)?;
-        file.write_all(body)?;
-        drop(file);
-    }
+    write_target(fs_path, body, metadata, target_is_dir)?;
 
-    write_status(stream, status_code, status_msg, &[])
-}
-
-fn members_changed(old: &[Member], new: &[Member]) -> bool {
-    if old.len() != new.len() { return true; }
-    let mut old_set: Vec<(&str, Permission)> = old.iter().map(|m| (m.address.as_str(), m.permission)).collect();
-    let mut new_set: Vec<(&str, Permission)> = new.iter().map(|m| (m.address.as_str(), m.permission)).collect();
-    old_set.sort_by(|a, b| a.0.cmp(b.0));
-    new_set.sort_by(|a, b| a.0.cmp(b.0));
-    old_set != new_set
+    write_text(stream, status_code, &[])
 }
 
 #[cfg(test)]
@@ -174,7 +140,7 @@ mod tests {
             let port = start_test_server(temp_dir.to_path_buf());
             let ts = now_seconds();
             let signed_body = b"original";
-            let sig = sign(&key, "PUT", "/ark/test/file", ts, signed_body);
+            let sig = sign(&key, port, "PUT", "/ark/test/file", ts, signed_body);
             let auth = build_auth("test@example.com", ts, &sig);
             let (code, _, _) = request(port, "PUT", "/ark/test/file", b"tampered", &[("Authorization", &auth)]);
             assert_eq!(code, 401);

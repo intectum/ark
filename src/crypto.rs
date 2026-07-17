@@ -74,7 +74,7 @@ pub fn sign_json(secret_key: &Key, json: &serde_json::Value) -> io::Result<Signa
     sign_bytes(secret_key, &jcs)
 }
 
-pub fn verify_bytes(public_key: &Key, signature: &Signature, bytes: Vec<u8>) -> io::Result<()> {
+pub fn verify_bytes(public_key: &Key, signature: &Signature, bytes: &[u8]) -> io::Result<()> {
     match public_key.algorithm.as_str() {
         "ed25519" if signature.algorithm == "ed25519" => {
             let public_key_arr: [u8; 32] = public_key.value.clone().try_into()
@@ -86,7 +86,7 @@ pub fn verify_bytes(public_key: &Key, signature: &Signature, bytes: Vec<u8>) -> 
                 .map_err(|_| io_err("ed25519 requires a 64 byte signature"))?;
             let signature_obj = ed25519_dalek::Signature::from_bytes(&signature_arr);
 
-            public_key_obj.verify(&bytes, &signature_obj)
+            public_key_obj.verify(bytes, &signature_obj)
                 .map_err(|e| io_err(&e.to_string()))
         },
         _ => Err(io_err("unsupported signature algorithm"))
@@ -97,7 +97,7 @@ pub fn verify_json(key: &Key, signature: &Signature, json: &serde_json::Value) -
     let jcs = serde_jcs::to_vec(json)
         .map_err(|_| io_err("failed to canonicalize json"))?;
 
-    verify_bytes(key, signature, jcs)
+    verify_bytes(key, signature, &jcs)
 }
 
 // TODO: EncodedValue return type (with named alts e.g. Key)

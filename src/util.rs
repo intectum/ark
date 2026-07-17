@@ -73,10 +73,13 @@ fn reject_path_traversal(url: &Url) -> std::io::Result<()> {
     Ok(())
 }
 
-pub fn request_to_bytes(method: &str, path: &str, timestamp: u64, body: &[u8]) -> Vec<u8> {
+pub fn request_to_bytes(method: &str, host: &str, path: &str, timestamp: u64, body: &[u8]) -> Vec<u8> {
+    let host_lower = host.to_ascii_lowercase();
     let timestamp_string = timestamp.to_string();
-    let mut bytes = Vec::with_capacity(method.len() + path.len() + timestamp_string.len() + body.len() + 3);
+    let mut bytes = Vec::with_capacity(method.len() + host_lower.len() + path.len() + timestamp_string.len() + body.len() + 4);
     bytes.extend_from_slice(method.as_bytes());
+    bytes.push(b'\n');
+    bytes.extend_from_slice(host_lower.as_bytes());
     bytes.push(b'\n');
     bytes.extend_from_slice(path.as_bytes());
     bytes.push(b'\n');

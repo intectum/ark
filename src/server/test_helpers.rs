@@ -10,8 +10,12 @@ use crate::types::{Identity, Key, Member, Metadata};
 use crate::util::{encode_base64url, now_seconds, request_to_bytes};
 use crate::util::test::create_plain_test_metadata;
 
-pub fn sign(key: &[u8], method: &str, path: &str, ts: u64, body: &[u8]) -> String {
-    let bytes = request_to_bytes(method, path, ts, body);
+pub fn test_host(port: u16) -> String {
+    format!("127.0.0.1:{}", port)
+}
+
+pub fn sign(key: &[u8], port: u16, method: &str, path: &str, ts: u64, body: &[u8]) -> String {
+    let bytes = request_to_bytes(method, &test_host(port), path, ts, body);
     encode_base64url(sign_bytes(&Key { algorithm: DEFAULT_SIGNING_ALGORITHM.to_string(), value: key.to_vec() }, &bytes).unwrap().value)
 }
 
@@ -25,7 +29,7 @@ pub fn build_auth(address: &str, timestamp: u64, sig_b64: &str) -> String {
 pub fn request(port: u16, method: &str, path: &str, body: &[u8], extra: &[(&str, &str)]) -> (u16, Vec<u8>, Vec<(String, String)>) {
     let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    let mut head = format!("{} {} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n", method, path, body.len());
+    let mut head = format!("{} {} HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\nConnection: close\r\n", method, path, test_host(port), body.len());
     for (k, v) in extra {
         head.push_str(&format!("{}: {}\r\n", k, v));
     }
@@ -57,7 +61,7 @@ pub fn signed_request(port: u16, requestor: &Identity, secret_key: &Key, method:
 
 pub fn signed_request_with_headers(port: u16, requestor: &Identity, secret_key: &Key, method: &str, path: &str, body: &[u8], extra: &[(&str, &str)]) -> (u16, Vec<u8>, Vec<(String, String)>) {
     let timestamp = now_seconds();
-    let sig_b64 = sign(&secret_key.value, method, path, timestamp, body);
+    let sig_b64 = sign(&secret_key.value, port, method, path, timestamp, body);
     let auth = build_auth(&requestor.address, timestamp, &sig_b64);
     let mut headers: Vec<(&str, &str)> = vec![("Authorization", &auth)];
     headers.extend_from_slice(extra);
@@ -123,9 +127,21 @@ pub fn signed_put_dir_metadata(
     path: &str,
     metadata: &Metadata,
 ) -> u16 {
+    signed_put_dir_metadata_with_headers(port, signer, signer_key, path, metadata, &[])
+}
+
+pub fn signed_put_dir_metadata_with_headers(
+    port: u16,
+    signer: &Identity,
+    signer_key: &Key,
+    path: &str,
+    metadata: &Metadata,
+    extra: &[(&str, &str)],
+) -> u16 {
     let headers = write_metadata_headers(metadata);
-    let extra: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    signed_request_with_headers(port, signer, signer_key, "PUT", path, b"", &extra).0
+    let mut all: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    all.extend_from_slice(extra);
+    signed_request_with_headers(port, signer, signer_key, "PUT", path, b"", &all).0
 }
 
 pub fn signed_put_metadata(
@@ -136,7 +152,20 @@ pub fn signed_put_metadata(
     body: &[u8],
     metadata: &Metadata,
 ) -> u16 {
+    signed_put_metadata_with_headers(port, signer, signer_key, path, body, metadata, &[])
+}
+
+pub fn signed_put_metadata_with_headers(
+    port: u16,
+    signer: &Identity,
+    signer_key: &Key,
+    path: &str,
+    body: &[u8],
+    metadata: &Metadata,
+    extra: &[(&str, &str)],
+) -> u16 {
     let headers = write_metadata_headers(metadata);
-    let extra: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    signed_request_with_headers(port, signer, signer_key, "PUT", path, body, &extra).0
+    let mut all: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    all.extend_from_slice(extra);
+    signed_request_with_headers(port, signer, signer_key, "PUT", path, body, &all).0
 }

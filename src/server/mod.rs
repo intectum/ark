@@ -2,34 +2,39 @@ mod auth;
 mod delete;
 mod get;
 mod put;
+mod relay;
 #[cfg(test)]
 mod test_helpers;
+mod util;
 
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::net::{TcpListener, TcpStream};
-use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 
 use crate::context::{create_server_context, create_target_context};
-use crate::http::{read_request, write_response};
-use crate::metadata::read_metadata_attributes;
-use crate::types::{IdentityContext, Member, Permission};
+use crate::http::{read_request, write_text};
+use crate::identity::resolve_identity;
+use crate::metadata::{read_metadata_attributes, read_metadata_headers};
+use crate::types::{IdentityContext, Permission};
 use crate::util::resolve_server_url;
 
 use self::auth::{authenticate, authorize};
 use self::delete::serve_delete;
 use self::get::serve_get;
 use self::put::{serve_put, serve_put_init};
+use self::relay::relay_same_server;
+use self::util::find_ancestor_members;
 
 pub const MAX_CLOCK_SKEW_SECS: u64 = 300;
 
-pub fn cmd_server(port: u16) {
+pub fn cmd_server(port: u16, host: &str) {
     let root = env::current_dir().expect("cwd");
-    let server_ctx = create_server_context(&root).expect("init server identity");
+    let server_ctx = create_server_context(&root, host).expect("init server identity");
     let listener = TcpListener::bind(("0.0.0.0", port)).expect("bind");
     eprintln!("Ark serving {} on http://0.0.0.0:{}", root.display(), port);
     serve(listener, server_ctx, true);
@@ -39,7 +44,7 @@ pub fn cmd_server(port: u16) {
 pub fn start_test_server(root: PathBuf) -> u16 {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
     let port = listener.local_addr().unwrap().port();
-    let server_ctx = create_server_context(&root).expect("init server identity");
+    let server_ctx = create_server_context(&root, &format!("127.0.0.1:{}", port)).expect("init server identity");
     thread::spawn(move || serve(listener, server_ctx, false));
     port
 }
@@ -53,14 +58,14 @@ pub fn serve(listener: TcpListener, server_ctx: IdentityContext, verbose: bool) 
                 thread::spawn(move || {
                     if let Err(e) = handle(s, &server_ctx, verbose) {
                         if verbose {
-                            eprintln!("ERROR: {}", e);
+                            eprintln!("ERROR {}", e);
                         }
                     }
                 });
             }
             Err(e) => {
                 if verbose {
-                    eprintln!("ERROR: {}", e);
+                    eprintln!("ERROR {}", e);
                 }
             }
         }
@@ -69,24 +74,35 @@ pub fn serve(listener: TcpListener, server_ctx: IdentityContext, verbose: bool) 
 
 fn handle(mut stream: TcpStream, server_ctx: &IdentityContext, verbose: bool) -> std::io::Result<()> {
     let (method, target, headers, body) = read_request(&mut stream)?;
-
     if verbose {
-        println!("{} {}", method, target)
+        println!("{} {}", method, target);
     }
 
-    let url = match resolve_server_url(&target) {
+    handle_parsed(&mut stream, server_ctx, &method, &target, &headers, &body, verbose)
+}
+
+pub fn handle_parsed(
+    stream: &mut dyn Write,
+    server_ctx: &IdentityContext,
+    method: &str,
+    target: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+    verbose: bool,
+) -> std::io::Result<()> {
+    let url = match resolve_server_url(target) {
         Ok(u) => u,
-        Err(_) => return write_status(&mut stream, 400, "Bad Request", b"bad path"),
+        Err(_) => return write_text(stream, 400, b"bad path"),
     };
 
     let segments: Vec<&str> = url.path_segments()
         .map(|s| s.filter(|p| !p.is_empty()).collect())
         .unwrap_or_default();
     if segments.first() != Some(&"ark") || segments.len() < 2 {
-        return write_status(&mut stream, 403, "Forbidden", b"forbidden");
+        return write_text(stream, 403, b"forbidden");
     }
     if segments.len() == 2 && method != "GET" && method != "HEAD" {
-        return write_status(&mut stream, 405, "Method Not Allowed", b"method not allowed");
+        return write_text(stream, 405, b"method not allowed");
     }
 
     let server_root = server_ctx.root.parent().unwrap().parent().unwrap();
@@ -94,27 +110,31 @@ fn handle(mut stream: TcpStream, server_ctx: &IdentityContext, verbose: bool) ->
     let target_identity_path = server_root.join("ark").join(name).join(".ark").join("identity.json");
 
     if method == "PUT" && url.path() == format!("/ark/{}/.ark/identity.json", name) && !target_identity_path.exists() {
-        return serve_put_init(server_ctx, &mut stream, &headers, &body, &target_identity_path);
+        let metadata = match read_metadata_headers(headers) {
+            Ok(m) => m,
+            Err(e) => return write_text(stream, 400, e.to_string().as_bytes()),
+        };
+        return serve_put_init(stream, &metadata, body, &target_identity_path);
     }
 
     let target_ctx = match create_target_context(server_root, name) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound =>
-            return write_status(&mut stream, 403, "Forbidden", b"forbidden"),
+            return write_text(stream, 403, b"forbidden"),
         Err(e) => return Err(e),
     };
 
     let fs_path = server_root.join(url.path().trim_start_matches('/'));
 
     if fs::symlink_metadata(&fs_path).map(|m| m.is_symlink()).unwrap_or(false) {
-        return write_status(&mut stream, 403, "Forbidden", b"symlinks not allowed");
+        return write_text(stream, 403, b"symlinks not allowed");
     }
 
     let target_is_dir = url.path().ends_with('/') || fs_path.is_dir();
 
     let existing_members = read_metadata_attributes(&fs_path).ok().map(|metadata| metadata.members);
     if fs_path.is_file() && existing_members.is_none() {
-        return write_status(&mut stream, 500, "Internal Server Error", b"file missing metadata");
+        return write_text(stream, 500, b"file missing metadata");
     }
 
     let effective_members = match existing_members.clone() {
@@ -127,48 +147,66 @@ fn handle(mut stream: TcpStream, server_ctx: &IdentityContext, verbose: bool) ->
         .and_then(|members| members.iter().find(|member| member.address == "*"));
 
     if public_member.is_some() && (method == "GET" || method == "HEAD") {
-        return serve_get(&fs_path, &mut stream, method == "GET");
+        return serve_get(&fs_path, stream, method == "GET");
     }
 
-    let requestor_identity = match authenticate(server_ctx, &url, &method, &headers, &body) {
+    let requestor_identity = match authenticate(server_ctx, &url, method, headers, body) {
         Ok(i) => i,
-        Err(e) => return write_status(&mut stream, 401, "Unauthorized", e.to_string().as_bytes())
+        Err(e) => return write_text(stream, 401, e.to_string().as_bytes())
     };
 
-    let permission = match authorize(&target_ctx, &requestor_identity, effective_members.as_deref()) {
+    let metadata = if method == "PUT" {
+        match read_metadata_headers(headers) {
+            Ok(m) => Some(m),
+            Err(e) => return write_text(stream, 400, e.to_string().as_bytes()),
+        }
+    } else {
+        None
+    };
+
+    let modifier_identity = if let Some(m) = metadata.as_ref() {
+        match resolve_identity(server_ctx, &m.modified_by) {
+            Ok(i) => Some(i),
+            Err(e) => return write_text(stream, 403, e.to_string().as_bytes())
+        }
+    } else {
+        None
+    };
+
+    let permission = match authorize(&target_ctx, &requestor_identity, modifier_identity.as_ref(), effective_members.as_deref()) {
         Ok(p) => p,
-        Err(e) => return write_status(&mut stream, 403, "Forbidden", e.to_string().as_bytes())
+        Err(e) => return write_text(stream, 403, e.to_string().as_bytes())
     };
 
     if permission == Permission::Read {
-        match method.as_str() {
-            "PUT" | "DELETE" => return write_status(&mut stream, 403, "Forbidden", b"write permission required"),
+        match method {
+            "PUT" | "DELETE" => return write_text(stream, 403, b"write permission required"),
             _ => {}
         }
     }
 
-    match method.as_str() {
-        "GET" => serve_get(&fs_path, &mut stream, true),
-        "HEAD" => serve_get(&fs_path, &mut stream, false),
-        "PUT" => serve_put(server_ctx, &fs_path, &mut stream, &body, &headers, existing_members, permission, target_is_dir, None),
-        "DELETE" => serve_delete(&fs_path, &mut stream),
-        _ => write_status(&mut stream, 405, "Method Not Allowed", b"method not allowed"),
-    }
-}
+    match method {
+        "GET" => serve_get(&fs_path, stream, true),
+        "HEAD" => serve_get(&fs_path, stream, false),
+        "PUT" => {
+            let metadata = metadata.as_ref().expect("metadata presence checked above");
+            let modifier = modifier_identity.as_ref().expect("modifier presence checked above");
+            serve_put(&fs_path, stream, body, metadata, modifier, existing_members.as_deref(), permission, target_is_dir)?;
 
-fn find_ancestor_members(fs_path: &Path, fs_account_path: &Path) -> Option<Vec<Member>> {
-    let mut current = fs_path.parent()?;
-    while current.starts_with(fs_account_path) {
-        if let Ok(m) = read_metadata_attributes(current) {
-            return Some(m.members);
+            let relay_requested = headers.iter().any(|(name, value)| name.eq_ignore_ascii_case("x-ark-relay") && value.eq_ignore_ascii_case("true"));
+            if relay_requested {
+                if let Err(e) = relay_same_server(server_ctx, method, &url, headers, body, metadata, verbose) {
+                    if verbose {
+                        eprintln!("ERROR(relay) {}", e);
+                    }
+                }
+            }
+
+            Ok(())
         }
-        current = current.parent()?;
+        "DELETE" => serve_delete(&fs_path, stream),
+        _ => write_text(stream, 405, b"method not allowed"),
     }
-    None
-}
-
-pub fn write_status(stream: &mut TcpStream, status_code: u16, status_msg: &str, body: &[u8]) -> std::io::Result<()> {
-    write_response(stream, status_code, status_msg, &[("Content-Type", "text/plain"), ("Connection", "close")], body)
 }
 
 #[cfg(test)]
@@ -246,7 +284,7 @@ mod tests {
             let key = [17u8; 32];
             create_test_account(temp_dir, TEST_ADDRESS);
             let port = start_test_server(temp_dir.to_path_buf());
-            let sig = sign(&key, "GET", "/ark/test/x", now_seconds(), &[]);
+            let sig = sign(&key, port, "GET", "/ark/test/x", now_seconds(), &[]);
             let auth = format!("ArkAccount address=\"test@example.com\", signature=\"{}\"", sig);
             let (code, _, _) = request(port, "GET", "/ark/test/x", &[], &[("Authorization", &auth)]);
             assert_eq!(code, 401);
@@ -260,7 +298,7 @@ mod tests {
             create_test_account(temp_dir, TEST_ADDRESS);
             let port = start_test_server(temp_dir.to_path_buf());
             let old = now_seconds() - (MAX_CLOCK_SKEW_SECS + 60);
-            let sig = sign(&key, "GET", "/ark/test/x", old, &[]);
+            let sig = sign(&key, port, "GET", "/ark/test/x", old, &[]);
             let auth = build_auth("test@example.com", old, &sig);
             let (code, _, _) = request(port, "GET", "/ark/test/x", &[], &[("Authorization", &auth)]);
             assert_eq!(code, 401);
@@ -274,7 +312,7 @@ mod tests {
             create_test_account(temp_dir, TEST_ADDRESS);
             let port = start_test_server(temp_dir.to_path_buf());
             let ts = now_seconds();
-            let sig = sign(&key, "GET", "/ark/test/somethingelse", ts, &[]);
+            let sig = sign(&key, port, "GET", "/ark/test/somethingelse", ts, &[]);
             let auth = build_auth("test@example.com", ts, &sig);
             let (code, _, _) = request(port, "GET", "/ark/test/realtarget", &[], &[("Authorization", &auth)]);
             assert_eq!(code, 401);

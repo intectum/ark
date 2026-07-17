@@ -13,14 +13,14 @@ pub fn create_client_context() -> io::Result<IdentityContext> {
     read_context(&root)
 }
 
-pub fn create_server_context(server_root: &Path) -> io::Result<IdentityContext> {
+pub fn create_server_context(server_root: &Path, host: &str) -> io::Result<IdentityContext> {
     let root = server_root.join("ark").join("ark");
     let dot_ark_dir = root.join(".ark");
     let identity_path = dot_ark_dir.join("identity.json");
     let key_path = dot_ark_dir.join("identity.key");
 
     if !identity_path.exists() {
-        let (identity, secret_key) = create_identity("ark@localhost")?;
+        let (identity, secret_key) = create_identity(&format!("ark@{}", host))?;
         fs::create_dir_all(&dot_ark_dir)?;
         write_identity(&identity_path, &identity)?;
         write_identity_key(&key_path, &secret_key.value)?;

@@ -8,6 +8,8 @@ mod server;
 mod types;
 mod util;
 
+use std::env;
+
 use clap::{Parser, Subcommand};
 
 use crate::client::{DecryptArgs, EncryptArgs, cmd_chmod, cmd_decrypt, cmd_delete, cmd_encrypt, cmd_get, cmd_head, cmd_init, cmd_put, cmd_sync};
@@ -27,6 +29,8 @@ enum Cmd {
     Server {
         #[arg(default_value_t = 8080)]
         port: u16,
+        #[arg(long)]
+        host: Option<String>,
     },
     /// Initialise an account in the current directory.
     Init {
@@ -127,10 +131,14 @@ enum Cmd {
 }
 
 fn main() {
+    let _ = dotenvy::dotenv();
     let cli = Cli::parse();
     let result: std::io::Result<()> = match cli.cmd {
-        Cmd::Server { port } => {
-            cmd_server(port);
+        Cmd::Server { port, host } => {
+            let resolved_host = host
+                .or_else(|| env::var("HOST").ok())
+                .unwrap_or_else(|| format!("localhost:{}", port));
+            cmd_server(port, &resolved_host);
             Ok(())
         },
         Cmd::Init { address } => cmd_init(&address),

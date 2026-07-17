@@ -105,7 +105,8 @@ pub fn cmd_put(ctx: &IdentityContext, path: &str, input: Option<&str>, encryptio
     }
 
     let metadata_headers = write_metadata_headers(&metadata);
-    let headers: Vec<(&str, &str)> = metadata_headers.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
+    let mut headers: Vec<(&str, &str)> = metadata_headers.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
+    headers.push(("X-Ark-Relay", "true"));
 
     let (response_code, _, response_body) = ark_request(Some(ctx), "PUT", &url, &headers, &final_body)?;
     if response_code != 201 && response_code != 204 {
