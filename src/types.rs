@@ -13,7 +13,6 @@ pub struct DirectoryEntry {
     #[serde(rename = "type")]
     pub kind: DirectoryEntryKind,
     pub name: String,
-    pub size: u64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -131,6 +130,14 @@ pub struct Signature {
     pub value: Vec<u8>,
 }
 
+#[derive(Debug, Default)]
+pub struct StreamEvent {
+    #[allow(dead_code)]
+    pub id: String,
+    pub event: String,
+    pub data: String,
+}
+
 mod base64url {
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -156,13 +163,11 @@ mod tests {
         let e = DirectoryEntry {
             kind: DirectoryEntryKind::File,
             name: "a.txt".to_string(),
-            size: 42,
         };
         let s = serde_json::to_string(&e).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["type"], "file");
         assert_eq!(v["name"], "a.txt");
-        assert_eq!(v["size"], 42);
     }
 
     #[test]
@@ -177,18 +182,16 @@ mod tests {
         let original = DirectoryEntry {
             kind: DirectoryEntryKind::Symlink,
             name: "link".to_string(),
-            size: 7,
         };
         let s = serde_json::to_string(&original).unwrap();
         let back: DirectoryEntry = serde_json::from_str(&s).unwrap();
         assert!(matches!(back.kind, DirectoryEntryKind::Symlink));
         assert_eq!(back.name, "link");
-        assert_eq!(back.size, 7);
     }
 
     #[test]
     fn directory_entry_rejects_unknown_kind() {
-        let bad = r#"{"type":"bogus","name":"x","size":0}"#;
+        let bad = r#"{"type":"bogus","name":"x"}"#;
         let res: Result<DirectoryEntry, _> = serde_json::from_str(bad);
         assert!(res.is_err());
     }

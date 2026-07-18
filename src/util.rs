@@ -8,6 +8,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sha2::{Digest, Sha256};
 use url::Url;
 
+use crate::crypto::sign_bytes;
 use crate::types::IdentityContext;
 
 pub fn find_account_root() -> std::io::Result<PathBuf> {
@@ -89,6 +90,18 @@ pub fn request_to_bytes(method: &str, host: &str, path: &str, timestamp: u64, bo
     bytes
 }
 
+pub fn create_authorization_header(ctx: &IdentityContext, method: &str, host: &str, path: &str, timestamp: u64, body: &[u8]) -> std::io::Result<String> {
+    let identity_key = ctx.identity_key.as_ref().ok_or_else(|| io_err("context missing identity_key"))?;
+    let request_bytes = request_to_bytes(method, host, path, timestamp, body);
+    let signature = sign_bytes(identity_key, &request_bytes)?;
+    Ok(format!(
+        "ArkAccount address=\"{}\", timestamp=\"{}\", signature=\"{}\"",
+        ctx.identity.address,
+        timestamp,
+        encode_base64url(signature.value),
+    ))
+}
+
 pub fn encode_base64url<T: AsRef<[u8]>>(input: T) -> String {
     URL_SAFE_NO_PAD.encode(input)
 }
@@ -101,6 +114,10 @@ pub fn sha256(data: &[u8]) -> Vec<u8> {
     let mut hash = Sha256::new();
     hash.update(data);
     hash.finalize().to_vec()
+}
+
+pub fn now_milliseconds() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
 }
 
 pub fn now_seconds() -> u64 {

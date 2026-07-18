@@ -1,5 +1,6 @@
 mod auth;
 mod delete;
+mod stream;
 mod get;
 mod put;
 mod relay;
@@ -25,6 +26,7 @@ use crate::util::resolve_server_url;
 
 use self::auth::{authenticate, authorize};
 use self::delete::serve_delete;
+use self::stream::serve_stream;
 use self::get::serve_get;
 use self::put::{serve_put, serve_put_init};
 use self::relay::relay;
@@ -186,7 +188,14 @@ pub fn handle_parsed(
     }
 
     match method {
-        "GET" => serve_get(&fs_path, stream, true),
+        "GET" => {
+            let wants_stream = target_is_dir && headers.iter().any(|(n, v)|
+                n.eq_ignore_ascii_case("accept") && v.contains("text/event-stream"));
+            if wants_stream {
+                return serve_stream(&fs_path, stream);
+            }
+            serve_get(&fs_path, stream, true)
+        },
         "HEAD" => serve_get(&fs_path, stream, false),
         "PUT" => {
             let metadata = metadata.as_ref().expect("metadata presence checked above");

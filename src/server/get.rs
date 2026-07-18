@@ -60,7 +60,6 @@ fn list_dir(path: &Path) -> std::io::Result<String> {
             Ok(DirectoryEntry {
                 kind,
                 name: e.file_name().to_string_lossy().into_owned(),
-                size: meta.len(),
             })
         })
         .collect::<std::io::Result<_>>()?;
@@ -128,7 +127,6 @@ mod tests {
             let entries: Vec<DirectoryEntry> = serde_json::from_slice(&body).unwrap();
             let file = entries.iter().find(|e| e.name == "a.txt").unwrap();
             assert!(matches!(file.kind, DirectoryEntryKind::File));
-            assert_eq!(file.size, 5);
             let dir = entries.iter().find(|e| e.name == "sub").unwrap();
             assert!(matches!(dir.kind, DirectoryEntryKind::Dir));
         });

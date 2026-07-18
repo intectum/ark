@@ -91,6 +91,9 @@ enum Cmd {
         /// Watch for changes and re-sync continuously.
         #[arg(short, long)]
         watch: bool,
+        /// Decrypt pulled files using their metadata key.
+        #[arg(short, long)]
+        decrypt: bool,
     },
     /// Seed ark metadata on a local file or directory.
     Track {
@@ -155,7 +158,7 @@ fn main() {
         Cmd::Delete { path } => create_client_context().and_then(|c| cmd_delete(&c, &path)),
         Cmd::Get { output, decrypt, path } => create_client_context().and_then(|c| cmd_get(&c, &path, output.as_deref(), decrypt)),
         Cmd::Put { input, encryption_algorithm, path } => create_client_context().and_then(|c| cmd_put(&c, &path, input.as_deref(), encryption_algorithm.as_deref())),
-        Cmd::Sync { watch } => create_client_context().and_then(|c| cmd_sync(&c, watch)),
+        Cmd::Sync { watch, decrypt } => create_client_context().and_then(|c| cmd_sync(&c, watch, decrypt)),
         Cmd::Track { encryption_algorithm, path } => create_client_context().and_then(|c| cmd_track(&c, &path, encryption_algorithm.as_deref())),
         Cmd::Decrypt { input, output, in_place, key, encryption_algorithm } => {
             create_client_context().and_then(|c| cmd_decrypt(&c, DecryptArgs { input, output, in_place, key, encryption_algorithm }))

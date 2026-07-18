@@ -5,10 +5,9 @@ use std::sync::Arc;
 use url::Url;
 
 use crate::client::ark_request;
-use crate::crypto::sign_bytes;
 use crate::http::read_response;
 use crate::types::{IdentityContext, Metadata, RelayMode};
-use crate::util::{encode_base64url, io_err, now_seconds, request_to_bytes};
+use crate::util::{create_authorization_header, io_err, now_seconds};
 
 use super::handle_parsed;
 
@@ -64,17 +63,8 @@ pub fn relay(
             .collect();
 
         if same_host {
-            let server_key = server_ctx.identity_key.as_ref()
-                .ok_or_else(|| io_err("server context missing identity_key"))?;
-            let timestamp = now_seconds();
-            let signature = sign_bytes(server_key, &request_to_bytes(method, server_host, &member_path, timestamp, body))?;
-
-            final_headers.push(("Authorization".to_string(), format!(
-                "ArkAccount address=\"{}\", timestamp=\"{}\", signature=\"{}\"",
-                server_ctx.identity.address,
-                timestamp,
-                encode_base64url(signature.value),
-            )));
+            let authorization = create_authorization_header(server_ctx, method, server_host, &member_path, now_seconds(), body)?;
+            final_headers.push(("Authorization".to_string(), authorization));
             final_headers.push(("Host".to_string(), server_host.to_string()));
         } else {
             final_headers.push(("X-Ark-Relay".to_string(), RelayMode::Internal.as_str().to_string()));

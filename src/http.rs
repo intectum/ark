@@ -3,6 +3,7 @@ use std::io::{BufRead, BufReader, Read, Result, Write};
 use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
 use url::Url;
 
+use crate::types::StreamEvent;
 use crate::util::io_err;
 
 const PATH_ENCODE_SET: &AsciiSet = &CONTROLS.add(b' ').add(b'"').add(b'#').add(b'<').add(b'>').add(b'?').add(b'`').add(b'{').add(b'}');
@@ -61,6 +62,85 @@ pub fn write_response(stream: &mut dyn Write, status_code: u16, headers: &[(&str
 
 pub fn write_text(stream: &mut dyn Write, status_code: u16, body: &[u8]) -> Result<()> {
     write_response(stream, status_code, &[("Content-Type", "text/plain"), ("Connection", "close")], body)
+}
+
+pub fn write_stream_start(stream: &mut dyn Write) -> std::io::Result<()> {
+    stream.write_all(b"HTTP/1.1 200 OK\r\n")?;
+    stream.write_all(b"Content-Type: text/event-stream\r\n")?;
+    stream.write_all(b"Cache-Control: no-cache\r\n")?;
+    stream.write_all(b"Connection: keep-alive\r\n")?;
+    stream.write_all(b"X-Accel-Buffering: no\r\n")?;
+    stream.write_all(b"\r\n")?;
+    stream.flush()
+}
+
+pub fn read_stream_events<F>(stream: &mut dyn Read, on_event: &mut F) -> std::io::Result<()>
+where
+    F: FnMut(&StreamEvent) -> std::io::Result<()>,
+{
+    let mut reader = BufReader::new(stream);
+
+    let mut status = String::new();
+    if reader.read_line(&mut status)? == 0 {
+        return Err(io_err("connection closed before status"));
+    }
+
+    if !status.starts_with("HTTP/1.1 200") {
+        return Err(io_err(&format!("stream open failed: {}", status.trim_end())));
+    }
+
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            return Err(io_err("connection closed in headers"));
+        }
+        if line.trim_end_matches(&['\r', '\n'][..]).is_empty() { break; }
+    }
+
+    let mut event = StreamEvent::default();
+
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            return Err(io_err("stream closed"));
+        }
+        let line = line.trim_end_matches(&['\r', '\n'][..]);
+
+        if line.is_empty() {
+            if !event.data.is_empty() {
+                on_event(&event)?;
+            }
+            event = StreamEvent::default();
+            continue;
+        }
+
+        if line.starts_with(':') { continue; }
+
+        let (field, value) = match line.split_once(':') {
+            Some((f, v)) => (f, v.strip_prefix(' ').unwrap_or(v)),
+            None => (line, ""),
+        };
+
+        match field {
+            "id" => event.id = value.to_string(),
+            "event" => event.event = value.to_string(),
+            "data" => {
+                if !event.data.is_empty() { event.data.push('\n'); }
+                event.data.push_str(value);
+            }
+            _ => {}
+        }
+    }
+}
+
+pub fn write_stream_event(stream: &mut dyn Write, id: &str, event: &str, data: &str) -> std::io::Result<()> {
+    write!(stream, "id: {}\nevent: {}\ndata: {}\n\n", id, event, data)?;
+    stream.flush()
+}
+
+pub fn write_stream_keepalive(stream: &mut dyn Write) -> std::io::Result<()> {
+    stream.write_all(b": keepalive\n\n")?;
+    stream.flush()
 }
 
 fn read_message(stream: &mut dyn Read, skip_body: bool) -> Result<(String, Vec<(String, String)>, Vec<u8>)> {

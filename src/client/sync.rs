@@ -1,71 +1,87 @@
 use std::fs;
 use std::io;
+use std::net::TcpStream;
 use std::path::Path;
 use std::sync::mpsc::channel;
+use std::thread;
+use std::time::Duration;
 
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::event::ModifyKind;
+use url::Url;
 
+use crate::client::get::cmd_get;
 use crate::client::put::cmd_put;
+use crate::http::{read_stream_events, write_request};
 use crate::metadata::read_local_metadata_attributes;
-use crate::types::IdentityContext;
-use crate::util::{io_err, sha256};
+use crate::types::{DirectoryEntry, DirectoryEntryKind, IdentityContext, StreamEvent};
+use crate::util::{create_authorization_header, io_err, now_seconds, resolve_client_url, sha256};
 
-pub fn cmd_sync(ctx: &IdentityContext, watch: bool) -> io::Result<()> {
-    sync_dir(&ctx, &ctx.root)?;
+const READ_TIMEOUT: Duration = Duration::from_secs(45);
+const RECONNECT_DELAY: Duration = Duration::from_secs(2);
+
+pub fn cmd_sync(ctx: &IdentityContext, watch: bool, decrypt: bool) -> io::Result<()> {
+    // TODO: pull_dir
+    push_dir(&ctx, &ctx.root)?;
 
     if watch {
-        sync_watch(ctx)?;
-    }
-
-    Ok(())
-}
-
-fn sync_dir(ctx: &IdentityContext, dir: &Path) -> io::Result<()> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        if entry.file_type()?.is_symlink() {
-            continue;
-        }
-
-        let path = entry.path();
-        if path.file_name().map_or(false, |file_name| file_name == ".ark") {
-            continue;
-        }
-
-        if path.is_dir() {
-            sync_dir(ctx, &path)?;
-        } else if path.is_file() {
-            if let Err(e) = sync_file(ctx, &path) {
-                eprintln!("sync failed for {}: {}", path.display(), e);
+        thread::scope(|s| {
+            s.spawn(|| {
+                if let Err(e) = pull_watch(ctx, decrypt) {
+                    eprintln!("pull watch: {}", e);
+                }
+            });
+            if let Err(e) = push_watch(ctx) {
+                eprintln!("push watch: {}", e);
             }
+        });
+    }
+
+    Ok(())
+}
+
+fn pull_watch(ctx: &IdentityContext, decrypt: bool) -> io::Result<()> {
+    let url = resolve_client_url(ctx, "/")?;
+
+    stream_events(ctx, &url, |event| {
+        let entry: DirectoryEntry = match serde_json::from_str(&event.data) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("pull watch: bad SSE payload: {}", e);
+                return Ok(());
+            }
+        };
+
+        let rel = entry.name.trim_start_matches('/');
+        if rel.is_empty() || rel == ".ark" || rel.starts_with(".ark/") {
+            return Ok(());
         }
-    }
+        if matches!(entry.kind, DirectoryEntryKind::Dir) {
+            return Ok(());
+        }
 
-    Ok(())
+        let local_path = ctx.root.join(rel);
+
+        match event.event.as_str() {
+            "created" | "modified" => {
+                if let Err(e) = pull_file(ctx, rel, &local_path, decrypt) {
+                    eprintln!("pull file {}: {}", rel, e);
+                }
+            }
+            "deleted" => {
+                if local_path.exists() {
+                    if let Err(e) = fs::remove_file(&local_path) {
+                        eprintln!("pull delete {}: {}", rel, e);
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    })
 }
 
-fn sync_file(ctx: &IdentityContext, local_path: &Path) -> io::Result<()> {
-    let sync_hash = match read_local_metadata_attributes(local_path)?.sync_hash {
-        Some(v) => v,
-        None => return Ok(()),
-    };
-
-    let bytes = fs::read(local_path)?;
-    if sync_hash == sha256(&bytes) {
-        return Ok(());
-    }
-
-    let rel = local_path.strip_prefix(&ctx.root)
-        .map_err(|_| io_err("path outside account root"))?;
-    let target = format!("/{}", rel.to_string_lossy());
-
-    eprintln!("sync: {}", target);
-    cmd_put(ctx, &target, local_path.to_str(), None)?;
-
-    Ok(())
-}
-
-fn sync_watch(ctx: &IdentityContext) -> io::Result<()> {
+fn push_watch(ctx: &IdentityContext) -> io::Result<()> {
     let (tx, rx) = channel();
     let mut watcher = RecommendedWatcher::new(
         move |res| { let _ = tx.send(res); },
@@ -84,7 +100,9 @@ fn sync_watch(ctx: &IdentityContext) -> io::Result<()> {
         };
 
         match event.kind {
-            EventKind::Create(_) | EventKind::Modify(_) => {}
+            EventKind::Create(_)
+            | EventKind::Modify(ModifyKind::Data(_))
+            | EventKind::Modify(ModifyKind::Name(_)) => {}
             _ => continue,
         }
 
@@ -96,12 +114,113 @@ fn sync_watch(ctx: &IdentityContext) -> io::Result<()> {
 
             if !path.is_file() { continue; }
 
-            if let Err(e) = sync_file(ctx, &path) {
-                eprintln!("sync failed for {}: {}", path.display(), e);
+            if let Err(e) = push_file(ctx, &path) {
+                eprintln!("push failed for {}: {}", path.display(), e);
             }
         }
     }
     Ok(())
+}
+
+fn push_dir(ctx: &IdentityContext, dir: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_symlink() {
+            continue;
+        }
+
+        let path = entry.path();
+        if path.file_name().map_or(false, |file_name| file_name == ".ark") {
+            continue;
+        }
+
+        if path.is_dir() {
+            push_dir(ctx, &path)?;
+        } else if path.is_file() {
+            if let Err(e) = push_file(ctx, &path) {
+                eprintln!("push failed for {}: {}", path.display(), e);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn pull_file(ctx: &IdentityContext, remote_rel: &str, local_path: &Path, decrypt: bool) -> io::Result<()> {
+    let target = format!("/{}", remote_rel);
+
+    if let Some(parent) = local_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let local_str = local_path.to_str().ok_or_else(|| io_err("local path is not valid UTF-8"))?;
+    cmd_get(ctx, &target, Some(local_str), decrypt)
+}
+
+fn push_file(ctx: &IdentityContext, local_path: &Path) -> io::Result<()> {
+    let sync_hash = match read_local_metadata_attributes(local_path)?.sync_hash {
+        Some(v) => v,
+        None => return Ok(()),
+    };
+
+    let bytes = fs::read(local_path)?;
+    if sync_hash == sha256(&bytes) {
+        return Ok(());
+    }
+
+    let rel = local_path.strip_prefix(&ctx.root)
+        .map_err(|_| io_err("path outside account root"))?;
+    let target = format!("/{}", rel.to_string_lossy());
+
+    eprintln!("push: {}", target);
+    cmd_put(ctx, &target, local_path.to_str(), None)?;
+
+    Ok(())
+}
+
+fn stream_events<F>(
+    ctx: &IdentityContext,
+    url: &Url,
+    mut on_event: F,
+) -> std::io::Result<()>
+where
+    F: FnMut(&StreamEvent) -> std::io::Result<()>,
+{
+    loop {
+        match connect_and_read(ctx, url, &mut on_event) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                eprintln!("pull watch: {} (reconnecting)", e);
+                thread::sleep(RECONNECT_DELAY);
+            }
+        }
+    }
+}
+
+fn connect_and_read<F>(
+    ctx: &IdentityContext,
+    url: &Url,
+    on_event: &mut F,
+) -> std::io::Result<()>
+where
+    F: FnMut(&StreamEvent) -> std::io::Result<()>,
+{
+    let host = url.host_str().ok_or_else(|| io_err("URL missing host"))?;
+    let port = url.port().unwrap_or(80);
+    let host_header = format!("{}:{}", host, port);
+
+    let authorization = create_authorization_header(ctx, "GET", &host_header, url.path(), now_seconds(), &[])?;
+
+    let headers: Vec<(&str, &str)> = vec![
+        ("Authorization", authorization.as_str()),
+        ("Accept", "text/event-stream"),
+    ];
+
+    let mut stream = TcpStream::connect((host, port))?;
+    stream.set_read_timeout(Some(READ_TIMEOUT))?;
+    write_request(&mut stream, url, "GET", &headers, &[])?;
+
+    read_stream_events(&mut stream, on_event)
 }
 
 #[cfg(test)]
@@ -128,7 +247,7 @@ mod tests {
 
             fs::write(temp_dir.join("bare.txt"), b"hi").unwrap();
 
-            cmd_sync(&ctx, false).unwrap();
+            cmd_sync(&ctx, false, false).unwrap();
 
             assert!(!temp_dir.join("ark/gyan/bare.txt").exists(), "untracked file should not upload");
         });
@@ -146,7 +265,7 @@ mod tests {
             prime_plain(&ctx, &local, "a/b/c.txt", b"deep v1");
 
             fs::write(&local, b"deep v2").unwrap();
-            cmd_sync(&ctx, false).unwrap();
+            cmd_sync(&ctx, false, false).unwrap();
 
             let server_body = fs::read(temp_dir.join("ark/gyan/a/b/c.txt")).unwrap();
             assert_eq!(server_body, b"deep v2");
@@ -160,7 +279,7 @@ mod tests {
             let address = format!("gyan@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &address);
 
-            cmd_sync(&ctx, false).unwrap();
+            cmd_sync(&ctx, false, false).unwrap();
 
             assert!(!temp_dir.join("ark/gyan/.ark/identity.key").exists());
         });
@@ -179,7 +298,7 @@ mod tests {
             let server_path = temp_dir.join("ark/gyan/f.txt");
             let before = fs::read(&server_path).unwrap();
 
-            cmd_sync(&ctx, false).unwrap();
+            cmd_sync(&ctx, false, false).unwrap();
 
             let after = fs::read(&server_path).unwrap();
             assert_eq!(before, after, "server file should be unchanged when content matches cached hash");
@@ -200,7 +319,7 @@ mod tests {
             let before = fs::read(&server_path).unwrap();
 
             fs::write(&local, b"same").unwrap();
-            cmd_sync(&ctx, false).unwrap();
+            cmd_sync(&ctx, false, false).unwrap();
 
             let after = fs::read(&server_path).unwrap();
             assert_eq!(before, after, "identical content should skip upload even after rewrite");
@@ -221,7 +340,7 @@ mod tests {
             let local = temp_dir.join("pulled.txt");
             cmd_get(&ctx, "pulled.txt", Some(local.to_str().unwrap()), false).unwrap();
 
-            cmd_sync(&ctx, false).unwrap();
+            cmd_sync(&ctx, false, false).unwrap();
 
             let after = fs::read(&server_path).unwrap();
             assert_eq!(before, after, "sync after get must not re-upload identical body");
@@ -239,10 +358,79 @@ mod tests {
             prime_plain(&ctx, &local, "f.txt", b"v1");
 
             fs::write(&local, b"v2").unwrap();
-            cmd_sync(&ctx, false).unwrap();
+            cmd_sync(&ctx, false, false).unwrap();
 
             let server_body = fs::read(temp_dir.join("ark/gyan/f.txt")).unwrap();
             assert_eq!(server_body, b"v2");
+        });
+    }
+
+    #[test]
+    fn sync_skips_symlinks() {
+        in_test_dir("ark_sync_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let address = format!("gyan@127.0.0.1:{}", port);
+            let ctx = init_with_server(temp_dir, &address);
+
+            let target = temp_dir.join("target.txt");
+            prime_plain(&ctx, &target, "target.txt", b"v1");
+
+            let link = temp_dir.join("link.txt");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+
+            fs::write(&target, b"v2").unwrap();
+            cmd_sync(&ctx, false, false).unwrap();
+
+            assert_eq!(fs::read(temp_dir.join("ark/gyan/target.txt")).unwrap(), b"v2");
+            assert!(!temp_dir.join("ark/gyan/link.txt").exists(), "symlink must not be uploaded");
+        });
+    }
+
+    #[test]
+    fn sync_skips_nested_dot_ark_dir() {
+        in_test_dir("ark_sync_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let address = format!("gyan@127.0.0.1:{}", port);
+            let ctx = init_with_server(temp_dir, &address);
+
+            let staging = temp_dir.join("staging.txt");
+            prime_plain(&ctx, &staging, "staging.txt", b"v1");
+
+            fs::create_dir_all(temp_dir.join("a/.ark")).unwrap();
+            let hidden = temp_dir.join("a/.ark/hidden.txt");
+            fs::rename(&staging, &hidden).unwrap();
+            fs::write(&hidden, b"v2 modified").unwrap();
+            assert!(read_local_metadata_attributes(&hidden).unwrap().sync_hash.is_some(), "hidden must carry sync_hash so a naive walk would push it");
+
+            cmd_sync(&ctx, false, false).unwrap();
+
+            assert!(!temp_dir.join("ark/gyan/a/.ark").exists(), "nested .ark dir must not be uploaded");
+        });
+    }
+
+    #[test]
+    fn sync_refreshes_sync_hash_after_push() {
+        in_test_dir("ark_sync_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let address = format!("gyan@127.0.0.1:{}", port);
+            let ctx = init_with_server(temp_dir, &address);
+
+            let local = temp_dir.join("f.txt");
+            prime_plain(&ctx, &local, "f.txt", b"v1");
+
+            fs::write(&local, b"v2").unwrap();
+            cmd_sync(&ctx, false, false).unwrap();
+
+            assert_eq!(
+                read_local_metadata_attributes(&local).unwrap().sync_hash.as_deref(),
+                Some(sha256(b"v2").as_slice()),
+                "sync_hash must track uploaded body after push"
+            );
+
+            let server_path = temp_dir.join("ark/gyan/f.txt");
+            let before = fs::read(&server_path).unwrap();
+            cmd_sync(&ctx, false, false).unwrap();
+            assert_eq!(fs::read(&server_path).unwrap(), before, "second sync must no-op");
         });
     }
 
@@ -262,7 +450,7 @@ mod tests {
             assert!(read_local_metadata_attributes(&local).unwrap().sync_hash.is_none(), "encrypted-at-rest file should not carry sync_hash");
 
             let before = fs::read(&server_path).unwrap();
-            cmd_sync(&ctx, false).unwrap();
+            cmd_sync(&ctx, false, false).unwrap();
             let after = fs::read(&server_path).unwrap();
             assert_eq!(before, after, "encrypted-at-rest file should be skipped by sync");
         });
