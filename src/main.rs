@@ -12,7 +12,7 @@ use std::env;
 
 use clap::{Parser, Subcommand};
 
-use crate::client::{DecryptArgs, EncryptArgs, cmd_chmod, cmd_decrypt, cmd_delete, cmd_encrypt, cmd_get, cmd_head, cmd_init, cmd_put, cmd_sync};
+use crate::client::{DecryptArgs, EncryptArgs, cmd_chmod, cmd_decrypt, cmd_delete, cmd_encrypt, cmd_get, cmd_head, cmd_init, cmd_put, cmd_sync, cmd_track};
 use crate::context::create_client_context;
 use crate::server::cmd_server;
 
@@ -92,6 +92,14 @@ enum Cmd {
         #[arg(short, long)]
         watch: bool,
     },
+    /// Seed ark metadata on a local file or directory.
+    Track {
+        /// Encryption algorithm; use "none" for plaintext. Files only.
+        #[arg(short, long, value_name = "NAME")]
+        encryption_algorithm: Option<String>,
+        /// Local file or directory path.
+        path: String,
+    },
     /// Decrypt an encrypted file.
     Decrypt {
         /// Read ciphertext from FILE (otherwise stdin).
@@ -148,6 +156,7 @@ fn main() {
         Cmd::Get { output, decrypt, path } => create_client_context().and_then(|c| cmd_get(&c, &path, output.as_deref(), decrypt)),
         Cmd::Put { input, encryption_algorithm, path } => create_client_context().and_then(|c| cmd_put(&c, &path, input.as_deref(), encryption_algorithm.as_deref())),
         Cmd::Sync { watch } => create_client_context().and_then(|c| cmd_sync(&c, watch)),
+        Cmd::Track { encryption_algorithm, path } => create_client_context().and_then(|c| cmd_track(&c, &path, encryption_algorithm.as_deref())),
         Cmd::Decrypt { input, output, in_place, key, encryption_algorithm } => {
             create_client_context().and_then(|c| cmd_decrypt(&c, DecryptArgs { input, output, in_place, key, encryption_algorithm }))
         }

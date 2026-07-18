@@ -80,7 +80,7 @@ pub fn authorize(
         .flatten()
         .map(|member| member.permission)
         .max_by_key(|permission| permission_rank(*permission))
-        .ok_or_else(|| io_err("actor not a member"))
+        .ok_or_else(|| io_err("forbidden"))
 }
 
 fn permission_rank(permission: Permission) -> u8 {

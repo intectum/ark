@@ -219,14 +219,6 @@ pub fn validate_metadata(metadata: &Metadata) -> io::Result<()> {
         return Err(io_err("metadata must contain at least one owner"));
     }
 
-    if metadata.encryption_algorithm.is_some() {
-        for member in &metadata.members {
-            if member.key.is_none() {
-                return Err(io_err("missing member key field"));
-            }
-        }
-    }
-
     Ok(())
 }
 

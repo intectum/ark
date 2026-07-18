@@ -8,6 +8,7 @@ mod init;
 mod put;
 mod request;
 mod sync;
+mod track;
 
 pub use chmod::cmd_chmod;
 pub use decrypt::{DecryptArgs, cmd_decrypt};
@@ -21,3 +22,4 @@ pub use init::init;
 pub use put::cmd_put;
 pub use request::ark_request;
 pub use sync::cmd_sync;
+pub use track::cmd_track;
