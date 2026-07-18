@@ -101,6 +101,29 @@ impl Permission {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelayMode {
+    Full,
+    Internal,
+}
+
+impl RelayMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RelayMode::Full => "full",
+            RelayMode::Internal => "internal",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "full" => Some(RelayMode::Full),
+            "internal" => Some(RelayMode::Internal),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Signature {
     pub algorithm: String,

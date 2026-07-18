@@ -20,14 +20,14 @@ use crate::context::{create_server_context, create_target_context};
 use crate::http::{read_request, write_text};
 use crate::identity::resolve_identity;
 use crate::metadata::{read_metadata_attributes, read_metadata_headers};
-use crate::types::{IdentityContext, Permission};
+use crate::types::{IdentityContext, Permission, RelayMode};
 use crate::util::resolve_server_url;
 
 use self::auth::{authenticate, authorize};
 use self::delete::serve_delete;
 use self::get::serve_get;
 use self::put::{serve_put, serve_put_init};
-use self::relay::relay_same_server;
+use self::relay::relay;
 use self::util::find_ancestor_members;
 
 pub const MAX_CLOCK_SKEW_SECS: u64 = 300;
@@ -72,7 +72,7 @@ pub fn serve(listener: TcpListener, server_ctx: IdentityContext, verbose: bool) 
     }
 }
 
-fn handle(mut stream: TcpStream, server_ctx: &IdentityContext, verbose: bool) -> std::io::Result<()> {
+fn handle(mut stream: TcpStream, server_ctx: &Arc<IdentityContext>, verbose: bool) -> std::io::Result<()> {
     let (method, target, headers, body) = read_request(&mut stream)?;
     if verbose {
         println!("{} {}", method, target);
@@ -83,7 +83,7 @@ fn handle(mut stream: TcpStream, server_ctx: &IdentityContext, verbose: bool) ->
 
 pub fn handle_parsed(
     stream: &mut dyn Write,
-    server_ctx: &IdentityContext,
+    server_ctx: &Arc<IdentityContext>,
     method: &str,
     target: &str,
     headers: &[(String, String)],
@@ -193,13 +193,22 @@ pub fn handle_parsed(
             let modifier = modifier_identity.as_ref().expect("modifier presence checked above");
             serve_put(&fs_path, stream, body, metadata, modifier, existing_members.as_deref(), permission, target_is_dir)?;
 
-            let relay_requested = headers.iter().any(|(name, value)| name.eq_ignore_ascii_case("x-ark-relay") && value.eq_ignore_ascii_case("true"));
-            if relay_requested {
-                if let Err(e) = relay_same_server(server_ctx, method, &url, headers, body, metadata, verbose) {
-                    if verbose {
-                        eprintln!("ERROR(relay) {}", e);
+            let relay_mode = headers.iter()
+                .find_map(|(name, value)| if name.eq_ignore_ascii_case("x-ark-relay") { RelayMode::parse(value) } else { None });
+            if let Some(mode) = relay_mode {
+                let server_ctx = Arc::clone(server_ctx);
+                let method = method.to_string();
+                let url = url.clone();
+                let headers = headers.to_vec();
+                let body = body.to_vec();
+                let metadata = metadata.clone();
+                thread::spawn(move || {
+                    if let Err(e) = relay(&server_ctx, &method, &url, &headers, &body, &metadata, mode, verbose) {
+                        if verbose {
+                            eprintln!("ERROR(relay) {}", e);
+                        }
                     }
-                }
+                });
             }
 
             Ok(())

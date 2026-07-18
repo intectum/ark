@@ -53,7 +53,10 @@ pub fn resolve_identity(ctx: &IdentityContext, address: &str) -> io::Result<Iden
         .join(name).join(".ark").join("identity.json");
 
     if fs::exists(&peer_path)? {
-        return read_identity(&peer_path);
+        let peer_identity = read_identity(&peer_path)?;
+        if peer_identity.address == address {
+            return Ok(peer_identity);
+        }
     }
 
     let cache_dir = ctx.root.join(".ark").join("identities");
