@@ -10,6 +10,15 @@ use crate::types::{DirectoryEntryKind, IdentityContext, WatchAction};
 use crate::util::{io_err, resolve_client_url, sha256};
 use crate::watch;
 
+/// Push tracked local files under `ctx.root` to the server. Skips symlinks,
+/// `.ark/` directories, and files whose current SHA-256 matches the stored
+/// `sync_hash` (unchanged files) or that lack a `sync_hash` entirely
+/// (untracked or encrypted-at-rest).
+///
+/// When `watch` is true, blocks after the initial push and spawns two watchers:
+/// a local FS watcher that re-pushes on change, and a remote SSE watcher that
+/// pulls remote creates/modifies/deletes. `decrypt` controls whether pulled
+/// files are decrypted on write.
 pub fn sync_io(ctx: &IdentityContext, watch: bool, decrypt: bool) -> io::Result<()> {
     // TODO: pull_dir
     push_dir(&ctx, &ctx.root)?;

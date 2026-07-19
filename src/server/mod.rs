@@ -34,6 +34,12 @@ use self::util::find_ancestor_members;
 
 pub const MAX_CLOCK_SKEW_SECS: u64 = 300;
 
+/// Bind `0.0.0.0:<port>` and serve the current working directory as the ark
+/// server root. Blocks. Bootstraps the server's `ark@<host>` identity on
+/// first run.
+///
+/// Panics if the current directory can't be read, the port can't be bound, or
+/// the server identity can't be initialized.
 pub fn start_server(port: u16, host: &str) {
     let root = env::current_dir().expect("cwd");
     let server_ctx = create_server_context(&root, host).expect("init server identity");

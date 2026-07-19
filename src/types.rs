@@ -2,9 +2,17 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+/// Runtime context for an ark account.
+///
+/// Passed to every client operation. Clients have `identity_key` set (they
+/// can sign requests and unwrap file keys); server-side target contexts have
+/// it as `None` (the server does not hold other accounts' private keys).
 pub struct IdentityContext {
+    /// Account root — the directory containing `.ark/`.
     pub root: PathBuf,
+    /// The account's identity document (address + public key).
     pub identity: Identity,
+    /// The account's private key, when known.
     pub identity_key: Option<Key>,
 }
 
@@ -45,6 +53,9 @@ pub struct Key {
     pub value: Vec<u8>,
 }
 
+/// A member entry in a file or directory's metadata: address, permission,
+/// and (for encrypted files) the file key wrapped for this member's public
+/// key. Address `*` is the public wildcard.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Member {
     pub address: String,
@@ -53,6 +64,8 @@ pub struct Member {
     pub key: Option<Key>,
 }
 
+/// Signed metadata for a file or directory. Stored as `user.ark.*` xattrs at
+/// rest, `X-Ark-Meta-*` HTTP headers in transit. See `spec.md` §8.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Metadata {
     pub id: String,
@@ -67,12 +80,18 @@ pub struct Metadata {
     pub signature: Signature,
 }
 
+/// Local-only companion to [`Metadata`], stored as `user.ark_local.*` xattrs.
+/// Not part of the wire protocol.
 #[derive(Clone, Default)]
 pub struct LocalMetadata {
+    /// Whether the file's bytes on disk are ciphertext.
     pub encrypted: Option<bool>,
+    /// SHA-256 of the last-synced plaintext body. Absent = do not sync.
     pub sync_hash: Option<Vec<u8>>,
 }
 
+/// Permission tier for a [`Member`]. Ordered: `Owner` > `Write` > `Read`.
+/// See `spec.md` §3.3 for the read/modify/change-members matrix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Permission {

@@ -7,6 +7,15 @@ use crate::metadata::{create_metadata, sign_metadata, write_local_metadata_attri
 use crate::types::{IdentityContext, LocalMetadata};
 use crate::util::{io_err, io_invalid_input, sha256};
 
+/// Seed ark metadata on an existing local file or directory. Signs and writes
+/// `user.ark.*` xattrs and (for files) sets `sync_hash` so
+/// [`sync_io`](super::sync_io) will consider the file.
+///
+/// `encryption_algorithm`: `Some("none")` = plaintext, `None` = default
+/// (AES-256-GCM), any other value = named algorithm. Directories accept only
+/// absent/`none`.
+///
+/// Errors if the target already has metadata.
 pub fn track_io(ctx: &IdentityContext, path: &str, encryption_algorithm: Option<&str>) -> io::Result<()> {
     let target = Path::new(path);
     if !fs::exists(target)? {

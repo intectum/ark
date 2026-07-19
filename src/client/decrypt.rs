@@ -8,6 +8,9 @@ use crate::metadata::{apply_key_to_metadata, create_metadata, extract_key_from_m
 use crate::types::{IdentityContext, Key, LocalMetadata, Metadata};
 use crate::util::{decode_base64url, io_err, io_invalid_input, sha256};
 
+/// Decrypt `ciphertext` to `plaintext` using the file key wrapped in
+/// `metadata` for the current account. The metadata's `encryption_algorithm`
+/// selects the AEAD.
 pub fn decrypt(
     ctx: &IdentityContext,
     metadata: &Metadata,
@@ -29,6 +32,15 @@ pub fn decrypt(
     Ok(())
 }
 
+/// CLI-shaped [`decrypt`]. Rewrites `in_place` or reads `input` → writes
+/// `output` (each side defaults to stdio when the corresponding option is
+/// `None`). `in_place` is mutually exclusive with `input`/`output`.
+///
+/// If the source file has ark metadata, its file key and algorithm are reused
+/// and `key`/`encryption_algorithm` must be absent. Otherwise `key` (base64url,
+/// 32 bytes) is required; `encryption_algorithm` defaults to AES-256-GCM.
+///
+/// Refuses to run when `user.ark_local.encrypted=false` on the source.
 pub fn decrypt_io(
     ctx: &IdentityContext,
     input: Option<&str>,

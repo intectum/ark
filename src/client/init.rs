@@ -13,6 +13,22 @@ use crate::metadata::{create_metadata, read_metadata_headers, sign_metadata, wri
 use crate::types::{Identity, IdentityContext, Key, Member, Permission, Signature};
 use crate::util::{decode_base64url, io_err, now_iso, resolve_client_url_raw};
 
+/// Create or download the account identity in the current directory.
+///
+/// If the server already hosts an identity at `address`, downloads and pins it
+/// (writes `.ark/identity.json` only). Otherwise generates a fresh keypair
+/// locally, writes both `.ark/identity.json` and `.ark/identity.key`, and
+/// uploads the identity file to the server.
+///
+/// When `password` is provided:
+/// - On download, fetches the encrypted `.ark/identity.key` from the server and
+///   decrypts it using a password identity derived from the password.
+/// - On upload, uploads a password identity at
+///   `.ark/passwords/primary.json` and an encrypted `.ark/identity.key`
+///   readable by that password identity.
+///
+/// Errors if `.ark/identity.json` or `.ark/identity.key` already exists in the
+/// current directory, or if the server returns a non-200/403/404 response.
 pub fn init(address: &str, password: Option<&str>) -> io::Result<()> {
     let root = current_dir()?;
     let url = resolve_client_url_raw(&root, "/.ark/identity.json", address)?;
@@ -70,6 +86,8 @@ pub fn init(address: &str, password: Option<&str>) -> io::Result<()> {
     Ok(())
 }
 
+/// Create a fresh identity keypair under `root/.ark/` without touching the
+/// network. Test helper. Returns the new [`Identity`] and its secret [`Key`].
 pub fn init_local(root: &Path, address: &str) -> io::Result<(Identity, Key)> {
     let dot_ark_dir = root.join(".ark");
     let (identity, secret_key) = create_identity(address)?;

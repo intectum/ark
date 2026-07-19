@@ -4,6 +4,8 @@ use crate::client::request;
 use crate::types::IdentityContext;
 use crate::util::{io_err, resolve_client_url};
 
+/// Delete a file or directory (recursive) at `path`. Requires the account to
+/// have `write` or `owner` permission on the target.
 pub fn delete(ctx: &IdentityContext, path: &str) -> io::Result<()> {
     let url = resolve_client_url(ctx, path)?;
 

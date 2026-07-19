@@ -7,6 +7,11 @@ use crate::identity::resolve_identity;
 use crate::metadata::{read_metadata_headers, verify_metadata_signature};
 use crate::util::{io_err, resolve_client_url};
 
+/// Fetch response headers and signed metadata for `path` without downloading
+/// the body. Verifies the metadata signature against the modifier's identity.
+///
+/// `path` accepts relative, absolute account, or address form. See the
+/// [module documentation](../index.html) for path resolution details.
 pub fn head(ctx: &IdentityContext, path: &str) -> io::Result<(Vec<(String, String)>, Metadata)> {
     let url = resolve_client_url(ctx, path)?;
 
@@ -23,6 +28,7 @@ pub fn head(ctx: &IdentityContext, path: &str) -> io::Result<(Vec<(String, Strin
     Ok((headers, metadata))
 }
 
+/// [`head`] wrapper that prints every response header to stdout, one per line.
 pub fn head_io(ctx: &IdentityContext, path: &str) -> io::Result<()> {
     let (headers, _) = head(ctx, path)?;
 

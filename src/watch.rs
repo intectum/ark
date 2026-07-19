@@ -16,6 +16,16 @@ use crate::util::{create_authorization_header, io_err, now_seconds};
 const REMOTE_READ_TIMEOUT: Duration = Duration::from_secs(45);
 const REMOTE_RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
+/// Watch a local directory tree recursively and invoke `on_event` for every
+/// create/modify/delete. Blocks.
+///
+/// `on_event` returning `true` stops the watcher. When `keepalive` is `Some`,
+/// synthesises a [`WatchAction::Keepalive`] event after each idle interval so
+/// the callback can time out.
+///
+/// Events are advisory. On macOS, FSEvents coalesces batches with coarser
+/// timestamps and may reorder Create/Modify pairs; consumers should re-read
+/// the file to get authoritative state.
 // notify: on macOS FSEvents coalesces batched events with coarser timestamps
 // and may reorder Create/Modify pairs. Consumers should treat (path, action)
 // as an advisory hint and re-check the file to get authoritative state.
@@ -65,6 +75,13 @@ where
     }
 }
 
+/// Subscribe to a server-sent event stream at `url` and invoke `on_event` for
+/// each remote change. Blocks; auto-reconnects on stream errors after a short
+/// delay.
+///
+/// Requests the stream via `Accept: text/event-stream` and signs the request
+/// using `ctx`. `url` points at any directory on the server — events cover
+/// changes under it.
 pub fn watch_remote<F>(ctx: &IdentityContext, url: &Url, mut on_event: F) -> io::Result<()>
 where
     F: FnMut(WatchEvent) -> io::Result<()>,

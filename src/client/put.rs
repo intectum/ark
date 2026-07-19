@@ -10,6 +10,21 @@ use crate::types::{IdentityContext, LocalMetadata, Metadata};
 use crate::metadata::{apply_key_to_metadata, create_metadata, get_member, read_local_metadata_attributes, read_metadata_attributes, sign_metadata, write_local_metadata_attributes, write_metadata_attributes, write_metadata_headers};
 use crate::util::{io_err, io_invalid_input, now_iso, resolve_client_url, sha256};
 
+/// Upload a body (or create a directory) at `path`.
+///
+/// - `body = None` OR a `path` ending in `/` produces a directory PUT
+///   (empty body). Passing both a directory path and a body is an error.
+/// - `encryption_algorithm`: `None` reuses the existing metadata's algorithm
+///   (or defaults to AES-256-GCM). `Some("none")` uploads raw plaintext.
+///   Directories reject any algorithm.
+/// - `existing_metadata` / `existing_local`: when present, update in place
+///   rather than minting a new [`Metadata`]. Used by [`put_io`] when the input
+///   file already has ark xattrs.
+///
+/// A fresh file key is generated on every encrypted put and wrapped for every
+/// member. If `existing_local.encrypted == Some(true)`, the body is uploaded
+/// as-is without re-encryption. The request adds `X-Ark-Relay: full` so the
+/// server relays the write to co-members.
 pub fn put(
     ctx: &IdentityContext,
     path: &str,
@@ -99,6 +114,10 @@ pub fn put(
     Ok((metadata, local_metadata))
 }
 
+/// CLI-shaped [`put`]. Reads the body from `input` (or stdin when `None`),
+/// pulls existing `user.ark.*` xattrs from the input file if present, and
+/// writes back updated metadata + local metadata xattrs after a successful
+/// upload.
 pub fn put_io(ctx: &IdentityContext, path: &str, input: Option<&str>, encryption_algorithm: Option<&str>) -> io::Result<()> {
     let input_path: Option<PathBuf> = input.map(PathBuf::from);
     if let Some(i) = input_path.as_deref() {

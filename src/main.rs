@@ -7,7 +7,12 @@ use ark::context::create_client_context;
 use ark::server::start_server;
 
 #[derive(Parser)]
-#[command(name = "ark", about = "Ark CLI", version)]
+#[command(
+    name = "ark",
+    about = "Ark CLI — federated, end-to-end encrypted file protocol",
+    long_about = "Ark CLI. See README.md for the full guide and spec.md for the protocol.",
+    version,
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -16,13 +21,27 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Run the file server.
+    ///
+    /// Serves the current working directory as the server root. Accounts land
+    /// under ./ark/<name>/. Bootstraps ./ark/ark/.ark/identity.{json,key} on
+    /// first start.
     Server {
         #[arg(default_value_t = 8080)]
         port: u16,
+        /// Advertised host used for the auto-created ark@<host> identity.
+        /// Defaults to $HOST, else localhost:<port>.
         #[arg(long)]
         host: Option<String>,
     },
     /// Initialise an account in the current directory.
+    ///
+    /// If the server already has an identity at ADDRESS, downloads it. If not,
+    /// generates a fresh keypair locally and uploads it. Writes
+    /// .ark/identity.json and (on generate) .ark/identity.key.
+    ///
+    /// With --password, on first init encrypts and uploads identity.key
+    /// gated by a password identity; on subsequent inits from another machine,
+    /// recovers identity.key using the password.
     Init {
         /// Address in the form <name>@<host>[:<port>].
         address: String,
@@ -36,6 +55,11 @@ enum Cmd {
         path: String,
     },
     /// Change members and permissions on a local file's metadata. Use `put` to sync.
+    ///
+    /// Only updates the file's local xattrs. For encrypted files, adding a
+    /// member re-wraps the current file key for them. Removing a member does
+    /// NOT rotate the file key — the next `put` will. Follow `chmod` with
+    /// `ark put -i <FILE> <PATH>` to upload the change.
     Chmod {
         /// Add or promote an owner (repeatable). Use "public" for wildcard `*`.
         #[arg(short = 'o', long = "owner", value_name = "ADDR")]
@@ -69,17 +93,29 @@ enum Cmd {
         path: String,
     },
     /// Encrypt and upload a file.
+    ///
+    /// A trailing slash on PATH creates or updates a directory (empty body).
+    /// A fresh file key is minted on every encrypted put and wrapped for every
+    /// member. If the input file already has user.ark_local.encrypted=true
+    /// (e.g. after `ark encrypt`), the body is uploaded as-is. The server
+    /// relays the write to co-members' inboxes automatically.
     Put {
         /// Read body from FILE instead of stdin.
         #[arg(short, long, value_name = "FILE")]
         input: Option<String>,
-        /// Encryption algorithm; omit to send body as-is.
+        /// Encryption algorithm; use "none" for plaintext. Default: reuse
+        /// existing metadata's algorithm, else aes-256-gcm.
         #[arg(short, long, value_name = "NAME")]
         encryption_algorithm: Option<String>,
         /// Ark URL or path.
         path: String,
     },
     /// Push local files to the server. One-way client-to-server.
+    ///
+    /// Only files with a sync_hash (set by `track` or a prior `put`/`get`) are
+    /// considered. Files whose SHA-256 matches the stored hash are skipped;
+    /// symlinks and .ark/ directories are always skipped. With --watch,
+    /// blocks after the initial push and also pulls remote changes via SSE.
     Sync {
         /// Watch for changes and re-sync continuously.
         #[arg(short, long)]
@@ -89,6 +125,9 @@ enum Cmd {
         decrypt: bool,
     },
     /// Seed ark metadata on a local file or directory.
+    ///
+    /// Signs and writes user.ark.* xattrs. For files, also sets sync_hash so
+    /// `sync` will consider the file. Errors if metadata already exists.
     Track {
         /// Encryption algorithm; use "none" for plaintext. Files only.
         #[arg(short, long, value_name = "NAME")]
@@ -97,6 +136,10 @@ enum Cmd {
         path: String,
     },
     /// Decrypt an encrypted file.
+    ///
+    /// If the source has ark metadata, its file key and algorithm are reused
+    /// and --key/--encryption-algorithm are rejected. Otherwise --key is
+    /// required. Refuses to run when user.ark_local.encrypted=false.
     Decrypt {
         /// Read ciphertext from FILE (otherwise stdin).
         #[arg(short, long, value_name = "FILE", conflicts_with = "in_place")]
@@ -115,6 +158,10 @@ enum Cmd {
         encryption_algorithm: Option<String>,
     },
     /// Encrypt a plaintext file.
+    ///
+    /// If the source has ark metadata, its file key and algorithm are reused
+    /// and --key/--encryption-algorithm are rejected. Otherwise --key is
+    /// required. Refuses to run when user.ark_local.encrypted=true.
     Encrypt {
         /// Read plaintext from FILE (otherwise stdin).
         #[arg(short, long, value_name = "FILE", conflicts_with = "in_place")]

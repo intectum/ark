@@ -12,6 +12,18 @@ use crate::util::{io_err, io_invalid_input, now_iso};
 const PUBLIC_CLI: &str = "public";
 const PUBLIC_WIRE: &str = "*";
 
+/// Change members and permissions on a local file's metadata.
+///
+/// Adds or promotes each address in `owners`/`writers`/`readers` to the
+/// matching permission; removes each address in `drops`. The literal
+/// `"public"` maps to the wildcard address `*` (rejected for encrypted files).
+///
+/// For encrypted files, adding a member re-wraps the current file key against
+/// their public key (looked up via [`crate::identity::resolve_identity`]).
+/// The caller must currently be an owner. At least one owner must remain.
+///
+/// Does not upload — the file's xattrs are updated locally. Follow with
+/// [`put_io`](super::put_io) to sync the change to the server.
 pub fn chmod_io(
     ctx: &IdentityContext,
     path: &str,

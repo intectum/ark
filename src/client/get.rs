@@ -10,6 +10,16 @@ use crate::identity::resolve_identity;
 use crate::metadata::{read_metadata_headers, verify_metadata, write_local_metadata_attributes, write_metadata_attributes};
 use crate::util::{io_err, resolve_client_url, sha256};
 
+/// Fetch a file body and metadata from the server and write the body to
+/// `output`.
+///
+/// Verifies the metadata signature against the modifier's identity. When
+/// `decrypt` is true, unwraps the file key using `ctx.identity_key` and
+/// decrypts the body before writing.
+///
+/// The returned [`LocalMetadata`] reflects whether the written body is
+/// ciphertext (`encrypted=Some(true)`) or plaintext, and includes a
+/// `sync_hash` when a plaintext body is written.
 pub fn get(
     ctx: &IdentityContext,
     path: &str,
@@ -50,6 +60,10 @@ pub fn get(
     Ok((metadata, local_metadata))
 }
 
+/// CLI-shaped [`get`]. When `output` is `Some`, writes the body to that file
+/// path and stores signed metadata as `user.ark.*` xattrs plus local metadata
+/// as `user.ark_local.*` xattrs. When `output` is `None`, writes the body to
+/// stdout.
 pub fn get_io(ctx: &IdentityContext, path: &str, output: Option<&str>, decrypt: bool) -> io::Result<()> {
     match output {
         Some(o) => {

@@ -7,6 +7,11 @@ use crate::metadata::{create_metadata, sign_metadata, write_metadata_attributes}
 use crate::types::{IdentityContext, Key, Member, Permission};
 use crate::util::find_account_root;
 
+/// Locate an ark account by walking up from the current working directory to
+/// find a `.ark/` folder, then load its identity and identity key. The
+/// returned [`IdentityContext`] has `identity_key` set.
+///
+/// Errors with `NotFound` if no `.ark/` ancestor exists.
 pub fn create_client_context() -> io::Result<IdentityContext> {
     let root = find_account_root()?;
 
