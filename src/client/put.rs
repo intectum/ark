@@ -3,7 +3,7 @@ use std::io::Read;
 use std::path::PathBuf;
 
 use crate::client::ark_request;
-use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, create_key, encrypt_bytes};
+use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, create_secret_key, encrypt_bytes};
 use crate::types::{IdentityContext, LocalMetadata};
 use crate::metadata::{apply_key_to_metadata, create_metadata, get_member, read_local_metadata_attributes, read_metadata_attributes, sign_metadata, write_local_metadata_attributes, write_metadata_attributes, write_metadata_headers};
 use crate::util::{io_err, io_invalid_input, now_iso, resolve_client_url, sha256};
@@ -86,7 +86,7 @@ pub fn cmd_put(ctx: &IdentityContext, path: &str, input: Option<&str>, encryptio
         body
     } else {
         let encryption_algorithm = metadata.encryption_algorithm.as_deref().unwrap();
-        let file_key = create_key(encryption_algorithm)?;
+        let file_key = create_secret_key(encryption_algorithm)?;
         let (_, ciphertext) = encrypt_bytes(&file_key, &body)?;
         apply_key_to_metadata(ctx, &mut metadata, &file_key)?;
         local_metadata.encrypted = Some(false);
@@ -162,7 +162,7 @@ mod tests {
             assert_ne!(on_disk, b"plaintext");
 
             let alg = xattr::get(&server_path, "user.ark.encryption_algorithm").unwrap();
-            assert_eq!(alg.as_deref(), Some(b"aes-256-gcm".as_slice()));
+            assert_eq!(alg.as_deref(), Some(DEFAULT_ENCRYPTION_ALGORITHM.as_bytes()));
             let file_key = unwrap_first_member_key(&server_path, &ctx.identity_key.as_ref().unwrap().value);
             let decrypted = aes_decrypt(&file_key, &on_disk).unwrap();
             assert_eq!(decrypted, b"plaintext");
@@ -179,7 +179,7 @@ mod tests {
             let input = put_via_cmd(temp_dir, "out.bin", b"hello", "");
             assert_eq!(
                 xattr::get(&input, "user.ark.encryption_algorithm").unwrap().as_deref(),
-                Some(b"aes-256-gcm".as_slice())
+                Some(DEFAULT_ENCRYPTION_ALGORITHM.as_bytes())
             );
             let _file_key = unwrap_first_member_key(&input, &ctx.identity_key.as_ref().unwrap().value);
         });
@@ -195,7 +195,7 @@ mod tests {
             let input = temp_dir.join("input.bin");
             write_plain_test_file(&input, &ctx.identity, ctx.identity_key.as_ref().unwrap(), b"hello");
             let mut preset_meta = create_metadata(&ctx.identity.address, Some(DEFAULT_ENCRYPTION_ALGORITHM));
-            let preset_file_key = create_key(DEFAULT_ENCRYPTION_ALGORITHM).unwrap();
+            let preset_file_key = create_secret_key(DEFAULT_ENCRYPTION_ALGORITHM).unwrap();
             apply_key_to_metadata(&ctx, &mut preset_meta, &preset_file_key).unwrap();
             sign_metadata(ctx.identity_key.as_ref().unwrap(), &mut preset_meta, Some(b"hello")).unwrap();
             write_metadata_attributes(&input, &preset_meta).unwrap();
@@ -316,7 +316,7 @@ mod tests {
             let address = format!("gyan@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &address);
 
-            let file_key = create_key(DEFAULT_ENCRYPTION_ALGORITHM).unwrap();
+            let file_key = create_secret_key(DEFAULT_ENCRYPTION_ALGORITHM).unwrap();
             let ciphertext = encrypt_bytes(&file_key, b"hidden").unwrap().1;
             let input = temp_dir.join("input.bin");
             fs::write(&input, &ciphertext).unwrap();
@@ -402,7 +402,7 @@ mod tests {
             let address = format!("gyan@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &address);
 
-            let err = cmd_put(&ctx, "shared/", None, Some("aes-256-gcm")).unwrap_err();
+            let err = cmd_put(&ctx, "shared/", None, Some(DEFAULT_ENCRYPTION_ALGORITHM)).unwrap_err();
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         });
     }
@@ -462,7 +462,7 @@ mod tests {
 
             let input_dir = temp_dir.join("input_dir");
             fs::create_dir_all(&input_dir).unwrap();
-            let err = cmd_put(&ctx, "shared", Some(input_dir.to_str().unwrap()), Some("aes-256-gcm")).unwrap_err();
+            let err = cmd_put(&ctx, "shared", Some(input_dir.to_str().unwrap()), Some(DEFAULT_ENCRYPTION_ALGORITHM)).unwrap_err();
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         });
     }

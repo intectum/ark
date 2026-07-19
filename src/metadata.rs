@@ -228,6 +228,11 @@ pub fn apply_key_to_metadata(
     secret_key: &Key,
 ) -> std::io::Result<()> {
     for member in metadata.members.iter_mut() {
+        if member.address == "*" {
+            member.key = None;
+            continue;
+        }
+
         let recipient_identity = resolve_identity(ctx, &member.address)?;
         let (algorithm, value) = encrypt_bytes(&recipient_identity.public_key, &secret_key.value)?;
         member.key = Some(Key {
@@ -413,6 +418,7 @@ mod tests {
     use std::fs;
 
     use super::*;
+    use crate::crypto::DEFAULT_ENCRYPTION_ALGORITHM;
     use crate::identity::create_identity;
     use crate::util::test::{TEST_ADDRESS, create_plain_test_metadata, in_test_dir};
 
@@ -428,7 +434,7 @@ mod tests {
     #[test]
     fn write_headers_emits_all_fields() {
         let (owner, owner_key) = create_identity(TEST_ADDRESS).unwrap();
-        let mut m = create_metadata(&owner.address, Some("aes-256-gcm"));
+        let mut m = create_metadata(&owner.address, Some(DEFAULT_ENCRYPTION_ALGORITHM));
         sign_metadata(&owner_key, &mut m, Some(b"body")).unwrap();
         let headers = write_metadata_headers(&m);
         assert!(headers.iter().any(|(k, _)| k == "X-Ark-Meta-Id"));
@@ -446,7 +452,7 @@ mod tests {
     #[test]
     fn header_round_trip_preserves_all_fields() {
         let (owner, owner_key) = create_identity(TEST_ADDRESS).unwrap();
-        let mut m = create_metadata(&owner.address, Some("aes-256-gcm"));
+        let mut m = create_metadata(&owner.address, Some(DEFAULT_ENCRYPTION_ALGORITHM));
         m.members[0].key = Some(Key {
             algorithm: "hpke-x25519-hkdf-sha256-aes256gcm".to_string(),
             value: vec![0u8; 32],

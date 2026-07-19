@@ -95,11 +95,31 @@ pub fn create_authorization_header(ctx: &IdentityContext, method: &str, host: &s
     let request_bytes = request_to_bytes(method, host, path, timestamp, body);
     let signature = sign_bytes(identity_key, &request_bytes)?;
     Ok(format!(
-        "ArkAccount address=\"{}\", timestamp=\"{}\", signature=\"{}\"",
+        "ArkIdentity address=\"{}\", timestamp=\"{}\", signature=\"{}\"",
         ctx.identity.address,
         timestamp,
         encode_base64url(signature.value),
     ))
+}
+
+pub fn parse_authorization_header(value: &str) -> Option<(String, String, String)> {
+    let mut address = None;
+    let mut timestamp = None;
+    let mut signature = None;
+
+    let rest = value.strip_prefix("ArkIdentity ")?.trim();
+    for part in rest.split(',') {
+        let (key, value) = part.trim().split_once('=')?;
+        let value = value.trim().trim_matches('"').to_string();
+        match key.trim().to_ascii_lowercase().as_str() {
+            "address" => address = Some(value),
+            "timestamp" => timestamp = Some(value),
+            "signature" => signature = Some(value),
+            _ => {},
+        }
+    }
+
+    Some((address?, timestamp?, signature?))
 }
 
 pub fn encode_base64url<T: AsRef<[u8]>>(input: T) -> String {
@@ -147,9 +167,9 @@ pub mod test {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::client::init;
-    use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, create_key, encrypt_bytes};
+    use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, create_secret_key, encrypt_bytes};
     use crate::context::create_client_context;
-    use crate::identity::write_identity;
+    use crate::identity::{parse_address, write_identity};
     use crate::metadata::{create_metadata, sign_metadata, write_metadata_attributes};
     use crate::types::{IdentityContext, Identity, Key, Metadata};
 
@@ -178,8 +198,8 @@ pub mod test {
     }
 
     pub fn create_test_account(temp_dir: &Path, address: &str) -> (Identity, Key, PathBuf) {
-        let name = address.split_once('@').unwrap().0;
-        let account_dir = temp_dir.join("ark").join(name);
+        let (name, _, _) = parse_address(address).unwrap();
+        let account_dir = temp_dir.join("ark").join(&name);
         fs::create_dir_all(&account_dir).unwrap();
         let (identity, secret_key) = init(&account_dir, address).unwrap();
         (identity, secret_key, account_dir)
@@ -187,8 +207,8 @@ pub mod test {
 
     pub fn init_with_server(temp_dir: &Path, address: &str) -> IdentityContext {
         let (identity, _) = init(temp_dir, address).unwrap();
-        let name = address.split_once('@').unwrap().0;
-        let server_dot_ark = temp_dir.join("ark").join(name).join(".ark");
+        let (name, _, _) = parse_address(address).unwrap();
+        let server_dot_ark = temp_dir.join("ark").join(&name).join(".ark");
         fs::create_dir_all(&server_dot_ark).unwrap();
         write_identity(&server_dot_ark.join("identity.json"), &identity).unwrap();
         create_client_context().unwrap()
@@ -209,7 +229,7 @@ pub mod test {
 
     pub fn create_encrypted_test_metadata(owner: &Identity, owner_key: &Key, plaintext: &[u8]) -> (Metadata, Vec<u8>) {
         let mut metadata = create_metadata(&owner.address, Some(DEFAULT_ENCRYPTION_ALGORITHM));
-        let file_key = create_key(DEFAULT_ENCRYPTION_ALGORITHM).unwrap();
+        let file_key = create_secret_key(DEFAULT_ENCRYPTION_ALGORITHM).unwrap();
         let (_, ciphertext) = encrypt_bytes(&file_key, plaintext).unwrap();
         let (wrap_alg, wrapped) = encrypt_bytes(&owner.public_key, &file_key.value).unwrap();
         metadata.members[0].key = Some(Key { algorithm: wrap_alg, value: wrapped });

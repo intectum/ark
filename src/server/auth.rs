@@ -3,10 +3,10 @@ use std::io::Result;
 use url::Url;
 
 use crate::crypto::verify_bytes;
-use crate::identity::resolve_identity;
+use crate::identity::{parse_address, resolve_identity};
 use crate::metadata::get_member;
 use crate::types::{Identity, IdentityContext, Member, Permission, Signature};
-use crate::util::{decode_base64url, io_err, now_seconds, request_to_bytes};
+use crate::util::{decode_base64url, io_err, now_seconds, parse_authorization_header, request_to_bytes};
 
 use super::MAX_CLOCK_SKEW_SECS;
 
@@ -27,23 +27,18 @@ pub fn authenticate(
         .find_map(|(name, value)| if name.eq_ignore_ascii_case("host") { Some(value.as_str()) } else { None })
         .ok_or_else(|| io_err("missing Host header"))?;
     let request_host = host_header.to_ascii_lowercase();
-    let server_host = server_ctx.identity.address.split_once('@').map(|(_, h)| h).unwrap_or("").to_ascii_lowercase();
+    let (_, server_host, _) = parse_address(&server_ctx.identity.address)?;
+    let server_host = server_host.to_ascii_lowercase();
     if request_host != server_host {
         return Err(io_err("Host header does not match server"));
     }
 
-    let params = match parse_auth_params(authorization) {
-        Some(p) => p,
-        None => return Err(io_err("unsupported Authorization scheme")),
-    };
+    let (address, timestamp_str, signature_b64) = parse_authorization_header(authorization)
+        .ok_or_else(|| io_err("unsupported or malformed Authorization header"))?;
 
-    let address = params.get("address").ok_or_else(|| io_err("missing address in Authorization"))?;
-    let signature_b64 = params.get("signature").ok_or_else(|| io_err("missing signature in Authorization"))?;
-    let timestamp_str = params.get("timestamp").ok_or_else(|| io_err("missing timestamp in Authorization"))?;
+    let requestor_identity = resolve_identity(server_ctx, &address)?;
 
-    let requestor_identity = resolve_identity(server_ctx, address)?;
-
-    let signature = decode_base64url(signature_b64).map_err(|_| io_err("auth signature not base64url encoded"))?;
+    let signature = decode_base64url(&signature_b64).map_err(|_| io_err("auth signature not base64url encoded"))?;
 
     let timestamp: u64 = timestamp_str.parse().map_err(|_| io_err("invalid timestamp in Authorization"))?;
     if now_seconds().abs_diff(timestamp) > MAX_CLOCK_SKEW_SECS {
@@ -91,12 +86,3 @@ fn permission_rank(permission: Permission) -> u8 {
     }
 }
 
-fn parse_auth_params(value: &str) -> Option<std::collections::HashMap<String, String>> {
-    let rest = value.strip_prefix("ArkAccount ")?.trim();
-    let mut out = std::collections::HashMap::new();
-    for part in rest.split(',') {
-        let (k, v) = part.trim().split_once('=')?;
-        out.insert(k.trim().to_ascii_lowercase(), v.trim().trim_matches('"').to_string());
-    }
-    Some(out)
-}

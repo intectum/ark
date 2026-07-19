@@ -132,7 +132,7 @@ mod tests {
 
             env::set_current_dir(&account_dir).unwrap();
             let ctx = create_client_context().unwrap();
-            let err = cmd_track(&ctx, dir.to_str().unwrap(), Some("aes-256-gcm")).unwrap_err();
+            let err = cmd_track(&ctx, dir.to_str().unwrap(), Some(DEFAULT_ENCRYPTION_ALGORITHM)).unwrap_err();
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         });
     }

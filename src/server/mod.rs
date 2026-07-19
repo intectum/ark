@@ -231,7 +231,7 @@ pub fn handle_parsed(
 mod tests {
     use super::test_helpers::*;
     use super::*;
-    use crate::crypto::{DEFAULT_SIGNING_ALGORITHM, create_key};
+    use crate::crypto::{DEFAULT_SIGNING_ALGORITHM, create_secret_key};
     use crate::identity::create_identity;
     use crate::util::now_seconds;
     use crate::util::test::{TEST_ADDRESS, create_test_account, in_test_dir, write_plain_test_file};
@@ -303,7 +303,7 @@ mod tests {
             create_test_account(temp_dir, TEST_ADDRESS);
             let port = start_test_server(temp_dir.to_path_buf());
             let sig = sign(&key, port, "GET", "/ark/test/x", now_seconds(), &[]);
-            let auth = format!("ArkAccount address=\"test@example.com\", signature=\"{}\"", sig);
+            let auth = format!("ArkIdentity address=\"test@example.com\", signature=\"{}\"", sig);
             let (code, _, _) = request(port, "GET", "/ark/test/x", &[], &[("Authorization", &auth)]);
             assert_eq!(code, 401);
         });
@@ -341,7 +341,7 @@ mod tests {
     fn wrong_key_401() {
         in_test_dir("ark_server_test", |temp_dir| {
             let (identity, _, _) = create_test_account(temp_dir, TEST_ADDRESS);
-            let attacker_key = create_key(DEFAULT_SIGNING_ALGORITHM).unwrap();
+            let attacker_key = create_secret_key(DEFAULT_SIGNING_ALGORITHM).unwrap();
             let port = start_test_server(temp_dir.to_path_buf());
             let (code, _, _) = signed_request(port, &identity, &attacker_key, "GET", "/ark/test/x", &[]);
             assert_eq!(code, 401);

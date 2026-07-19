@@ -5,14 +5,14 @@ use std::path::Path;
 use getrandom::getrandom;
 use url::Url;
 
-use crate::crypto::{DEFAULT_SIGNING_ALGORITHM, create_key, sign_json, to_public_key, verify_json};
+use crate::crypto::{DEFAULT_SIGNING_ALGORITHM, create_secret_key, sign_json, to_public_key, verify_json};
 use crate::client::ark_request;
 use crate::types::IdentityContext;
 use crate::types::{Identity, Key, Signature};
 use crate::util::{decode_base64url, encode_base64url, io_err, io_invalid_input, now_iso, resolve_client_url};
 
 pub fn create_identity(address: &str) -> io::Result<(Identity, Key)> {
-    let mut secret_key = create_key(DEFAULT_SIGNING_ALGORITHM)?;
+    let mut secret_key = create_secret_key(DEFAULT_SIGNING_ALGORITHM)?;
 
     getrandom(&mut secret_key.value)
         .map_err(|e| io_err(&e.to_string()))?;
@@ -47,10 +47,10 @@ pub fn resolve_identity(ctx: &IdentityContext, address: &str) -> io::Result<Iden
         return Ok(ctx.identity.clone());
     }
 
-    let (name, _) = address.split_once('@')
-        .ok_or_else(|| io_invalid_input("address must be <name>@<host>"))?;
+    let (name, host, path) = parse_address(address)?;
+
     let peer_path = ctx.root.parent().unwrap()
-        .join(name).join(".ark").join("identity.json");
+        .join(&name).join(path.trim_start_matches('/'));
 
     if fs::exists(&peer_path)? {
         let peer_identity = read_identity(&peer_path)?;
@@ -60,13 +60,13 @@ pub fn resolve_identity(ctx: &IdentityContext, address: &str) -> io::Result<Iden
     }
 
     let cache_dir = ctx.root.join(".ark").join("identities");
-    let cache_path = cache_dir.join(format!("{}.json", address));
+    let cache_path = cache_dir.join(format!("{}.json", address.replace('/', "_")));
 
     if fs::exists(&cache_path)? {
         return read_identity(&cache_path);
     }
 
-    let url = resolve_client_url(ctx, &format!("{}/.ark/identity.json", address))?;
+    let url = resolve_client_url(ctx, &format!("{}@{}{}", name, host, path))?;
     let (code, _, body) = ark_request(Some(ctx), "GET", &url, &[], &[])?;
     if code != 200 {
         return Err(io_err(&format!("HTTP {}: {}", code, String::from_utf8_lossy(&body))));
@@ -88,14 +88,17 @@ pub fn write_identity(path: &Path, identity: &Identity) -> io::Result<()> {
     fs::write(path, pretty)
 }
 
-pub fn validate_identity(identity: &Identity) -> io::Result<()> {
-    let address_url = Url::parse(&format!("https://{}", identity.address))
-        .map_err(|_| io_invalid_input("invalid address"))?;
-    if address_url.host_str().is_none() {
-        return Err(io_invalid_input("address must be <name>@<host>"));
-    }
+pub fn sign_identity(secret_key: &Key, identity: &mut Identity) -> io::Result<()> {
+    let json = serde_json::to_value(identity_for_signing(identity)).expect("serialize identity");
+    identity.signature = sign_json(secret_key, &json)?;
 
-    if !is_valid_account_name(address_url.username()) {
+    Ok(())
+}
+
+pub fn validate_identity(identity: &Identity) -> io::Result<()> {
+    let (name, _, _) = parse_address(&identity.address)?;
+
+    if !is_valid_account_name(&name) {
         return Err(io_invalid_input("invalid account name (must be lowercase alphanumeric, dots, hyphens, underscores; 1-64 chars; not pure dots)"));
     }
 
@@ -113,6 +116,29 @@ pub fn verify_identity(identity: &Identity) -> io::Result<()> {
 
     verify_json(&identity.public_key, &identity.signature, &json)
         .map_err(|_| io_err("identity signature verification failed"))
+}
+
+pub fn parse_address(address: &str) -> io::Result<(String, String, String)> {
+    let url = Url::parse(&format!("https://{}", address))
+        .map_err(|_| io_invalid_input("invalid address"))?;
+
+    let name = url.username();
+    let host_str = url.host_str();
+    if name.is_empty() || host_str.is_none() {
+        return Err(io_invalid_input("address must be <name>@<host>[/<path>]"));
+    }
+    let host = match url.port() {
+        Some(port) => format!("{}:{}", host_str.unwrap(), port),
+        None => host_str.unwrap().to_string(),
+    };
+
+    let path = if url.path().is_empty() || url.path() == "/" {
+        "/.ark/identity.json".to_string()
+    } else {
+        url.path().to_string()
+    };
+
+    Ok((name.to_string(), host, path))
 }
 
 fn identity_for_signing(identity: &Identity) -> Identity {

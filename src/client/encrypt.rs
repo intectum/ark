@@ -178,7 +178,7 @@ mod tests {
             );
             assert_eq!(
                 xattr::get(&p, "user.ark.encryption_algorithm").unwrap().as_deref(),
-                Some(b"aes-256-gcm".as_slice())
+                Some(DEFAULT_ENCRYPTION_ALGORITHM.as_bytes())
             );
             let file_key = unwrap_first_member_key(&p, &secret_key.value);
             assert_eq!(aes_decrypt(&file_key, &ciphertext), b"data");

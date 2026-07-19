@@ -21,7 +21,7 @@ pub fn sign(key: &[u8], port: u16, method: &str, path: &str, ts: u64, body: &[u8
 
 pub fn build_auth(address: &str, timestamp: u64, sig_b64: &str) -> String {
     format!(
-        "ArkAccount address=\"{}\", timestamp=\"{}\", signature=\"{}\"",
+        "ArkIdentity address=\"{}\", timestamp=\"{}\", signature=\"{}\"",
         address, timestamp, sig_b64,
     )
 }

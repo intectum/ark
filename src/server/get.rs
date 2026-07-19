@@ -86,6 +86,7 @@ fn content_type(path: &Path) -> &'static str {
 mod tests {
     use super::super::start_test_server;
     use super::super::test_helpers::*;
+    use crate::crypto::DEFAULT_ENCRYPTION_ALGORITHM;
     use crate::types::{DirectoryEntry, DirectoryEntryKind, Member, Permission};
     use crate::util::test::{TEST_ADDRESS, create_test_account, in_test_dir, write_encrypted_test_file, write_plain_test_file};
     use std::fs;
@@ -252,7 +253,7 @@ mod tests {
 
             let (code, _body, headers) = signed_request(port, &identity, &secret_key, "GET", "/ark/test/secret", &[]);
             assert_eq!(code, 200);
-            assert_eq!(header(&headers, "x-ark-meta-encryption-algorithm"), Some("aes-256-gcm"));
+            assert_eq!(header(&headers, "x-ark-meta-encryption-algorithm"), Some(DEFAULT_ENCRYPTION_ALGORITHM));
             assert_eq!(header(&headers, "x-ark-meta-member-0-address"), Some(TEST_ADDRESS));
         });
     }
@@ -358,8 +359,9 @@ mod tests {
             ]);
 
             let port = start_test_server(temp_dir.to_path_buf());
+            let auth = build_auth("nobody@x", 0, "AAAA");
             let (code, body, _) = request(port, "GET", "/ark/owner/public.txt", &[], &[
-                ("Authorization", "ArkAccount address=\"nobody@x\", timestamp=\"0\", signature=\"AAAA\""),
+                ("Authorization", &auth),
             ]);
             assert_eq!(code, 200);
             assert_eq!(body, b"open");

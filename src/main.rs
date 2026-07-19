@@ -36,6 +36,9 @@ enum Cmd {
     Init {
         /// Address in the form <name>@<host>[:<port>].
         address: String,
+        /// Password to gate remote access to the identity key.
+        #[arg(short, long)]
+        password: Option<String>,
     },
     /// Print response headers (HEAD request).
     Head {
@@ -152,7 +155,7 @@ fn main() {
             cmd_server(port, &resolved_host);
             Ok(())
         },
-        Cmd::Init { address } => cmd_init(&address),
+        Cmd::Init { address, password } => cmd_init(&address, password.as_deref()),
         Cmd::Chmod { owner, write, read, drop, file } => create_client_context().and_then(|c| cmd_chmod(&c, &file, &owner, &write, &read, &drop)),
         Cmd::Head { path } => create_client_context().and_then(|c| cmd_head(&c, &path)),
         Cmd::Delete { path } => create_client_context().and_then(|c| cmd_delete(&c, &path)),

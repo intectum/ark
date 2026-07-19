@@ -42,10 +42,10 @@ mod tests {
 
     use super::*;
     use crate::client::init;
-    use crate::crypto::verify_bytes;
+    use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, verify_bytes};
     use crate::context::create_client_context;
     use crate::types::Signature;
-    use crate::util::{decode_base64url, request_to_bytes};
+    use crate::util::{decode_base64url, parse_authorization_header, request_to_bytes};
     use crate::util::test::in_test_dir;
 
     pub fn bind_local() -> (TcpListener, u16) {
@@ -98,16 +98,6 @@ mod tests {
             }
         }
         None
-    }
-
-    fn parse_auth_params(value: &str) -> Option<std::collections::HashMap<String, String>> {
-        let rest = value.strip_prefix("ArkAccount ")?.trim();
-        let mut out = std::collections::HashMap::new();
-        for part in rest.split(',') {
-            let (k, v) = part.trim().split_once('=')?;
-            out.insert(k.trim().to_ascii_lowercase(), v.trim().trim_matches('"').to_string());
-        }
-        Some(out)
     }
 
     #[test]
@@ -178,10 +168,10 @@ mod tests {
 
             let req = captured.join().unwrap();
             let auth = parse_header(&req, "Authorization").unwrap();
-            let params = parse_auth_params(auth).unwrap();
-            assert_eq!(params.get("address").map(String::as_str), Some(identity.address.as_str()));
-            let ts_n: u64 = params.get("timestamp").unwrap().parse().unwrap();
-            let sig_value = decode_base64url(params.get("signature").unwrap()).unwrap();
+            let (address, timestamp, signature) = parse_authorization_header(auth).unwrap();
+            assert_eq!(address, identity.address);
+            let ts_n: u64 = timestamp.parse().unwrap();
+            let sig_value = decode_base64url(signature).unwrap();
 
             let msg = request_to_bytes("GET", &format!("127.0.0.1:{}", port), "/x", ts_n, &[]);
             let signature = Signature { algorithm: identity.public_key.algorithm.clone(), value: sig_value };
@@ -228,12 +218,12 @@ mod tests {
                 Some(&ctx),
                 "PUT",
                 &url,
-                &[("X-Ark-Meta-Encryption-Algorithm", "aes-256-gcm"), ("X-Custom", "hi")],
+                &[("X-Ark-Meta-Encryption-Algorithm", DEFAULT_ENCRYPTION_ALGORITHM), ("X-Custom", "hi")],
                 b"d",
             ).unwrap();
 
             let req = captured.join().unwrap();
-            assert_eq!(parse_header(&req, "X-Ark-Meta-Encryption-Algorithm"), Some("aes-256-gcm"));
+            assert_eq!(parse_header(&req, "X-Ark-Meta-Encryption-Algorithm"), Some(DEFAULT_ENCRYPTION_ALGORITHM));
             assert_eq!(parse_header(&req, "X-Custom"), Some("hi"));
         });
     }

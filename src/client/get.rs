@@ -76,7 +76,7 @@ mod tests {
     use std::env;
 
     use super::*;
-    use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, create_key, encrypt_bytes};
+    use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, create_secret_key, encrypt_bytes};
     use crate::context::create_client_context;
     use crate::identity::{create_identity, write_identity};
     use crate::metadata::{create_metadata, read_metadata_attributes, sign_metadata, write_metadata_attributes};
@@ -166,7 +166,7 @@ mod tests {
 
             assert_eq!(fs::read(&out).unwrap(), expected_ciphertext);
             let m = read_metadata_attributes(&out).unwrap();
-            assert_eq!(m.encryption_algorithm.as_deref(), Some("aes-256-gcm"));
+            assert_eq!(m.encryption_algorithm.as_deref(), Some(DEFAULT_ENCRYPTION_ALGORITHM));
             assert_eq!(m.members.iter().next().unwrap().key.as_ref().unwrap().value, expected_key_value);
         });
     }
@@ -178,7 +178,7 @@ mod tests {
             let address = format!("gyan@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &address);
 
-            let file_key = create_key(DEFAULT_ENCRYPTION_ALGORITHM).unwrap();
+            let file_key = create_secret_key(DEFAULT_ENCRYPTION_ALGORITHM).unwrap();
             let (_, ct) = encrypt_bytes(&file_key, b"clear text").unwrap();
             let server_file = temp_dir.join("ark/gyan/secret");
             fs::write(&server_file, &ct).unwrap();

@@ -30,6 +30,7 @@ pub fn cmd_head(ctx: &IdentityContext, path: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::DEFAULT_ENCRYPTION_ALGORITHM;
     use crate::identity::read_identity;
     use crate::metadata::read_metadata_attributes;
     use crate::server::start_test_server;
@@ -72,7 +73,7 @@ mod tests {
             let (code, headers, body) = ark_request(Some(&ctx), "HEAD", &url, &[], &[]).unwrap();
             assert_eq!(code, 200);
             assert!(body.is_empty());
-            assert!(headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("x-ark-meta-encryption-algorithm") && v == "aes-256-gcm"));
+            assert!(headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("x-ark-meta-encryption-algorithm") && v == DEFAULT_ENCRYPTION_ALGORITHM));
             assert!(headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("x-ark-meta-member-0-permission") && v == "owner"));
             assert!(headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("x-ark-meta-member-0-key-value") && v == &expected_key_b64));
         });

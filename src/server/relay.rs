@@ -6,6 +6,7 @@ use url::Url;
 
 use crate::client::ark_request;
 use crate::http::read_response;
+use crate::identity::parse_address;
 use crate::types::{IdentityContext, Metadata, RelayMode};
 use crate::util::{create_authorization_header, io_err, now_seconds};
 
@@ -21,8 +22,7 @@ pub fn relay(
     mode: RelayMode,
     verbose: bool,
 ) -> io::Result<()> {
-    let server_host = server_ctx.identity.address.split('@').nth(1)
-        .ok_or_else(|| io_err("server identity address missing host"))?;
+    let (_, server_host, _) = parse_address(&server_ctx.identity.address)?;
 
     let path = url.path();
     let segments: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
@@ -37,14 +37,14 @@ pub fn relay(
     let mut remote_hosts: HashSet<String> = HashSet::new();
 
     for member in &metadata.members {
-        let (member_name, member_host) = match parse_member_address(&member.address) {
-            Some(v) => v,
-            None => continue,
+        let (member_name, member_host, _) = match parse_address(&member.address) {
+            Ok(v) => v,
+            Err(_) => continue,
         };
 
-        let member_path = build_member_path(member_name, &relative_path, trailing_slash);
+        let member_path = build_member_path(&member_name, &relative_path, trailing_slash);
 
-        let same_host = member_host.eq_ignore_ascii_case(server_host);
+        let same_host = member_host.eq_ignore_ascii_case(&server_host);
         if same_host {
             if member_name == source_name {
                 continue;
@@ -63,9 +63,9 @@ pub fn relay(
             .collect();
 
         if same_host {
-            let authorization = create_authorization_header(server_ctx, method, server_host, &member_path, now_seconds(), body)?;
+            let authorization = create_authorization_header(server_ctx, method, &server_host, &member_path, now_seconds(), body)?;
             final_headers.push(("Authorization".to_string(), authorization));
-            final_headers.push(("Host".to_string(), server_host.to_string()));
+            final_headers.push(("Host".to_string(), server_host.clone()));
         } else {
             final_headers.push(("X-Ark-Relay".to_string(), RelayMode::Internal.as_str().to_string()));
         }
@@ -98,16 +98,6 @@ pub fn relay(
     }
 
     Ok(())
-}
-
-fn parse_member_address(address: &str) -> Option<(&str, &str)> {
-    if address == "*" {
-        return None;
-    }
-    if address.starts_with("groups:") || address.starts_with("passkeys:") || address.starts_with("passwords:") {
-        return None;
-    }
-    address.split_once('@')
 }
 
 fn build_member_path(member_name: &str, rel: &[&str], trailing_slash: bool) -> String {

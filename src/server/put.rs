@@ -57,6 +57,7 @@ pub fn serve_put(fs_path: &Path, stream: &mut dyn Write, body: &[u8], metadata: 
 mod tests {
     use super::super::start_test_server;
     use super::super::test_helpers::*;
+    use crate::crypto::DEFAULT_ENCRYPTION_ALGORITHM;
     use crate::metadata::{read_metadata_attributes, sign_metadata, write_metadata_headers};
     use crate::types::{Member, Permission};
     use crate::util::now_seconds;
@@ -163,7 +164,7 @@ mod tests {
             let p = temp_dir.join("ark/test/secret");
             assert_eq!(
                 xattr::get(&p, "user.ark.encryption_algorithm").unwrap().as_deref(),
-                Some(b"aes-256-gcm".as_slice())
+                Some(DEFAULT_ENCRYPTION_ALGORITHM.as_bytes())
             );
             let loaded = read_metadata_attributes(&p).unwrap();
             assert_eq!(loaded.members.len(), 1);

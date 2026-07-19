@@ -58,18 +58,20 @@ Every account has a cryptographic keypair — like a crypto wallet. The public k
 [TODO move address info to 4.1 Identities?]
 ### 2.1 Address
 
-Addresses use the familiar `account@host` format:
+Addresses use the familiar `account@host` format, with an optional path pointing to a specific identity file within the account:
 
 ```
 alice@example.com
 bob@ark.myserver.org
 charlie@127.0.0.1:8080
+alice@example.com/.ark/passwords/primary.json
 ```
 
 - `account`: The local part, unique within the server. Lowercase alphanumeric, dots, hyphens, underscores. Max 64 characters.
 - `host`: The server's hostname or IP address (and optional port, defaults to `443`).
+- `path`: Optional. Path to a specific identity file within the account. Defaults to `/.ark/identity.json` (the primary account identity). Non-primary identity paths (e.g. password identities under `/.ark/passwords/`, passkey identities under `/.ark/passkeys/`) address alternative keypairs bound to the same account.
 
-This format is deliberately identical to email. Users already understand it, and it requires no new mental model.
+For the primary account identity, the `account@host` form matches email and requires no new mental model.
 
 ### 2.2 Creation
 
@@ -231,10 +233,8 @@ One or more members are listed in the metadata. For encrypted files, every membe
 
 | Type | Available permissions |
 |---|---|
-| Account (see 2 Accounts) | All |
+| Account (see 2 Accounts) | All. Any addressable identity, including password (4.5) and passkey (4.4) identities within an account. |
 | Group (see 4.2 Groups) | All |
-| Passkey (see 4.4 Passkeys) | `read` only (not verifiable as an author) |
-| Password (see 4.5 Passwords) | `read` only (not verifiable as an author) |
 | Public (see below) | All |
 
 Public members are denoted by the wildcard address (`*`) and require identity verification to modify (all modifications require a verifiable author) but can read without being verified. This means that a file with a public member can be fetched without any form of authentication.
@@ -355,15 +355,31 @@ See [TODO] for the full format of invitation files.
 
 ### 4.4 Passkeys
 
-A passkey file is a text file containing an unencrypted WebAuthn public key that can be used to verify a requestor has the passkey. They are stored in the `ark/<account>/.ark/passkeys/` directory.
+A passkey file is an `Identity` (Appendix C.1) file whose keypair is derived from a WebAuthn passkey. They are stored in the `ark/<account>/.ark/passkeys/` directory. [TODO not yet implemented — mirrors 4.5 with WebAuthn PRF in place of Argon2id.]
 
-To address the passkey file `ark/<account>/.ark/passkeys/phone.json` (e.g. as a file member) use the address `passkeys:phone`. Passkey files must have one member, the account in which they are contained (with the `owner` permission).
+The passkey identity has:
+- `public_key.algorithm`: `webauthn-prf-ed25519`.
+- `public_key.value`: `credential_id || prf_salt || ed25519_public_key`. The ed25519 public key is derived from `HKDF-SHA256(WebAuthn-PRF(prf_salt), info: "ark-ed25519-v1")` used as an Ed25519 seed.
+- `address`: `<account>@<host>/.ark/passkeys/<name>.json` (see 2.1 Address).
+- `signature`: self-signed by the passkey identity's Ed25519 key.
+
+The file's file metadata lists a `*` member with `read` permission so it is publicly readable (like `identity.json`). A client with the authenticator can derive the private key and sign requests as the passkey identity via the `ArkIdentity` scheme (Section 5). Passkey identities are hardware-bound — the PRF secret never leaves the authenticator — and resist offline brute force.
 
 ### 4.5 Passwords
 
-A password file is a text file containing an unencrypted verifier that can be used to verify a requestor has the password. They are stored in the `ark/<account>/.ark/passwords/` directory.
+A password file is an `Identity` (Appendix C.1) file whose keypair is derived from a password using Argon2id + HKDF. They are stored in the `ark/<account>/.ark/passwords/` directory.
 
-To address the password file `ark/<account>/.ark/passwords/primary.json` (e.g. as a file member) use the address `passwords:primary`. Password files must have one member, the account in which they are contained (with the `owner` permission). A *compromised* server holding the verifier can brute-force a weak password offline, so passwords are the weaker option — prefer passkeys. The server cannot enforce strong passwords but it is strongly recommended that clients do.
+The password identity has:
+- `public_key.algorithm`: `argon2id-ed25519`.
+- `public_key.value`: `verifier || salt || ed25519_public_key`. The verifier is `SHA-256(HKDF-SHA256(Argon2id(password, salt), info: "ark-auth-v1"))`. The ed25519 public key is derived from `HKDF-SHA256(Argon2id(password, salt), info: "ark-ed25519-v1")` used as an Ed25519 seed.
+- `address`: `<account>@<host>/.ark/passwords/<name>.json` (see 2.1 Address).
+- `signature`: self-signed by the password identity's Ed25519 key.
+
+The file's file metadata lists a `*` member with `read` permission so it is publicly readable (like `identity.json`).
+
+A client that knows the password can derive the Ed25519 private key and sign requests as the password identity via the `ArkIdentity` scheme (Section 5). A password identity can be a member of any other file — for example, `identity.key` lists a password identity as a `read` member so that a client with only the password can decrypt and recover the account's identity key (see 2.3 Recovery).
+
+A *compromised* server holding the identity file can brute-force a weak password offline (the verifier is derivable from any guess), so passwords are the weaker recovery method — prefer passkeys. The server cannot enforce strong passwords but it is strongly recommended that clients do.
 
 ### 4.6 Paths
 
@@ -377,30 +393,13 @@ A request file is a text file containing an unencrypted method and path e.g. `GE
 
 The name of the file is the timestamp when the request was received (with the `.txt` extension).
 
-[TODO extract what we need from here]
-### 3.10 Credential members (password / passkey)
-
-**1. Gate material** — what the server checks to authorize a request:
-- *Passkey:* the credential's WebAuthn public key. On access the server runs a challenge-response (`401` + challenge → client returns a signed assertion → server verifies, Section 7.2). Nothing here is offline-attackable — the authenticator private key never leaves the device.
-- *Password:* a `verifier`. The client sends an `auth_secret` over TLS; the server compares it to the verifier and rate-limits. A *compromised* server holding the verifier can brute-force the password offline, so passwords are the weaker option — prefer passkeys.
-
-**2. Wrapped file key** — the file key wrapped to a `wrap_key` derived from the same credential and stored in `wrapped_key` (with `key_nonce`; the `ephemeral_key` ECIES fields are empty — wrapping is direct AES-256-GCM under `wrap_key`, not ECIES):
-- *Passkey:* `wrap_key = HKDF-SHA256(WebAuthn-PRF(prf_salt))`.
-- *Password:* `wrap_key = HKDF-SHA256(Argon2id(password, salt), info: "wrap")`.
-
-**The gate key and the wrap key are domain-separated.** For passwords, `auth_secret = HKDF-SHA256(Argon2id(password, salt), info: "auth")` while `wrap_key` uses `info: "wrap"` — so the server learns `auth_secret` but can never derive `wrap_key`. The server gates access **without being able to decrypt**; end-to-end encryption is preserved.
-
-**Metadata exposure.** A password member's `verifier` and `salt` are brute-force material, so for a file with password members the server MUST require the same authorization for `HEAD` and directory listings as for `GET` — it must not reveal those fields to an unauthenticated requester. Passkey gate material (a public key) is safe to expose.
-
-**Browser fallback.** As with invitations (Section 6.4), a server may serve an HTML page that prompts for the password (or invokes the passkey) and fetches the file, so recipients without a native client can open a credential-shared file.
-
 ---
 
 ## 4. System 3: Encryption — "Nobody else can read this"
 
 ### 4.1 Concept
 
-Every file's body is encrypted with a **symmetric file key** (AES-256-GCM). The file key is then wrapped (encrypted) to each member — to an identity key via ECIES, or to a credential-derived key for credential members (Section 3.10). This two-layer approach means:
+Every file's body is encrypted with a **symmetric file key** (AES-256-GCM). The file key is then wrapped (encrypted) to each member via ECIES against the member's identity public key (whether primary account, password identity, passkey identity, or group). This two-layer approach means:
 
 - Content is encrypted once, regardless of how members there are.
 - Adding a member only requires wrapping the existing file key — no re-encryption of content.
@@ -467,17 +466,13 @@ When Alice decrypts a file:
 
 When receiving a request for a file, the server performs several authentication checks. The requestor is granted the highest permission granted by any of the checks.
 
-The Authorization header can be one of:
+The Authorization header must be of the form `ArkIdentity address="<address>", timestamp="<unix-seconds>", signature="<base64url>"` — a signature over `method \n path \n timestamp \n body`, produced with the requestor's identity key. `address` identifies the requestor (so the server can look up the verifying key directly). `timestamp` is unix seconds; requests outside a ±5 minute window are rejected to prevent replay. Params follow RFC 7235 auth-param syntax; order is not significant.
 
-- `ArkAccount address="<address>", timestamp="<unix-seconds>", signature="<base64url>"` — an ed25519 signature over `method \n path \n timestamp \n body`, produced with the requestor's identity key. `address` identifies the requestor (so the server can look up the verifying key directly). `timestamp` is unix seconds; requests outside a ±5 minute window are rejected to prevent replay. Params follow RFC 7235 auth-param syntax; order is not significant.
-- `ArkPasskey <WebAuthn public key>`
-- `ArkPassword <auth secret>`
-
-An `ArkAccount` authorization header can identify the requestor as the same account that is receiving the request. In this case, the requestor is granted the `owner` permission. Otherwise, the authorization is applied to the current member list of the file or directory and the requestor is given the highest permission of all the members it has been authenticated as. Creation of a file is considered an operation of the directory it is being created in.
+An `ArkIdentity` authorization header can identify the requestor as the **primary identity** of the account that is receiving the request (address exactly equal to the target account's `<name>@<host>`, i.e. the identity at `/.ark/identity.json`). In this case the requestor is granted the `owner` permission. Sub-identities of the same account — password identities (4.5), passkey identities (4.4), or any other identity file under a non-default path — do NOT get this automatic grant; they only receive the permission at which they appear in the file or directory's member list. Otherwise, the authorization is applied to the current member list of the file or directory and the requestor is given the highest permission of all the members it has been authenticated as. Creation of a file is considered an operation of the directory it is being created in.
 
 If authorization fails, the request is rejected with `401 Unauthorized`. If authorization succeeds but the permission granted is not sufficient for the operation requested, the request is rejected with `403 Forbidden`. The signature of the request is also verified to ensure the content and metadata has not been tampered with. If the signature is invalid, the request is rejected with `403 Forbidden`.
 
-[TODO rate limiting / PoW for certain requests like ArkPasskey, ArkPassword, account creation?]
+[TODO rate limiting / PoW for password identity signing, account creation?]
 
 ---
 
@@ -493,7 +488,7 @@ The client generates a random token and PUTs an invitation file (Section C.5) at
 
 ```
 PUT /ark/alice/.ark/invitations/<token>.json
-Authorization: ArkUser <signature>
+Authorization: ArkIdentity <signature>
 Content-Type: application/json
 
 {
@@ -539,18 +534,7 @@ Transport has three modes:
 
 Alice's client communicates with her home server over HTTPS.
 
-**Authentication:** Every request is signed with the identity key:
-```
-Authorization: ArkUser <signature-over-method-path-timestamp-body>
-X-Ark-Timestamp: 1712838400
-```
-The server verifies the signature against the identity key in Alice's identity document. Requests with timestamps older than 5 minutes are rejected (replay protection).
-
-**Credential authentication.** Requests for files with credential members (Section 3.10) authorize with a credential instead of an identity signature:
-- `Authorization: ArkPasskey <assertion>` — a WebAuthn assertion over a server challenge. The server issues the challenge with `401 Unauthorized` and `WWW-Authenticate: ArkPasskey challenge=<nonce>`; the client retries with the signed assertion.
-- `Authorization: ArkPassword <auth_secret>` — the password-derived auth secret (Section 3.10), sent over TLS and rate-limited.
-
-The server verifies the proof against the file's credential members before serving. For a file with password members, the server applies the same check to `HEAD` and directory listings (Section 3.10).
+**Authentication:** Every request is signed with an identity key using the `ArkIdentity` scheme (Section 5). The signing identity may be the primary account identity or an addressable sub-identity of the same account — e.g. a password identity (4.5) or passkey identity (4.4). The server verifies the signature against the identity document at the address in the header. Requests with timestamps outside the ±5 minute window are rejected (replay protection).
 
 **File operations:**
 
@@ -644,7 +628,7 @@ If a server misses pushed updates (e.g., downtime exceeding the retry window), m
 
 ```
 GET https://example.com/ark/alice/.ark/paths/<file_id>
-Authorization: ArkUser <signature>
+Authorization: ArkIdentity <signature>
 ```
 
 The server resolves `file_id` to the local path and returns it. Returns `404` if the file_id is unknown. The requester then HEADs or GETs the file at that path; membership is enforced on the file read itself.
@@ -655,7 +639,7 @@ The server resolves `file_id` to the local path and returns it. Returns `404` if
 
 ```
 GET https://example.com/ark/alice/.ark/stream
-Authorization: ArkUser <signature>
+Authorization: ArkIdentity <signature>
 ```
 
 WebSocket or SSE stream. Events:
@@ -799,87 +783,37 @@ An Ark file is split into two parts that live and travel separately:
 - **Body** — the file content itself, stored as the file's bytes on disk:
   - `encryption_algorithm` omitted: the raw file bytes (a public `.html` is stored and served verbatim).
   - encrypted (`aes-256-gcm` / `chacha20-poly1305`): `nonce (12 bytes) ‖ ciphertext + tag`.
-- **Metadata** — a signed Protocol Buffers blob (Section 8.2) holding everything else: `file_id`, members + wrapped keys, permissions, timestamps, algorithm, signature. It is **not** part of the body; it is stored and carried out-of-band (Section 8.3).
+- **Metadata** — a set of signed scalar fields (Section 8.2) holding everything else: `id`, timestamps, members + wrapped keys, permissions, algorithm, body hash, signature. It is **not** part of the body; it is stored and carried out-of-band (Section 8.3).
 
 Because the body is just the file content, a decrypted file (or a public unencrypted file) is a normal, directly usable file — no prefix to strip. The metadata accompanies it out-of-band.
 
 ### 8.2 Metadata
 
-The metadata is a single Protocol Buffers blob. It is signed and stored/transmitted **verbatim** — never decomposed into separate attributes or headers (decomposition would reintroduce a canonicalization problem for the signature).
+The metadata is a `Metadata` struct (Appendix C.13) — a small set of named scalar fields. The signature is computed over the JCS-canonical JSON serialization of the struct with the `signature.algorithm` and `signature.value` fields cleared. The body is bound through `body_hash` (`SHA-256(body)`), which is included in the signed fields.
 
-```protobuf
-syntax = "proto3";
-
-message Metadata {
-  uint32 version = 1;                   // Format version (1)
-  bytes file_id = 2;                    // 16 bytes, random UUID, immutable after creation
-
-  uint64 created = 3;                   // Unix milliseconds
-  uint64 modified = 4;                  // Unix milliseconds
-
-  repeated Member members = 5;
-
-  string algorithm = 6;                 // "aes-256-gcm", "chacha20-poly1305", or "none"
-  string encryption_algorithm = 7;      // "x25519" — target for deriving the ECIES wrapping key
-
-  string modified_by = 8;              // "alice@example.com"
-  string signature_algorithm = 9;      // "ed25519"
-  bytes signature = 10;                // Ed25519 over fields 1-9 + SHA-256(body)
-}
-
-message Member {
-  string address = 1;                   // "alice@example.com" or a local group path (Section 3.9)
-  string identity_key_algorithm = 2;   // "ed25519"
-  bytes identity_key = 3;              // Member's (or group's) public key
-  string permission = 4;               // "owner", "write", or "read"
-
-  // File key wrapped for this member.
-  // Identity members: ECIES (ephemeral_key set). Credential members: direct
-  // AES-256-GCM under wrap_key (ephemeral_key empty), see Section 3.10.
-  string ephemeral_key_algorithm = 5;  // "x25519" (identity members)
-  bytes ephemeral_key = 6;            // Ephemeral public key (32 bytes); empty for credential members
-  bytes key_nonce = 7;                // AES-256-GCM nonce for key wrapping (12 bytes)
-  bytes wrapped_key = 8;              // File key wrapped to this member (32 bytes + 16 byte tag)
-
-  // Credential members (Section 3.10). credential_type defaults to "identity".
-  string credential_type = 9;          // "identity" (default), "password", or "passkey"
-  // Password credential
-  string kdf = 10;                     // "argon2id"
-  string kdf_params = 11;              // e.g. "m=1048576,t=3,p=4"
-  bytes kdf_salt = 12;                // Argon2id salt (shared by auth_secret and wrap_key derivation)
-  bytes verifier = 13;                // server-checked gate value (e.g. SHA-256 of auth_secret)
-  // Passkey credential
-  bytes webauthn_credential_id = 14;  // selects the authenticator
-  bytes webauthn_public_key = 15;     // gate: verifies WebAuthn assertions
-  bytes prf_salt = 16;                // input to the WebAuthn PRF (derives wrap_key)
-}
-```
-
-The signature covers fields 1–9 of the canonical (deterministic) protobuf serialization plus `SHA-256(body)`, so the metadata and body are cryptographically bound even though they are stored apart — a body cannot be swapped under a signed metadata blob.
+Directory metadata omits `encryption_algorithm` (directories have no body to encrypt) and `body_hash` (no body). File metadata always includes `body_hash`.
 
 ### 8.3 Metadata storage and transport
 
-**At rest.** The metadata blob is stored in a single extended attribute, `user.ark`, on the body file. Ark requires a filesystem that supports extended attributes; those without them are unsupported. Updates are atomic: write the new body to a temporary file in the same directory, set its `user.ark` xattr, `fsync`, then `rename` over the target. The rename swaps body and metadata together, so neither a concurrent reader nor a crash ever sees a body that disagrees with its metadata.
+**At rest.** Each metadata field is stored as its own extended attribute on the body file, under the `user.ark.` namespace. Ark requires a filesystem that supports extended attributes; those without them are unsupported. Field names use snake_case (e.g. `user.ark.id`, `user.ark.modified_by`, `user.ark.signature_value`). Members are numbered (e.g. `user.ark.member_0_address`, `user.ark.member_0_permission`, `user.ark.member_0_key_algorithm`, `user.ark.member_0_key_value`). Binary values are base64url-encoded (RFC 4648, no padding).
 
-**In transit.** Over HTTP the metadata travels as one header, base64-encoded:
+Updates are atomic: write the new body to a temporary file in the same directory, set its `user.ark.*` xattrs, `fsync`, then `rename` over the target. The rename swaps body and metadata together, so neither a concurrent reader nor a crash ever sees a body that disagrees with its metadata.
 
-```
-X-Ark-Metadata: <base64 of the metadata blob>
-```
+**In transit.** Over HTTP the same fields travel as `X-Ark-Meta-*` response/request headers, one header per field (kebab-case, e.g. `X-Ark-Meta-Id`, `X-Ark-Meta-Modified-By`, `X-Ark-Meta-Member-0-Address`, `X-Ark-Meta-Signature-Value`).
 
-`GET` returns the body as the HTTP entity body plus `X-Ark-Metadata`; `HEAD` returns `X-Ark-Metadata` with no body; `PUT` and inbox `POST` send both. Because the entity body is always the raw file, there is no separate "raw" form — a non-Ark client (e.g. a browser fetching a public file) simply ignores the `X-Ark-Metadata` header.
+`GET` returns the body as the HTTP entity body plus the `X-Ark-Meta-*` headers; `HEAD` returns the headers with no body; `PUT` and inbox `POST` send both. Because the entity body is always the raw file, there is no separate "raw" form — a non-Ark client (e.g. a browser fetching a public file) simply ignores the `X-Ark-Meta-*` headers.
 
-**Size budget.** The blob must fit a single xattr value; the binding constraint is ext4's ~4 KB per-inode limit. A blob is ~120 B fixed plus ~150–200 B per member entry, so a file with a handful of members — or a single group member (Section 3.9) — sits far under it. Past ~25 direct members, use a group. The same budget keeps `X-Ark-Metadata` within proxies' HTTP header-size limits.
+**Size budget.** Each field lives in its own xattr, so per-field limits (typically 64 KB on ext4) are not the binding constraint; the total `user.ark.*` xattr budget on ext4 is ~4 KB per inode. A file with a handful of members — or a single group member (Section 4.2) — sits far under it. Past ~25 direct members, use a group. The same budget keeps the aggregate `X-Ark-Meta-*` header size within typical proxy limits.
 
 ### 8.4 Identity and contacts documents
 
-Identity documents and contacts are JSON (human-readable, easy to debug with curl). See Section 2.4 for the identity document schema.
+Identity documents and contacts are JSON (human-readable, easy to debug with curl). See Appendix C.1 for the identity document schema.
 
 ### 8.5 Serialization rules
 
-- **Metadata:** Protocol Buffers (binary), stored verbatim in the `user.ark` xattr and the `X-Ark-Metadata` header.
+- **Metadata:** scalar fields stored one-per-xattr under `user.ark.*` and transmitted as `X-Ark-Meta-*` headers (Section 8.3).
 - **Identity documents, contacts:** JSON. Human-readable.
-- **Signatures:** computed over the canonical protobuf serialization of metadata fields 1–9 (deterministic encoding) plus `SHA-256(body)`.
+- **Signatures over structured values** (identity, metadata): computed over the JCS-canonical JSON serialization of the value with its own `signature` field cleared. Metadata additionally binds the body via `body_hash = SHA-256(body)`.
 - **All binary values in JSON:** base64url encoding (RFC 4648, no padding).
 
 ---
@@ -903,7 +837,7 @@ Identity documents and contacts are JSON (human-readable, easy to debug with cur
 | **Metadata** | File paths, sizes, timestamps, member addresses, and cross-server delivery patterns are visible to the server and network observers. Path names may reveal content intent (e.g., `/notes/tax-2025`). |
 | **Forward secrecy** | If the identity private key is compromised, all file keys can be unwrapped, and all past and future data can be decrypted. This is a deliberate tradeoff for simplicity and recoverability. |
 | **Mode B server trust** | The key is client-generated and uploaded encrypted, so a Mode B server can read data only if it holds a credential — a **server recovery member** (Section 2.11). Without one it stores ciphertext it cannot read. Self-hosters mitigate either way by controlling the server. |
-| **Password member brute force** | `identity.key` (and any password-gated file) is served only after the server verifies the credential, so it is not freely downloadable — online attempts are rate-limited. A *compromised* server holding the `verifier` can still brute-force a password member offline (Sections 2.11, 3.10). Passkey members are hardware-bound and resist even that. |
+| **Password brute force** | A password identity's `verifier` is derivable from any password guess, so a *compromised* server holding the password identity file can brute-force a weak password offline (Section 4.5). Once cracked, the attacker can sign as the password identity and unwrap `identity.key`. Passkey identities are hardware-bound and resist this. |
 | **Removed member's existing copy** | When a member is removed from a shared file, they retain any copy they already downloaded. Re-keying prevents access to future edits, not past content. |
 | **Path metadata** | File paths are unencrypted (the server needs them for routing). Path names like `/mail/inbox/` or `/notes/secret-project` are visible to the server. For maximum privacy, use opaque paths. |
 | **Unencrypted files** | Files with no `encryption_algorithm` have no confidentiality protection. The body is readable by the server, network observers (if TLS is broken), and anyone with read access. Integrity and authenticity are still provided by the file signature. |
@@ -918,7 +852,7 @@ Identity documents and contacts are JSON (human-readable, easy to debug with cur
 
 **Scenario: Alice's server is compromised (Mode B — server-hosted key)**
 - *With a server recovery member*: the attacker gets Alice's private key, **can** read all files (past and future, until the key is rotated), and **can** forge files from Alice. This is the tradeoff of opting into server recovery.
-- *Without a server recovery member*: the attacker holds the `identity.key` file and its metadata (a password member's `verifier` and `salt`), so they can brute-force a password member offline; passkey members are not attackable this way. Until a password is cracked, the attacker **cannot** read files or forge as Alice.
+- *Without a server recovery member*: the attacker holds the `identity.key` file and any password identity files in `/.ark/passwords/` (whose `public_key.value` contains `verifier || salt`), so they can brute-force a password identity offline (Section 4.5); passkey identities (Section 4.4) are not attackable this way. Until a password is cracked, the attacker **cannot** read files or forge as Alice.
 - Mitigation: omit the server recovery member, use passkey members, and choose a strong passphrase — or use Mode A for high-security needs.
 
 **Scenario: Alice's identity key is compromised (either mode)**
@@ -1086,10 +1020,10 @@ The Double Ratchet is fundamentally a 2-party protocol. Group forward secrecy (3
 
 Nothing in the core protocol blocks adding ratcheted sequences later:
 
-- Ratcheted files are standard Ark files — same format, same transport, same inbox delivery. The Metadata protobuf is extended with `key_derivation`, `sequence_id`, `message_index`, and `ratchet_key` fields.
+- Ratcheted files are standard Ark files — same format, same transport, same inbox delivery. The `Metadata` (Appendix C.13) is extended with `key_derivation`, `sequence_id`, `message_index`, and `ratchet_key` fields, transmitted as additional `X-Ark-Meta-*` headers.
 - The identity document is extended with a `prekeys` object.
 - Old clients that don't understand ratcheted files simply cannot decrypt them (they lack the ratchet state regardless).
-- Proto3 silently ignores unknown fields, so old clients won't break on new headers.
+- Unknown `X-Ark-Meta-*` headers are ignored by old clients, so extension fields don't break them.
 
 ### 10.2 Legacy Email Interop
 
@@ -1241,10 +1175,12 @@ The `/ark/<user>/.ark/` directory is a special directory that is limited to spec
 - `/ark/<user>/.ark/groups/<name>.key`: group private key, wrapped per member. Members-only.
 - `/ark/<user>/.ark/identity.html`: Contact HTML page, auto-generated, HEAD/GET only, no authentication required. This should contain a link to add the user to your contacts.
 - `/ark/<user>/.ark/identity.json`: `Identity`, no authentication required for PUT if creating new file. The creation of this file creates a new user.
-- `/ark/<user>/.ark/identity.key`: `File` (Section 8, C.12) whose body is the Mode B identity private key, with credential members (Sections 2.11, 3.10). GET/HEAD require a valid credential proof (Section 7.2); PUT requires the identity (owner) key.
+- `/ark/<user>/.ark/identity.key`: `File` (Section 8, C.12) whose body is the identity private key. Members are the account (`owner`) plus one or more recovery identities under `/.ark/passwords/` or `/.ark/passkeys/` (`read`). GET/HEAD/PUT use the standard `ArkIdentity` authorization (Section 5) as signed by any member.
 - `/ark/<user>/.ark/inbox/<file_id>`: `File` (or an `Identity` document for a move notification). New files are keyed by `file_id`; senders in `/ark/<user>/.ark/contacts.json` allowed for new files, existing-file members for updates (Section 7.3).
 - `/ark/<user>/.ark/invitations/<token>.html`: Invitation HTML page, auto-generated, no authentication required. This should contain a link to redeem the invitation i.e. add yourself to their contacts (HEAD/GET only, no authentication required)
 - `/ark/<user>/.ark/invitations/<token>.json`: `Invitation`
+- `/ark/<user>/.ark/passkeys/<name>.json`: `Identity` (C.1) whose keypair is derived from a WebAuthn passkey (Section 4.4). Publicly readable; HEAD/GET require no authentication. PUT requires the account (owner) key.
+- `/ark/<user>/.ark/passwords/<name>.json`: `Identity` (C.1) whose keypair is derived from a password (Section 4.5). Publicly readable; HEAD/GET require no authentication. PUT requires the account (owner) key.
 - `/ark/<user>/.ark/paths/<file_id>`: File path e.g. `/ark/<user>/my_dir/my_file.txt`, auto-generated, HEAD/GET only, users listed in `/ark/<user>/.ark/contacts.json` allowed.
 
 The following are special requests that do not fit the standard file resource model:
@@ -1458,28 +1394,54 @@ Like an identity document, but identifies a set of members instead of a single a
 ```json
 {
   "address": "alice@example.com",
-  "identity_key": "<base64url>",
   "permission": "owner",
-  "wrapped_key": "<base64url>"
+  "key": Key
 }
 ```
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `address` | string | Yes | Member's full address. |
-| `identity_key` | string | Yes | Base64url-encoded member identity public key bytes. |
+| `address` | string | Yes | Member's full address (Section 2.1). May be a primary account (`alice@example.com`), a sub-identity path (e.g. `alice@example.com/.ark/passwords/primary.json`), a local group path (Section 4.2), or `*` for public. |
 | `permission` | string | Yes | `"owner"`, `"write"`, or `"read"`. |
-| `wrapped_key` | string | No | Base64url-encoded file key wrapped to this member. Omitted for files with no `encryption_algorithm`. |
+| `key` | Key | No | The file key wrapped (ECIES via HPKE) to this member's public key. Omitted for files with no `encryption_algorithm`, for the `*` (public) member, and for group members without a group key. |
 
-### C.12 Identity key file (`identity.key`, Section 2.11)
+### C.12 Identity key file (`identity.key`)
 
 Not a distinct document type — an ordinary Ark **File** (Section 8) served at `/ark/<user>/.ark/identity.key`:
 
-- **Body:** the identity private key, encrypted with the file key (like any file body).
-- **Members:** one or more **credential members** (Section 3.10, `credential_type` `"password"` / `"passkey"`) with `read` permission — the credentials that can unlock the key — plus the identity itself as an `owner` identity member (used to add/remove credentials). An optional server-controlled credential member enables admin recovery (Section 2.11).
-- **Metadata / signature:** standard file metadata (Section 8.2), self-signed by the identity key. The signature binds the member list, so a malicious server cannot strip a credential member to force a downgrade.
+- **Body:** the identity's Ed25519 private key (base64url-encoded), encrypted with a per-file key like any file body.
+- **Members:** the account identity itself as an `owner` member, plus one or more recovery members with `read` permission whose addresses point to password identities (Section 4.5) or passkey identities (Section 4.4) — e.g. `alice@example.com/.ark/passwords/primary.json`. Each such member's `key` field wraps the file key to that identity's public key via the standard ECIES path.
+- **Metadata / signature:** standard file metadata (Section 8.2), signed by the account's identity key. The signature binds the member list, so a malicious server cannot strip a recovery member to force a downgrade.
 
-The server verifies a credential before returning the body (Section 3.10), so the encrypted key is never served to an unauthenticated requester. There is no bespoke schema: a credential member's fields (`kdf`, `kdf_salt`, `verifier`, `webauthn_public_key`, `prf_salt`, `wrapped_key`, …) live in the `Member` message (Section 8.2).
+A client with only a password (or passkey) resolves the password identity file, derives the sub-identity's private key from the credential, signs an `ArkIdentity` request as that sub-identity to fetch the encrypted body, unwraps the file key using its member entry, then decrypts the body to recover the account's Ed25519 private key.
+
+### C.13 Metadata
+
+The signed metadata attached to every Ark file or directory. Stored as `user.ark.*` xattrs and transmitted as `X-Ark-Meta-*` headers (Section 8.3). The JSON form below is the canonical shape used for signing (JCS-canonical, with `signature.algorithm`/`signature.value` cleared before signing).
+
+```json
+{
+  "id": "<uuid>",
+  "created": "2026-04-11T12:00:00Z",
+  "modified": "2026-04-11T12:00:00Z",
+  "modified_by": "alice@example.com",
+  "encryption_algorithm": "aes-256-gcm",
+  "members": Member[],
+  "body_hash": Hash,
+  "signature": Signature
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `id` | string | Yes | UUID identifying the file or directory. Immutable after creation. |
+| `created` | string | Yes | RFC 3339 timestamp of creation. |
+| `modified` | string | Yes | RFC 3339 timestamp of last modification. |
+| `modified_by` | string | Yes | Address of the identity that last signed this metadata. |
+| `encryption_algorithm` | string | No | e.g. `"aes-256-gcm"`, `"chacha20-poly1305"`. Omitted for unencrypted files and for directories. |
+| `members` | Member[] | Yes | Member entries (Appendix C.11). At least one must have `owner` permission. |
+| `body_hash` | Hash | No | `SHA-256(body)`. Required for files; omitted for directories (they have no body). |
+| `signature` | Signature | Yes | Signature by `modified_by`'s identity key over the JCS-canonical serialization of the fields above with `signature.algorithm` and `signature.value` cleared. |
 
 ---
 
@@ -1495,8 +1457,8 @@ The server verifies a credential before returning the body (Section 3.10), so th
 | Alt. body encryption | ChaCha20-Poly1305 | 256-bit | ciphertext + 128-bit tag |
 | No encryption | None | — | raw bytes |
 | Seed phrase | BIP-39 | 256-bit entropy | 24 words |
-| Password member KDF (Section 3.10) | Argon2id | — | 256-bit wrapping key |
-| Passkey member secret (Section 3.10) | WebAuthn PRF (`hmac-secret`) | — | 256-bit |
+| Password identity seed (Section 4.5) | Argon2id + HKDF-SHA256 | — | 256-bit Ed25519 seed |
+| Passkey identity seed (Section 4.4) | WebAuthn PRF (`hmac-secret`) + HKDF-SHA256 | — | 256-bit Ed25519 seed |
 
 [TODO review everything below here]
 
