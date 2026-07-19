@@ -1,3 +1,4 @@
+use std::io;
 use std::net::TcpStream;
 use std::time::Duration;
 
@@ -7,7 +8,7 @@ use crate::types::IdentityContext;
 use crate::http::{read_response, write_request};
 use crate::util::{create_authorization_header, io_err, now_seconds};
 
-pub fn ark_request(ctx: Option<&IdentityContext>, method: &str, url: &Url, headers: &[(&str, &str)], body: &[u8]) -> std::io::Result<(u16, Vec<(String, String)>, Vec<u8>)> {
+pub fn request(ctx: Option<&IdentityContext>, method: &str, url: &Url, headers: &[(&str, &str)], body: &[u8]) -> io::Result<(u16, Vec<(String, String)>, Vec<u8>)> {
     let mut final_headers = headers.to_vec();
 
     let host = url.host_str().ok_or_else(|| io_err("URL missing host"))?;
@@ -41,7 +42,7 @@ mod tests {
     use std::thread;
 
     use super::*;
-    use crate::client::init;
+    use crate::client::init_local;
     use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, verify_bytes};
     use crate::context::create_client_context;
     use crate::types::Signature;
@@ -101,9 +102,9 @@ mod tests {
     }
 
     #[test]
-    fn ark_request_returns_status_and_body() {
-        in_test_dir("ark_request_test", |temp_dir| {
-            init(temp_dir, "alice@example.com").unwrap();
+    fn request_returns_status_and_body() {
+        in_test_dir("request_test", |temp_dir| {
+            init_local(temp_dir, "alice@example.com").unwrap();
             let ctx = create_client_context().unwrap();
 
             let (listener, port) = bind_local();
@@ -114,7 +115,7 @@ mod tests {
             });
 
             let url = Url::parse(&format!("http://127.0.0.1:{}/x", port)).unwrap();
-            let (code, headers, body) = ark_request(Some(&ctx), "PUT", &url, &[], b"data").unwrap();
+            let (code, headers, body) = request(Some(&ctx), "PUT", &url, &[], b"data").unwrap();
             assert_eq!(code, 201);
             assert_eq!(body, b"hello");
             assert!(headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("content-length") && v == "5"));
@@ -123,9 +124,9 @@ mod tests {
     }
 
     #[test]
-    fn ark_request_sends_method_path_and_body() {
-        in_test_dir("ark_request_test", |temp_dir| {
-            init(temp_dir, "alice@example.com").unwrap();
+    fn request_sends_method_path_and_body() {
+        in_test_dir("request_test", |temp_dir| {
+            init_local(temp_dir, "alice@example.com").unwrap();
             let ctx = create_client_context().unwrap();
 
             let (listener, port) = bind_local();
@@ -137,7 +138,7 @@ mod tests {
             });
 
             let url = Url::parse(&format!("http://127.0.0.1:{}/ark/alice/x", port)).unwrap();
-            let (code, _, _) = ark_request(Some(&ctx), "PUT", &url, &[], b"payload").unwrap();
+            let (code, _, _) = request(Some(&ctx), "PUT", &url, &[], b"payload").unwrap();
             assert_eq!(code, 204);
 
             let req = captured.join().unwrap();
@@ -150,9 +151,9 @@ mod tests {
     }
 
     #[test]
-    fn ark_request_signs_method_path_timestamp_body() {
-        in_test_dir("ark_request_test", |temp_dir| {
-            let (identity, _) = init(temp_dir, "alice@example.com").unwrap();
+    fn request_signs_method_path_timestamp_body() {
+        in_test_dir("request_test", |temp_dir| {
+            let (identity, _) = init_local(temp_dir, "alice@example.com").unwrap();
             let ctx = create_client_context().unwrap();
 
             let (listener, port) = bind_local();
@@ -164,7 +165,7 @@ mod tests {
             });
 
             let url = Url::parse(&format!("http://127.0.0.1:{}/x", port)).unwrap();
-            let _ = ark_request(Some(&ctx), "GET", &url, &[], &[]).unwrap();
+            let _ = request(Some(&ctx), "GET", &url, &[], &[]).unwrap();
 
             let req = captured.join().unwrap();
             let auth = parse_header(&req, "Authorization").unwrap();
@@ -180,9 +181,9 @@ mod tests {
     }
 
     #[test]
-    fn ark_request_propagates_non_2xx_status() {
-        in_test_dir("ark_request_test", |temp_dir| {
-            init(temp_dir, "alice@example.com").unwrap();
+    fn request_propagates_non_2xx_status() {
+        in_test_dir("request_test", |temp_dir| {
+            init_local(temp_dir, "alice@example.com").unwrap();
             let ctx = create_client_context().unwrap();
 
             let (listener, port) = bind_local();
@@ -193,16 +194,16 @@ mod tests {
             });
 
             let url = Url::parse(&format!("http://127.0.0.1:{}/ark/x", port)).unwrap();
-            let (code, _, body) = ark_request(Some(&ctx), "GET", &url, &[], &[]).unwrap();
+            let (code, _, body) = request(Some(&ctx), "GET", &url, &[], &[]).unwrap();
             assert_eq!(code, 403);
             assert_eq!(body, b"denied!");
         });
     }
 
     #[test]
-    fn ark_request_sends_extra_headers() {
-        in_test_dir("ark_request_test", |temp_dir| {
-            init(temp_dir, "alice@example.com").unwrap();
+    fn request_sends_extra_headers() {
+        in_test_dir("request_test", |temp_dir| {
+            init_local(temp_dir, "alice@example.com").unwrap();
             let ctx = create_client_context().unwrap();
 
             let (listener, port) = bind_local();
@@ -214,7 +215,7 @@ mod tests {
             });
 
             let url = Url::parse(&format!("http://127.0.0.1:{}/x", port)).unwrap();
-            let _ = ark_request(
+            let _ = request(
                 Some(&ctx),
                 "PUT",
                 &url,

@@ -1,20 +1,10 @@
-mod client;
-mod context;
-mod crypto;
-mod http;
-mod identity;
-mod metadata;
-mod server;
-mod types;
-mod util;
-
 use std::env;
 
 use clap::{Parser, Subcommand};
 
-use crate::client::{DecryptArgs, EncryptArgs, cmd_chmod, cmd_decrypt, cmd_delete, cmd_encrypt, cmd_get, cmd_head, cmd_init, cmd_put, cmd_sync, cmd_track};
-use crate::context::create_client_context;
-use crate::server::cmd_server;
+use ark::client::{chmod_io, decrypt_io, delete, encrypt_io, get_io, head_io, init, put_io, sync_io, track_io};
+use ark::context::create_client_context;
+use ark::server::start_server;
 
 #[derive(Parser)]
 #[command(name = "ark", about = "Ark CLI", version)]
@@ -152,22 +142,22 @@ fn main() {
             let resolved_host = host
                 .or_else(|| env::var("HOST").ok())
                 .unwrap_or_else(|| format!("localhost:{}", port));
-            cmd_server(port, &resolved_host);
+            start_server(port, &resolved_host);
             Ok(())
         },
-        Cmd::Init { address, password } => cmd_init(&address, password.as_deref()),
-        Cmd::Chmod { owner, write, read, drop, file } => create_client_context().and_then(|c| cmd_chmod(&c, &file, &owner, &write, &read, &drop)),
-        Cmd::Head { path } => create_client_context().and_then(|c| cmd_head(&c, &path)),
-        Cmd::Delete { path } => create_client_context().and_then(|c| cmd_delete(&c, &path)),
-        Cmd::Get { output, decrypt, path } => create_client_context().and_then(|c| cmd_get(&c, &path, output.as_deref(), decrypt)),
-        Cmd::Put { input, encryption_algorithm, path } => create_client_context().and_then(|c| cmd_put(&c, &path, input.as_deref(), encryption_algorithm.as_deref())),
-        Cmd::Sync { watch, decrypt } => create_client_context().and_then(|c| cmd_sync(&c, watch, decrypt)),
-        Cmd::Track { encryption_algorithm, path } => create_client_context().and_then(|c| cmd_track(&c, &path, encryption_algorithm.as_deref())),
+        Cmd::Init { address, password } => init(&address, password.as_deref()),
+        Cmd::Chmod { owner, write, read, drop, file } => create_client_context().and_then(|c| chmod_io(&c, &file, &owner, &write, &read, &drop)),
+        Cmd::Head { path } => create_client_context().and_then(|c| head_io(&c, &path)),
+        Cmd::Delete { path } => create_client_context().and_then(|c| delete(&c, &path)),
+        Cmd::Get { output, decrypt, path } => create_client_context().and_then(|c| get_io(&c, &path, output.as_deref(), decrypt)),
+        Cmd::Put { input, encryption_algorithm, path } => create_client_context().and_then(|c| put_io(&c, &path, input.as_deref(), encryption_algorithm.as_deref())),
+        Cmd::Sync { watch, decrypt } => create_client_context().and_then(|c| sync_io(&c, watch, decrypt)),
+        Cmd::Track { encryption_algorithm, path } => create_client_context().and_then(|c| track_io(&c, &path, encryption_algorithm.as_deref())),
         Cmd::Decrypt { input, output, in_place, key, encryption_algorithm } => {
-            create_client_context().and_then(|c| cmd_decrypt(&c, DecryptArgs { input, output, in_place, key, encryption_algorithm }))
+            create_client_context().and_then(|c| decrypt_io(&c, input.as_deref(), output.as_deref(), in_place.as_deref(), key.as_deref(), encryption_algorithm.as_deref()))
         }
         Cmd::Encrypt { input, output, in_place, key, encryption_algorithm } => {
-            create_client_context().and_then(|c| cmd_encrypt(&c, EncryptArgs { input, output, in_place, key, encryption_algorithm }))
+            create_client_context().and_then(|c| encrypt_io(&c, input.as_deref(), output.as_deref(), in_place.as_deref(), key.as_deref(), encryption_algorithm.as_deref()))
         }
     };
     if let Err(e) = result {

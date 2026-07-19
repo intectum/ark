@@ -1,62 +1,82 @@
 use std::fs;
+use std::io;
 use std::io::{Read, Write};
 use std::path::Path;
 
-use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, decrypt_bytes, encrypt_bytes};
-use crate::types::{IdentityContext, Key, LocalMetadata};
-use crate::metadata::{apply_key_to_metadata, create_metadata, get_member, read_local_metadata_attributes, read_metadata_attributes, validate_metadata, write_local_metadata_attributes, write_metadata_attributes};
+use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, encrypt_bytes};
+use crate::metadata::{apply_key_to_metadata, create_metadata, extract_key_from_metadata, read_local_metadata_attributes, read_metadata_attributes, validate_metadata, write_local_metadata_attributes, write_metadata_attributes};
+use crate::types::{IdentityContext, Key, LocalMetadata, Metadata};
 use crate::util::{decode_base64url, io_err, io_invalid_input, sha256};
 
-pub struct EncryptArgs {
-    pub input: Option<String>,
-    pub output: Option<String>,
-    pub in_place: Option<String>,
-    pub key: Option<String>,
-    pub encryption_algorithm: Option<String>,
+pub fn encrypt(
+    ctx: &IdentityContext,
+    metadata: &Metadata,
+    plaintext: &mut dyn Read,
+    ciphertext: &mut dyn Write,
+) -> io::Result<()> {
+    let file_key = extract_key_from_metadata(ctx, metadata)?;
+
+    let encryption_algorithm = metadata.encryption_algorithm.clone()
+        .ok_or_else(|| io_err("metadata missing encryption_algorithm"))?;
+
+    let mut plaintext_bytes = Vec::new();
+    plaintext.read_to_end(&mut plaintext_bytes)?;
+
+    let (_, ciphertext_bytes) = encrypt_bytes(&Key { algorithm: encryption_algorithm, value: file_key }, &plaintext_bytes)?;
+    ciphertext.write_all(&ciphertext_bytes)?;
+
+    Ok(())
 }
 
-pub fn cmd_encrypt(ctx: &IdentityContext, args: EncryptArgs) -> std::io::Result<()> {
-    if args.in_place.is_some() && (args.input.is_some() || args.output.is_some()) {
+pub fn encrypt_io(
+    ctx: &IdentityContext,
+    input: Option<&str>,
+    output: Option<&str>,
+    in_place: Option<&str>,
+    key: Option<&str>,
+    encryption_algorithm: Option<&str>,
+) -> std::io::Result<()> {
+    if in_place.is_some() && (input.is_some() || output.is_some()) {
         return Err(io_err("--in-place is mutually exclusive with -i/--input and -o/--output"));
     }
 
-    let source_path: Option<&str> = args.in_place.as_deref().or(args.input.as_deref());
-    let dest_path: Option<&str> = args.in_place.as_deref().or(args.output.as_deref());
-    if let Some(p) = source_path {
+    let source: Option<&str> = in_place.or(input);
+    let destination: Option<&str> = in_place.or(output);
+    if let Some(p) = source {
         if !fs::exists(Path::new(p))? {
             return Err(io_invalid_input("input does not exist"));
         }
     }
 
-    let source_has_metadata = match source_path {
+    let source_has_metadata = match source {
         Some(p) => xattr::get(Path::new(p), "user.ark.id")?.is_some(),
         None => false,
     };
 
     // TODO: probably should be possible
-    if source_has_metadata && (args.key.is_some() || args.encryption_algorithm.is_some()) {
+    if source_has_metadata && (key.is_some() || encryption_algorithm.is_some()) {
         return Err(io_err("-k/--key and -e/--encryption-algortihm cannot override existing metadata"));
     }
 
-    if !source_has_metadata && args.key.is_none() {
+    if !source_has_metadata && key.is_none() {
         return Err(io_err("no file key available: pass --key or use -i/--in-place on a file with metadata"));
     }
 
-    let plaintext = match source_path {
+    let plaintext_bytes = match source {
         Some(p) => fs::read(p)?,
         None => {
             let mut buf = Vec::new();
-            std::io::stdin().read_to_end(&mut buf)?;
+            io::stdin().read_to_end(&mut buf)?;
             buf
         }
     };
 
-    let metadata = match source_path {
+    let metadata = match source {
         Some(p) if source_has_metadata => read_metadata_attributes(Path::new(p))?,
         _ => {
             let key = Key {
-                algorithm: args.encryption_algorithm.clone().unwrap_or(DEFAULT_ENCRYPTION_ALGORITHM.to_string()),
-                value: decode_base64url(args.key.as_ref().expect("key presence checked above").trim())
+                algorithm: encryption_algorithm.map(str::to_string).unwrap_or(DEFAULT_ENCRYPTION_ALGORITHM.to_string()),
+                value: decode_base64url(key.expect("key presence checked above").trim())
                     .map_err(|e| io_err(&format!("--key decode: {}", e)))?
             };
 
@@ -68,7 +88,7 @@ pub fn cmd_encrypt(ctx: &IdentityContext, args: EncryptArgs) -> std::io::Result<
         }
     };
 
-    let local_metadata = match source_path {
+    let local_metadata = match source {
         Some(p) => read_local_metadata_attributes(Path::new(p))?,
         None => LocalMetadata::default(),
     };
@@ -77,33 +97,20 @@ pub fn cmd_encrypt(ctx: &IdentityContext, args: EncryptArgs) -> std::io::Result<
         return Err(io_err("file is already encrypted"));
     }
 
-    let member = get_member(&metadata.members, &ctx.identity.address)
-        .ok_or_else(|| io_err("no member entry for current account"))?;
-    let encrypted_file_key = member.key.as_ref()
-        .ok_or_else(|| io_err("no file key for current account"))?;
-    let file_key = decrypt_bytes(
-        &Key {
-            algorithm: encrypted_file_key.algorithm.clone(),
-            value: ctx.identity_key.as_ref().expect("client context missing identity_key").value.clone()
-        },
-        &encrypted_file_key.value,
-    )?;
+    let mut ciphertext_bytes: Vec<u8> = Vec::new();
+    encrypt(ctx, &metadata, &mut plaintext_bytes.as_slice(), &mut ciphertext_bytes)?;
 
-    let encryption_algorithm = metadata.encryption_algorithm.clone()
-        .ok_or_else(|| io_err("encryption_algorithm is missing"))?;
-    let (_, ciphertext) = encrypt_bytes(&Key { algorithm: encryption_algorithm, value: file_key }, &plaintext)?;
-
-    match dest_path {
-        Some(p) => {
-            let path = Path::new(p);
-            fs::write(path, &ciphertext)?;
-            write_metadata_attributes(path, &metadata)?;
-            write_local_metadata_attributes(path, &LocalMetadata {
+    match destination {
+        Some(d) => {
+            let destination_path = Path::new(d);
+            fs::write(destination_path, &ciphertext_bytes)?;
+            write_metadata_attributes(destination_path, &metadata)?;
+            write_local_metadata_attributes(destination_path, &LocalMetadata {
                 encrypted: Some(true),
-                sync_hash: Some(sha256(&plaintext)),
+                sync_hash: Some(sha256(&plaintext_bytes)),
             })?;
         }
-        None => std::io::stdout().write_all(&ciphertext)?,
+        None => io::stdout().write_all(&ciphertext_bytes)?,
     }
 
     Ok(())
@@ -118,10 +125,6 @@ mod tests {
     use crate::context::create_client_context;
     use crate::util::encode_base64url;
     use crate::util::test::{TEST_ADDRESS, create_test_account, in_test_dir, write_plain_test_file};
-
-    fn args() -> EncryptArgs {
-        EncryptArgs { input: None, output: None, in_place: None, key: None, encryption_algorithm: None }
-    }
 
     fn aes_decrypt(key: &[u8], ciphertext: &[u8]) -> Vec<u8> {
         decrypt_bytes(&Key { algorithm: DEFAULT_ENCRYPTION_ALGORITHM.to_string(), value: key.to_vec() }, ciphertext).unwrap()
@@ -142,13 +145,8 @@ mod tests {
             let out_path = temp_dir.join("out.bin");
             env::set_current_dir(&acc).unwrap();
             let ctx = create_client_context().unwrap();
-            let raw_key = [7u8; 32];
-            cmd_encrypt(&ctx, EncryptArgs {
-                input: Some(in_path.to_string_lossy().into_owned()),
-                output: Some(out_path.to_string_lossy().into_owned()),
-                key: Some(encode_base64url(raw_key)),
-                ..args()
-            }).unwrap();
+            let k = encode_base64url([7u8; 32]);
+            encrypt_io(&ctx, Some(in_path.to_str().unwrap()), Some(out_path.to_str().unwrap()), None, Some(&k), None).unwrap();
             let ciphertext = fs::read(&out_path).unwrap();
             assert_ne!(ciphertext, b"hello world");
             let file_key = unwrap_first_member_key(&out_path, &secret_key.value);
@@ -164,12 +162,8 @@ mod tests {
             fs::write(&p, b"data").unwrap();
             env::set_current_dir(&acc).unwrap();
             let ctx = create_client_context().unwrap();
-            let raw_key = [3u8; 32];
-            cmd_encrypt(&ctx, EncryptArgs {
-                in_place: Some(p.to_string_lossy().into_owned()),
-                key: Some(encode_base64url(raw_key)),
-                ..args()
-            }).unwrap();
+            let k = encode_base64url([3u8; 32]);
+            encrypt_io(&ctx, None, None, Some(p.to_str().unwrap()), Some(&k), None).unwrap();
             let ciphertext = fs::read(&p).unwrap();
             assert_ne!(ciphertext, b"data");
             assert_eq!(
@@ -191,11 +185,8 @@ mod tests {
             let (_identity, _secret_key, acc) = create_test_account(temp_dir, TEST_ADDRESS);
             env::set_current_dir(&acc).unwrap();
             let ctx = create_client_context().unwrap();
-            let err = cmd_encrypt(&ctx, EncryptArgs {
-                input: Some("a".to_string()),
-                in_place: Some(temp_dir.join("x").to_string_lossy().into_owned()),
-                ..args()
-            }).unwrap_err();
+            let x = temp_dir.join("x");
+            let err = encrypt_io(&ctx, Some("a"), None, Some(x.to_str().unwrap()), None, None).unwrap_err();
             assert!(err.to_string().contains("mutually exclusive"));
         });
     }
@@ -210,12 +201,8 @@ mod tests {
             let out_path = temp_dir.join("out.bin");
             env::set_current_dir(&acc).unwrap();
             let ctx = create_client_context().unwrap();
-            cmd_encrypt(&ctx, EncryptArgs {
-                input: Some(in_path.to_string_lossy().into_owned()),
-                output: Some(out_path.to_string_lossy().into_owned()),
-                key: Some(encode_base64url(raw_key)),
-                ..args()
-            }).unwrap();
+            let k = encode_base64url(raw_key);
+            encrypt_io(&ctx, Some(in_path.to_str().unwrap()), Some(out_path.to_str().unwrap()), None, Some(&k), None).unwrap();
             let ciphertext = fs::read(&out_path).unwrap();
             assert_eq!(aes_decrypt(&raw_key, &ciphertext), b"secret");
             let wrapped = unwrap_first_member_key(&out_path, &secret_key.value);
@@ -230,7 +217,7 @@ mod tests {
             env::set_current_dir(&acc).unwrap();
             let ctx = create_client_context().unwrap();
             let _ = temp_dir;
-            let err = cmd_encrypt(&ctx, args()).unwrap_err();
+            let err = encrypt_io(&ctx, None, None, None, None, None).unwrap_err();
             assert!(err.to_string().contains("no file key available"), "msg was {}", err);
         });
     }
@@ -244,10 +231,7 @@ mod tests {
             write_local_metadata_attributes(&p, &LocalMetadata { encrypted: Some(true), sync_hash: None }).unwrap();
             env::set_current_dir(&acc).unwrap();
             let ctx = create_client_context().unwrap();
-            let err = cmd_encrypt(&ctx, EncryptArgs {
-                input: Some(p.to_string_lossy().into_owned()),
-                ..args()
-            }).unwrap_err();
+            let err = encrypt_io(&ctx, Some(p.to_str().unwrap()), None, None, None, None).unwrap_err();
             assert!(err.to_string().contains("already encrypted"), "msg was {}", err);
         });
     }
@@ -263,16 +247,10 @@ mod tests {
             let ctx = create_client_context().unwrap();
             let original_file_key = unwrap_first_member_key(&ct_path, &secret_key.value);
 
-            crate::client::cmd_decrypt(&ctx, crate::client::DecryptArgs {
-                in_place: Some(ct_path.to_string_lossy().into_owned()),
-                input: None, output: None, key: None, encryption_algorithm: None,
-            }).unwrap();
+            crate::client::decrypt_io(&ctx, None, None, Some(ct_path.to_str().unwrap()), None, None).unwrap();
             assert_eq!(fs::read(&ct_path).unwrap(), b"hello");
 
-            cmd_encrypt(&ctx, EncryptArgs {
-                in_place: Some(ct_path.to_string_lossy().into_owned()),
-                ..args()
-            }).unwrap();
+            encrypt_io(&ctx, None, None, Some(ct_path.to_str().unwrap()), None, None).unwrap();
 
             let re_ct = fs::read(&ct_path).unwrap();
             let re_key = unwrap_first_member_key(&ct_path, &secret_key.value);
@@ -290,12 +268,8 @@ mod tests {
             let out_path = temp_dir.join("out.bin");
             env::set_current_dir(&acc).unwrap();
             let ctx = create_client_context().unwrap();
-            cmd_encrypt(&ctx, EncryptArgs {
-                input: Some(in_path.to_string_lossy().into_owned()),
-                output: Some(out_path.to_string_lossy().into_owned()),
-                key: Some(encode_base64url([9u8; 32])),
-                ..args()
-            }).unwrap();
+            let k = encode_base64url([9u8; 32]);
+            encrypt_io(&ctx, Some(in_path.to_str().unwrap()), Some(out_path.to_str().unwrap()), None, Some(&k), None).unwrap();
             let local = read_local_metadata_attributes(&out_path).unwrap();
             assert_eq!(local.sync_hash.as_deref(), Some(sha256(b"plain").as_slice()));
             assert_eq!(local.encrypted, Some(true));
@@ -309,10 +283,7 @@ mod tests {
             env::set_current_dir(&acc).unwrap();
             let ctx = create_client_context().unwrap();
             let missing = temp_dir.join("nope.bin");
-            let err = cmd_encrypt(&ctx, EncryptArgs {
-                input: Some(missing.to_string_lossy().into_owned()),
-                ..args()
-            }).unwrap_err();
+            let err = encrypt_io(&ctx, Some(missing.to_str().unwrap()), None, None, None, None).unwrap_err();
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
             assert!(format!("{}", err).contains("input does not exist"));
         });
@@ -327,13 +298,8 @@ mod tests {
             let out_path = temp_dir.join("out.bin");
             env::set_current_dir(&acc).unwrap();
             let ctx = create_client_context().unwrap();
-            let err = cmd_encrypt(&ctx, EncryptArgs {
-                input: Some(in_path.to_string_lossy().into_owned()),
-                output: Some(out_path.to_string_lossy().into_owned()),
-                key: Some(encode_base64url([1u8; 32])),
-                encryption_algorithm: Some("chacha20-poly1305".to_string()),
-                ..args()
-            }).unwrap_err();
+            let k = encode_base64url([1u8; 32]);
+            let err = encrypt_io(&ctx, Some(in_path.to_str().unwrap()), Some(out_path.to_str().unwrap()), None, Some(&k), Some("chacha20-poly1305")).unwrap_err();
             assert!(err.to_string().contains("unsupported encryption algorithm"), "msg was {}", err);
         });
     }

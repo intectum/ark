@@ -138,6 +138,42 @@ pub struct StreamEvent {
     pub data: String,
 }
 
+#[derive(Clone)]
+pub enum WatchAction {
+    Created,
+    Deleted,
+    Keepalive,
+    Modified,
+}
+
+impl WatchAction {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            WatchAction::Created => "created",
+            WatchAction::Deleted => "deleted",
+            WatchAction::Keepalive => "keepalive",
+            WatchAction::Modified => "modified",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "created" => Some(WatchAction::Created),
+            "deleted" => Some(WatchAction::Deleted),
+            "keepalive" => Some(WatchAction::Keepalive),
+            "modified" => Some(WatchAction::Modified),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct WatchEvent {
+    pub action: WatchAction,
+    pub kind: Option<DirectoryEntryKind>,
+    pub path: PathBuf,
+}
+
 mod base64url {
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;

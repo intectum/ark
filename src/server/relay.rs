@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use url::Url;
 
-use crate::client::ark_request;
+use crate::client::request;
 use crate::http::read_response;
 use crate::identity::parse_address;
 use crate::types::{IdentityContext, Metadata, RelayMode};
@@ -82,7 +82,7 @@ pub fn relay(
 
             let url = Url::parse(&url_string).map_err(|e| io_err(&format!("invalid remote URL {}: {}", url_string, e)))?;
             let ref_headers: Vec<(&str, &str)> = final_headers.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
-            ark_request(Some(server_ctx.as_ref()), method, &url, &ref_headers, body)
+            request(Some(server_ctx.as_ref()), method, &url, &ref_headers, body)
         };
 
         if verbose {

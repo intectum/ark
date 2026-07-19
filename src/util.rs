@@ -166,7 +166,7 @@ pub mod test {
     use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crate::client::init;
+    use crate::client::init_local;
     use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, create_secret_key, encrypt_bytes};
     use crate::context::create_client_context;
     use crate::identity::{parse_address, write_identity};
@@ -201,12 +201,12 @@ pub mod test {
         let (name, _, _) = parse_address(address).unwrap();
         let account_dir = temp_dir.join("ark").join(&name);
         fs::create_dir_all(&account_dir).unwrap();
-        let (identity, secret_key) = init(&account_dir, address).unwrap();
+        let (identity, secret_key) = init_local(&account_dir, address).unwrap();
         (identity, secret_key, account_dir)
     }
 
     pub fn init_with_server(temp_dir: &Path, address: &str) -> IdentityContext {
-        let (identity, _) = init(temp_dir, address).unwrap();
+        let (identity, _) = init_local(temp_dir, address).unwrap();
         let (name, _, _) = parse_address(address).unwrap();
         let server_dot_ark = temp_dir.join("ark").join(&name).join(".ark");
         fs::create_dir_all(&server_dot_ark).unwrap();

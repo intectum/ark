@@ -34,7 +34,7 @@ use self::util::find_ancestor_members;
 
 pub const MAX_CLOCK_SKEW_SECS: u64 = 300;
 
-pub fn cmd_server(port: u16, host: &str) {
+pub fn start_server(port: u16, host: &str) {
     let root = env::current_dir().expect("cwd");
     let server_ctx = create_server_context(&root, host).expect("init server identity");
     let listener = TcpListener::bind(("0.0.0.0", port)).expect("bind");

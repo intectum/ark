@@ -1,32 +1,34 @@
 use std::env::current_dir;
 use std::fs;
+use std::io;
 use std::path::Path;
 
-use crate::client::put::cmd_put;
-use crate::client::request::ark_request;
+use crate::client::decrypt::decrypt;
+use crate::client::put::put_io;
+use crate::client::request::request;
 use crate::context::create_client_context;
-use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, DEFAULT_PASSWORD_ALGORITHM, create_secret_key_from_password, decrypt_bytes, restore_secret_key_from_password, to_public_key};
+use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, DEFAULT_PASSWORD_ALGORITHM, create_secret_key_from_password, restore_secret_key_from_password, to_public_key};
 use crate::identity::{create_identity, sign_identity, validate_identity, write_identity, write_identity_key};
-use crate::metadata::{create_metadata, get_member, read_metadata_headers, sign_metadata, write_metadata_attributes};
+use crate::metadata::{create_metadata, read_metadata_headers, sign_metadata, write_metadata_attributes};
 use crate::types::{Identity, IdentityContext, Key, Member, Permission, Signature};
 use crate::util::{decode_base64url, io_err, now_iso, resolve_client_url_raw};
 
-pub fn cmd_init(address: &str, password: Option<&str>) -> std::io::Result<()> {
+pub fn init(address: &str, password: Option<&str>) -> io::Result<()> {
     let root = current_dir()?;
     let url = resolve_client_url_raw(&root, "/.ark/identity.json", address)?;
     let dot_ark_dir = root.join(".ark");
 
     let identity_path = dot_ark_dir.join("identity.json");
     if identity_path.exists() {
-        return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, format!("{} already exists", identity_path.display())));
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{} already exists", identity_path.display())));
     }
 
     let identity_key_path = dot_ark_dir.join("identity.key");
     if identity_key_path.exists() {
-        return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, format!("{} already exists", identity_key_path.display())));
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{} already exists", identity_key_path.display())));
     }
 
-    let (code, _, body) = ark_request(None, "GET", &url, &[], &[])?;
+    let (code, _, body) = request(None, "GET", &url, &[], &[])?;
     match code {
         200 => {
             let identity: Identity = serde_json::from_slice(&body)
@@ -43,12 +45,7 @@ pub fn cmd_init(address: &str, password: Option<&str>) -> std::io::Result<()> {
             }
         }
         403 | 404 => {
-            let (identity, secret_key) = create_identity(address)?;
-            validate_identity(&identity)?;
-
-            fs::create_dir_all(&dot_ark_dir)?;
-            write_identity(&identity_path, &identity)?;
-            write_identity_key(&identity_key_path, &secret_key.value)?;
+            let (identity, secret_key) = init_local(&root, address)?;
 
             let body = fs::read(&identity_path)?;
             let mut metadata = create_metadata(&identity.address, None);
@@ -61,7 +58,7 @@ pub fn cmd_init(address: &str, password: Option<&str>) -> std::io::Result<()> {
             write_metadata_attributes(&identity_path, &metadata)?;
 
             let ctx = create_client_context()?;
-            cmd_put(&ctx, "/.ark/identity.json", identity_path.to_str(), None)?;
+            put_io(&ctx, "/.ark/identity.json", identity_path.to_str(), None)?;
 
             if let Some(pw) = password {
                 push_secret_key_with_password(&ctx, pw)?;
@@ -73,14 +70,26 @@ pub fn cmd_init(address: &str, password: Option<&str>) -> std::io::Result<()> {
     Ok(())
 }
 
+pub fn init_local(root: &Path, address: &str) -> io::Result<(Identity, Key)> {
+    let dot_ark_dir = root.join(".ark");
+    let (identity, secret_key) = create_identity(address)?;
+    validate_identity(&identity)?;
+
+    fs::create_dir_all(&dot_ark_dir)?;
+    write_identity(&dot_ark_dir.join("identity.json"), &identity)?;
+    write_identity_key(&dot_ark_dir.join("identity.key"), &secret_key.value)?;
+
+    Ok((identity, secret_key))
+}
+
 fn pull_secret_key_with_password(
     root: &Path,
     identity: &Identity,
     password: &str,
-) -> std::io::Result<()> {
+) -> io::Result<()> {
     let password_address = format!("{}/.ark/passwords/primary.json", identity.address);
     let password_url = resolve_client_url_raw(root, &password_address, &identity.address)?;
-    let (password_code, _, password_body) = ark_request(None, "GET", &password_url, &[], &[])?;
+    let (password_code, _, password_body) = request(None, "GET", &password_url, &[], &[])?;
     if password_code != 200 {
         return Err(io_err(&format!("HTTP {}: {}", password_code, String::from_utf8_lossy(&password_body))));
     }
@@ -90,40 +99,22 @@ fn pull_secret_key_with_password(
     validate_identity(&password_identity)?;
 
     let password_ctx = IdentityContext {
+        // TODO: should use identity key path to limit scope
         root: root.to_path_buf(),
         identity: password_identity.clone(),
         identity_key: Some(restore_secret_key_from_password(&password_identity, password)?),
     };
 
     let identity_key_url = resolve_client_url_raw(root, "/.ark/identity.key", &identity.address)?;
-    // TODO: after making a lib, review to see if can call a 'get' instead of this. Check other uses
-    // of ark_request too.
-    let (identity_key_code, identity_key_headers, identity_key_body) = ark_request(Some(&password_ctx), "GET", &identity_key_url, &[], &[])?;
+    let (identity_key_code, identity_key_headers, identity_key_body) = request(Some(&password_ctx), "GET", &identity_key_url, &[], &[])?;
     if identity_key_code != 200 {
         return Err(io_err(&format!("HTTP {}: {}", identity_key_code, String::from_utf8_lossy(&identity_key_body))));
     }
 
     let identity_key_metadata = read_metadata_headers(&identity_key_headers)?;
 
-    let password_member = match get_member(&identity_key_metadata.members, &password_identity.address) {
-        Some(m) => m,
-        None => return Err(io_err("no member entry for password"))
-    };
-    let encrypted_file_key = password_member.key.as_ref()
-        .ok_or_else(|| io_err("no file key for password"))?;
-    let file_key = decrypt_bytes(
-        password_ctx.identity_key.as_ref().expect("password context missing identity_key"),
-        &encrypted_file_key.value,
-    )?;
-
-    let encryption_algorithm = identity_key_metadata.encryption_algorithm.clone()
-        .ok_or_else(|| io_err("file is not encrypted"))?;
-    let identity_key_bytes = decrypt_bytes(&Key { algorithm: encryption_algorithm, value: file_key }, &identity_key_body).map_err(|e| {
-        io_err(&format!(
-            "{} — server data may not be encrypted or the key may be wrong",
-            e
-        ))
-    })?;
+    let mut identity_key_bytes = Vec::new();
+    decrypt(&password_ctx, &identity_key_metadata, &mut identity_key_body.as_slice(), &mut identity_key_bytes)?;
 
     let identity_key_b64 = std::str::from_utf8(&identity_key_bytes)
         .map_err(|_| io_err("identity.key plaintext not utf8"))?;
@@ -140,7 +131,7 @@ fn pull_secret_key_with_password(
 fn push_secret_key_with_password(
     ctx: &IdentityContext,
     password: &str,
-) -> std::io::Result<()> {
+) -> io::Result<()> {
     let password_secret_key = create_secret_key_from_password(DEFAULT_PASSWORD_ALGORITHM, password)?;
     let dot_ark_dir = ctx.root.join(".ark");
     let secret_key = ctx.identity_key.as_ref().expect("client context missing identity_key");
@@ -171,7 +162,7 @@ fn push_secret_key_with_password(
     sign_metadata(secret_key, &mut password_metadata, Some(&password_body))?;
     write_metadata_attributes(&password_path, &password_metadata)?;
 
-    cmd_put(ctx, "/.ark/passwords/primary.json", password_path.to_str(), None)?;
+    put_io(ctx, "/.ark/passwords/primary.json", password_path.to_str(), None)?;
 
     let identity_key_path = dot_ark_dir.join("identity.key");
     let mut key_metadata = create_metadata(&ctx.identity.address, Some(DEFAULT_ENCRYPTION_ALGORITHM));
@@ -182,21 +173,9 @@ fn push_secret_key_with_password(
     });
     write_metadata_attributes(&identity_key_path, &key_metadata)?;
 
-    cmd_put(ctx, "/.ark/identity.key", identity_key_path.to_str(), None)?;
+    put_io(ctx, "/.ark/identity.key", identity_key_path.to_str(), None)?;
 
     Ok(())
-}
-
-#[cfg(test)]
-pub fn init(root: &Path, address: &str) -> std::io::Result<(Identity, Key)> {
-    let dot_ark_dir = root.join(".ark");
-    let (identity, secret_key) = create_identity(address)?;
-
-    fs::create_dir_all(&dot_ark_dir)?;
-    write_identity(&dot_ark_dir.join("identity.json"), &identity)?;
-    write_identity_key(&dot_ark_dir.join("identity.key"), &secret_key.value)?;
-
-    Ok((identity, secret_key))
 }
 
 #[cfg(test)]
@@ -216,7 +195,7 @@ mod tests {
     #[test]
     fn init_writes_identity_file() {
         in_test_dir("ark_init_test", |temp_dir| {
-            let (_, secret_key) = init(temp_dir, "gyan@example.com:8080").unwrap();
+            let (_, secret_key) = init_local(temp_dir, "gyan@example.com:8080").unwrap();
             let identity_path = temp_dir.join(".ark/identity.json");
             assert!(Path::new(&identity_path).exists());
 
@@ -240,7 +219,7 @@ mod tests {
     #[test]
     fn init_writes_identity_key_file() {
         in_test_dir("ark_init_test", |temp_dir| {
-            let (_, secret_key) = init(temp_dir, "gyan@example.com").unwrap();
+            let (_, secret_key) = init_local(temp_dir, "gyan@example.com").unwrap();
             let identity_key_path = temp_dir.join(".ark/identity.key");
             assert!(Path::new(&identity_key_path).exists());
 
@@ -251,14 +230,14 @@ mod tests {
     }
 
     #[test]
-    fn cmd_init_downloads_existing_server_identity() {
+    fn init_downloads_existing_server_identity() {
         in_test_dir("ark_init_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
 
             let server_account_dir = temp_dir.join("ark").join("gyan");
             fs::create_dir_all(&server_account_dir).unwrap();
-            let (server_identity, server_secret_key) = init(&server_account_dir, &address).unwrap();
+            let (server_identity, server_secret_key) = init_local(&server_account_dir, &address).unwrap();
 
             let server_identity_path = server_account_dir.join(".ark").join("identity.json");
             let identity_bytes = fs::read(&server_identity_path).unwrap();
@@ -276,7 +255,7 @@ mod tests {
             fs::create_dir_all(&client_dir).unwrap();
             set_current_dir(&client_dir).unwrap();
 
-            cmd_init(&address, None).unwrap();
+            init(&address, None).unwrap();
 
             let identity_path = client_dir.join(".ark").join("identity.json");
             assert!(identity_path.exists());
@@ -290,12 +269,12 @@ mod tests {
     }
 
     #[test]
-    fn cmd_init_creates_and_uploads_when_server_empty() {
+    fn init_creates_and_uploads_when_server_empty() {
         in_test_dir("ark_init_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
 
-            cmd_init(&address, None).unwrap();
+            init(&address, None).unwrap();
 
             let identity_path = temp_dir.join(".ark").join("identity.json");
             let identity_key_path = temp_dir.join(".ark").join("identity.key");
@@ -313,9 +292,9 @@ mod tests {
     }
 
     #[test]
-    fn cmd_init_errors_when_server_unreachable() {
+    fn init_errors_when_server_unreachable() {
         in_test_dir("ark_init_test", |_temp_dir| {
-            let err = cmd_init("gyan@127.0.0.1:1", None).unwrap_err();
+            let err = init("gyan@127.0.0.1:1", None).unwrap_err();
             assert!(
                 matches!(err.kind(), std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Other),
                 "unexpected error kind: {:?} ({})", err.kind(), err
@@ -324,17 +303,17 @@ mod tests {
     }
 
     #[test]
-    fn cmd_init_rejects_existing_local_identity() {
+    fn init_rejects_existing_local_identity() {
         in_test_dir("ark_init_test", |temp_dir| {
             fs::create_dir_all(temp_dir.join(".ark")).unwrap();
             fs::write(temp_dir.join(".ark/identity.json"), b"placeholder").unwrap();
-            let err = cmd_init("gyan@127.0.0.1:1", None).unwrap_err();
+            let err = init("gyan@127.0.0.1:1", None).unwrap_err();
             assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
         });
     }
 
     #[test]
-    fn cmd_init_password_uploads_credential_and_identity_key() {
+    fn init_password_uploads_credential_and_identity_key() {
         use crate::crypto::{DEFAULT_PASSWORD_ALGORITHM, PASSWORD_SALT_LEN, PASSWORD_VERIFIER_LEN, decrypt_bytes, to_public_key};
         use crate::metadata::read_metadata_attributes;
 
@@ -343,7 +322,7 @@ mod tests {
             let address = format!("gyan@127.0.0.1:{}", port);
             let expected_credential_address = format!("{}/.ark/passwords/primary.json", address);
 
-            cmd_init(&address, Some("hunter2")).unwrap();
+            init(&address, Some("hunter2")).unwrap();
 
             let local_key_path = temp_dir.join(".ark/identity.key");
             assert!(local_key_path.exists(), "local seed file must remain");
@@ -384,19 +363,19 @@ mod tests {
     }
 
     #[test]
-    fn cmd_init_password_recovers_identity_key_on_second_client() {
+    fn init_password_recovers_identity_key_on_second_client() {
         in_test_dir("ark_init_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
 
-            cmd_init(&address, Some("hunter2")).unwrap();
+            init(&address, Some("hunter2")).unwrap();
             let original_seed = decode_base64url(fs::read_to_string(temp_dir.join(".ark/identity.key")).unwrap().trim()).unwrap();
 
             let second_client = temp_dir.join("second");
             fs::create_dir_all(&second_client).unwrap();
             set_current_dir(&second_client).unwrap();
 
-            cmd_init(&address, Some("hunter2")).unwrap();
+            init(&address, Some("hunter2")).unwrap();
 
             let recovered = decode_base64url(fs::read_to_string(second_client.join(".ark/identity.key")).unwrap().trim()).unwrap();
             assert_eq!(recovered, original_seed);
@@ -404,36 +383,36 @@ mod tests {
     }
 
     #[test]
-    fn cmd_init_password_wrong_password_errors() {
+    fn init_password_wrong_password_errors() {
         in_test_dir("ark_init_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
 
-            cmd_init(&address, Some("hunter2")).unwrap();
+            init(&address, Some("hunter2")).unwrap();
 
             let second_client = temp_dir.join("second");
             fs::create_dir_all(&second_client).unwrap();
             set_current_dir(&second_client).unwrap();
 
-            let err = cmd_init(&address, Some("wrongpw")).unwrap_err();
+            let err = init(&address, Some("wrongpw")).unwrap_err();
             assert!(err.to_string().contains("verifier mismatch"), "err was {}", err);
         });
     }
 
     #[test]
-    fn cmd_init_second_client_downloads_from_server() {
+    fn init_second_client_downloads_from_server() {
         in_test_dir("ark_init_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
 
-            cmd_init(&address, None).unwrap();
+            init(&address, None).unwrap();
             let first_identity = read_identity(&temp_dir.join(".ark/identity.json")).unwrap();
 
             let second_client = temp_dir.join("second");
             fs::create_dir_all(&second_client).unwrap();
             set_current_dir(&second_client).unwrap();
 
-            cmd_init(&address, None).unwrap();
+            init(&address, None).unwrap();
 
             let downloaded = read_identity(&second_client.join(".ark/identity.json")).unwrap();
             assert_eq!(downloaded.public_key.value, first_identity.public_key.value);

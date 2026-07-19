@@ -1,11 +1,13 @@
-use crate::client::ark_request;
+use std::io;
+
+use crate::client::request;
 use crate::types::IdentityContext;
 use crate::util::{io_err, resolve_client_url};
 
-pub fn cmd_delete(ctx: &IdentityContext, path: &str) -> std::io::Result<()> {
+pub fn delete(ctx: &IdentityContext, path: &str) -> io::Result<()> {
     let url = resolve_client_url(ctx, path)?;
 
-    let (code, _, body) = ark_request(Some(ctx), "DELETE", &url, &[], &[])?;
+    let (code, _, body) = request(Some(ctx), "DELETE", &url, &[], &[])?;
     if code != 204 {
         return Err(io_err(&format!("HTTP {}: {}", code, String::from_utf8_lossy(&body))));
     }
@@ -22,7 +24,7 @@ mod tests {
     use crate::util::test::{in_test_dir, init_with_server, write_plain_test_file};
 
     #[test]
-    fn cmd_delete_removes_file() {
+    fn delete_removes_file() {
         in_test_dir("ark_delete_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
@@ -30,14 +32,14 @@ mod tests {
             let f = temp_dir.join("ark/gyan/x.txt");
             write_plain_test_file(&f, &ctx.identity, ctx.identity_key.as_ref().unwrap(), b"bye");
 
-            cmd_delete(&ctx, "x.txt").unwrap();
+            delete(&ctx, "x.txt").unwrap();
 
             assert!(!f.exists());
         });
     }
 
     #[test]
-    fn cmd_delete_removes_directory_recursively() {
+    fn delete_removes_directory_recursively() {
         in_test_dir("ark_delete_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
@@ -46,26 +48,26 @@ mod tests {
             fs::create_dir_all(&d).unwrap();
             fs::write(d.join("inner"), b"data").unwrap();
 
-            cmd_delete(&ctx, "sub").unwrap();
+            delete(&ctx, "sub").unwrap();
 
             assert!(!d.exists());
         });
     }
 
     #[test]
-    fn cmd_delete_missing_file_errors() {
+    fn delete_missing_file_errors() {
         in_test_dir("ark_delete_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &address);
 
-            let err = cmd_delete(&ctx, "nope").unwrap_err();
+            let err = delete(&ctx, "nope").unwrap_err();
             assert!(err.to_string().contains("HTTP 404"), "msg was {}", err);
         });
     }
 
     #[test]
-    fn cmd_delete_via_address_form() {
+    fn delete_via_address_form() {
         in_test_dir("ark_delete_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
@@ -74,7 +76,7 @@ mod tests {
             write_plain_test_file(&f, &ctx.identity, ctx.identity_key.as_ref().unwrap(), b"gone");
 
             let arg = format!("gyan@127.0.0.1:{}/explicit.txt", port);
-            cmd_delete(&ctx, &arg).unwrap();
+            delete(&ctx, &arg).unwrap();
 
             assert!(!f.exists());
         });

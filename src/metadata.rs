@@ -3,7 +3,7 @@ use std::path::Path;
 
 use uuid::Uuid;
 
-use crate::crypto::{DEFAULT_HASH_ALGORITHM, encrypt_bytes, sign_json, verify_json};
+use crate::crypto::{DEFAULT_HASH_ALGORITHM, DEFAULT_PASSWORD_ALGORITHM, decrypt_bytes, encrypt_bytes, sign_json, verify_json};
 use crate::types::IdentityContext;
 use crate::identity::resolve_identity;
 use crate::types::{Hash, Key, LocalMetadata, Member, Metadata, Permission, Signature};
@@ -242,6 +242,27 @@ pub fn apply_key_to_metadata(
     }
 
     Ok(())
+}
+
+pub fn extract_key_from_metadata(ctx: &IdentityContext, metadata: &Metadata) -> io::Result<Vec<u8>> {
+    let member = get_member(&metadata.members, &ctx.identity.address)
+        .ok_or_else(|| io_err(&format!("no member entry for {}", ctx.identity.address)))?;
+    let encrypted_file_key = member.key.as_ref()
+        .ok_or_else(|| io_err(&format!("no key for {}", ctx.identity.address)))?;
+    let identity_key = ctx.identity_key.as_ref().expect("context missing identity_key");
+    // TODO: review this. seems strange...
+    let algorithm = if identity_key.algorithm == DEFAULT_PASSWORD_ALGORITHM {
+        identity_key.algorithm.clone()
+    } else {
+        encrypted_file_key.algorithm.clone()
+    };
+    decrypt_bytes(
+        &Key {
+            algorithm,
+            value: identity_key.value.clone(),
+        },
+        &encrypted_file_key.value,
+    )
 }
 
 pub fn sign_metadata(secret_key: &Key, metadata: &mut Metadata, body: Option<&[u8]>) -> io::Result<()> {

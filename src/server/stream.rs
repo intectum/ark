@@ -1,59 +1,25 @@
 use std::io::Write;
 use std::path::Path;
-use std::sync::mpsc::{RecvTimeoutError, channel};
 use std::time::Duration;
 
-use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use notify::event::{CreateKind, ModifyKind, RemoveKind};
-
 use crate::http::{write_stream_event, write_stream_keepalive, write_stream_start};
-use crate::types::{DirectoryEntry, DirectoryEntryKind};
+use crate::types::{DirectoryEntry, DirectoryEntryKind, WatchAction};
 use crate::util::{io_err, now_milliseconds};
+use crate::watch;
 
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
 pub fn serve_stream(fs_path: &Path, stream: &mut dyn Write) -> std::io::Result<()> {
     write_stream_start(stream)?;
 
-    // notify: on macOS FSEvents coalesces batched events with coarser timestamps
-    // and may reorder Create/Modify pairs. Consumers should treat (path, event)
-    // as an advisory hint and re-HEAD the file to get authoritative metadata.
-    let (tx, rx) = channel();
-    let mut watcher = RecommendedWatcher::new(
-        move |res| { let _ = tx.send(res); },
-        Config::default(),
-    ).map_err(|e| io_err(&format!("watcher: {}", e)))?;
+    watch::watch_local(fs_path, |event| {
+        let name = match event.action {
+            WatchAction::Keepalive => return write_stream_keepalive(stream).is_err(),
+            a => a.as_str(),
+        };
 
-    watcher.watch(fs_path, RecursiveMode::Recursive)
-        .map_err(|e| io_err(&format!("watch {}: {}", fs_path.display(), e)))?;
-
-    loop {
-        match rx.recv_timeout(KEEPALIVE_INTERVAL) {
-            Ok(Ok(event)) => {
-                let (name, kind) = match &event.kind {
-                    EventKind::Create(CreateKind::Folder) => ("created", Some(DirectoryEntryKind::Dir)),
-                    EventKind::Create(CreateKind::File) => ("created", Some(DirectoryEntryKind::File)),
-                    EventKind::Create(_) => ("created", None),
-                    EventKind::Modify(ModifyKind::Data(_)) | EventKind::Modify(ModifyKind::Name(_)) => ("modified", None),
-                    EventKind::Modify(_) => continue,
-                    EventKind::Remove(RemoveKind::Folder) => ("deleted", Some(DirectoryEntryKind::Dir)),
-                    EventKind::Remove(_) => ("deleted", Some(DirectoryEntryKind::File)),
-                    _ => continue,
-                };
-
-                for path in &event.paths {
-                    if write_event(stream, fs_path, path, name, kind.as_ref()).is_err() {
-                        return Ok(());
-                    }
-                }
-            }
-            Ok(Err(_)) => continue,
-            Err(RecvTimeoutError::Timeout) => {
-                if write_stream_keepalive(stream).is_err() { return Ok(()); }
-            }
-            Err(RecvTimeoutError::Disconnected) => return Ok(()),
-        }
-    }
+        write_event(stream, fs_path, &event.path, name, event.kind.as_ref()).is_err()
+    }, Some(KEEPALIVE_INTERVAL))
 }
 
 fn write_event(stream: &mut dyn Write, root: &Path, path: &Path, name: &str, kind: Option<&DirectoryEntryKind>) -> std::io::Result<()> {

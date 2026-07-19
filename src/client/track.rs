@@ -1,4 +1,5 @@
 use std::fs;
+use std::io;
 use std::path::Path;
 
 use crate::crypto::DEFAULT_ENCRYPTION_ALGORITHM;
@@ -6,7 +7,7 @@ use crate::metadata::{create_metadata, sign_metadata, write_local_metadata_attri
 use crate::types::{IdentityContext, LocalMetadata};
 use crate::util::{io_err, io_invalid_input, sha256};
 
-pub fn cmd_track(ctx: &IdentityContext, path: &str, encryption_algorithm: Option<&str>) -> std::io::Result<()> {
+pub fn track_io(ctx: &IdentityContext, path: &str, encryption_algorithm: Option<&str>) -> io::Result<()> {
     let target = Path::new(path);
     if !fs::exists(target)? {
         return Err(io_invalid_input("path does not exist"));
@@ -69,7 +70,7 @@ mod tests {
 
             env::set_current_dir(&account_dir).unwrap();
             let ctx = create_client_context().unwrap();
-            cmd_track(&ctx, path.to_str().unwrap(), None).unwrap();
+            track_io(&ctx, path.to_str().unwrap(), None).unwrap();
 
             let m = read_metadata_attributes(&path).unwrap();
             assert_eq!(m.modified_by, TEST_ADDRESS);
@@ -95,7 +96,7 @@ mod tests {
 
             env::set_current_dir(&account_dir).unwrap();
             let ctx = create_client_context().unwrap();
-            cmd_track(&ctx, path.to_str().unwrap(), Some("none")).unwrap();
+            track_io(&ctx, path.to_str().unwrap(), Some("none")).unwrap();
 
             let m = read_metadata_attributes(&path).unwrap();
             assert_eq!(m.encryption_algorithm, None);
@@ -112,7 +113,7 @@ mod tests {
 
             env::set_current_dir(&account_dir).unwrap();
             let ctx = create_client_context().unwrap();
-            cmd_track(&ctx, dir.to_str().unwrap(), None).unwrap();
+            track_io(&ctx, dir.to_str().unwrap(), None).unwrap();
 
             let m = read_metadata_attributes(&dir).unwrap();
             assert_eq!(m.modified_by, TEST_ADDRESS);
@@ -132,7 +133,7 @@ mod tests {
 
             env::set_current_dir(&account_dir).unwrap();
             let ctx = create_client_context().unwrap();
-            let err = cmd_track(&ctx, dir.to_str().unwrap(), Some(DEFAULT_ENCRYPTION_ALGORITHM)).unwrap_err();
+            let err = track_io(&ctx, dir.to_str().unwrap(), Some(DEFAULT_ENCRYPTION_ALGORITHM)).unwrap_err();
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         });
     }
@@ -144,7 +145,7 @@ mod tests {
             env::set_current_dir(&account_dir).unwrap();
             let ctx = create_client_context().unwrap();
             let missing = account_dir.join("nope");
-            let err = cmd_track(&ctx, missing.to_str().unwrap(), None).unwrap_err();
+            let err = track_io(&ctx, missing.to_str().unwrap(), None).unwrap_err();
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         });
     }
@@ -158,9 +159,9 @@ mod tests {
 
             env::set_current_dir(&account_dir).unwrap();
             let ctx = create_client_context().unwrap();
-            cmd_track(&ctx, path.to_str().unwrap(), None).unwrap();
+            track_io(&ctx, path.to_str().unwrap(), None).unwrap();
 
-            let err = cmd_track(&ctx, path.to_str().unwrap(), None).unwrap_err();
+            let err = track_io(&ctx, path.to_str().unwrap(), None).unwrap_err();
             assert!(err.to_string().contains("already exists"), "msg was {}", err);
         });
     }

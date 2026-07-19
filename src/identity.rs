@@ -6,7 +6,7 @@ use getrandom::getrandom;
 use url::Url;
 
 use crate::crypto::{DEFAULT_SIGNING_ALGORITHM, create_secret_key, sign_json, to_public_key, verify_json};
-use crate::client::ark_request;
+use crate::client::request;
 use crate::types::IdentityContext;
 use crate::types::{Identity, Key, Signature};
 use crate::util::{decode_base64url, encode_base64url, io_err, io_invalid_input, now_iso, resolve_client_url};
@@ -67,7 +67,7 @@ pub fn resolve_identity(ctx: &IdentityContext, address: &str) -> io::Result<Iden
     }
 
     let url = resolve_client_url(ctx, &format!("{}@{}{}", name, host, path))?;
-    let (code, _, body) = ark_request(Some(ctx), "GET", &url, &[], &[])?;
+    let (code, _, body) = request(Some(ctx), "GET", &url, &[], &[])?;
     if code != 200 {
         return Err(io_err(&format!("HTTP {}: {}", code, String::from_utf8_lossy(&body))));
     }
@@ -190,7 +190,7 @@ fn is_valid_account_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::init;
+    use crate::client::init_local;
     use crate::context::create_client_context;
     use crate::server::start_test_server;
     use crate::util::test::{create_test_account, in_test_dir};
@@ -319,7 +319,7 @@ mod tests {
     #[test]
     fn resolve_identity_returns_cached_when_present() {
         in_test_dir("ark_identity_test", |temp_dir| {
-            init(temp_dir, "alice@example.com").unwrap();
+            init_local(temp_dir, "alice@example.com").unwrap();
             let ctx = create_client_context().unwrap();
 
             let cache_dir = temp_dir.join(".ark/identities");
@@ -337,7 +337,7 @@ mod tests {
     #[test]
     fn resolve_identity_returns_self_without_cache_lookup() {
         in_test_dir("ark_identity_test", |temp_dir| {
-            let (identity, _) = init(temp_dir, "alice@example.com").unwrap();
+            let (identity, _) = init_local(temp_dir, "alice@example.com").unwrap();
             let ctx = create_client_context().unwrap();
 
             let loaded = resolve_identity(&ctx, &identity.address).unwrap();
@@ -348,7 +348,7 @@ mod tests {
     #[test]
     fn resolve_identity_errors_on_invalid_cached_file() {
         in_test_dir("ark_identity_test", |temp_dir| {
-            init(temp_dir, "alice@example.com").unwrap();
+            init_local(temp_dir, "alice@example.com").unwrap();
             let ctx = create_client_context().unwrap();
 
             let cache_dir = temp_dir.join(".ark/identities");
