@@ -31,7 +31,7 @@ pub fn put(
     body: Option<&mut dyn Read>,
     encryption_algorithm: Option<&str>,
     existing_metadata: Option<Metadata>,
-    existing_local: Option<LocalMetadata>,
+    existing_local_metadata: Option<LocalMetadata>,
 ) -> io::Result<(Metadata, LocalMetadata)> {
     let url = resolve_client_url(ctx, path)?;
 
@@ -72,7 +72,7 @@ pub fn put(
         metadata.encryption_algorithm = None;
     }
 
-    let mut local_metadata = existing_local.unwrap_or_default();
+    let mut local_metadata = existing_local_metadata.unwrap_or_default();
 
     let skip_encrypt = metadata.encryption_algorithm.is_none();
     let already_encrypted = local_metadata.encrypted == Some(true);

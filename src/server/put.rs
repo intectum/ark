@@ -3,8 +3,8 @@ use std::path::Path;
 
 use crate::http::write_text;
 use crate::identity::validate_identity;
-use crate::metadata::verify_metadata;
-use crate::server::util::{members_changed, write_target};
+use crate::metadata::{members_changed, verify_metadata};
+use crate::server::util::write_target;
 use crate::types::{Identity, Member, Metadata, Permission};
 
 pub fn serve_put_init(

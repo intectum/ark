@@ -8,8 +8,8 @@ use crate::util::io_err;
 
 const PATH_ENCODE_SET: &AsciiSet = &CONTROLS.add(b' ').add(b'"').add(b'#').add(b'<').add(b'>').add(b'?').add(b'`').add(b'{').add(b'}');
 
-pub fn read_request(stream: &mut dyn Read) -> Result<(String, String, Vec<(String, String)>, Vec<u8>)> {
-    let (first_line, headers, body) = read_message(stream, false)?;
+pub fn read_request(stream: &mut dyn Read, skip_body: bool) -> Result<(String, String, Vec<(String, String)>, Vec<u8>)> {
+    let (first_line, headers, body) = read_message(stream, skip_body)?;
 
     let request_line_parts: Vec<&str> = first_line.trim_end().split_whitespace().collect();
     if request_line_parts.len() != 3 {
@@ -41,8 +41,8 @@ pub fn write_request(stream: &mut dyn Write, url: &Url, method: &str, headers: &
     write_message(stream, &request_line, &final_headers, body)
 }
 
-pub fn read_response(stream: &mut dyn Read, method: &str) -> Result<(u16, Vec<(String, String)>, Vec<u8>)> {
-    let (first_line, headers, body) = read_message(stream, method == "HEAD")?;
+pub fn read_response(stream: &mut dyn Read, skip_body: bool) -> Result<(u16, Vec<(String, String)>, Vec<u8>)> {
+    let (first_line, headers, body) = read_message(stream, skip_body)?;
 
     let code: u16 = first_line
         .split_whitespace()

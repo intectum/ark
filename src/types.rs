@@ -53,6 +53,16 @@ pub struct Key {
     pub value: Vec<u8>,
 }
 
+/// Local-only companion to [`Metadata`], stored as `user.ark_local.*` xattrs.
+/// Not part of the wire protocol.
+#[derive(Clone, Default)]
+pub struct LocalMetadata {
+    /// Whether the file's bytes on disk are ciphertext.
+    pub encrypted: Option<bool>,
+    /// SHA-256 of the last-synced plaintext body. Absent = do not sync.
+    pub sync_hash: Option<Vec<u8>>,
+}
+
 /// A member entry in a file or directory's metadata: address, permission,
 /// and (for encrypted files) the file key wrapped for this member's public
 /// key. Address `*` is the public wildcard.
@@ -78,16 +88,6 @@ pub struct Metadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body_hash: Option<Hash>,
     pub signature: Signature,
-}
-
-/// Local-only companion to [`Metadata`], stored as `user.ark_local.*` xattrs.
-/// Not part of the wire protocol.
-#[derive(Clone, Default)]
-pub struct LocalMetadata {
-    /// Whether the file's bytes on disk are ciphertext.
-    pub encrypted: Option<bool>,
-    /// SHA-256 of the last-synced plaintext body. Absent = do not sync.
-    pub sync_hash: Option<Vec<u8>>,
 }
 
 /// Permission tier for a [`Member`]. Ordered: `Owner` > `Write` > `Read`.
@@ -117,6 +117,20 @@ impl Permission {
             _ => None,
         }
     }
+
+    pub fn rank(&self) -> u8 {
+        match self {
+            Permission::Read => 0,
+            Permission::Write => 1,
+            Permission::Owner => 2,
+        }
+    }
+}
+
+pub struct Proposal {
+    pub id: String,
+    pub target: String,
+    pub metadata: Metadata,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

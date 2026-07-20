@@ -75,7 +75,7 @@ pub fn relay(
 
             let mut buf: Vec<u8> = Vec::new();
             handle_parsed(&mut buf, server_ctx, method, &member_path, &final_headers, body, false)?;
-            read_response(&mut buf.as_slice(), method)
+            read_response(&mut buf.as_slice(), method == "HEAD")
         } else {
             let url_string = format!("http://{}{}", member_host, member_path);
             println!("{}(relay) {}", method, url_string);

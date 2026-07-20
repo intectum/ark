@@ -74,15 +74,7 @@ pub fn authorize(
         .into_iter()
         .flatten()
         .map(|member| member.permission)
-        .max_by_key(|permission| permission_rank(*permission))
+        .max_by_key(|permission| permission.rank())
         .ok_or_else(|| io_err("forbidden"))
-}
-
-fn permission_rank(permission: Permission) -> u8 {
-    match permission {
-        Permission::Read => 0,
-        Permission::Write => 1,
-        Permission::Owner => 2,
-    }
 }
 

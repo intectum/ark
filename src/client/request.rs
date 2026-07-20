@@ -32,7 +32,7 @@ pub fn request(ctx: Option<&IdentityContext>, method: &str, url: &Url, headers: 
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
 
     write_request(&mut stream, url, method, &final_headers, body)?;
-    read_response(&mut stream, method)
+    read_response(&mut stream, method == "HEAD")
 }
 
 #[cfg(test)]

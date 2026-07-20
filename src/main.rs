@@ -2,7 +2,7 @@ use std::env;
 
 use clap::{Parser, Subcommand};
 
-use ark::client::{chmod_io, decrypt_io, delete, encrypt_io, get_io, head_io, init, put_io, sync_io, track_io};
+use ark::client::{accept_proposal_io, chmod_io, decrypt_io, delete, encrypt_io, get_io, head_io, init, list_proposals_io, put_io, reject_proposal_io, sync_io, track_io};
 use ark::context::create_client_context;
 use ark::server::start_server;
 
@@ -16,6 +16,26 @@ use ark::server::start_server;
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum ProposalsCmd {
+    /// List pending share proposals.
+    List,
+    /// Accept a proposal by index (from `list`) or log entry id.
+    Accept {
+        /// Index (1-based) or log entry filename.
+        id: String,
+        /// Bypass metadata-change safety checks (accept fresher metadata even if
+        /// members were added or self was downgraded by a non-owner).
+        #[arg(short, long)]
+        force: bool,
+    },
+    /// Reject a proposal by index (from `list`) or log entry id.
+    Reject {
+        /// Index (1-based) or log entry filename.
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -157,6 +177,17 @@ enum Cmd {
         #[arg(short, long, value_name = "NAME")]
         encryption_algorithm: Option<String>,
     },
+    /// Review and act on pending share proposals.
+    ///
+    /// A proposal is any 403 PUT recorded in .ark/requests/ — another account
+    /// tried to write to your server at a path where they are not yet
+    /// authorized. Accepting materializes the target dir with the proposed
+    /// members and pulls the file from the sender. Rejecting deletes the log
+    /// entry.
+    Proposals {
+        #[command(subcommand)]
+        cmd: ProposalsCmd,
+    },
     /// Encrypt a plaintext file.
     ///
     /// If the source has ark metadata, its file key and algorithm are reused
@@ -197,6 +228,11 @@ fn main() {
         Cmd::Head { path } => create_client_context().and_then(|c| head_io(&c, &path)),
         Cmd::Delete { path } => create_client_context().and_then(|c| delete(&c, &path)),
         Cmd::Get { output, decrypt, path } => create_client_context().and_then(|c| get_io(&c, &path, output.as_deref(), decrypt)),
+        Cmd::Proposals { cmd } => create_client_context().and_then(|c| match cmd {
+            ProposalsCmd::List => list_proposals_io(&c),
+            ProposalsCmd::Accept { id, force } => accept_proposal_io(&c, &id, force),
+            ProposalsCmd::Reject { id } => reject_proposal_io(&c, &id),
+        }),
         Cmd::Put { input, encryption_algorithm, path } => create_client_context().and_then(|c| put_io(&c, &path, input.as_deref(), encryption_algorithm.as_deref())),
         Cmd::Sync { watch, decrypt } => create_client_context().and_then(|c| sync_io(&c, watch, decrypt)),
         Cmd::Track { encryption_algorithm, path } => create_client_context().and_then(|c| track_io(&c, &path, encryption_algorithm.as_deref())),

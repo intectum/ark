@@ -8,7 +8,7 @@ use crate::client::put::put_io;
 use crate::client::request::request;
 use crate::context::create_client_context;
 use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, DEFAULT_PASSWORD_ALGORITHM, create_secret_key_from_password, restore_secret_key_from_password, to_public_key};
-use crate::identity::{create_identity, sign_identity, validate_identity, write_identity, write_identity_key};
+use crate::identity::{create_identity, parse_address, resolve_identity, sign_identity, validate_identity, write_identity, write_identity_key};
 use crate::metadata::{create_metadata, read_metadata_headers, sign_metadata, write_metadata_attributes};
 use crate::types::{Identity, IdentityContext, Key, Member, Permission, Signature};
 use crate::util::{decode_base64url, io_err, now_iso, resolve_client_url_raw};
@@ -76,6 +76,8 @@ pub fn init(address: &str, password: Option<&str>) -> io::Result<()> {
             let ctx = create_client_context()?;
             put_io(&ctx, "/.ark/identity.json", identity_path.to_str(), None)?;
 
+            grant_requests_write(&ctx)?;
+
             if let Some(pw) = password {
                 push_secret_key_with_password(&ctx, pw)?;
             }
@@ -98,6 +100,28 @@ pub fn init_local(root: &Path, address: &str) -> io::Result<(Identity, Key)> {
     write_identity_key(&dot_ark_dir.join("identity.key"), &secret_key.value)?;
 
     Ok((identity, secret_key))
+}
+
+fn grant_requests_write(ctx: &IdentityContext) -> io::Result<()> {
+    let (_, host, _) = parse_address(&ctx.identity.address)?;
+    let ark_identity = resolve_identity(ctx, &format!("ark@{}", host))?;
+
+    let requests_dir = ctx.root.join(".ark").join("requests");
+    fs::create_dir_all(&requests_dir)?;
+
+    let mut metadata = create_metadata(&ctx.identity.address, None);
+    metadata.members.push(Member {
+        address: ark_identity.address,
+        permission: Permission::Write,
+        key: None,
+    });
+    let secret_key = ctx.identity_key.as_ref().expect("client context missing identity_key");
+    sign_metadata(secret_key, &mut metadata, None)?;
+    write_metadata_attributes(&requests_dir, &metadata)?;
+
+    put_io(ctx, "/.ark/requests/", requests_dir.to_str(), None)?;
+
+    Ok(())
 }
 
 fn pull_secret_key_with_password(
@@ -306,6 +330,29 @@ mod tests {
             assert!(server_path.exists(), "server should have uploaded identity");
             let server = read_identity(&server_path).unwrap();
             assert_eq!(server.public_key.value, local.public_key.value);
+        });
+    }
+
+    #[test]
+    fn init_grants_ark_write_on_requests_dir() {
+        in_test_dir("ark_init_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let address = format!("gyan@127.0.0.1:{}", port);
+
+            init(&address, None).unwrap();
+
+            let requests_dir = temp_dir.join("ark/gyan/.ark/requests");
+            assert!(requests_dir.is_dir(), "server should have requests dir");
+
+            let metadata = crate::metadata::read_metadata_attributes(&requests_dir).unwrap();
+            let ark_address = format!("ark@127.0.0.1:{}", port);
+            let ark_member = metadata.members.iter().find(|m| m.address == ark_address)
+                .expect("ark must be a member of requests dir");
+            assert_eq!(ark_member.permission, Permission::Write);
+
+            let owner = metadata.members.iter().find(|m| m.address == address)
+                .expect("account must be owner of requests dir");
+            assert_eq!(owner.permission, Permission::Owner);
         });
     }
 

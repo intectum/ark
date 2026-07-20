@@ -2,6 +2,7 @@ mod auth;
 mod delete;
 mod stream;
 mod get;
+mod log;
 mod put;
 mod relay;
 #[cfg(test)]
@@ -28,6 +29,7 @@ use self::auth::{authenticate, authorize};
 use self::delete::serve_delete;
 use self::stream::serve_stream;
 use self::get::serve_get;
+use self::log::{LoggingStream, try_log_request};
 use self::put::{serve_put, serve_put_init};
 use self::relay::relay;
 use self::util::find_ancestor_members;
@@ -81,7 +83,7 @@ pub fn serve(listener: TcpListener, server_ctx: IdentityContext, verbose: bool) 
 }
 
 fn handle(mut stream: TcpStream, server_ctx: &Arc<IdentityContext>, verbose: bool) -> std::io::Result<()> {
-    let (method, target, headers, body) = read_request(&mut stream)?;
+    let (method, target, headers, body) = read_request(&mut stream, false)?;
     if verbose {
         println!("{} {}", method, target);
     }
@@ -90,6 +92,27 @@ fn handle(mut stream: TcpStream, server_ctx: &Arc<IdentityContext>, verbose: boo
 }
 
 pub fn handle_parsed(
+    stream: &mut dyn Write,
+    server_ctx: &Arc<IdentityContext>,
+    method: &str,
+    target: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+    verbose: bool,
+) -> std::io::Result<()> {
+    let mut logger = LoggingStream::new(stream);
+    let result = handle_parsed_inner(&mut logger, server_ctx, method, target, headers, body, verbose);
+
+    if let Err(e) = try_log_request(server_ctx, method, target, headers, &logger.captured) {
+        if verbose {
+            eprintln!("ERROR(log) {}", e);
+        }
+    }
+
+    result
+}
+
+fn handle_parsed_inner(
     stream: &mut dyn Write,
     server_ctx: &Arc<IdentityContext>,
     method: &str,

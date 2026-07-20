@@ -39,6 +39,7 @@ Consequences:
 - **No vendor lock-in for apps.** Any Ark-speaking app can read a user's files (with permission). Switching apps doesn't mean re-uploading.
 - **No mass-breach target.** Servers store ciphertext they cannot read; there is no central identity provider.
 - **Cross-user features come for free.** Messaging, sharing, collaboration — all reduce to "add a member to a file."
+- **First contact is explicit.** Unauthorised writes never silently land on your server. They are rejected and recorded in a per-account request log as share proposals; you accept or reject on your terms.
 
 ---
 
@@ -79,7 +80,12 @@ ark get note.txt -o out.txt -d  # download + decrypt
 
 # Share with another user
 ark chmod -r bob@localhost:8080 note.txt
-ark put -i note.txt note.txt    # re-upload; bob's server gets a copy
+ark put -i note.txt note.txt    # re-upload; server relays a copy to bob
+
+# On bob's side — review and accept the share
+ark proposals list              # shows pending share offers
+ark proposals accept 1          # pulls the file, materialises it on bob's server
+ark proposals reject 1          # discard instead
 
 # Sync a whole tree
 ark sync -w                     # push + watch (bidirectional)
@@ -106,6 +112,9 @@ Every command takes `-h` for details. Paths accept three forms:
 | `ark chmod <FILE>` | Change members: `-o` owner, `-w` writer, `-r` reader, `-d` drop. Use `public` for anyone. Follow with `put` to sync. |
 | `ark sync` | Push local changes to the server. `-w` also watches and pulls. |
 | `ark track <PATH>` | Mark an existing local file as an ark file. |
+| `ark proposals list` | Show pending share proposals — unauthorised PUTs from other accounts, recorded in `.ark/requests/`. |
+| `ark proposals accept <ID>` | Fetch, verify, and PUT the shared file/dir. `-f` bypasses metadata-change checks. |
+| `ark proposals reject <ID>` | Delete the log entry. |
 | `ark encrypt` / `ark decrypt` | Local file crypto. `--in-place` rewrites the file. |
 
 ---
@@ -114,29 +123,45 @@ Every command takes `-h` for details. Paths accept three forms:
 
 Every CLI command has a corresponding library function. Two shapes:
 
-- **Plain** — `get`, `put`, `head`, `encrypt`, `decrypt`. Take/return values, read/write streams.
-- **`_io`** — `get_io`, `put_io`, `head_io`, `encrypt_io`, `decrypt_io`, `chmod_io`, `sync_io`, `track_io`. CLI shape: optional file paths, stdio fallbacks, side effects on disk.
+- **Plain** — `get`, `put`, `head`, `encrypt`, `decrypt`, `list_proposals`, `accept_proposal`, `reject_proposal`. Take/return values, read/write streams.
+- **`_io`** — `get_io`, `put_io`, `head_io`, `encrypt_io`, `decrypt_io`, `chmod_io`, `sync_io`, `track_io`, `list_proposals_io`, `accept_proposal_io`, `reject_proposal_io`. CLI shape: optional file paths, stdio fallbacks, side effects on disk.
 
 ### Client
 
 ```rust
 use ark::context::create_client_context;
-use ark::client::{get_io, put_io, delete, chmod_io, sync_io};
+use ark::client::{init, get_io, put_io, delete, chmod_io, sync_io};
+use ark::watch::{watch_local, watch_remote};
 
-let ctx = create_client_context()?;  // walks up from cwd to find .ark/
+init("alice@example.com:8080", None)?;   // create or recover the account
+
+let ctx = create_client_context()?;      // walks up from cwd to find .ark/
 
 put_io(&ctx, "notes.txt", Some("local.txt"), None)?;
 get_io(&ctx, "notes.txt", Some("out.txt"), /*decrypt=*/ true)?;
 
 chmod_io(&ctx, "local.txt",
     &[],
-    &["bob@example.com".into()],   // writers
+    &["bob@example.com".into()],         // writers
     &[],
     &[])?;
 
 delete(&ctx, "old.txt")?;
 
 sync_io(&ctx, /*watch=*/ true, /*decrypt=*/ true)?;  // blocks
+
+// Local filesystem: create/modify/delete under a directory.
+watch_local(&ctx.root, |event| {
+    println!("{:?} {}", event.action.as_str(), event.path.display());
+    false  // return true to stop
+}, None)?;
+
+// Remote SSE stream — events for any directory on the server.
+let url = ark::util::resolve_client_url(&ctx, "/")?;
+watch_remote(&ctx, &url, |event| {
+    println!("remote: {}", event.path.display());
+    Ok(())
+})?;
 ```
 
 Streaming form when you don't want to touch the filesystem:
@@ -158,30 +183,6 @@ start_server(8080, "example.com:8080");  // blocks
 
 `start_server` uses `cwd` as its root and bootstraps its own identity on first run.
 
-### Watching for changes
-
-```rust
-use ark::watch::{watch_local, watch_remote};
-
-// Local filesystem: create/modify/delete under a directory.
-watch_local(&ctx.root, |event| {
-    println!("{:?} {}", event.action.as_str(), event.path.display());
-    false  // return true to stop
-}, None)?;
-
-// Remote SSE stream — events for any directory on the server.
-let url = ark::util::resolve_client_url(&ctx, "/")?;
-watch_remote(&ctx, &url, |event| {
-    println!("remote: {}", event.path.display());
-    Ok(())
-})?;
-```
-
-### More
-
-- `ark::client::init(address, password)` — create or recover an account.
-- `ark::types` — `IdentityContext`, `Metadata`, `Permission`, `Member`, `Key`, `Identity`.
-
 ---
 
 ## Capabilities
@@ -193,7 +194,7 @@ watch_remote(&ctx, &url, |event| {
 | Public files | Supported for plaintext only (any browser can fetch). |
 | Directories | First-class. Recursive delete. Permissions inherit. |
 | Sharing | Owner / writer / reader per file. Add or drop members with `chmod`. |
-| Federation | On write, the server relays to co-members' inboxes. |
+| Federation | On write, the server relays to co-members' servers at the same path. |
 | Sync | One-shot push, or watch mode (push + pull via SSE). |
 | Transport | Plain HTTP. Put a reverse proxy in front for TLS. |
 | Auth scheme | `ArkIdentity` signed requests. No tokens, no sessions. |
@@ -206,8 +207,7 @@ Planned, not yet built. See `spec.md` for details.
 
 - Passkey identities (WebAuthn PRF).
 - Groups — invite many users at once, one member entry.
-- Contacts & invitations — token-based onboarding, allowlisted inbox delivery.
+- Invitations — token-based onboarding as a pre-accepted proposal shortcut.
 - Key rotation with contact notification.
 - Ratcheted sequences (Signal-style forward secrecy) for messaging.
 - Legacy email interop.
-- Built-in TLS / ACME.

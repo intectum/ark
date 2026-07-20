@@ -5,6 +5,7 @@ mod encrypt;
 mod get;
 mod head;
 mod init;
+mod proposals;
 mod put;
 mod request;
 mod sync;
@@ -19,6 +20,7 @@ pub use head::{head, head_io};
 pub use init::init;
 #[cfg(test)]
 pub use init::init_local;
+pub use proposals::{accept_proposal_io, list_proposals_io, reject_proposal_io};
 pub use put::{put, put_io};
 pub use request::request;
 pub use sync::sync_io;

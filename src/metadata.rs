@@ -35,6 +35,15 @@ pub fn get_member<'a>(members: &'a [Member], address: &str) -> Option<&'a Member
     members.iter().find(|m| m.address == address)
 }
 
+pub fn members_changed(old: &[Member], new: &[Member]) -> bool {
+    if old.len() != new.len() { return true; }
+    let mut old_set: Vec<(&str, Permission)> = old.iter().map(|m| (m.address.as_str(), m.permission)).collect();
+    let mut new_set: Vec<(&str, Permission)> = new.iter().map(|m| (m.address.as_str(), m.permission)).collect();
+    old_set.sort_by(|a, b| a.0.cmp(b.0));
+    new_set.sort_by(|a, b| a.0.cmp(b.0));
+    old_set != new_set
+}
+
 pub fn create_metadata(owner_address: &str, encryption_algorithm: Option<&str>) -> Metadata {
     let now = now_iso();
 
