@@ -3,9 +3,9 @@ use std::io;
 use std::io::{Read, Write};
 use std::path::Path;
 
-use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, decrypt_bytes};
-use crate::metadata::{apply_key_to_metadata, create_metadata, extract_key_from_metadata, read_local_metadata_attributes, read_metadata_attributes, validate_metadata, write_local_metadata_attributes, write_metadata_attributes};
-use crate::types::{IdentityContext, Key, LocalMetadata, Metadata};
+use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, DEFAULT_HASH_ALGORITHM, decrypt_bytes};
+use crate::metadata::{apply_key_to_metadata, create_metadata, extract_key_from_metadata, has_metadata_attributes, read_local_metadata_attributes, read_metadata_attributes, validate_metadata, write_local_metadata_attributes, write_metadata_attributes};
+use crate::types::{Hash, IdentityContext, Key, LocalMetadata, Metadata};
 use crate::util::{decode_base64url, io_err, io_invalid_input, sha256};
 
 /// Decrypt `ciphertext` to `plaintext` using the file key wrapped in
@@ -62,7 +62,7 @@ pub fn decrypt_io(
     }
 
     let source_has_metadata = match source {
-        Some(p) => xattr::get(Path::new(p), "user.ark.id")?.is_some(),
+        Some(p) => has_metadata_attributes(Path::new(p))?,
         None => false,
     };
 
@@ -120,7 +120,8 @@ pub fn decrypt_io(
             write_metadata_attributes(destination_path, &metadata)?;
             write_local_metadata_attributes(destination_path, &LocalMetadata {
                 encrypted: Some(false),
-                sync_hash: Some(sha256(&plaintext_bytes)),
+                sync_body_hash: Some(Hash { algorithm: DEFAULT_HASH_ALGORITHM.to_string(), value: sha256(&plaintext_bytes) }),
+                sync_modified: Some(metadata.modified.clone()),
             })?;
         }
         None => io::stdout().write_all(&plaintext_bytes)?,
@@ -284,7 +285,7 @@ mod tests {
             m.members[0].key = Some(Key { algorithm: wrap_alg, value: wrapped });
             sign_metadata(&secret_key, &mut m, Some(&body)).unwrap();
             write_metadata_attributes(&p, &m).unwrap();
-            write_local_metadata_attributes(&p, &LocalMetadata { encrypted: Some(true), sync_hash: None }).unwrap();
+            write_local_metadata_attributes(&p, &LocalMetadata { encrypted: Some(true), sync_body_hash: None, sync_modified: None }).unwrap();
             env::set_current_dir(&acc).unwrap();
             let ctx = create_client_context().unwrap();
             let err = decrypt_io(&ctx, Some(p.to_str().unwrap()), None, None, None, None).unwrap_err();

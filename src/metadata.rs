@@ -29,7 +29,9 @@ const FIELD_SIGNATURE_ALGORITHM: &str = "signature_algorithm";
 const FIELD_SIGNATURE_VALUE: &str = "signature_value";
 
 const LOCAL_FIELD_ENCRYPTED: &str = "encrypted";
-const LOCAL_FIELD_SYNC_HASH: &str = "sync_hash";
+const LOCAL_FIELD_SYNC_BODY_HASH_ALGORITHM: &str = "sync_body_hash_algorithm";
+const LOCAL_FIELD_SYNC_BODY_HASH_VALUE: &str = "sync_body_hash_value";
+const LOCAL_FIELD_SYNC_MODIFIED: &str = "sync_modified";
 
 pub fn get_member<'a>(members: &'a [Member], address: &str) -> Option<&'a Member> {
     members.iter().find(|m| m.address == address)
@@ -66,6 +68,10 @@ pub fn create_metadata(owner_address: &str, encryption_algorithm: Option<&str>) 
     }
 }
 
+pub fn has_metadata_attributes(path: &Path) -> io::Result<bool> {
+    Ok(xattr::get(path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_ID))?.is_some())
+}
+
 pub fn read_metadata_attributes(path: &Path) -> io::Result<Metadata> {
     let mut partial_metadata = PartialMetadata::default();
 
@@ -93,12 +99,7 @@ pub fn read_metadata_attributes(path: &Path) -> io::Result<Metadata> {
 }
 
 pub fn write_metadata_attributes(path: &Path, metadata: &Metadata) -> io::Result<()> {
-    for attribute in xattr::list(path)? {
-        let name = attribute.to_string_lossy();
-        if name.starts_with(ATTRIBUTE_PREFIX) {
-            xattr::remove(path, &*name)?;
-        }
-    }
+    remove_metadata_attributes(path)?;
 
     xattr::set(path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_ID), metadata.id.as_bytes())?;
     xattr::set(path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_CREATED), metadata.created.as_bytes())?;
@@ -126,8 +127,21 @@ pub fn write_metadata_attributes(path: &Path, metadata: &Metadata) -> io::Result
     Ok(())
 }
 
+pub fn remove_metadata_attributes(path: &Path) -> io::Result<()> {
+    for attribute in xattr::list(path)? {
+        let name = attribute.to_string_lossy();
+        if name.starts_with(ATTRIBUTE_PREFIX) {
+            xattr::remove(path, &*name)?;
+        }
+    }
+
+    Ok(())
+}
+
 pub fn read_local_metadata_attributes(path: &Path) -> io::Result<LocalMetadata> {
     let mut local = LocalMetadata::default();
+    let mut sync_body_hash_algorithm: Option<String> = None;
+    let mut sync_body_hash_value: Option<Vec<u8>> = None;
 
     for attribute in xattr::list(path)? {
         let name = attribute.to_string_lossy().into_owned();
@@ -150,30 +164,51 @@ pub fn read_local_metadata_attributes(path: &Path) -> io::Result<LocalMetadata> 
                     other => return Err(io_err(&format!("encrypted local attribute invalid: {}", other))),
                 };
             }
-            LOCAL_FIELD_SYNC_HASH => {
-                local.sync_hash = Some(decode_base64url(value)
-                    .map_err(|_| io_err("sync_hash is not base64url encoded"))?);
+            LOCAL_FIELD_SYNC_BODY_HASH_ALGORITHM => {
+                sync_body_hash_algorithm = Some(value);
+            }
+            LOCAL_FIELD_SYNC_BODY_HASH_VALUE => {
+                sync_body_hash_value = Some(decode_base64url(value)
+                    .map_err(|_| io_err("sync_body_hash_value is not base64url encoded"))?);
+            }
+            LOCAL_FIELD_SYNC_MODIFIED => {
+                local.sync_modified = Some(value);
             }
             _ => {}
         }
     }
 
+    local.sync_body_hash = match (sync_body_hash_algorithm, sync_body_hash_value) {
+        (Some(algorithm), Some(value)) => Some(Hash { algorithm, value }),
+        _ => None,
+    };
+
     Ok(local)
 }
 
 pub fn write_local_metadata_attributes(path: &Path, local: &LocalMetadata) -> io::Result<()> {
+    remove_local_metadata_attributes(path)?;
+
+    if let Some(encrypted) = local.encrypted {
+        xattr::set(path, &format!("{}{}", LOCAL_ATTRIBUTE_PREFIX, LOCAL_FIELD_ENCRYPTED), if encrypted { b"true" } else { b"false" })?;
+    }
+    if let Some(sync_body_hash) = &local.sync_body_hash {
+        xattr::set(path, &format!("{}{}", LOCAL_ATTRIBUTE_PREFIX, LOCAL_FIELD_SYNC_BODY_HASH_ALGORITHM), sync_body_hash.algorithm.as_bytes())?;
+        xattr::set(path, &format!("{}{}", LOCAL_ATTRIBUTE_PREFIX, LOCAL_FIELD_SYNC_BODY_HASH_VALUE), encode_base64url(&sync_body_hash.value).as_bytes())?;
+    }
+    if let Some(sync_modified) = &local.sync_modified {
+        xattr::set(path, &format!("{}{}", LOCAL_ATTRIBUTE_PREFIX, LOCAL_FIELD_SYNC_MODIFIED), sync_modified.as_bytes())?;
+    }
+
+    Ok(())
+}
+
+pub fn remove_local_metadata_attributes(path: &Path) -> io::Result<()> {
     for attribute in xattr::list(path)? {
         let name = attribute.to_string_lossy();
         if name.starts_with(LOCAL_ATTRIBUTE_PREFIX) {
             xattr::remove(path, &*name)?;
         }
-    }
-
-    if let Some(encrypted) = local.encrypted {
-        xattr::set(path, &format!("{}{}", LOCAL_ATTRIBUTE_PREFIX, LOCAL_FIELD_ENCRYPTED), if encrypted { b"true" } else { b"false" })?;
-    }
-    if let Some(sync_hash) = &local.sync_hash {
-        xattr::set(path, &format!("{}{}", LOCAL_ATTRIBUTE_PREFIX, LOCAL_FIELD_SYNC_HASH), encode_base64url(sync_hash).as_bytes())?;
     }
 
     Ok(())
@@ -521,11 +556,14 @@ mod tests {
         in_test_dir("ark_metadata_test", |temp_dir| {
             let p = temp_dir.join("file");
             fs::write(&p, b"x").unwrap();
-            let local = LocalMetadata { encrypted: Some(true), sync_hash: Some(vec![0xAB, 0xCD]) };
+            let local = LocalMetadata { encrypted: Some(true), sync_body_hash: Some(Hash { algorithm: crate::crypto::DEFAULT_HASH_ALGORITHM.to_string(), value: vec![0xAB, 0xCD] }), sync_modified: Some("2026-01-01T00:00:00Z".to_string()) };
             write_local_metadata_attributes(&p, &local).unwrap();
             let back = read_local_metadata_attributes(&p).unwrap();
             assert_eq!(back.encrypted, Some(true));
-            assert_eq!(back.sync_hash.as_deref(), Some(&[0xAB, 0xCD][..]));
+            let back_hash = back.sync_body_hash.as_ref().unwrap();
+            assert_eq!(back_hash.algorithm, crate::crypto::DEFAULT_HASH_ALGORITHM);
+            assert_eq!(back_hash.value, vec![0xAB, 0xCD]);
+            assert_eq!(back.sync_modified.as_deref(), Some("2026-01-01T00:00:00Z"));
         });
     }
 
@@ -534,12 +572,14 @@ mod tests {
         in_test_dir("ark_metadata_test", |temp_dir| {
             let p = temp_dir.join("file");
             fs::write(&p, b"x").unwrap();
-            let full = LocalMetadata { encrypted: Some(true), sync_hash: Some(vec![1, 2, 3]) };
+            let full = LocalMetadata { encrypted: Some(true), sync_body_hash: Some(Hash { algorithm: crate::crypto::DEFAULT_HASH_ALGORITHM.to_string(), value: vec![1, 2, 3] }), sync_modified: Some("2026-01-01T00:00:00Z".to_string()) };
             write_local_metadata_attributes(&p, &full).unwrap();
             let cleared = LocalMetadata::default();
             write_local_metadata_attributes(&p, &cleared).unwrap();
             assert_eq!(xattr::get(&p, "user.ark_local.encrypted").unwrap(), None);
-            assert_eq!(xattr::get(&p, "user.ark_local.sync_hash").unwrap(), None);
+            assert_eq!(xattr::get(&p, "user.ark_local.sync_body_hash_algorithm").unwrap(), None);
+            assert_eq!(xattr::get(&p, "user.ark_local.sync_body_hash_value").unwrap(), None);
+            assert_eq!(xattr::get(&p, "user.ark_local.sync_modified").unwrap(), None);
         });
     }
 

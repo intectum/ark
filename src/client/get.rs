@@ -5,7 +5,8 @@ use std::path::Path;
 
 use super::decrypt::decrypt as decrypt_body;
 use crate::client::request;
-use crate::types::{IdentityContext, LocalMetadata, Metadata};
+use crate::crypto::DEFAULT_HASH_ALGORITHM;
+use crate::types::{Hash, IdentityContext, LocalMetadata, Metadata};
 use crate::identity::resolve_identity;
 use crate::metadata::{read_metadata_headers, verify_metadata, write_local_metadata_attributes, write_metadata_attributes};
 use crate::util::{io_err, resolve_client_url, sha256};
@@ -19,7 +20,7 @@ use crate::util::{io_err, resolve_client_url, sha256};
 ///
 /// The returned [`LocalMetadata`] reflects whether the written body is
 /// ciphertext (`encrypted=Some(true)`) or plaintext, and includes a
-/// `sync_hash` when a plaintext body is written.
+/// `sync_body_hash` when a plaintext body is written.
 pub fn get(
     ctx: &IdentityContext,
     path: &str,
@@ -36,9 +37,10 @@ pub fn get(
     let metadata = read_metadata_headers(&headers)?;
 
     let modifier_identity = resolve_identity(ctx, &metadata.modified_by)?;
-    verify_metadata(&modifier_identity.public_key, &metadata, Some(&body))?;
+    let verify_body = if metadata.body_hash.is_some() { Some(body.as_slice()) } else { None };
+    verify_metadata(&modifier_identity.public_key, &metadata, verify_body)?;
 
-    let final_body = if decrypt {
+    let final_body = if decrypt && metadata.encryption_algorithm.is_some() {
         let mut buf = Vec::new();
         decrypt_body(ctx, &metadata, &mut body.as_slice(), &mut buf)?;
         buf
@@ -48,11 +50,12 @@ pub fn get(
 
     let local_metadata = LocalMetadata {
         encrypted: Some(!decrypt),
-        sync_hash: if decrypt || metadata.encryption_algorithm.is_none() {
-            Some(sha256(&final_body))
+        sync_body_hash: if decrypt || metadata.encryption_algorithm.is_none() {
+            Some(Hash { algorithm: DEFAULT_HASH_ALGORITHM.to_string(), value: sha256(&final_body) })
         } else {
             None
         },
+        sync_modified: Some(metadata.modified.clone()),
     };
 
     output.write_all(&final_body)?;
@@ -69,9 +72,15 @@ pub fn get_io(ctx: &IdentityContext, path: &str, output: Option<&str>, decrypt: 
         Some(o) => {
             let mut buf: Vec<u8> = Vec::new();
             let (metadata, local_metadata) = get(ctx, path, &mut buf, decrypt)?;
-            fs::write(o, &buf)?;
 
             let output_path = Path::new(o);
+            if let Some(parent) = output_path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    fs::create_dir_all(parent)?;
+                }
+            }
+            fs::write(output_path, &buf)?;
+
             write_metadata_attributes(output_path, &metadata)?;
             write_local_metadata_attributes(output_path, &local_metadata)?;
         }
@@ -109,6 +118,27 @@ mod tests {
             get_io(&ctx, "hello.txt", Some(out.to_str().unwrap()), false).unwrap();
 
             assert_eq!(fs::read(&out).unwrap(), b"hi from server");
+        });
+    }
+
+    #[test]
+    fn get_dir_returns_metadata_without_body_hash_error() {
+        in_test_dir("ark_get_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let address = format!("gyan@127.0.0.1:{}", port);
+            let ctx = init_with_server(temp_dir, &address);
+
+            let server_dir = temp_dir.join("ark/gyan/shared");
+            fs::create_dir_all(&server_dir).unwrap();
+            let mut m = create_metadata(&ctx.identity.address, None);
+            m.members[0].key = None;
+            sign_metadata(ctx.identity_key.as_ref().unwrap(), &mut m, None).unwrap();
+            write_metadata_attributes(&server_dir, &m).unwrap();
+
+            let mut buf = Vec::new();
+            let (metadata, _) = get(&ctx, "shared", &mut buf, false).unwrap();
+            assert!(metadata.body_hash.is_none(), "dir metadata should have no body_hash");
+            assert!(!buf.is_empty(), "dir listing body should be returned");
         });
     }
 
@@ -222,14 +252,14 @@ mod tests {
             let address = format!("gyan@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &address);
             let (other_identity, other_key) = create_identity("other@example.com").unwrap();
-            write_plain_test_file(&temp_dir.join("ark/gyan/plain"), &other_identity, &other_key, b"raw");
+            write_encrypted_test_file(&temp_dir.join("ark/gyan/secret"), &other_identity, &other_key, b"raw");
 
             let identities_dir = temp_dir.join(".ark").join("identities");
             fs::create_dir_all(&identities_dir).unwrap();
             write_identity(&identities_dir.join("other@example.com.json"), &other_identity).unwrap();
 
             let out = temp_dir.join("out.bin");
-            let err = get_io(&ctx, "plain", Some(out.to_str().unwrap()), true).unwrap_err();
+            let err = get_io(&ctx, "secret", Some(out.to_str().unwrap()), true).unwrap_err();
             assert!(err.to_string().contains("no member entry"), "msg was {}", err);
         });
     }

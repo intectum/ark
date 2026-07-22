@@ -2,13 +2,13 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use crate::crypto::DEFAULT_ENCRYPTION_ALGORITHM;
-use crate::metadata::{create_metadata, sign_metadata, write_local_metadata_attributes, write_metadata_attributes};
-use crate::types::{IdentityContext, LocalMetadata};
+use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, DEFAULT_HASH_ALGORITHM};
+use crate::metadata::{create_metadata, has_metadata_attributes, sign_metadata, write_local_metadata_attributes, write_metadata_attributes};
+use crate::types::{Hash, IdentityContext, LocalMetadata};
 use crate::util::{io_err, io_invalid_input, sha256};
 
 /// Seed ark metadata on an existing local file or directory. Signs and writes
-/// `user.ark.*` xattrs and (for files) sets `sync_hash` so
+/// `user.ark.*` xattrs and (for files) sets `sync_body_hash` so
 /// [`sync_io`](super::sync_io) will consider the file.
 ///
 /// `encryption_algorithm`: `Some("none")` = plaintext, `None` = default
@@ -22,7 +22,7 @@ pub fn track_io(ctx: &IdentityContext, path: &str, encryption_algorithm: Option<
         return Err(io_invalid_input("path does not exist"));
     }
 
-    if xattr::get(target, "user.ark.id")?.is_some() {
+    if has_metadata_attributes(target)? {
         return Err(io_err("metadata already exists"));
     }
 
@@ -52,7 +52,8 @@ pub fn track_io(ctx: &IdentityContext, path: &str, encryption_algorithm: Option<
     if let Some(body_bytes) = body.as_deref() {
         write_local_metadata_attributes(target, &LocalMetadata {
             encrypted: Some(false),
-            sync_hash: Some(sha256(body_bytes)),
+            sync_body_hash: Some(Hash { algorithm: DEFAULT_HASH_ALGORITHM.to_string(), value: sha256(body_bytes) }),
+            sync_modified: Some(metadata.modified.clone()),
         })?;
     }
 
@@ -89,7 +90,7 @@ mod tests {
 
             let local = read_local_metadata_attributes(&path).unwrap();
             assert_eq!(local.encrypted, Some(false));
-            assert_eq!(local.sync_hash.as_deref(), Some(sha256(b"hello").as_slice()));
+            assert_eq!(local.sync_body_hash.as_ref().unwrap().value, sha256(b"hello"));
 
             let on_disk = fs::read(&path).unwrap();
             assert_eq!(on_disk, b"hello", "local file stays plain");

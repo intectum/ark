@@ -114,7 +114,7 @@ enum Cmd {
     },
     /// Encrypt and upload a file.
     ///
-    /// A trailing slash on PATH creates or updates a directory (empty body).
+    /// If INPUT is a directory, creates or updates a directory (empty body).
     /// A fresh file key is minted on every encrypted put and wrapped for every
     /// member. If the input file already has user.ark_local.encrypted=true
     /// (e.g. after `ark encrypt`), the body is uploaded as-is. The server
@@ -130,12 +130,17 @@ enum Cmd {
         /// Ark URL or path.
         path: String,
     },
-    /// Push local files to the server. One-way client-to-server.
+    /// Reconcile local and remote state in one pass.
     ///
-    /// Only files with a sync_hash (set by `track` or a prior `put`/`get`) are
-    /// considered. Files whose SHA-256 matches the stored hash are skipped;
-    /// symlinks and .ark/ directories are always skipped. With --watch,
-    /// blocks after the initial push and also pulls remote changes via SSE.
+    /// Fetches new entries from the server's request log (`.ark/requests/`)
+    /// since the checkpoint in `.ark/last_sync_request`, then walks the local tree.
+    /// Per tracked file, compares local SHA-256 to `sync_body_hash`
+    /// (local_modified?) and local `body_hash` to the log's `body_hash`
+    /// (remote_modified?). Pure local edits push; pure remote changes pull;
+    /// concurrent changes on both sides rename the local copy to
+    /// `<name>.conflict-<iso>` and pull remote. Untracked local files, symlinks, and `.ark/` are left alone.
+    /// With --watch, spawns the SSE watcher before the initial pass, then
+    /// blocks on the local FS watcher for continuous sync.
     Sync {
         /// Watch for changes and re-sync continuously.
         #[arg(short, long)]
@@ -146,7 +151,7 @@ enum Cmd {
     },
     /// Seed ark metadata on a local file or directory.
     ///
-    /// Signs and writes user.ark.* xattrs. For files, also sets sync_hash so
+    /// Signs and writes user.ark.* xattrs. For files, also sets sync_body_hash so
     /// `sync` will consider the file. Errors if metadata already exists.
     Track {
         /// Encryption algorithm; use "none" for plaintext. Files only.

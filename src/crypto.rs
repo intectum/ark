@@ -53,7 +53,7 @@ pub fn restore_secret_key_from_password(identity: &Identity, password: &str) -> 
     match identity.public_key.algorithm.as_str() {
         DEFAULT_PASSWORD_ALGORITHM => {
             if identity.public_key.value.len() != PASSWORD_VERIFIER_LEN + PASSWORD_SALT_LEN + PASSWORD_PUBKEY_LEN {
-                return Err(io_err("public key wrong length"));
+                return Err(io_err("public key is wrong length"));
             }
 
             let verifier = &identity.public_key.value[..PASSWORD_VERIFIER_LEN];
@@ -100,7 +100,7 @@ pub fn to_public_key(secret_key: &Key) -> io::Result<Key> {
     match secret_key.algorithm.as_str() {
         DEFAULT_PASSWORD_ALGORITHM => {
             if secret_key.value.len() < PASSWORD_SALT_LEN {
-                return Err(io_err("secret key too short"));
+                return Err(io_err("secret key is too short"));
             }
 
             let (salt, password) = secret_key.value.split_at(PASSWORD_SALT_LEN);
@@ -249,7 +249,7 @@ pub fn decrypt_bytes(secret_key: &Key, ciphertext: &[u8]) -> std::io::Result<Vec
     match secret_key.algorithm.as_str() {
         DEFAULT_ENCRYPTION_ALGORITHM => {
             if ciphertext.len() < 12 {
-                return Err(io_err("ciphertext too short"));
+                return Err(io_err("ciphertext is too short"));
             }
 
             let (nonce, ciphertext) = ciphertext.split_at(12);
@@ -272,7 +272,7 @@ pub fn decrypt_bytes(secret_key: &Key, ciphertext: &[u8]) -> std::io::Result<Vec
         },
         "hpke-x25519-hkdf-sha256-aes256gcm" => {
             if ciphertext.len() < 32 {
-                return Err(io_err("ciphertext too short"));
+                return Err(io_err("ciphertext is too short"));
             }
 
             let (encapped_key, ciphertext) = ciphertext.split_at(32);
@@ -321,7 +321,7 @@ fn expand_argon2id_ed25519(password: &str, salt: &[u8]) -> io::Result<(Vec<u8>, 
 fn derive_public_ed25519_from_argon2id_ed25519(public_key: &Key) -> io::Result<Key> {
     let offset = PASSWORD_VERIFIER_LEN + PASSWORD_SALT_LEN;
     if public_key.value.len() < offset + PASSWORD_PUBKEY_LEN {
-        return Err(io_err("public key too short"));
+        return Err(io_err("public key is too short"));
     }
 
     Ok(Key {
@@ -332,7 +332,7 @@ fn derive_public_ed25519_from_argon2id_ed25519(public_key: &Key) -> io::Result<K
 
 fn derive_secret_ed25519_from_argon2id_ed25519(secret_key: &Key) -> io::Result<Key> {
     if secret_key.value.len() < PASSWORD_SALT_LEN {
-        return Err(io_err("secret key too short"));
+        return Err(io_err("secret key is too short"));
     }
 
     let (salt, password) = secret_key.value.split_at(PASSWORD_SALT_LEN);
@@ -397,7 +397,7 @@ mod tests {
         };
 
         let err = decrypt_bytes(&key, b"short").unwrap_err();
-        assert!(err.to_string().contains("too short"));
+        assert!(err.to_string().contains("is too short"));
     }
 
     #[test]
@@ -435,7 +435,7 @@ mod tests {
         };
 
         let err = decrypt_bytes(&key, b"short").unwrap_err();
-        assert!(err.to_string().contains("too short"));
+        assert!(err.to_string().contains("is too short"));
     }
 
     #[test]

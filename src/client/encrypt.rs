@@ -3,9 +3,9 @@ use std::io;
 use std::io::{Read, Write};
 use std::path::Path;
 
-use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, encrypt_bytes};
-use crate::metadata::{apply_key_to_metadata, create_metadata, extract_key_from_metadata, read_local_metadata_attributes, read_metadata_attributes, validate_metadata, write_local_metadata_attributes, write_metadata_attributes};
-use crate::types::{IdentityContext, Key, LocalMetadata, Metadata};
+use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, DEFAULT_HASH_ALGORITHM, encrypt_bytes};
+use crate::metadata::{apply_key_to_metadata, create_metadata, extract_key_from_metadata, has_metadata_attributes, read_local_metadata_attributes, read_metadata_attributes, validate_metadata, write_local_metadata_attributes, write_metadata_attributes};
+use crate::types::{Hash, IdentityContext, Key, LocalMetadata, Metadata};
 use crate::util::{decode_base64url, io_err, io_invalid_input, sha256};
 
 /// Encrypt `plaintext` to `ciphertext` using the file key wrapped in
@@ -61,7 +61,7 @@ pub fn encrypt_io(
     }
 
     let source_has_metadata = match source {
-        Some(p) => xattr::get(Path::new(p), "user.ark.id")?.is_some(),
+        Some(p) => has_metadata_attributes(Path::new(p))?,
         None => false,
     };
 
@@ -119,7 +119,8 @@ pub fn encrypt_io(
             write_metadata_attributes(destination_path, &metadata)?;
             write_local_metadata_attributes(destination_path, &LocalMetadata {
                 encrypted: Some(true),
-                sync_hash: Some(sha256(&plaintext_bytes)),
+                sync_body_hash: Some(Hash { algorithm: DEFAULT_HASH_ALGORITHM.to_string(), value: sha256(&plaintext_bytes) }),
+                sync_modified: Some(metadata.modified.clone()),
             })?;
         }
         None => io::stdout().write_all(&ciphertext_bytes)?,
@@ -240,7 +241,7 @@ mod tests {
             let (identity, secret_key, acc) = create_test_account(temp_dir, TEST_ADDRESS);
             let p = temp_dir.join("in.bin");
             write_plain_test_file(&p, &identity, &secret_key, b"x");
-            write_local_metadata_attributes(&p, &LocalMetadata { encrypted: Some(true), sync_hash: None }).unwrap();
+            write_local_metadata_attributes(&p, &LocalMetadata { encrypted: Some(true), sync_body_hash: None, sync_modified: None }).unwrap();
             env::set_current_dir(&acc).unwrap();
             let ctx = create_client_context().unwrap();
             let err = encrypt_io(&ctx, Some(p.to_str().unwrap()), None, None, None, None).unwrap_err();
@@ -272,7 +273,7 @@ mod tests {
     }
 
     #[test]
-    fn encrypt_sets_sync_hash_over_plaintext() {
+    fn encrypt_sets_sync_body_hash_over_plaintext() {
         in_test_dir("ark_encrypt_test", |temp_dir| {
             let (_identity, _secret_key, acc) = create_test_account(temp_dir, TEST_ADDRESS);
             let in_path = temp_dir.join("in.bin");
@@ -283,7 +284,7 @@ mod tests {
             let k = encode_base64url([9u8; 32]);
             encrypt_io(&ctx, Some(in_path.to_str().unwrap()), Some(out_path.to_str().unwrap()), None, Some(&k), None).unwrap();
             let local = read_local_metadata_attributes(&out_path).unwrap();
-            assert_eq!(local.sync_hash.as_deref(), Some(sha256(b"plain").as_slice()));
+            assert_eq!(local.sync_body_hash.as_ref().unwrap().value, sha256(b"plain"));
             assert_eq!(local.encrypted, Some(true));
         });
     }

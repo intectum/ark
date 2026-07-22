@@ -11,7 +11,7 @@ use url::Url;
 
 use crate::http::{read_stream_events, write_request};
 use crate::types::{DirectoryEntry, DirectoryEntryKind, IdentityContext, StreamEvent, WatchAction, WatchEvent};
-use crate::util::{create_authorization_header, io_err, now_seconds};
+use crate::util::{create_authorization_header, io_err, now};
 
 const REMOTE_READ_TIMEOUT: Duration = Duration::from_secs(45);
 const REMOTE_RECONNECT_DELAY: Duration = Duration::from_secs(2);
@@ -66,8 +66,9 @@ where
             Err(e) => { eprintln!("watch error: {}", e); continue; }
         };
 
-        for path in event.paths {
-            let watch_event = to_watch_event_local(&event.kind, &path);
+        for event_path in event.paths {
+            let relative_path = event_path.strip_prefix(path).unwrap_or(&event_path);
+            let watch_event = to_watch_event_local(&event.kind, relative_path);
             if let Some(e) = watch_event {
                 if on_event(e) { return Ok(()); }
             }
@@ -91,7 +92,7 @@ where
         let port = url.port().unwrap_or(80);
         let host_header = format!("{}:{}", host, port);
 
-        let authorization = create_authorization_header(ctx, "GET", &host_header, url.path(), now_seconds(), &[])?;
+        let authorization = create_authorization_header(ctx, "GET", &host_header, url.path(), now(), &[])?;
 
         let headers: Vec<(&str, &str)> = vec![
             ("Authorization", authorization.as_str()),

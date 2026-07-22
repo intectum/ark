@@ -59,8 +59,11 @@ pub struct Key {
 pub struct LocalMetadata {
     /// Whether the file's bytes on disk are ciphertext.
     pub encrypted: Option<bool>,
-    /// SHA-256 of the last-synced plaintext body. Absent = do not sync.
-    pub sync_hash: Option<Vec<u8>>,
+    /// Hash of the last-synced plaintext body. Absent = do not sync.
+    pub sync_body_hash: Option<Hash>,
+    /// `Metadata.modified` at the last successful sync. Baseline for detecting
+    /// local metadata drift (e.g. `chmod_io` since last sync).
+    pub sync_modified: Option<String>,
 }
 
 /// A member entry in a file or directory's metadata: address, permission,
@@ -154,6 +157,16 @@ impl RelayMode {
             _ => None,
         }
     }
+}
+
+/// One parsed entry from an account's `.ark/requests/` log — request line,
+/// request headers, and response status. Bodies are not recorded in log
+/// entries.
+pub struct RequestEntry {
+    pub method: String,
+    pub target: String,
+    pub request_headers: Vec<(String, String)>,
+    pub status: u16,
 }
 
 #[derive(Clone, Serialize, Deserialize)]

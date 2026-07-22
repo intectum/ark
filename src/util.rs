@@ -1,4 +1,6 @@
 use std::env::current_dir;
+use std::fs;
+use std::io;
 use std::io::{Error, ErrorKind};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -9,13 +11,14 @@ use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::crypto::sign_bytes;
-use crate::types::IdentityContext;
+use crate::http::{read_request, read_response};
+use crate::types::{IdentityContext, RequestEntry};
 
-pub fn find_account_root() -> std::io::Result<PathBuf> {
+pub fn find_account_root() -> io::Result<PathBuf> {
     let current = current_dir()?;
 
     let mut root = current.as_path();
-    while !std::fs::exists(root.join(".ark"))? {
+    while !fs::exists(root.join(".ark"))? {
         root = root
             .parent()
             .ok_or_else(|| Error::new(ErrorKind::NotFound, "no .ark dir found"))?;
@@ -24,11 +27,11 @@ pub fn find_account_root() -> std::io::Result<PathBuf> {
     Ok(root.to_path_buf())
 }
 
-pub fn resolve_client_url(ctx: &IdentityContext, path: &str) -> std::io::Result<Url> {
+pub fn resolve_client_url(ctx: &IdentityContext, path: &str) -> io::Result<Url> {
     resolve_client_url_raw(&ctx.root, path, &ctx.identity.address)
 }
 
-pub fn resolve_client_url_raw(root: &Path, path: &str, address: &str) -> std::io::Result<Url> {
+pub fn resolve_client_url_raw(root: &Path, path: &str, address: &str) -> io::Result<Url> {
     let mut s = path.to_string();
     if !s.contains('@') {
         if !s.starts_with('/') {
@@ -55,7 +58,7 @@ pub fn resolve_client_url_raw(root: &Path, path: &str, address: &str) -> std::io
     Ok(url)
 }
 
-pub fn resolve_server_url(path: &str) -> std::io::Result<Url> {
+pub fn resolve_server_url(path: &str) -> io::Result<Url> {
     let url = Url::parse(&format!("http://localhost{}", path))
         .map_err(|e| io_invalid_input(&format!("invalid URL {}: {}", path, e)))?;
 
@@ -64,7 +67,7 @@ pub fn resolve_server_url(path: &str) -> std::io::Result<Url> {
     Ok(url)
 }
 
-fn reject_path_traversal(url: &Url) -> std::io::Result<()> {
+fn reject_path_traversal(url: &Url) -> io::Result<()> {
     for component in Path::new(url.path()).components() {
         if matches!(component, Component::ParentDir) {
             return Err(io_invalid_input("path traversal not allowed"));
@@ -90,7 +93,20 @@ pub fn request_to_bytes(method: &str, host: &str, path: &str, timestamp: u64, bo
     bytes
 }
 
-pub fn create_authorization_header(ctx: &IdentityContext, method: &str, host: &str, path: &str, timestamp: u64, body: &[u8]) -> std::io::Result<String> {
+pub fn parse_request_entry(entry_bytes: &[u8]) -> io::Result<RequestEntry> {
+    let boundary = entry_bytes.windows(4).position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| io_err("no header separator"))?;
+
+    let request_bytes = &entry_bytes[..boundary];
+    let response_bytes = &entry_bytes[boundary + 4..];
+
+    let (method, target, request_headers, _) = read_request(&mut &request_bytes[..], true)?;
+    let (status, _, _) = read_response(&mut &response_bytes[..], true)?;
+
+    Ok(RequestEntry { method, target, request_headers, status })
+}
+
+pub fn create_authorization_header(ctx: &IdentityContext, method: &str, host: &str, path: &str, timestamp: u64, body: &[u8]) -> io::Result<String> {
     let identity_key = ctx.identity_key.as_ref().ok_or_else(|| io_err("context missing identity_key"))?;
     let request_bytes = request_to_bytes(method, host, path, timestamp, body);
     let signature = sign_bytes(identity_key, &request_bytes)?;
@@ -136,18 +152,25 @@ pub fn sha256(data: &[u8]) -> Vec<u8> {
     hash.finalize().to_vec()
 }
 
-pub fn now_milliseconds() -> u64 {
+pub fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
 }
 
-pub fn now_seconds() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+pub fn now_iso() -> String {
+    let millis = now();
+    let secs = (millis / 1000) as i64;
+    let sub_millis = (millis % 1000) as u16;
+    let dt = time::OffsetDateTime::from_unix_timestamp(secs).expect("valid unix timestamp");
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        dt.year(), dt.month() as u8, dt.day(), dt.hour(), dt.minute(), dt.second(), sub_millis
+    )
 }
 
-pub fn now_iso() -> String {
-    let timestamp = time::OffsetDateTime::from_unix_timestamp(now_seconds() as i64).expect("valid unix timestamp");
-    timestamp.format(&time::format_description::well_known::Rfc3339)
-        .expect("rfc3339 format")
+/// ISO 8601 timestamp with filename-safe substitutions (`:` → `-`).
+/// NTFS and other filesystems reject `:` in filenames.
+pub fn now_iso_fs() -> String {
+    now_iso().replace(':', "-")
 }
 
 pub fn io_err(s: &str) -> Error {

@@ -6,9 +6,9 @@ use crate::crypto::verify_bytes;
 use crate::identity::{parse_address, resolve_identity};
 use crate::metadata::get_member;
 use crate::types::{Identity, IdentityContext, Member, Permission, Signature};
-use crate::util::{decode_base64url, io_err, now_seconds, parse_authorization_header, request_to_bytes};
+use crate::util::{decode_base64url, io_err, now, parse_authorization_header, request_to_bytes};
 
-use super::MAX_CLOCK_SKEW_SECS;
+use super::MAX_CLOCK_SKEW_MS;
 
 pub fn authenticate(
     server_ctx: &IdentityContext,
@@ -41,7 +41,7 @@ pub fn authenticate(
     let signature = decode_base64url(&signature_b64).map_err(|_| io_err("auth signature not base64url encoded"))?;
 
     let timestamp: u64 = timestamp_str.parse().map_err(|_| io_err("invalid timestamp in Authorization"))?;
-    if now_seconds().abs_diff(timestamp) > MAX_CLOCK_SKEW_SECS {
+    if now().abs_diff(timestamp) > MAX_CLOCK_SKEW_MS {
         return Err(io_err("timestamp outside allowed window"));
     }
 

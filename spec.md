@@ -556,7 +556,7 @@ Alice's client communicates with her home server over HTTPS.
 | `PUT` | `/ark/alice/path/to/file` | Create or update a file |
 | `DELETE` | `/ark/alice/path/to/file` | Delete a file |
 | `GET` | `/ark/alice/path/to/dir/` | List directory contents; also returns directory `X-Ark-Metadata` if present |
-| `PUT` | `/ark/alice/path/to/dir/` | Create or update directory metadata (empty body, trailing slash required for a directory that does not yet exist) |
+| `PUT` | `/ark/alice/path/to/dir/` | Create or update directory metadata (empty body; dir vs file is determined by the presence of `body_hash` in the request metadata, not by the URL) |
 | `DELETE` | `/ark/alice/path/to/dir/` | Delete a directory recursively |
 
 **GET response:**

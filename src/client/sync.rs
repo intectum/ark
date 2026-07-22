@@ -1,69 +1,155 @@
+use std::collections::HashMap;
+use std::env::current_dir;
 use std::fs;
 use std::io;
 use std::path::Path;
 use std::thread;
 
-use crate::client::get::get_io;
+use crate::client::get::{get, get_io};
+use crate::client::head::head;
 use crate::client::put::put_io;
-use crate::metadata::read_local_metadata_attributes;
-use crate::types::{DirectoryEntryKind, IdentityContext, WatchAction};
-use crate::util::{io_err, resolve_client_url, sha256};
+use crate::client::request::request;
+use crate::identity::parse_address;
+use crate::metadata::{has_metadata_attributes, read_local_metadata_attributes, read_metadata_attributes, read_metadata_headers, remove_local_metadata_attributes, write_local_metadata_attributes, write_metadata_attributes};
+use crate::types::{DirectoryEntry, DirectoryEntryKind, IdentityContext, Metadata, WatchAction};
+use crate::util::{now_iso_fs, io_err, parse_request_entry, resolve_client_url, sha256};
 use crate::watch;
 
-/// Push tracked local files under `ctx.root` to the server. Skips symlinks,
-/// `.ark/` directories, and files whose current SHA-256 matches the stored
-/// `sync_hash` (unchanged files) or that lack a `sync_hash` entirely
-/// (untracked or encrypted-at-rest).
-///
-/// When `watch` is true, blocks after the initial push and spawns two watchers:
-/// a local FS watcher that re-pushes on change, and a remote SSE watcher that
-/// pulls remote creates/modifies/deletes. `decrypt` controls whether pulled
-/// files are decrypted on write.
-pub fn sync_io(ctx: &IdentityContext, watch: bool, decrypt: bool) -> io::Result<()> {
-    // TODO: pull_dir
-    push_dir(&ctx, &ctx.root)?;
+struct SyncEntry {
+    relative_path: String,
+    modified_local_body: bool,
+    modified_local_metadata: bool,
+    modified_remote_body: bool,
+    modified_remote_metadata: bool,
+}
 
+/// CLI-shaped [`sync`]. Reconciles the current working directory (which
+/// must live under an account root).
+pub fn sync_io(ctx: &IdentityContext, watch: bool, decrypt: bool) -> io::Result<()> {
+    sync(ctx, &current_dir()?, watch, decrypt)
+}
+
+/// Reconcile local and remote state under `path` in a single pass. `path`
+/// must be `ctx.root` or a descendant.
+///
+/// Fetches `.ark/requests/` — the server-signed request log — for entries
+/// newer than the checkpoint in `.ark/last_sync_request` and builds a map of
+/// `rel_path → latest successful PUT`. Then walks the local tree under
+/// `path` once and compares each log entry against local state:
+///
+/// - `local_body_modified` = current SHA-256 differs from stored `sync_body_hash`
+///   (files only).
+/// - `remote_body_modified` = log entry's `body_hash` differs from local
+///   `body_hash` (files only).
+/// - `remote_metadata_modified` = log entry's `modified` timestamp differs
+///   from local's.
+///
+/// Dispatch per entry: push body when only local changed; pull body when
+/// only remote body changed; pull metadata-only (via HEAD) when just
+/// timestamps diverge; conflict when both bodies changed — pull remote
+/// into `<name>.conflict-<iso>` sidecar carrying remote body plus remote
+/// `user.ark.*` metadata (with `user.ark_local.*` sync attributes
+/// stripped so the sidecar is not itself sync-tracked), leaving the
+/// local edit at the original path untouched. Metadata-only conflict
+/// (both sides bumped timestamps but bodies match) writes a similar
+/// sidecar: files copy the local body (bytes match remote), dirs get an
+/// empty sidecar dir, both carrying remote metadata for side-by-side
+/// comparison. Directories carry only metadata; a divergent dir
+/// triggers a metadata pull (creating the local dir if missing).
+/// `.ark/` targets, log entries outside `path`, and entries authored by
+/// self are ignored. When `path` equals `ctx.root` the last seen log
+/// entry filename is written back to `.ark/last_sync_request` so the
+/// next full sync skips it; subdirectory syncs do not advance the
+/// checkpoint (they would otherwise drop entries outside the subtree).
+///
+/// Symlinks, `.ark/` dirs, and files without `sync_body_hash` (untracked or
+/// encrypted-at-rest) are skipped by the push side; the pull side leaves
+/// untracked local files alone rather than clobbering them. Metadata
+/// changes made via [`chmod_io`](super::chmod_io) are local-only and do
+/// not auto-propagate — a manual PUT is required to publish them.
+///
+/// When `watch` is true, spawns both the remote SSE watcher and the local FS
+/// watcher before the initial reconciliation so events landing during
+/// catchup are still delivered (operations are idempotent, so duplicates
+/// from watchers firing during the initial pass are harmless), then runs
+/// the initial pass and blocks until either watcher exits. Watchers are
+/// scoped to `path` too. `decrypt` controls whether pulled files are
+/// decrypted on write.
+pub fn sync(ctx: &IdentityContext, path: &Path, watch: bool, decrypt: bool) -> io::Result<()> {
     if watch {
         thread::scope(|s| {
             s.spawn(|| {
-                if let Err(e) = pull_watch(ctx, decrypt) {
+                if let Err(e) = pull_watch(ctx, path, decrypt) {
                     eprintln!("pull watch: {}", e);
                 }
             });
-            if let Err(e) = push_watch(ctx) {
-                eprintln!("push watch: {}", e);
+            s.spawn(|| {
+                if let Err(e) = push_watch(ctx, path) {
+                    eprintln!("push watch: {}", e);
+                }
+            });
+            if let Err(e) = initial_sync(ctx, path, decrypt) {
+                eprintln!("initial sync: {}", e);
             }
         });
+    } else {
+        initial_sync(ctx, path, decrypt)?;
     }
 
     Ok(())
 }
 
-fn pull_watch(ctx: &IdentityContext, decrypt: bool) -> io::Result<()> {
-    let url = resolve_client_url(ctx, "/")?;
+fn initial_sync(ctx: &IdentityContext, path: &Path, decrypt: bool) -> io::Result<()> {
+    let (entries, last_sync_request) = check(ctx, path)?;
+
+    for entry in entries {
+        if let Err(e) = sync_entry(ctx, &entry, decrypt) {
+            eprintln!("sync failed for {}: {}", entry.relative_path, e);
+        }
+    }
+
+    if path == ctx.root {
+        if let Some(cp) = last_sync_request {
+            fs::write(ctx.root.join(".ark").join("last_sync_request"), &cp)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn pull_watch(ctx: &IdentityContext, path: &Path, decrypt: bool) -> io::Result<()> {
+    let rel_prefix = to_relative_path(ctx, path)?;
+    let url = resolve_client_url(ctx, &format!("/{}", rel_prefix))?;
 
     watch::watch_remote(ctx, &url, |event| {
-        let rel_str = event.path.to_string_lossy();
-        let rel = rel_str.trim_start_matches('/');
-        if rel.is_empty() || rel == ".ark" || rel.starts_with(".ark/") {
-            return Ok(());
-        }
-        if matches!(event.kind, Some(DirectoryEntryKind::Dir)) {
-            return Ok(());
-        }
-
-        let local_path = ctx.root.join(rel);
+        let subpath = event.path.to_string_lossy();
+        let relative_path = if rel_prefix.is_empty() {
+            subpath.into_owned()
+        } else if subpath.is_empty() {
+            rel_prefix.clone()
+        } else {
+            format!("{}/{}", rel_prefix, subpath)
+        };
+        let is_dir = matches!(event.kind, Some(DirectoryEntryKind::Dir));
 
         match event.action {
             WatchAction::Created | WatchAction::Modified => {
-                if let Err(e) = pull_file(ctx, rel, &local_path, decrypt) {
-                    eprintln!("pull file {}: {}", rel, e);
+                let entry = SyncEntry {
+                    relative_path: relative_path.clone(),
+                    modified_local_body: false,
+                    modified_local_metadata: false,
+                    modified_remote_body: !is_dir,
+                    modified_remote_metadata: true,
+                };
+                if let Err(e) = sync_entry(ctx, &entry, decrypt) {
+                    eprintln!("sync failed for {}: {}", relative_path, e);
                 }
             }
             WatchAction::Deleted => {
-                if local_path.exists() {
+                let local_path = ctx.root.join(&relative_path);
+                if local_path.exists() && !is_dir {
                     if let Err(e) = fs::remove_file(&local_path) {
-                        eprintln!("pull delete {}: {}", rel, e);
+                        eprintln!("pull delete {}: {}", relative_path, e);
                     }
                 }
             }
@@ -73,46 +159,112 @@ fn pull_watch(ctx: &IdentityContext, decrypt: bool) -> io::Result<()> {
     })
 }
 
-fn push_watch(ctx: &IdentityContext) -> io::Result<()> {
-    eprintln!("watching {}", ctx.root.display());
-
-    watch::watch_local(&ctx.root, |event| {
+fn push_watch(ctx: &IdentityContext, path: &Path) -> io::Result<()> {
+    watch::watch_local(path, |event| {
         match event.action {
             WatchAction::Created | WatchAction::Modified => {}
             _ => return false,
         }
 
-        if let Ok(rel) = event.path.strip_prefix(&ctx.root) {
-            if rel.starts_with(".ark") { return false; }
-        }
+        let absolute = path.join(&event.path);
+        if !absolute.is_file() { return false; }
 
-        if !event.path.is_file() { return false; }
-
-        if let Err(e) = push_file(ctx, &event.path) {
-            eprintln!("push failed for {}: {}", event.path.display(), e);
+        match check_entry(ctx, &absolute) {
+            Ok(Some(entry)) => {
+                if let Err(e) = sync_entry(ctx, &entry, false) {
+                    eprintln!("push failed for {}: {}", absolute.display(), e);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => eprintln!("check {}: {}", absolute.display(), e),
         }
 
         false
     }, None)
 }
 
-fn push_dir(ctx: &IdentityContext, dir: &Path) -> io::Result<()> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        if entry.file_type()?.is_symlink() {
+fn check(ctx: &IdentityContext, path: &Path) -> io::Result<(Vec<SyncEntry>, Option<String>)> {
+    let (log_map, last_sync_request) = fetch_log_map(ctx)?;
+    let rel_prefix = to_relative_path(ctx, path)?;
+
+    let mut entries: HashMap<String, SyncEntry> = HashMap::new();
+    check_dir(ctx, path, &mut entries)?;
+
+    for (rel, log) in &log_map {
+        if log.modified_by == ctx.identity.address { continue; }
+        if !under_prefix(rel, &rel_prefix) { continue; }
+
+        let is_dir = log.body_hash.is_none();
+        let local_path = ctx.root.join(rel);
+        let has_local_metadata = local_path.exists() && has_metadata_attributes(&local_path)?;
+
+        if !is_dir && local_path.exists() && !has_local_metadata {
+            eprintln!("skip pull for untracked local {}", local_path.display());
             continue;
         }
+
+        let (local_modified, local_body_hash, sync_modified) = if has_local_metadata {
+            let m = read_metadata_attributes(&local_path)?;
+            let l = read_local_metadata_attributes(&local_path)?;
+            (Some(m.modified), m.body_hash.map(|h| h.value), l.sync_modified)
+        } else {
+            (None, None, None)
+        };
+
+        let body_changed = if is_dir {
+            false
+        } else {
+            let remote_body_hash = log.body_hash.as_ref().map(|h| &h.value);
+            match (&local_body_hash, remote_body_hash) {
+                (Some(l), Some(r)) if l == r => false,
+                (None, None) => false,
+                _ => true,
+            }
+        };
+        let baseline = sync_modified.as_ref().or(local_modified.as_ref());
+        let metadata_changed = baseline != Some(&log.modified);
+
+        if !body_changed && !metadata_changed { continue; }
+
+        entries.entry(rel.clone())
+            .and_modify(|e| {
+                e.modified_remote_body = body_changed;
+                e.modified_remote_metadata = metadata_changed;
+            })
+            .or_insert(SyncEntry {
+                relative_path: rel.clone(),
+                modified_local_body: false,
+                modified_local_metadata: false,
+                modified_remote_body: body_changed,
+                modified_remote_metadata: metadata_changed,
+            });
+    }
+
+    let list = entries.into_values()
+        .filter(|e| e.modified_local_body || e.modified_local_metadata || e.modified_remote_body || e.modified_remote_metadata)
+        .collect();
+    Ok((list, last_sync_request))
+}
+
+fn check_dir(
+    ctx: &IdentityContext,
+    path: &Path,
+    entries: &mut HashMap<String, SyncEntry>,
+) -> io::Result<()> {
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        if entry.file_type()?.is_symlink() { continue; }
 
         let path = entry.path();
-        if path.file_name().map_or(false, |file_name| file_name == ".ark") {
-            continue;
-        }
 
         if path.is_dir() {
-            push_dir(ctx, &path)?;
-        } else if path.is_file() {
-            if let Err(e) = push_file(ctx, &path) {
-                eprintln!("push failed for {}: {}", path.display(), e);
+            check_dir(ctx, &path, entries)?;
+        }
+        if path.is_dir() || path.is_file() {
+            match check_entry(ctx, &path) {
+                Ok(Some(e)) => { entries.insert(e.relative_path.clone(), e); }
+                Ok(None) => {}
+                Err(e) => eprintln!("check {}: {}", path.display(), e),
             }
         }
     }
@@ -120,51 +272,221 @@ fn push_dir(ctx: &IdentityContext, dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn pull_file(ctx: &IdentityContext, remote_rel: &str, local_path: &Path, decrypt: bool) -> io::Result<()> {
-    let target = format!("/{}", remote_rel);
+fn check_entry(
+    ctx: &IdentityContext,
+    path: &Path,
+) -> io::Result<Option<SyncEntry>> {
+    let local = read_local_metadata_attributes(path)?;
+    let is_dir = path.is_dir();
 
-    if let Some(parent) = local_path.parent() {
-        fs::create_dir_all(parent)?;
+    if is_dir {
+        if local.sync_modified.is_none() { return Ok(None); }
+    } else if local.sync_body_hash.is_none() {
+        return Ok(None);
     }
 
-    let local_str = local_path.to_str().ok_or_else(|| io_err("local path is not valid UTF-8"))?;
-    get_io(ctx, &target, Some(local_str), decrypt)
-}
-
-fn push_file(ctx: &IdentityContext, local_path: &Path) -> io::Result<()> {
-    let sync_hash = match read_local_metadata_attributes(local_path)?.sync_hash {
-        Some(v) => v,
-        None => return Ok(()),
+    let modified_local_body = match &local.sync_body_hash {
+        Some(h) if !is_dir => h.value != sha256(&fs::read(path)?),
+        _ => false,
     };
 
-    let bytes = fs::read(local_path)?;
-    if sync_hash == sha256(&bytes) {
-        return Ok(());
+    let modified_local_metadata = match (&local.sync_modified, has_metadata_attributes(path)?) {
+        (Some(baseline), true) => &read_metadata_attributes(path)?.modified != baseline,
+        _ => false,
+    };
+
+    Ok(Some(SyncEntry {
+        relative_path: to_relative_path(ctx, path)?,
+        modified_local_body,
+        modified_local_metadata,
+        modified_remote_body: false,
+        modified_remote_metadata: false,
+    }))
+}
+
+fn sync_entry(ctx: &IdentityContext, entry: &SyncEntry, decrypt: bool) -> io::Result<()> {
+    let local_path = ctx.root.join(&entry.relative_path);
+    let target = format!("/{}", entry.relative_path);
+
+    if entry.modified_local_body && entry.modified_remote_body {
+        eprintln!("pull: {}", entry.relative_path);
+        let sidecar_path = sidecar_path_for(&local_path);
+        get_io(ctx, &target, sidecar_path.to_str(), decrypt)?;
+
+        remove_local_metadata_attributes(&sidecar_path)?;
+        eprintln!("conflict: remote kept at {}", sidecar_path.display());
+    } else if entry.modified_local_body {
+        eprintln!("push: {}", entry.relative_path);
+        put_io(ctx, &target, local_path.to_str(), None)?;
+    } else if entry.modified_remote_body {
+        eprintln!("pull: {}", entry.relative_path);
+        get_io(ctx, &target, local_path.to_str(), decrypt)?;
+    } else if entry.modified_local_metadata && entry.modified_remote_metadata {
+        eprintln!("pull: {}", entry.relative_path);
+        let sidecar_path = sidecar_path_for(&local_path);
+        let (_, remote_metadata) = head(ctx, &target)?;
+
+        if remote_metadata.body_hash.is_none() {
+            fs::create_dir_all(&sidecar_path)?;
+        } else {
+            fs::copy(&local_path, &sidecar_path)?;
+        }
+        write_metadata_attributes(&sidecar_path, &remote_metadata)?;
+        eprintln!("conflict: remote kept at {}", sidecar_path.display());
+    } else if entry.modified_local_metadata {
+        eprintln!("push: {}", entry.relative_path);
+        put_io(ctx, &target, local_path.to_str(), None)?;
+    } else if entry.modified_remote_metadata {
+        eprintln!("pull: {}", entry.relative_path);
+        let (_, metadata) = head(ctx, &target)?;
+
+        if metadata.body_hash.is_none() {
+            fs::create_dir_all(&local_path)?;
+        }
+        if !local_path.exists() {
+            return Err(io_err(&format!("local path missing: {}", local_path.display())));
+        }
+        write_metadata_attributes(&local_path, &metadata)?;
+
+        let mut local = read_local_metadata_attributes(&local_path).unwrap_or_default();
+        local.sync_modified = Some(metadata.modified.clone());
+        write_local_metadata_attributes(&local_path, &local)?;
     }
 
-    let rel = local_path.strip_prefix(&ctx.root)
-        .map_err(|_| io_err("path outside account root"))?;
-    let target = format!("/{}", rel.to_string_lossy());
-
-    eprintln!("push: {}", target);
-    put_io(ctx, &target, local_path.to_str(), None)?;
-
     Ok(())
+}
+
+fn fetch_log_map(ctx: &IdentityContext) -> io::Result<(HashMap<String, Metadata>, Option<String>)> {
+    let last_sync_request = match fs::read_to_string(ctx.root.join(".ark").join("last_sync_request")) {
+        Ok(s) => Some(s.trim().to_string()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
+
+    let requests_path = "/.ark/requests/";
+    let requests_url = resolve_client_url(ctx, requests_path)?;
+    let (code, _, body) = request(Some(ctx), "GET", &requests_url, &[], &[])?;
+    if code == 404 {
+        return Ok((HashMap::new(), None));
+    }
+    if code != 200 {
+        return Err(io_err(&format!("HTTP {}: {}", code, String::from_utf8_lossy(&body))));
+    }
+
+    let mut entries: Vec<DirectoryEntry> = serde_json::from_slice(&body)
+        .map_err(|e| io_err(&format!("dir listing: {}", e)))?;
+    entries.retain(|entry|
+        matches!(entry.kind, DirectoryEntryKind::File) && entry.name.ends_with(".http"));
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let (account_name, _, _) = parse_address(&ctx.identity.address)?;
+    let account_prefix = format!("/ark/{}/", account_name);
+
+    let mut map: HashMap<String, Metadata> = HashMap::new();
+    let mut new_last_sync_request = last_sync_request.clone();
+
+    for entry in entries {
+        if let Some(cutoff) = &last_sync_request {
+            if entry.name.as_str() <= cutoff.as_str() {
+                continue;
+            }
+        }
+
+        new_last_sync_request = Some(entry.name.clone());
+
+        let entry_path = format!("{}{}", requests_path, entry.name);
+        let mut entry_body: Vec<u8> = Vec::new();
+        if get(ctx, &entry_path, &mut entry_body, false).is_err() {
+            continue;
+        }
+
+        let (relative_path, metadata) = match parse_put(&entry_body, &account_prefix) {
+            Ok(Some(v)) => v,
+            Ok(None) => continue,
+            Err(e) => { eprintln!("bad log entry: {}", e); continue; }
+        };
+
+        match map.get(&relative_path) {
+            Some(existing) if metadata.modified < existing.modified => {}
+            _ => { map.insert(relative_path, metadata); }
+        }
+    }
+
+    Ok((map, new_last_sync_request))
+}
+
+fn parse_put(entry_bytes: &[u8], account_prefix: &str) -> io::Result<Option<(String, Metadata)>> {
+    let entry = parse_request_entry(entry_bytes)?;
+
+    if entry.method != "PUT" { return Ok(None); }
+    if entry.status != 201 && entry.status != 204 { return Ok(None); }
+
+    let Some(relative_path) = entry.target.strip_prefix(account_prefix) else { return Ok(None); };
+
+    let metadata = read_metadata_headers(&entry.request_headers)?;
+
+    Ok(Some((relative_path.trim_end_matches('/').to_string(), metadata)))
+}
+
+fn to_relative_path(ctx: &IdentityContext, path: &Path) -> io::Result<String> {
+    Ok(path.strip_prefix(&ctx.root)
+        .map_err(|_| io_err("path is not within this account"))?
+        .to_string_lossy()
+        .into_owned())
+}
+
+fn under_prefix(rel: &str, prefix: &str) -> bool {
+    if prefix.is_empty() { return true; }
+    rel == prefix || rel.starts_with(&format!("{}/", prefix))
+}
+
+fn sidecar_path_for(local_path: &Path) -> std::path::PathBuf {
+    let file_name = local_path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "conflict".to_string());
+    local_path.with_file_name(format!("{}.conflict-{}", file_name, now_iso_fs()))
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
 
+    use std::env;
+
     use super::*;
-    use crate::client::get::get_io;
-    use crate::client::put::put_io;
+    use crate::client::{chmod_io, get::get_io, init, put::put_io, track_io};
+    use crate::context::create_client_context;
     use crate::server::start_test_server;
     use crate::util::test::{in_test_dir, init_with_server, write_encrypted_test_file, write_plain_test_file};
 
     fn prime_plain(ctx: &IdentityContext, path: &Path, target: &str, body: &[u8]) {
         fs::write(path, body).unwrap();
         put_io(ctx, target, path.to_str(), Some("none")).unwrap();
+    }
+
+    fn init_two_accounts(temp_dir: &Path, port: u16) -> (IdentityContext, IdentityContext) {
+        let alice_dir = temp_dir.join("alice_client");
+        let bob_dir = temp_dir.join("bob_client");
+        fs::create_dir_all(&alice_dir).unwrap();
+        fs::create_dir_all(&bob_dir).unwrap();
+
+        env::set_current_dir(&alice_dir).unwrap();
+        init(&format!("alice@127.0.0.1:{}", port), None).unwrap();
+        let alice_ctx = create_client_context().unwrap();
+
+        env::set_current_dir(&bob_dir).unwrap();
+        init(&format!("bob@127.0.0.1:{}", port), None).unwrap();
+        let bob_ctx = create_client_context().unwrap();
+
+        (alice_ctx, bob_ctx)
+    }
+
+    fn seed_shared_dir_with_writer(alice_dir: &Path, alice_ctx: &IdentityContext, writer_addr: &str) {
+        let shared = alice_dir.join("shared");
+        fs::create_dir(&shared).unwrap();
+        track_io(alice_ctx, shared.to_str().unwrap(), None).unwrap();
+        chmod_io(alice_ctx, shared.to_str().unwrap(), &[], &[writer_addr.to_string()], &[], &[]).unwrap();
+        put_io(alice_ctx, "shared/", Some(shared.to_str().unwrap()), None).unwrap();
     }
 
     #[test]
@@ -198,19 +520,6 @@ mod tests {
 
             let server_body = fs::read(temp_dir.join("ark/gyan/a/b/c.txt")).unwrap();
             assert_eq!(server_body, b"deep v2");
-        });
-    }
-
-    #[test]
-    fn sync_skips_dot_ark_dir() {
-        in_test_dir("ark_sync_test", |temp_dir| {
-            let port = start_test_server(temp_dir.to_path_buf());
-            let address = format!("gyan@127.0.0.1:{}", port);
-            let ctx = init_with_server(temp_dir, &address);
-
-            sync_io(&ctx, false, false).unwrap();
-
-            assert!(!temp_dir.join("ark/gyan/.ark/identity.key").exists());
         });
     }
 
@@ -316,29 +625,7 @@ mod tests {
     }
 
     #[test]
-    fn sync_skips_nested_dot_ark_dir() {
-        in_test_dir("ark_sync_test", |temp_dir| {
-            let port = start_test_server(temp_dir.to_path_buf());
-            let address = format!("gyan@127.0.0.1:{}", port);
-            let ctx = init_with_server(temp_dir, &address);
-
-            let staging = temp_dir.join("staging.txt");
-            prime_plain(&ctx, &staging, "staging.txt", b"v1");
-
-            fs::create_dir_all(temp_dir.join("a/.ark")).unwrap();
-            let hidden = temp_dir.join("a/.ark/hidden.txt");
-            fs::rename(&staging, &hidden).unwrap();
-            fs::write(&hidden, b"v2 modified").unwrap();
-            assert!(read_local_metadata_attributes(&hidden).unwrap().sync_hash.is_some(), "hidden must carry sync_hash so a naive walk would push it");
-
-            sync_io(&ctx, false, false).unwrap();
-
-            assert!(!temp_dir.join("ark/gyan/a/.ark").exists(), "nested .ark dir must not be uploaded");
-        });
-    }
-
-    #[test]
-    fn sync_refreshes_sync_hash_after_push() {
+    fn sync_refreshes_sync_body_hash_after_push() {
         in_test_dir("ark_sync_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
@@ -351,9 +638,9 @@ mod tests {
             sync_io(&ctx, false, false).unwrap();
 
             assert_eq!(
-                read_local_metadata_attributes(&local).unwrap().sync_hash.as_deref(),
-                Some(sha256(b"v2").as_slice()),
-                "sync_hash must track uploaded body after push"
+                read_local_metadata_attributes(&local).unwrap().sync_body_hash.as_ref().unwrap().value,
+                sha256(b"v2"),
+                "sync_body_hash must track uploaded body after push"
             );
 
             let server_path = temp_dir.join("ark/gyan/f.txt");
@@ -376,12 +663,429 @@ mod tests {
             let local = temp_dir.join("secret");
             get_io(&ctx, "secret", Some(local.to_str().unwrap()), false).unwrap();
             assert_eq!(xattr::get(&local, "user.ark_local.encrypted").unwrap().as_deref(), Some(b"true".as_slice()));
-            assert!(read_local_metadata_attributes(&local).unwrap().sync_hash.is_none(), "encrypted-at-rest file should not carry sync_hash");
+            assert!(read_local_metadata_attributes(&local).unwrap().sync_body_hash.is_none(), "encrypted-at-rest file should not carry sync_body_hash");
 
             let before = fs::read(&server_path).unwrap();
             sync_io(&ctx, false, false).unwrap();
             let after = fs::read(&server_path).unwrap();
             assert_eq!(before, after, "encrypted-at-rest file should be skipped by sync");
+        });
+    }
+
+    #[test]
+    fn sync_pulls_files_from_other_accounts_log_entries() {
+        in_test_dir("ark_sync_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let (alice_ctx, bob_ctx) = init_two_accounts(temp_dir, port);
+
+            let alice_dir = temp_dir.join("alice_client");
+            let bob_dir = temp_dir.join("bob_client");
+
+            env::set_current_dir(&alice_dir).unwrap();
+            seed_shared_dir_with_writer(&alice_dir, &alice_ctx, &bob_ctx.identity.address);
+
+            env::set_current_dir(&bob_dir).unwrap();
+            let payload = bob_dir.join("payload.bin");
+            fs::write(&payload, b"hello alice").unwrap();
+            let target = format!("alice@127.0.0.1:{}/shared/foo.txt", port);
+            put_io(&bob_ctx, &target, Some(payload.to_str().unwrap()), Some("none")).unwrap();
+
+            env::set_current_dir(&alice_dir).unwrap();
+            let alice_ctx = create_client_context().unwrap();
+            sync_io(&alice_ctx, false, false).unwrap();
+
+            let pulled = alice_dir.join("shared/foo.txt");
+            assert!(pulled.exists(), "sync should pull remote file");
+            assert_eq!(fs::read(&pulled).unwrap(), b"hello alice");
+        });
+    }
+
+    #[test]
+    fn sync_pulls_file_metadata_only_when_body_unchanged() {
+        in_test_dir("ark_sync_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let (alice_ctx, bob_ctx) = init_two_accounts(temp_dir, port);
+            let alice_dir = temp_dir.join("alice_client");
+            let bob_dir = temp_dir.join("bob_client");
+
+            env::set_current_dir(&alice_dir).unwrap();
+            let shared = alice_dir.join("shared");
+            fs::create_dir(&shared).unwrap();
+            track_io(&alice_ctx, shared.to_str().unwrap(), None).unwrap();
+            chmod_io(&alice_ctx, shared.to_str().unwrap(), &[bob_ctx.identity.address.clone()], &[], &[], &[]).unwrap();
+            put_io(&alice_ctx, "shared/", Some(shared.to_str().unwrap()), None).unwrap();
+
+            env::set_current_dir(&bob_dir).unwrap();
+            let bob_local = bob_dir.join("payload.bin");
+            fs::write(&bob_local, b"v1").unwrap();
+            let target = format!("alice@127.0.0.1:{}/shared/foo.txt", port);
+            put_io(&bob_ctx, &target, Some(bob_local.to_str().unwrap()), Some("none")).unwrap();
+
+            env::set_current_dir(&alice_dir).unwrap();
+            let alice_ctx = create_client_context().unwrap();
+            sync_io(&alice_ctx, false, false).unwrap();
+
+            let pulled = alice_dir.join("shared/foo.txt");
+            assert_eq!(fs::read(&pulled).unwrap(), b"v1");
+            let members_before = read_metadata_attributes(&pulled).unwrap().members.len();
+            let modified_before = read_metadata_attributes(&pulled).unwrap().modified;
+
+            env::set_current_dir(&bob_dir).unwrap();
+            chmod_io(&bob_ctx, bob_local.to_str().unwrap(), &[], &[], &["public".to_string()], &[]).unwrap();
+            put_io(&bob_ctx, &target, Some(bob_local.to_str().unwrap()), Some("none")).unwrap();
+
+            env::set_current_dir(&alice_dir).unwrap();
+            let alice_ctx = create_client_context().unwrap();
+            sync_io(&alice_ctx, false, false).unwrap();
+
+            assert_eq!(fs::read(&pulled).unwrap(), b"v1", "body should be unchanged");
+            let m = read_metadata_attributes(&pulled).unwrap();
+            assert!(m.members.iter().any(|mem| mem.address == "*"), "public member should be present after metadata sync");
+            assert!(m.members.len() > members_before, "members count should grow after metadata sync");
+            assert_ne!(m.modified, modified_before, "modified stamp should refresh after metadata sync");
+        });
+    }
+
+    #[test]
+    fn sync_pulls_dir_metadata_from_other_accounts_log_entries() {
+        in_test_dir("ark_sync_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let (alice_ctx, bob_ctx) = init_two_accounts(temp_dir, port);
+            let alice_dir = temp_dir.join("alice_client");
+            let bob_dir = temp_dir.join("bob_client");
+
+            env::set_current_dir(&alice_dir).unwrap();
+            seed_shared_dir_with_writer(&alice_dir, &alice_ctx, &bob_ctx.identity.address);
+
+            env::set_current_dir(&bob_dir).unwrap();
+            let local_dir = bob_dir.join("sub");
+            fs::create_dir_all(&local_dir).unwrap();
+            let target = format!("alice@127.0.0.1:{}/shared/sub", port);
+            put_io(&bob_ctx, &target, Some(local_dir.to_str().unwrap()), None).unwrap();
+
+            env::set_current_dir(&alice_dir).unwrap();
+            let alice_ctx = create_client_context().unwrap();
+            sync_io(&alice_ctx, false, false).unwrap();
+
+            let pulled_dir = alice_dir.join("shared/sub");
+            assert!(pulled_dir.is_dir(), "sync should create dir locally");
+            assert!(has_metadata_attributes(&pulled_dir).unwrap(), "dir metadata should be written locally");
+            let m = read_metadata_attributes(&pulled_dir).unwrap();
+            assert_eq!(m.modified_by, bob_ctx.identity.address, "modifier should be bob");
+        });
+    }
+
+    #[test]
+    fn sync_writes_last_sync_request() {
+        in_test_dir("ark_sync_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let alice_dir = temp_dir.join("alice_client");
+            fs::create_dir_all(&alice_dir).unwrap();
+            env::set_current_dir(&alice_dir).unwrap();
+            init(&format!("alice@127.0.0.1:{}", port), None).unwrap();
+            let alice_ctx = create_client_context().unwrap();
+
+            let local = alice_dir.join("notes.txt");
+            fs::write(&local, b"body").unwrap();
+            put_io(&alice_ctx, "notes.txt", Some(local.to_str().unwrap()), Some("none")).unwrap();
+
+            sync_io(&alice_ctx, false, false).unwrap();
+
+            let last_sync_request = alice_dir.join(".ark/last_sync_request");
+            assert!(last_sync_request.exists(), "last_sync_request should be recorded after sync");
+            let stamp = fs::read_to_string(&last_sync_request).unwrap();
+            assert!(stamp.ends_with(".http"), "last_sync_request should be a log entry filename, got {}", stamp);
+        });
+    }
+
+    #[test]
+    fn sync_skips_log_entries_older_than_last_sync() {
+        in_test_dir("ark_sync_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let (alice_ctx, bob_ctx) = init_two_accounts(temp_dir, port);
+
+            let alice_dir = temp_dir.join("alice_client");
+            let bob_dir = temp_dir.join("bob_client");
+
+            env::set_current_dir(&alice_dir).unwrap();
+            seed_shared_dir_with_writer(&alice_dir, &alice_ctx, &bob_ctx.identity.address);
+
+            env::set_current_dir(&bob_dir).unwrap();
+            let payload = bob_dir.join("payload.bin");
+            fs::write(&payload, b"first").unwrap();
+            let target = format!("alice@127.0.0.1:{}/shared/foo.txt", port);
+            put_io(&bob_ctx, &target, Some(payload.to_str().unwrap()), Some("none")).unwrap();
+
+            env::set_current_dir(&alice_dir).unwrap();
+            let alice_ctx = create_client_context().unwrap();
+            sync_io(&alice_ctx, false, false).unwrap();
+            assert_eq!(fs::read(alice_dir.join("shared/foo.txt")).unwrap(), b"first");
+
+            fs::remove_file(alice_dir.join("shared/foo.txt")).unwrap();
+            sync_io(&alice_ctx, false, false).unwrap();
+            assert!(!alice_dir.join("shared/foo.txt").exists(), "already-processed log entry must not re-pull");
+        });
+    }
+
+    #[test]
+    fn sync_ignores_own_puts_in_log() {
+        in_test_dir("ark_sync_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let alice_dir = temp_dir.join("alice_client");
+            fs::create_dir_all(&alice_dir).unwrap();
+            env::set_current_dir(&alice_dir).unwrap();
+            init(&format!("alice@127.0.0.1:{}", port), None).unwrap();
+            let alice_ctx = create_client_context().unwrap();
+
+            let local = alice_dir.join("notes.txt");
+            fs::write(&local, b"self body").unwrap();
+            put_io(&alice_ctx, "notes.txt", Some(local.to_str().unwrap()), Some("none")).unwrap();
+            fs::remove_file(&local).unwrap();
+
+            sync_io(&alice_ctx, false, false).unwrap();
+
+            assert!(!local.exists(), "own PUTs must not be pulled back");
+        });
+    }
+
+    #[test]
+    fn sync_writes_conflict_sidecar_when_both_sides_diverge() {
+        in_test_dir("ark_sync_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let (alice_ctx, bob_ctx) = init_two_accounts(temp_dir, port);
+
+            let alice_dir = temp_dir.join("alice_client");
+            let bob_dir = temp_dir.join("bob_client");
+
+            env::set_current_dir(&alice_dir).unwrap();
+            seed_shared_dir_with_writer(&alice_dir, &alice_ctx, &bob_ctx.identity.address);
+
+            let local = alice_dir.join("shared/foo.txt");
+            fs::create_dir_all(local.parent().unwrap()).unwrap();
+            fs::write(&local, b"alice-v1").unwrap();
+            put_io(&alice_ctx, "/shared/foo.txt", Some(local.to_str().unwrap()), Some("none")).unwrap();
+            chmod_io(&alice_ctx, local.to_str().unwrap(), &[], &[bob_ctx.identity.address.clone()], &[], &[]).unwrap();
+            put_io(&alice_ctx, "/shared/foo.txt", Some(local.to_str().unwrap()), Some("none")).unwrap();
+
+            let alice_ctx = create_client_context().unwrap();
+            sync_io(&alice_ctx, false, false).unwrap();
+
+            env::set_current_dir(&bob_dir).unwrap();
+            let bob_payload = bob_dir.join("payload.bin");
+            let target = format!("alice@127.0.0.1:{}/shared/foo.txt", port);
+            get_io(&bob_ctx, &target, Some(bob_payload.to_str().unwrap()), false).unwrap();
+            fs::write(&bob_payload, b"bob-v2").unwrap();
+            put_io(&bob_ctx, &target, Some(bob_payload.to_str().unwrap()), Some("none")).unwrap();
+
+            env::set_current_dir(&alice_dir).unwrap();
+            fs::write(&local, b"alice-v2-unpushed").unwrap();
+
+            let alice_ctx = create_client_context().unwrap();
+            sync_io(&alice_ctx, false, false).unwrap();
+
+            assert_eq!(fs::read(&local).unwrap(), b"alice-v2-unpushed", "local edit preserved at original path");
+
+            let entries: Vec<_> = fs::read_dir(alice_dir.join("shared")).unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            let sidecar = entries.iter().find(|n| n.starts_with("foo.txt.conflict-")).expect("sidecar file present");
+            let sidecar_path = alice_dir.join("shared").join(sidecar);
+            assert_eq!(fs::read(&sidecar_path).unwrap(), b"bob-v2", "sidecar carries pulled remote body");
+            assert!(has_metadata_attributes(&sidecar_path).unwrap(), "sidecar carries remote metadata for comparison");
+            assert!(read_local_metadata_attributes(&sidecar_path).unwrap().sync_body_hash.is_none(), "sidecar must not be sync-tracked");
+        });
+    }
+
+    #[test]
+    fn sync_pushes_when_only_local_modified() {
+        in_test_dir("ark_sync_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let address = format!("gyan@127.0.0.1:{}", port);
+            let ctx = init_with_server(temp_dir, &address);
+
+            let local = temp_dir.join("f.txt");
+            prime_plain(&ctx, &local, "f.txt", b"v1");
+
+            fs::write(&local, b"v2").unwrap();
+            sync_io(&ctx, false, false).unwrap();
+
+            assert_eq!(fs::read(temp_dir.join("ark/gyan/f.txt")).unwrap(), b"v2");
+            let entries: Vec<_> = fs::read_dir(temp_dir).unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            assert!(!entries.iter().any(|n| n.contains(".conflict-")), "no sidecar for pure local edit");
+        });
+    }
+
+    #[test]
+    fn sync_pushes_local_metadata_only_after_chmod() {
+        in_test_dir("ark_sync_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let address = format!("gyan@127.0.0.1:{}", port);
+            let ctx = init_with_server(temp_dir, &address);
+
+            let local = temp_dir.join("f.txt");
+            prime_plain(&ctx, &local, "f.txt", b"v1");
+
+            let server_path = temp_dir.join("ark/gyan/f.txt");
+            let body_before = fs::read(&server_path).unwrap();
+            let modified_before = read_metadata_attributes(&server_path).unwrap().modified;
+
+            chmod_io(&ctx, local.to_str().unwrap(), &[], &[], &["public".to_string()], &[]).unwrap();
+
+            sync_io(&ctx, false, false).unwrap();
+
+            let body_after = fs::read(&server_path).unwrap();
+            assert_eq!(body_after, body_before, "body should be unchanged");
+
+            let server_meta = read_metadata_attributes(&server_path).unwrap();
+            assert!(server_meta.members.iter().any(|m| m.address == "*"), "public member should propagate");
+            assert_ne!(server_meta.modified, modified_before, "modified stamp should advance");
+
+            let local_after = read_local_metadata_attributes(&local).unwrap();
+            assert_eq!(local_after.sync_modified.as_deref(), Some(server_meta.modified.as_str()),
+                "sync_modified should track pushed metadata stamp");
+        });
+    }
+
+    #[test]
+    fn sync_leaves_untracked_local_alone_when_remote_puts_same_path() {
+        in_test_dir("ark_sync_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let (alice_ctx, bob_ctx) = init_two_accounts(temp_dir, port);
+
+            let alice_dir = temp_dir.join("alice_client");
+            let bob_dir = temp_dir.join("bob_client");
+
+            env::set_current_dir(&alice_dir).unwrap();
+            seed_shared_dir_with_writer(&alice_dir, &alice_ctx, &bob_ctx.identity.address);
+
+            fs::create_dir_all(alice_dir.join("shared")).unwrap();
+            let local = alice_dir.join("shared/foo.txt");
+            fs::write(&local, b"untracked local").unwrap();
+
+            env::set_current_dir(&bob_dir).unwrap();
+            let payload = bob_dir.join("payload.bin");
+            fs::write(&payload, b"bob body").unwrap();
+            let target = format!("alice@127.0.0.1:{}/shared/foo.txt", port);
+            put_io(&bob_ctx, &target, Some(payload.to_str().unwrap()), Some("none")).unwrap();
+
+            env::set_current_dir(&alice_dir).unwrap();
+            let alice_ctx = create_client_context().unwrap();
+            sync_io(&alice_ctx, false, false).unwrap();
+
+            assert_eq!(fs::read(&local).unwrap(), b"untracked local", "untracked local must not be clobbered");
+        });
+    }
+
+    #[test]
+    fn sync_writes_metadata_sidecar_when_both_sides_bump_metadata() {
+        in_test_dir("ark_sync_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let (alice_ctx, bob_ctx) = init_two_accounts(temp_dir, port);
+            let alice_dir = temp_dir.join("alice_client");
+            let bob_dir = temp_dir.join("bob_client");
+
+            env::set_current_dir(&alice_dir).unwrap();
+            let shared = alice_dir.join("shared");
+            fs::create_dir(&shared).unwrap();
+            track_io(&alice_ctx, shared.to_str().unwrap(), None).unwrap();
+            chmod_io(&alice_ctx, shared.to_str().unwrap(), &[bob_ctx.identity.address.clone()], &[], &[], &[]).unwrap();
+            put_io(&alice_ctx, "shared/", Some(shared.to_str().unwrap()), None).unwrap();
+
+            let alice_local = alice_dir.join("shared/foo.txt");
+            fs::write(&alice_local, b"v1").unwrap();
+            put_io(&alice_ctx, "/shared/foo.txt", Some(alice_local.to_str().unwrap()), Some("none")).unwrap();
+            chmod_io(&alice_ctx, alice_local.to_str().unwrap(), &[bob_ctx.identity.address.clone()], &[], &[], &[]).unwrap();
+            put_io(&alice_ctx, "/shared/foo.txt", Some(alice_local.to_str().unwrap()), Some("none")).unwrap();
+
+            let alice_ctx = create_client_context().unwrap();
+            sync_io(&alice_ctx, false, false).unwrap();
+
+            env::set_current_dir(&bob_dir).unwrap();
+            let bob_payload = bob_dir.join("payload.bin");
+            let target = format!("alice@127.0.0.1:{}/shared/foo.txt", port);
+            get_io(&bob_ctx, &target, Some(bob_payload.to_str().unwrap()), false).unwrap();
+
+            chmod_io(&alice_ctx, alice_local.to_str().unwrap(), &[], &[], &["public".to_string()], &[]).unwrap();
+
+            chmod_io(&bob_ctx, bob_payload.to_str().unwrap(), &[], &["carol@host".to_string()], &[], &[]).unwrap();
+            put_io(&bob_ctx, &target, Some(bob_payload.to_str().unwrap()), Some("none")).unwrap();
+
+            env::set_current_dir(&alice_dir).unwrap();
+            let alice_ctx = create_client_context().unwrap();
+            sync_io(&alice_ctx, false, false).unwrap();
+
+            assert_eq!(fs::read(&alice_local).unwrap(), b"v1", "original body untouched");
+            let local_meta = read_metadata_attributes(&alice_local).unwrap();
+            assert!(local_meta.members.iter().any(|m| m.address == "*"), "local keeps its own chmod");
+
+            let sidecar = fs::read_dir(alice_dir.join("shared")).unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .find(|n| n.starts_with("foo.txt.conflict-"))
+                .expect("metadata sidecar present");
+            let sidecar_path = alice_dir.join("shared").join(&sidecar);
+            assert_eq!(fs::read(&sidecar_path).unwrap(), b"v1", "sidecar copies local body");
+            let sidecar_meta = read_metadata_attributes(&sidecar_path).unwrap();
+            assert!(sidecar_meta.members.iter().any(|m| m.address == "carol@host"), "sidecar carries remote members");
+            assert!(read_local_metadata_attributes(&sidecar_path).unwrap().sync_body_hash.is_none(), "sidecar must not be sync-tracked");
+        });
+    }
+
+    #[test]
+    fn sync_writes_dir_metadata_sidecar_when_both_sides_bump_metadata() {
+        in_test_dir("ark_sync_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let (alice_ctx, bob_ctx) = init_two_accounts(temp_dir, port);
+            let alice_dir = temp_dir.join("alice_client");
+            let bob_dir = temp_dir.join("bob_client");
+
+            env::set_current_dir(&alice_dir).unwrap();
+            let shared = alice_dir.join("shared");
+            fs::create_dir(&shared).unwrap();
+            track_io(&alice_ctx, shared.to_str().unwrap(), None).unwrap();
+            chmod_io(&alice_ctx, shared.to_str().unwrap(), &[bob_ctx.identity.address.clone()], &[], &[], &[]).unwrap();
+            put_io(&alice_ctx, "shared/", Some(shared.to_str().unwrap()), None).unwrap();
+
+            let alice_sub = alice_dir.join("shared/sub");
+            fs::create_dir(&alice_sub).unwrap();
+            track_io(&alice_ctx, alice_sub.to_str().unwrap(), None).unwrap();
+            chmod_io(&alice_ctx, alice_sub.to_str().unwrap(), &[bob_ctx.identity.address.clone()], &[], &[], &[]).unwrap();
+            put_io(&alice_ctx, "/shared/sub", Some(alice_sub.to_str().unwrap()), None).unwrap();
+
+            let alice_ctx = create_client_context().unwrap();
+            sync_io(&alice_ctx, false, false).unwrap();
+
+            env::set_current_dir(&bob_dir).unwrap();
+            let bob_sub = bob_dir.join("sub");
+            fs::create_dir(&bob_sub).unwrap();
+            let target = format!("alice@127.0.0.1:{}/shared/sub", port);
+            head(&bob_ctx, &target).unwrap();
+            let (_, remote_meta) = head(&bob_ctx, &target).unwrap();
+            crate::metadata::write_metadata_attributes(&bob_sub, &remote_meta).unwrap();
+
+            chmod_io(&alice_ctx, alice_sub.to_str().unwrap(), &[], &[], &["public".to_string()], &[]).unwrap();
+
+            chmod_io(&bob_ctx, bob_sub.to_str().unwrap(), &[], &["carol@host".to_string()], &[], &[]).unwrap();
+            put_io(&bob_ctx, &target, Some(bob_sub.to_str().unwrap()), None).unwrap();
+
+            env::set_current_dir(&alice_dir).unwrap();
+            let alice_ctx = create_client_context().unwrap();
+            sync_io(&alice_ctx, false, false).unwrap();
+
+            let sidecar = fs::read_dir(alice_dir.join("shared")).unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .find(|n| n.starts_with("sub.conflict-"))
+                .expect("dir metadata sidecar present");
+            let sidecar_path = alice_dir.join("shared").join(&sidecar);
+            assert!(sidecar_path.is_dir(), "sidecar must be a dir");
+            let sidecar_meta = read_metadata_attributes(&sidecar_path).unwrap();
+            assert!(sidecar_meta.members.iter().any(|m| m.address == "carol@host"), "sidecar carries remote members");
+            assert!(sidecar_meta.body_hash.is_none(), "dir sidecar carries no body_hash");
         });
     }
 }

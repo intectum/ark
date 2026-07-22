@@ -219,6 +219,7 @@ fn status_msg(status_code: u16) -> &'static str {
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        409 => "Conflict",
         500 => "Internal Server Error",
         _ => "Unknown",
     }

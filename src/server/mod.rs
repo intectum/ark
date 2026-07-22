@@ -7,7 +7,6 @@ mod put;
 mod relay;
 #[cfg(test)]
 mod test_helpers;
-mod util;
 
 use std::env;
 use std::fs;
@@ -32,9 +31,8 @@ use self::get::serve_get;
 use self::log::{LoggingStream, try_log_request};
 use self::put::{serve_put, serve_put_init};
 use self::relay::relay;
-use self::util::find_ancestor_members;
 
-pub const MAX_CLOCK_SKEW_SECS: u64 = 300;
+pub const MAX_CLOCK_SKEW_MS: u64 = 300_000;
 
 /// Bind `0.0.0.0:<port>` and serve the current working directory as the ark
 /// server root. Blocks. Bootstraps the server's `ark@<host>` identity on
@@ -161,16 +159,26 @@ fn handle_parsed_inner(
         return write_text(stream, 403, b"symlinks not allowed");
     }
 
-    let target_is_dir = url.path().ends_with('/') || fs_path.is_dir();
-
-    let existing_members = read_metadata_attributes(&fs_path).ok().map(|metadata| metadata.members);
-    if fs_path.is_file() && existing_members.is_none() {
+    let existing_metadata = read_metadata_attributes(&fs_path).ok();
+    if fs_path.is_file() && existing_metadata.is_none() {
         return write_text(stream, 500, b"file missing metadata");
     }
 
-    let effective_members = match existing_members.clone() {
-        Some(m) => Some(m),
-        None => find_ancestor_members(&fs_path, &target_ctx.root),
+    let effective_members = match existing_metadata.as_ref() {
+        Some(m) => Some(m.members.clone()),
+        None => {
+            let mut ancestor = None;
+            let mut current = fs_path.parent();
+            while let Some(dir) = current {
+                if !dir.starts_with(&target_ctx.root) { break; }
+                if let Ok(m) = read_metadata_attributes(dir) {
+                    ancestor = Some(m.members);
+                    break;
+                }
+                current = dir.parent();
+            }
+            ancestor
+        }
     };
 
     let public_member = effective_members
@@ -218,7 +226,7 @@ fn handle_parsed_inner(
 
     match method {
         "GET" => {
-            let wants_stream = target_is_dir && headers.iter().any(|(n, v)|
+            let wants_stream = fs_path.is_dir() && headers.iter().any(|(n, v)|
                 n.eq_ignore_ascii_case("accept") && v.contains("text/event-stream"));
             if wants_stream {
                 return serve_stream(&fs_path, stream);
@@ -229,7 +237,7 @@ fn handle_parsed_inner(
         "PUT" => {
             let metadata = metadata.as_ref().expect("metadata presence checked above");
             let modifier = modifier_identity.as_ref().expect("modifier presence checked above");
-            serve_put(&fs_path, stream, body, metadata, modifier, existing_members.as_deref(), permission, target_is_dir)?;
+            serve_put(&fs_path, stream, body, metadata, modifier, existing_metadata.as_ref(), permission)?;
 
             let relay_mode = headers.iter()
                 .find_map(|(name, value)| if name.eq_ignore_ascii_case("x-ark-relay") { RelayMode::parse(value) } else { None });
@@ -262,7 +270,7 @@ mod tests {
     use super::*;
     use crate::crypto::{DEFAULT_SIGNING_ALGORITHM, create_secret_key};
     use crate::identity::create_identity;
-    use crate::util::now_seconds;
+    use crate::util::now;
     use crate::util::test::{TEST_ADDRESS, create_test_account, in_test_dir, write_plain_test_file};
 
     #[test]
@@ -331,7 +339,7 @@ mod tests {
             let key = [17u8; 32];
             create_test_account(temp_dir, TEST_ADDRESS);
             let port = start_test_server(temp_dir.to_path_buf());
-            let sig = sign(&key, port, "GET", "/ark/test/x", now_seconds(), &[]);
+            let sig = sign(&key, port, "GET", "/ark/test/x", now(), &[]);
             let auth = format!("ArkIdentity address=\"test@example.com\", signature=\"{}\"", sig);
             let (code, _, _) = request(port, "GET", "/ark/test/x", &[], &[("Authorization", &auth)]);
             assert_eq!(code, 401);
@@ -344,7 +352,7 @@ mod tests {
             let key = [18u8; 32];
             create_test_account(temp_dir, TEST_ADDRESS);
             let port = start_test_server(temp_dir.to_path_buf());
-            let old = now_seconds() - (MAX_CLOCK_SKEW_SECS + 60);
+            let old = now() - (MAX_CLOCK_SKEW_MS + 60_000);
             let sig = sign(&key, port, "GET", "/ark/test/x", old, &[]);
             let auth = build_auth("test@example.com", old, &sig);
             let (code, _, _) = request(port, "GET", "/ark/test/x", &[], &[("Authorization", &auth)]);
@@ -358,7 +366,7 @@ mod tests {
             let key = [19u8; 32];
             create_test_account(temp_dir, TEST_ADDRESS);
             let port = start_test_server(temp_dir.to_path_buf());
-            let ts = now_seconds();
+            let ts = now();
             let sig = sign(&key, port, "GET", "/ark/test/somethingelse", ts, &[]);
             let auth = build_auth("test@example.com", ts, &sig);
             let (code, _, _) = request(port, "GET", "/ark/test/realtarget", &[], &[("Authorization", &auth)]);

@@ -8,7 +8,7 @@ use crate::client::request;
 use crate::http::read_response;
 use crate::identity::parse_address;
 use crate::types::{IdentityContext, Metadata, RelayMode};
-use crate::util::{create_authorization_header, io_err, now_seconds};
+use crate::util::{create_authorization_header, io_err, now};
 
 use super::handle_parsed;
 
@@ -32,7 +32,6 @@ pub fn relay(
 
     let source_name = segments[1];
     let relative_path: Vec<&str> = segments[2..].to_vec();
-    let trailing_slash = path.ends_with('/');
 
     let mut remote_hosts: HashSet<String> = HashSet::new();
 
@@ -42,7 +41,7 @@ pub fn relay(
             Err(_) => continue,
         };
 
-        let member_path = build_member_path(&member_name, &relative_path, trailing_slash);
+        let member_path = build_member_path(&member_name, &relative_path);
 
         let same_host = member_host.eq_ignore_ascii_case(&server_host);
         if same_host {
@@ -63,7 +62,7 @@ pub fn relay(
             .collect();
 
         if same_host {
-            let authorization = create_authorization_header(server_ctx, method, &server_host, &member_path, now_seconds(), body)?;
+            let authorization = create_authorization_header(server_ctx, method, &server_host, &member_path, now(), body)?;
             final_headers.push(("Authorization".to_string(), authorization));
             final_headers.push(("Host".to_string(), server_host.clone()));
         } else {
@@ -100,14 +99,11 @@ pub fn relay(
     Ok(())
 }
 
-fn build_member_path(member_name: &str, rel: &[&str], trailing_slash: bool) -> String {
+fn build_member_path(member_name: &str, rel: &[&str]) -> String {
     let mut member_path = format!("/ark/{}", member_name);
     for seg in rel {
         member_path.push('/');
         member_path.push_str(seg);
-    }
-    if trailing_slash && !member_path.ends_with('/') {
-        member_path.push('/');
     }
     member_path
 }

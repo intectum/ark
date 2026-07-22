@@ -23,5 +23,5 @@ pub use init::init_local;
 pub use proposals::{accept_proposal_io, list_proposals_io, reject_proposal_io};
 pub use put::{put, put_io};
 pub use request::request;
-pub use sync::sync_io;
+pub use sync::{sync, sync_io};
 pub use track::track_io;

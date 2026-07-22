@@ -5,15 +5,14 @@ use std::path::PathBuf;
 
 use super::encrypt::encrypt as encrypt_body;
 use crate::client::request;
-use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, create_secret_key};
-use crate::types::{IdentityContext, LocalMetadata, Metadata};
-use crate::metadata::{apply_key_to_metadata, create_metadata, get_member, read_local_metadata_attributes, read_metadata_attributes, sign_metadata, write_local_metadata_attributes, write_metadata_attributes, write_metadata_headers};
+use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, DEFAULT_HASH_ALGORITHM, create_secret_key};
+use crate::types::{Hash, IdentityContext, LocalMetadata, Metadata};
+use crate::metadata::{apply_key_to_metadata, create_metadata, get_member, has_metadata_attributes, read_local_metadata_attributes, read_metadata_attributes, sign_metadata, write_local_metadata_attributes, write_metadata_attributes, write_metadata_headers};
 use crate::util::{io_err, io_invalid_input, now_iso, resolve_client_url, sha256};
 
 /// Upload a body (or create a directory) at `path`.
 ///
-/// - `body = None` OR a `path` ending in `/` produces a directory PUT
-///   (empty body). Passing both a directory path and a body is an error.
+/// - `body = None` produces a directory PUT (empty body).
 /// - `encryption_algorithm`: `None` reuses the existing metadata's algorithm
 ///   (or defaults to AES-256-GCM). `Some("none")` uploads raw plaintext.
 ///   Directories reject any algorithm.
@@ -35,12 +34,7 @@ pub fn put(
 ) -> io::Result<(Metadata, LocalMetadata)> {
     let url = resolve_client_url(ctx, path)?;
 
-    let target_is_dir = url.path().ends_with('/');
-    let is_dir = target_is_dir || body.is_none();
-
-    if target_is_dir && body.is_some() {
-        return Err(io_invalid_input("directory path but body provided"));
-    }
+    let is_dir = body.is_none();
 
     if is_dir && encryption_algorithm.is_some() {
         return Err(io_invalid_input("--encryption-algorithm not supported for directories"));
@@ -77,7 +71,11 @@ pub fn put(
     let skip_encrypt = metadata.encryption_algorithm.is_none();
     let already_encrypted = local_metadata.encrypted == Some(true);
 
-    local_metadata.sync_hash = if !is_dir && !already_encrypted { Some(sha256(&body_bytes)) } else { None };
+    local_metadata.sync_body_hash = if !is_dir && !already_encrypted {
+        Some(Hash { algorithm: DEFAULT_HASH_ALGORITHM.to_string(), value: sha256(&body_bytes) })
+    } else {
+        None
+    };
 
     let final_body = if already_encrypted || skip_encrypt {
         if skip_encrypt {
@@ -101,6 +99,8 @@ pub fn put(
 
     let sign_body = if is_dir { None } else { Some(final_body.as_slice()) };
     sign_metadata(ctx.identity_key.as_ref().expect("client context missing identity_key"), &mut metadata, sign_body)?;
+
+    local_metadata.sync_modified = Some(metadata.modified.clone());
 
     let metadata_headers = write_metadata_headers(&metadata);
     let mut headers: Vec<(&str, &str)> = metadata_headers.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
@@ -126,18 +126,10 @@ pub fn put_io(ctx: &IdentityContext, path: &str, input: Option<&str>, encryption
         }
     }
 
-    let url = resolve_client_url(ctx, path)?;
-    let target_is_dir = url.path().ends_with('/');
-    let input_is_dir = input_path.as_deref().map(|p| p.is_dir()).unwrap_or(false);
-    let input_is_file = input_path.as_deref().map(|p| p.is_file()).unwrap_or(false);
-    let is_dir = target_is_dir || input_is_dir;
-
-    if target_is_dir && input_is_file {
-        return Err(io_invalid_input("directory path but input is a file"));
-    }
+    let is_dir = input_path.as_deref().map(|p| p.is_dir()).unwrap_or(false);
 
     let existing_metadata = match input_path.as_deref() {
-        Some(p) if xattr::get(p, "user.ark.id")?.is_some() => Some(read_metadata_attributes(p)?),
+        Some(p) if has_metadata_attributes(p)? => Some(read_metadata_attributes(p)?),
         _ => None,
     };
     let existing_local_metadata = match input_path.as_deref() {
@@ -305,9 +297,12 @@ mod tests {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &address);
-            write_plain_test_file(&temp_dir.join("ark/gyan/x.txt"), &ctx.identity, ctx.identity_key.as_ref().unwrap(), b"old");
 
-            put_via_io(temp_dir, "x.txt", b"new plaintext", "");
+            let input = temp_dir.join("input.bin");
+            fs::write(&input, b"old").unwrap();
+            put_io(&ctx, "x.txt", Some(input.to_str().unwrap()), None).unwrap();
+            fs::write(&input, b"new plaintext").unwrap();
+            put_io(&ctx, "x.txt", Some(input.to_str().unwrap()), None).unwrap();
 
             let on_disk = fs::read(temp_dir.join("ark/gyan/x.txt")).unwrap();
             assert_ne!(on_disk, b"old");
@@ -372,7 +367,7 @@ mod tests {
             apply_key_to_metadata(&ctx, &mut m, &file_key).unwrap();
             sign_metadata(ctx.identity_key.as_ref().unwrap(), &mut m, Some(&ciphertext)).unwrap();
             write_metadata_attributes(&input, &m).unwrap();
-            write_local_metadata_attributes(&input, &LocalMetadata { encrypted: Some(true), sync_hash: None }).unwrap();
+            write_local_metadata_attributes(&input, &LocalMetadata { encrypted: Some(true), sync_body_hash: None, sync_modified: None }).unwrap();
 
             put_io(&ctx, "file.bin", Some(input.to_str().unwrap()), None).unwrap();
 
@@ -426,13 +421,15 @@ mod tests {
     }
 
     #[test]
-    fn put_io_trailing_slash_creates_dir_with_metadata() {
+    fn put_io_dir_input_creates_dir_with_metadata() {
         in_test_dir("ark_put_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &address);
 
-            put_io(&ctx, "shared/", None, None).unwrap();
+            let input_dir = temp_dir.join("shared_input");
+            fs::create_dir_all(&input_dir).unwrap();
+            put_io(&ctx, "shared", Some(input_dir.to_str().unwrap()), None).unwrap();
 
             let dir = temp_dir.join("ark/gyan/shared");
             assert!(dir.is_dir());
@@ -444,13 +441,15 @@ mod tests {
     }
 
     #[test]
-    fn put_io_trailing_slash_rejects_encryption_algorithm() {
+    fn put_io_dir_input_rejects_encryption_algorithm_no_body() {
         in_test_dir("ark_put_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &address);
 
-            let err = put_io(&ctx, "shared/", None, Some(DEFAULT_ENCRYPTION_ALGORITHM)).unwrap_err();
+            let input_dir = temp_dir.join("shared_input");
+            fs::create_dir_all(&input_dir).unwrap();
+            let err = put_io(&ctx, "shared", Some(input_dir.to_str().unwrap()), Some(DEFAULT_ENCRYPTION_ALGORITHM)).unwrap_err();
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         });
     }
@@ -483,21 +482,6 @@ mod tests {
             let err = put_io(&ctx, "notes.txt", Some(missing.to_str().unwrap()), None).unwrap_err();
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
             assert!(format!("{}", err).contains("input does not exist"));
-        });
-    }
-
-    #[test]
-    fn put_io_trailing_slash_with_file_input_errors() {
-        in_test_dir("ark_put_test", |temp_dir| {
-            let port = start_test_server(temp_dir.to_path_buf());
-            let address = format!("gyan@127.0.0.1:{}", port);
-            let ctx = init_with_server(temp_dir, &address);
-
-            let input = temp_dir.join("input.bin");
-            fs::write(&input, b"hi").unwrap();
-            let err = put_io(&ctx, "shared/", Some(input.to_str().unwrap()), None).unwrap_err();
-            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-            assert!(format!("{}", err).contains("directory path but input is a file"));
         });
     }
 

@@ -5,7 +5,7 @@ use std::path::Path;
 use crate::identity::read_identity;
 use crate::metadata::{create_metadata, read_metadata_attributes, sign_metadata, write_metadata_attributes};
 use crate::types::{IdentityContext, Member, Permission};
-use crate::util::{io_err, now_iso};
+use crate::util::{now_iso_fs, io_err};
 
 const LOG_CAPTURE_LIMIT: usize = 16 * 1024;
 
@@ -131,7 +131,7 @@ fn find_double_crlf(buf: &[u8]) -> Option<usize> {
 }
 
 fn allocate_entry_path(dir: &Path) -> io::Result<std::path::PathBuf> {
-    let timestamp = now_iso();
+    let timestamp = now_iso_fs();
     for seq in 0..1000 {
         let name = format!("{}_{:03}.http", timestamp, seq);
         let candidate = dir.join(&name);

@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crate::http::{write_stream_event, write_stream_keepalive, write_stream_start};
 use crate::types::{DirectoryEntry, DirectoryEntryKind, WatchAction};
-use crate::util::{io_err, now_milliseconds};
+use crate::util::{io_err, now};
 use crate::watch;
 
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
@@ -36,5 +36,5 @@ fn write_event(stream: &mut dyn Write, root: &Path, path: &Path, name: &str, kin
     };
 
     let json = serde_json::to_string(&entry).map_err(|e| io_err(&e.to_string()))?;
-    write_stream_event(stream, &now_milliseconds().to_string(), name, &json)
+    write_stream_event(stream, &now().to_string(), name, &json)
 }

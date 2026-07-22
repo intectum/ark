@@ -4,11 +4,10 @@ use crate::client::delete::delete;
 use crate::client::get::get;
 use crate::client::head::head;
 use crate::client::request::request;
-use crate::http::{read_request, read_response};
 use crate::identity::parse_address;
 use crate::metadata::{get_member, read_metadata_headers, write_metadata_headers};
 use crate::types::{DirectoryEntry, IdentityContext, Metadata, Permission, Proposal};
-use crate::util::{io_err, io_invalid_input, resolve_client_url, sha256};
+use crate::util::{io_err, io_invalid_input, parse_request_entry, resolve_client_url, sha256};
 
 /// List pending share proposals — request-log entries where another account's
 /// PUT was rejected with `403` at a path the current account owns. Each entry
@@ -187,28 +186,27 @@ fn resolve_id(ctx: &IdentityContext, index_or_id: &str) -> io::Result<String> {
 }
 
 fn parse_proposal(filename: &str, entry_bytes: &[u8]) -> Option<Proposal> {
-    let boundary = entry_bytes.windows(4).position(|w| w == b"\r\n\r\n")?;
-    let request_bytes = &entry_bytes[..boundary];
-    let response_bytes = &entry_bytes[boundary + 4..];
+    let entry = parse_request_entry(entry_bytes)
+        .map_err(|e| eprintln!("bad log entry: {}", e))
+        .ok()?;
 
-    let (method, target, request_headers, _) = read_request(&mut &request_bytes[..], true).ok()?;
-    if method != "PUT" { return None; }
+    if entry.method != "PUT" { return None; }
+    if entry.status != 403 { return None; }
 
-    let (status, _, _) = read_response(&mut &response_bytes[..], true).ok()?;
-    if status != 403 { return None; }
-
-    let metadata = read_metadata_headers(&request_headers).ok()?;
+    let metadata = read_metadata_headers(&entry.request_headers)
+        .map_err(|e| eprintln!("bad log entry metadata: {}", e))
+        .ok()?;
 
     Some(Proposal {
         id: filename.to_string(),
-        target,
+        target: entry.target,
         metadata,
     })
 }
 
 fn verify_metadata_changes(proposal: &Metadata, current: &Metadata, self_address: &str) -> io::Result<()> {
     if current.id != proposal.id {
-        return Err(io_err("current has different id than proposal"));
+        return Err(io_err("id is wrong"));
     }
 
     if let Some(msg) = check_member_changes(proposal, current, self_address) {
