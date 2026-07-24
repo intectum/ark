@@ -74,7 +74,7 @@ pub fn try_log_request(
 
     let ark_authorized = dir_metadata.members.iter().any(|member|
         member.address == server_ctx.identity.address
-            && matches!(member.permission, Permission::Write | Permission::Owner));
+            && matches!(member.permission, Permission::Writer | Permission::Owner));
     if !ark_authorized {
         return Ok(());
     }
@@ -104,7 +104,7 @@ pub fn try_log_request(
         },
         Member {
             address: server_ctx.identity.address.clone(),
-            permission: Permission::Write,
+            permission: Permission::Writer,
             key: None,
         },
     ];
@@ -171,7 +171,7 @@ mod tests {
         let mut metadata = create_metadata(&account_identity.address, None);
         metadata.members.push(Member {
             address: ark.address.clone(),
-            permission: Permission::Write,
+            permission: Permission::Writer,
             key: None,
         });
         sign_metadata(account_key, &mut metadata, None).unwrap();
@@ -281,13 +281,13 @@ mod tests {
             grant_ark_write_on_requests(temp_dir, "bob", &bob_identity, &bob_key, &ark);
 
             seed_shared_dir(temp_dir, &bob_identity, &bob_key, "ark/bob/shared", vec![
-                Member { address: alice_identity.address.clone(), permission: Permission::Write, key: None },
+                Member { address: alice_identity.address.clone(), permission: Permission::Writer, key: None },
             ]);
 
             let mut m = create_plain_test_metadata(&alice_identity, &alice_key, b"body");
             m.encryption_algorithm = None;
             m.members[0].key = None;
-            m.members.push(Member { address: bob_identity.address.clone(), permission: Permission::Write, key: None });
+            m.members.push(Member { address: bob_identity.address.clone(), permission: Permission::Writer, key: None });
             sign_metadata(&alice_key, &mut m, Some(b"body")).unwrap();
 
             let code = signed_put_metadata_with_headers(port, &alice_identity, &alice_key, "/ark/alice/shared/todo.txt", b"body", &m, &[("X-Ark-Relay", "full")]);
@@ -326,7 +326,7 @@ mod tests {
             let meta = read_metadata_attributes(&entries[0]).unwrap();
             assert_eq!(meta.modified_by, ark.address);
             assert!(meta.members.iter().any(|m| m.address == identity.address && m.permission == Permission::Owner));
-            assert!(meta.members.iter().any(|m| m.address == ark.address && m.permission == Permission::Write));
+            assert!(meta.members.iter().any(|m| m.address == ark.address && m.permission == Permission::Writer));
         });
     }
 }

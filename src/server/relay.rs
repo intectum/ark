@@ -8,7 +8,7 @@ use crate::client::request;
 use crate::http::read_response;
 use crate::identity::parse_address;
 use crate::types::{IdentityContext, Metadata, RelayMode};
-use crate::util::{create_authorization_header, io_err, now};
+use crate::util::{create_authorization_header, io_err, is_loopback_host, now};
 
 use super::handle_parsed;
 
@@ -76,7 +76,9 @@ pub fn relay(
             handle_parsed(&mut buf, server_ctx, method, &member_path, &final_headers, body, false)?;
             read_response(&mut buf.as_slice(), method == "HEAD")
         } else {
-            let url_string = format!("http://{}{}", member_host, member_path);
+            let bare_host = member_host.split(':').next().unwrap_or(&member_host);
+            let scheme = if is_loopback_host(bare_host) { "http" } else { "https" };
+            let url_string = format!("{}://{}{}", scheme, member_host, member_path);
             println!("{}(relay) {}", method, url_string);
 
             let url = Url::parse(&url_string).map_err(|e| io_err(&format!("invalid remote URL {}: {}", url_string, e)))?;
@@ -124,7 +126,7 @@ mod tests {
         let body = fs::read(&path).unwrap();
         let mut meta = create_metadata(address, None);
         meta.members[0].key = None;
-        meta.members.push(Member { address: "*".to_string(), permission: Permission::Read, key: None });
+        meta.members.push(Member { address: "*".to_string(), permission: Permission::Reader, key: None });
         sign_metadata(key, &mut meta, Some(&body)).unwrap();
         write_metadata_attributes(&path, &meta).unwrap();
     }
@@ -153,13 +155,13 @@ mod tests {
             let (bob_id, bob_key, _) = create_test_account(temp_dir, &format!("bob@127.0.0.1:{}", port));
 
             seed_shared_dir(temp_dir, &bob_id, &bob_key, "ark/bob/shared", vec![
-                Member { address: alice_id.address.clone(), permission: Permission::Write, key: None },
+                Member { address: alice_id.address.clone(), permission: Permission::Writer, key: None },
             ]);
 
             let mut m = create_plain_test_metadata(&alice_id, &alice_key, b"todo body");
             m.encryption_algorithm = None;
             m.members[0].key = None;
-            m.members.push(Member { address: bob_id.address.clone(), permission: Permission::Write, key: None });
+            m.members.push(Member { address: bob_id.address.clone(), permission: Permission::Writer, key: None });
             sign_metadata(&alice_key, &mut m, Some(b"todo body")).unwrap();
 
             let code = signed_put_metadata_with_headers(port, &alice_id, &alice_key, "/ark/alice/shared/todo.txt", b"todo body", &m, &[("X-Ark-Relay", "full")]);
@@ -186,7 +188,7 @@ mod tests {
             let mut m = create_plain_test_metadata(&alice_id, &alice_key, b"body");
             m.encryption_algorithm = None;
             m.members[0].key = None;
-            m.members.push(Member { address: bob_id.address.clone(), permission: Permission::Write, key: None });
+            m.members.push(Member { address: bob_id.address.clone(), permission: Permission::Writer, key: None });
             sign_metadata(&alice_key, &mut m, Some(b"body")).unwrap();
 
             let code = signed_put_metadata_with_headers(port, &alice_id, &alice_key, "/ark/alice/shared/todo.txt", b"body", &m, &[("X-Ark-Relay", "full")]);
@@ -205,14 +207,14 @@ mod tests {
             let (bob_id, bob_key, _) = create_test_account(temp_dir, &format!("bob@127.0.0.1:{}", port));
 
             seed_shared_dir(temp_dir, &bob_id, &bob_key, "ark/bob/shared", vec![
-                Member { address: alice_id.address.clone(), permission: Permission::Write, key: None },
+                Member { address: alice_id.address.clone(), permission: Permission::Writer, key: None },
             ]);
             fs::create_dir_all(temp_dir.join("ark/alice/shared")).unwrap();
 
             let mut m = create_plain_test_metadata(&alice_id, &alice_key, b"");
             m.encryption_algorithm = None;
             m.members[0].key = None;
-            m.members.push(Member { address: bob_id.address.clone(), permission: Permission::Write, key: None });
+            m.members.push(Member { address: bob_id.address.clone(), permission: Permission::Writer, key: None });
             sign_metadata(&alice_key, &mut m, None).unwrap();
 
             let code = signed_put_dir_metadata_with_headers(port, &alice_id, &alice_key, "/ark/alice/shared/sub/", &m, &[("X-Ark-Relay", "full")]);
@@ -232,8 +234,8 @@ mod tests {
             let mut m = create_plain_test_metadata(&alice_id, &alice_key, b"pub");
             m.encryption_algorithm = None;
             m.members[0].key = None;
-            m.members.push(Member { address: "*".to_string(), permission: Permission::Read, key: None });
-            m.members.push(Member { address: "groups:contacts".to_string(), permission: Permission::Read, key: None });
+            m.members.push(Member { address: "*".to_string(), permission: Permission::Reader, key: None });
+            m.members.push(Member { address: "groups:contacts".to_string(), permission: Permission::Reader, key: None });
             sign_metadata(&alice_key, &mut m, Some(b"pub")).unwrap();
 
             let code = signed_put_metadata_with_headers(port, &alice_id, &alice_key, "/ark/alice/public.txt", b"pub", &m, &[("X-Ark-Relay", "full")]);
@@ -262,19 +264,19 @@ mod tests {
             make_identity_public(&server_a_root, "alice", &alice_address, &alice_key);
 
             seed_shared_dir(&server_b_root, &bob_id, &bob_key, "ark/bob/shared", vec![
-                Member { address: alice_id.address.clone(), permission: Permission::Write, key: None },
-                Member { address: carol_id.address.clone(), permission: Permission::Write, key: None },
+                Member { address: alice_id.address.clone(), permission: Permission::Writer, key: None },
+                Member { address: carol_id.address.clone(), permission: Permission::Writer, key: None },
             ]);
             seed_shared_dir(&server_b_root, &carol_id, &carol_key, "ark/carol/shared", vec![
-                Member { address: alice_id.address.clone(), permission: Permission::Write, key: None },
-                Member { address: bob_id.address.clone(), permission: Permission::Write, key: None },
+                Member { address: alice_id.address.clone(), permission: Permission::Writer, key: None },
+                Member { address: bob_id.address.clone(), permission: Permission::Writer, key: None },
             ]);
 
             let mut m = create_plain_test_metadata(&alice_id, &alice_key, b"hello");
             m.encryption_algorithm = None;
             m.members[0].key = None;
-            m.members.push(Member { address: bob_id.address.clone(), permission: Permission::Write, key: None });
-            m.members.push(Member { address: carol_id.address.clone(), permission: Permission::Write, key: None });
+            m.members.push(Member { address: bob_id.address.clone(), permission: Permission::Writer, key: None });
+            m.members.push(Member { address: carol_id.address.clone(), permission: Permission::Writer, key: None });
             sign_metadata(&alice_key, &mut m, Some(b"hello")).unwrap();
 
             let code = signed_put_metadata_with_headers(port_a, &alice_id, &alice_key, "/ark/alice/shared/todo.txt", b"hello", &m, &[("X-Ark-Relay", "full")]);
@@ -306,13 +308,13 @@ mod tests {
             let (alice_id, alice_key, _) = create_test_account(&server_a_root, &alice_address);
 
             seed_shared_dir(&server_b_root, &bob_id, &bob_key, "ark/bob/shared", vec![
-                Member { address: alice_id.address.clone(), permission: Permission::Write, key: None },
+                Member { address: alice_id.address.clone(), permission: Permission::Writer, key: None },
             ]);
 
             let mut m = create_plain_test_metadata(&alice_id, &alice_key, b"hello");
             m.encryption_algorithm = None;
             m.members[0].key = None;
-            m.members.push(Member { address: bob_id.address.clone(), permission: Permission::Write, key: None });
+            m.members.push(Member { address: bob_id.address.clone(), permission: Permission::Writer, key: None });
             sign_metadata(&alice_key, &mut m, Some(b"hello")).unwrap();
 
             let code = signed_put_metadata_with_headers(port_a, &alice_id, &alice_key, "/ark/alice/shared/todo.txt", b"hello", &m, &[("X-Ark-Relay", "internal")]);

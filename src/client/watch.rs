@@ -23,12 +23,9 @@ const REMOTE_RECONNECT_DELAY: Duration = Duration::from_secs(2);
 /// synthesises a [`WatchAction::Keepalive`] event after each idle interval so
 /// the callback can time out.
 ///
-/// Events are advisory. On macOS, FSEvents coalesces batches with coarser
-/// timestamps and may reorder Create/Modify pairs; consumers should re-read
-/// the file to get authoritative state.
-// notify: on macOS FSEvents coalesces batched events with coarser timestamps
-// and may reorder Create/Modify pairs. Consumers should treat (path, action)
-// as an advisory hint and re-check the file to get authoritative state.
+/// Events are advisory. On macOS, FSEvents may coalesce or reorder
+/// Create/Modify pairs; consumers should re-read the file to get authoritative
+/// state.
 pub fn watch_local<F>(path: &Path, mut on_event: F, keepalive: Option<Duration>) -> io::Result<()>
 where
     F: FnMut(WatchEvent) -> bool,
@@ -76,13 +73,10 @@ where
     }
 }
 
-/// Subscribe to a server-sent event stream at `url` and invoke `on_event` for
-/// each remote change. Blocks; auto-reconnects on stream errors after a short
-/// delay.
-///
-/// Requests the stream via `Accept: text/event-stream` and signs the request
-/// using `ctx`. `url` points at any directory on the server — events cover
-/// changes under it.
+/// Subscribe to server-sent events at `url` (any directory on the server) and
+/// invoke `on_event` for each remote change under it. Blocks; auto-reconnects
+/// on stream errors after a short delay. `ctx` authenticates the
+/// subscription.
 pub fn watch_remote<F>(ctx: &IdentityContext, url: &Url, mut on_event: F) -> io::Result<()>
 where
     F: FnMut(WatchEvent) -> io::Result<()>,

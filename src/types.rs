@@ -38,11 +38,19 @@ pub struct Hash {
     pub value: Vec<u8>,
 }
 
+/// Public identity of an ark account: address, public key, and a self-signature
+/// binding the two. Served as `.ark/identity.json` and used to verify request
+/// signatures and wrap file keys for members.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Identity {
+    /// Public key used to verify request signatures and wrap file keys for
+    /// this account.
     pub public_key: Key,
+    /// Account address in `name@host[:port]` form.
     pub address: String,
+    /// ISO 8601 timestamp of the most recent identity change.
     pub modified: String,
+    /// Signature over the other fields, produced by the account's private key.
     pub signature: Signature,
 }
 
@@ -93,38 +101,38 @@ pub struct Metadata {
     pub signature: Signature,
 }
 
-/// Permission tier for a [`Member`]. Ordered: `Owner` > `Write` > `Read`.
+/// Permission tier for a [`Member`]. Ordered: `Owner` > `Writer` > `Reader`.
 /// See `spec.md` §3.3 for the read/modify/change-members matrix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Permission {
     Owner,
-    Write,
-    Read,
+    Writer,
+    Reader,
 }
 
 impl Permission {
     pub fn as_str(&self) -> &'static str {
         match self {
             Permission::Owner => "owner",
-            Permission::Write => "write",
-            Permission::Read => "read",
+            Permission::Writer => "writer",
+            Permission::Reader => "reader",
         }
     }
 
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "owner" => Some(Permission::Owner),
-            "write" => Some(Permission::Write),
-            "read" => Some(Permission::Read),
+            "writer" => Some(Permission::Writer),
+            "reader" => Some(Permission::Reader),
             _ => None,
         }
     }
 
     pub fn rank(&self) -> u8 {
         match self {
-            Permission::Read => 0,
-            Permission::Write => 1,
+            Permission::Reader => 0,
+            Permission::Writer => 1,
             Permission::Owner => 2,
         }
     }
@@ -159,9 +167,6 @@ impl RelayMode {
     }
 }
 
-/// One parsed entry from an account's `.ark/requests/` log — request line,
-/// request headers, and response status. Bodies are not recorded in log
-/// entries.
 pub struct RequestEntry {
     pub method: String,
     pub target: String,

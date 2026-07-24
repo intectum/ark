@@ -623,7 +623,7 @@ mod tests {
     #[test]
     fn validate_metadata_rejects_no_owner() {
         let mut m = create_metadata(TEST_ADDRESS, None);
-        m.members[0].permission = Permission::Read;
+        m.members[0].permission = Permission::Reader;
         let err = match validate_metadata(&m) {
             Err(e) => e,
             Ok(_) => panic!("expected owner-missing error"),
@@ -647,7 +647,7 @@ mod tests {
         let m = create_metadata(TEST_ADDRESS, None);
         let mut headers = write_metadata_headers(&m);
         headers.push(("X-Ark-Meta-Member-2-Address".to_string(), "c@z".to_string()));
-        headers.push(("X-Ark-Meta-Member-2-Permission".to_string(), "read".to_string()));
+        headers.push(("X-Ark-Meta-Member-2-Permission".to_string(), "reader".to_string()));
         headers.push(("X-Ark-Meta-Member-2-Key-Algorithm".to_string(), "x25519".to_string()));
         headers.push(("X-Ark-Meta-Member-2-Key-Value".to_string(), encode_base64url([5u8; 32])));
         let err = match read_metadata_headers(&headers) {

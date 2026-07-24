@@ -18,9 +18,9 @@ const PUBLIC_WIRE: &str = "*";
 /// matching permission; removes each address in `drops`. The literal
 /// `"public"` maps to the wildcard address `*` (rejected for encrypted files).
 ///
-/// For encrypted files, adding a member re-wraps the current file key against
-/// their public key (looked up via [`crate::identity::resolve_identity`]).
-/// The caller must currently be an owner. At least one owner must remain.
+/// For encrypted files, adding a member re-wraps the file key against their
+/// public key. The caller must currently be an owner. At least one owner must
+/// remain.
 ///
 /// Does not upload — the file's xattrs are updated locally. Follow with
 /// [`put_io`](super::put_io) to sync the change to the server.
@@ -56,8 +56,8 @@ pub fn chmod_io(
     };
 
     apply_changes(ctx, &mut metadata.members, owners, Permission::Owner, file_key.as_deref())?;
-    apply_changes(ctx, &mut metadata.members, writers, Permission::Write, file_key.as_deref())?;
-    apply_changes(ctx, &mut metadata.members, readers, Permission::Read, file_key.as_deref())?;
+    apply_changes(ctx, &mut metadata.members, writers, Permission::Writer, file_key.as_deref())?;
+    apply_changes(ctx, &mut metadata.members, readers, Permission::Reader, file_key.as_deref())?;
 
     for addr in drops {
         let wire = cli_address_to_wire(addr);
@@ -154,7 +154,7 @@ mod tests {
 
             let m = read_metadata_attributes(&path).unwrap();
             let john = m.members.iter().find(|m| m.address == "john@example.com").unwrap();
-            assert_eq!(john.permission, Permission::Read);
+            assert_eq!(john.permission, Permission::Reader);
             assert!(m.members.iter().any(|m| m.address == TEST_ADDRESS && m.permission == Permission::Owner));
         });
     }
@@ -172,7 +172,7 @@ mod tests {
 
             let m = read_metadata_attributes(&path).unwrap();
             let pub_member = m.members.iter().find(|m| m.address == "*").unwrap();
-            assert_eq!(pub_member.permission, Permission::Read);
+            assert_eq!(pub_member.permission, Permission::Reader);
             assert!(pub_member.key.is_none());
         });
     }
@@ -215,7 +215,7 @@ mod tests {
 
             let m = read_metadata_attributes(&path).unwrap();
             let bob = m.members.iter().find(|m| m.address == "bob@example.com").unwrap();
-            assert_eq!(bob.permission, Permission::Read);
+            assert_eq!(bob.permission, Permission::Reader);
             let bob_wrapped = bob.key.as_ref().expect("bob's wrapped key");
             let recovered = crate::crypto::decrypt_bytes(
                 &Key { algorithm: bob_wrapped.algorithm.clone(), value: bob_secret_key.value.clone() },
@@ -236,7 +236,7 @@ mod tests {
             let mut m = create_metadata(&identity.address, None);
             m.members.push(Member {
                 address: "sam@example.com".to_string(),
-                permission: Permission::Read,
+                permission: Permission::Reader,
                 key: None,
             });
             sign_metadata(&secret_key, &mut m, Some(b"body")).unwrap();
@@ -248,7 +248,7 @@ mod tests {
 
             let m2 = read_metadata_attributes(&path).unwrap();
             let sam = m2.members.iter().find(|m| m.address == "sam@example.com").unwrap();
-            assert_eq!(sam.permission, Permission::Write);
+            assert_eq!(sam.permission, Permission::Writer);
         });
     }
 
@@ -263,7 +263,7 @@ mod tests {
             let mut m = create_metadata(&identity.address, None);
             m.members.push(Member {
                 address: "sam@example.com".to_string(),
-                permission: Permission::Read,
+                permission: Permission::Reader,
                 key: None,
             });
             sign_metadata(&secret_key, &mut m, Some(b"body")).unwrap();
@@ -301,7 +301,7 @@ mod tests {
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(&path, b"body").unwrap();
             let mut m = create_metadata(&identity.address, None);
-            m.members[0].permission = Permission::Write;
+            m.members[0].permission = Permission::Writer;
             m.members.push(Member {
                 address: "boss@example.com".to_string(),
                 permission: Permission::Owner,

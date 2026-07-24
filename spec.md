@@ -1,1402 +1,555 @@
 # Ark Protocol Specification
 
-> **Status:** Draft v0.5
-> **Date:** 2026-04-26
+> **Status:** Draft v0.6
+> **Date:** 2026-07-24
 
 ## Table of Contents
 
 1. [Overview](#1-overview)
-2. [System 1: Identity](#2-system-1-identity)
-3. [System 2: Files](#3-system-2-files--the-core-primitive)
-4. [System 3: Encryption](#4-system-3-encryption--nobody-else-can-read-this)
-5. [System 4: Authentication](#5-system-4-authentication--this-really-came-from-alice)
-6. [System 5: Delivery Control](#6-system-5-delivery-control--who-can-reach-you)
-7. [System 6: Transport](#7-system-6-transport--how-data-moves)
-8. [File Format](#8-file-format)
-9. [Threat Model](#9-threat-model)
-10. [Extensions](#10-extensions)
-- [Appendix A: Configuration](#appendix-a-configuration)
-- [Appendix B: Endpoints](#appendix-b-endpoints)
-- [Appendix C: Types](#appendix-c-types)
-- [Appendix D: Cryptographic Algorithms](#appendix-d-cryptographic-algorithms)
-- [Appendix E: Example Usage](#appendix-e-example-usage)
+2. [Concepts](#2-concepts)
+3. [Client ⇄ Server contract](#3-client--server-contract)
+4. [Endpoints](#4-endpoints)
+5. [Authentication (`ArkIdentity`)](#5-authentication-arkidentity)
+6. [Authorization](#6-authorization)
+7. [Metadata](#7-metadata)
+8. [Encryption](#8-encryption)
+9. [Federation & relay](#9-federation--relay)
+10. [Request log](#10-request-log)
+11. [Recovery](#11-recovery)
+12. [Threat model](#12-threat-model)
+13. [Not yet implemented](#13-not-yet-implemented)
+- [Appendix A — Types](#appendix-a--types)
+- [Appendix B — Algorithms](#appendix-b--algorithms)
 
 ---
 
 ## 1. Overview
 
-Ark is a federated, encrypted protocol for synchronizing and sharing files. It is built on cryptographic identity and end-to-end encryption with six core systems:
+Ark is a federated protocol for storing and sharing files. It gives an application four capabilities from one primitive:
 
-| System | Purpose |
-|---|---|
-| **Identity** | Who are you? Keypair mapped to a human-readable address. |
-| **Files** | The core data primitive. Everything — messages, documents, notes — is an encrypted file on disk. |
-| **Encryption** | Nobody else can read your data. Symmetric file keys wrapped with public-key encryption. |
-| **Authentication** | Proof that data really came from the claimed author. |
-| **Delivery Control** | Only members of a file or directory can write to it. Unauthorized writes are rejected and surfaced in the request log as share proposals. |
-| **Transport** | How files move between servers. Plain HTTPS, trivially self-hostable. |
+- **Storage** — files at HTTP paths, encrypted end-to-end by default.
+- **Auth** — one keypair per user; requests are signed, no passwords or tokens on the wire.
+- **Sharing** — add another account as a member of a file or directory; they can read, write, or own it.
+- **Federation** — a server writes to another user's server directly. No central service.
+
+An Ark **server** is an authenticated file server rooted at `/ark/<account>/…`. An Ark **client** signs requests with an account's private key, encrypts bodies before uploading, and unwraps them after downloading. Every file carries signed metadata that binds a body hash, an author, and a member list. Access decisions are made from that member list — no separate ACL system.
 
 ### Design principles
 
-- **Cryptographic identity, not reputation-based.** Your identity is a keypair, not an IP address or domain reputation score. This eliminates the entire class of deliverability problems that plague self-hosted email.
-- **Encrypted by default.** File content is end-to-end encrypted unless explicitly opted out. Servers store ciphertext they cannot read. Unencrypted files are supported for public content — the metadata still provides authentication and integrity via signatures.
-- **Files on disk.** Storage is the filesystem. No database for user data. Files are accessed by path over HTTPS. Any tool that can read files can interact with Ark data.
-- **One primitive.** Everything is a file: a body plus a small signed metadata record. Different membership patterns produce different behaviors, not different concepts.
-- **Simple to self-host.** A single binary, a single config file, a domain with an A record. That's it.
-- **Federated, not peer-to-peer.** Servers provide reliable offline storage and key hosting. Pure P2P systems (Bitmessage, Briar) struggle with reliability and adoption.
-- **Spam-resistant by construction.** Only members of a file or directory can write to it. Unauthorized writes are rejected; the account owner reviews them as share proposals in the request log. Unforgeable identity means no one can impersonate an existing member.
-- **Simple key model.** One keypair per identity, like a crypto wallet. Lose the key, lose the identity. Have the key, have all your data.
-- **Flexible trust model.** Users choose where their private key lives — on their device (maximum security) or on their server (maximum convenience). Self-hosters get both.
-- **App-agnostic.** The protocol defines files, membership, and transport. How files are organized into directories is up to applications. A mail app, a notes app, and a file manager all operate on the same files — just arranged differently.
+- **Cryptographic identity, not reputation.** An account is a keypair. There is no IP or domain reputation model.
+- **Encrypted by default.** Bodies are encrypted with a per-file symmetric key, wrapped for each member's public key. Servers store ciphertext they cannot read. Unencrypted files are allowed for public content; integrity is still signed.
+- **Files on disk.** Storage is the filesystem. No database is required. A file's body is its bytes; its metadata is stored in extended attributes.
+- **One primitive.** Everything is a file or directory. Membership decides what is a message, a note, a photo, a website.
+- **Simple to self-host.** A single binary, a single account root, a domain with an A record.
+- **Federated, not peer-to-peer.** Servers give offline availability and stable addressing. Delivery is server-to-server HTTPS.
+- **Spam-resistant by construction.** A write is only accepted from a member of the target path. Everything else is rejected and recorded.
+- **App-agnostic.** The protocol defines files, membership, and transport. Path layout is an application concern.
 
 ---
 
-## 2 Accounts
+## 2. Concepts
 
-Every account has a cryptographic keypair — like a crypto wallet. The public key *is* the identity of the account. It's mapped to a human-readable address like `alice@example.com`, where `example.com` is the server that hosts Alice's account.
+**Account.** An addressable entity on a server. Backed by an identity keypair. Rooted on disk at `/ark/<account>/`. Has a self-signed identity document at `/ark/<account>/.ark/identity.json`.
 
-[TODO move address info to 4.1 Identities?]
-### 2.1 Address
+**Address.** `<account>@<host>[:<port>][/<path>]`. `host` is the server's hostname or IP; port defaults to 443. Path defaults to `/.ark/identity.json` (the primary identity). A path other than the default addresses a **sub-identity** — a distinct keypair whose identity file lives under the same account root (for example a password identity at `/.ark/passwords/primary.json`).
 
-Addresses use the familiar `account@host` format, with an optional path pointing to a specific identity file within the account:
+**Identity.** A JSON document at some path under `/ark/<account>/.ark/` that pairs an address with a public key and a self-signature (Appendix A.1). The primary identity is at `identity.json`; alternative identities (password, passkey) live under `passwords/`, `passkeys/`. Servers do not validate identity content beyond the self-signature.
 
-```
-alice@example.com
-bob@ark.myserver.org
-charlie@127.0.0.1:8080
-alice@example.com/.ark/passwords/primary.json
-```
+**File.** Raw body bytes on disk, plus a signed metadata record (§7). The metadata carries the file's `id`, timestamps, author, member list, encryption algorithm, body hash, and signature. Bodies of encrypted files are `nonce ‖ ciphertext+tag`; bodies of unencrypted files are raw.
 
-- `account`: The local part, unique within the server. Lowercase alphanumeric, dots, hyphens, underscores. Max 64 characters.
-- `host`: The server's hostname or IP address (and optional port, defaults to `443`).
-- `path`: Optional. Path to a specific identity file within the account. Defaults to `/.ark/identity.json` (the primary account identity). Non-primary identity paths (e.g. password identities under `/.ark/passwords/`, passkey identities under `/.ark/passkeys/`) address alternative keypairs bound to the same account.
+**Directory.** A filesystem directory that may carry metadata of its own. Directory metadata omits `body_hash` and `encryption_algorithm`. A directory's members apply to files under it that do not carry their own metadata.
 
-For the primary account identity, the `account@host` form matches email and requires no new mental model.
+**Member.** An entry in a metadata's member list. Consists of an address, a permission, and — for encrypted files — the per-file key wrapped for that member's public key. Special address `*` denotes a public member.
 
-### 2.2 Creation
+**Permission.** `owner` > `writer` > `reader`. `owner` can modify the member list; `writer` can modify body/metadata but not membership; `reader` can read only. Highest permission a requestor is granted by any of its member matches wins.
 
-The creation of an identity file (`/ark/<account>/.ark/identity.json`) is equivalent to the creation of an account. The client must first create a keypair and include the public key (and algorithm) in the identity file. Only the client needs to have the private key and should not store it unencrypted. The server **must never have the unencrypted private key**.
-
-See 4.1 Identities for more information about identity files.
-
-**Account setup steps:**
-
-Clients should perform the following steps after account creation.
-
-1. Grant the Ark account the `write` permission for the `/ark/<account>/.ark/requests/` directory (see 4 Ark files).
-
-Servers can disable remote account creation:
-
-```toml
-allow_remote_registration = false  # Only admin can create accounts (default: true)
-```
-
-When disabled, attempting to create an identity file returns `403 Forbidden`. Local account creation (via the admin CLI) always works regardless of this setting.
-
-### 2.3 Recovery
-
-In the event that an account's private key is lost, the account will no longer be accessible. There are a few methods recommended to allow recovery of the acccount.
-
-**Seed phrase:**
-
-During account creation the client can generate a 24-word seed phrase using a BIP-39 wordlist. This seed phrase can then be recorded (preferably offline) and can be used at a later date to recover the private key (and therefore access the account). Using this method, the server **never has the private key**. This is the best method for security conscious users.
-
-Example seed phrase:
-
-```
-witch collapse practice feed shame open despair creek road again ice least
-glimpse tree mango mandate concert problem grief attack mosquito task final jeans
-```
-
-**Passkey/password:**
-
-The client can create an identity key file (`/ark/<account>/.ark/identity.key`) and allow passkey and/or password access to that file. The passkey/password can be used at a later date to fetch and decrypt the private key (and therefore access the account). Using this method, the server **has an encrypted copy of the private key**. It never sees the unencrypted private key. This is the best method for users seeking convenience. Before accepting a private key from the server, the client should first derive and verify that the public key is the account's public key. [TODO the file is signed, is this necessary? No harm in an extra step I guess?] Removal of a member from the identity key file must be accompanied by a key transition since the removed member had access to the current private key.
-
-It is expected that most users will opt into this recovery method because:
-
-- No seed phrase to lose.
-- Seamless multi-device support (each device decrypts the identity key file to get the private key).
-- Optionally allows admin access (see below).
-
-**Admin access:**
-
-In some cases it may be helpful to give the Ark account the `owner` permission of the identity key file. This can be useful for accounts within organizations and allows the admin to reset your password. NOTE: This effectively gives the Ark account full access to your account!
-
-### 2.4 Key transition
-
-Keys should be changed as part of a regular rotation or if it is suspected that it may be compromised.
-
-[TODO how does key transition interact with groups/accounts that don't get notified?]
-[TODO what if the attacker transitions the key?]
-
-**Transition steps:**
-
-1. Generate a new identity keypair.
-2. Replace the `Key` and add a `KeyTransition` to the account's identity file.
-3. Broadcast the new identity file to the account's contacts to notify them of the key transition.
-4. All encrypted files with the account as a member must update the key wrapper using the new identity key.[TODO If the key was compromised, encrypted files may need to be re-encrypted with new keys?]
-5. After a transition period, the `KeyTransition` is removed.[TODO transition period? 30 days? how would this work?]
-
-### 2.5 Verification
-
-[TODO review]
-When Bob wants to verify Alice's account for the first time:
-
-1. Bob's client extracts the domain from `alice@example.com`.
-2. Bob's client makes an HTTPS GET to `https://example.com/ark/alice/.ark/identity.json`.
-3. Bob's client verifies the `signature` field against the `Key` in the document.
-4. **Trust On First Use (TOFU):** Bob's client stores Alice's `Key` locally. This is the first time Bob has seen this key, so he trusts it (like SSH's "The authenticity of host 'example.com' can't be established... Are you sure you want to continue?").
-5. On subsequent fetches, Bob's client compares the `Key` against the stored value. If it has changed without a proper key transition (see 2.8), the client raises an alert.
-
-### 2.6 Aliases
-
-A single identity keypair can have **multiple addresses** that all resolve to the same account. One address is the **primary**. All others are **aliases** that redirect to the primary. For example, Alice may have the primary account `alice@example.com` and the alias account `alice-alias@example-alias.com`.
-
-To create an alias account, create an identity file with the primary account's address e.g. Alice would create a file at `https://example-alias.com/ark/alice-alias/.ark/identity.json` with the address `alice@example.com`. Servers must verify that the alias account is pointing to an account with the same identity key.
-
-Clients who contact `alice@example-alias.com` are seamlessly redirected to the primary account. Clients who have Alice's key pinned via TOFU won't be alarmed — it's the same key, just a new address.
-
-**Use cases:**
-
-- Name changes: Alice changes her username from `old-alice` to `alice`. The old address becomes an alias. Existing contacts are seamlessly redirected.
-- Vanity aliases: Alice has `alice@example.com` as primary but also wants `a@example.com`.
-- Generated aliases: Machine-generated aliases for special purposes.
-
-### 2.7 Migration
-
-Alice can change her account name and even move from one server to another while keeping the same identity keypair.
-
-**Migration steps:**
-
-1. Alice creates an account on the new server with her existing identity keypair.
-2. Alice copies her files from the old server to the new server. No re-encryption needed — all file keys are encrypted to the same identity key regardless of which server stores them.
-3. On the old server, Alice's identity file is converted to an alias file.
-4. Alice broadcasts her new identity file to her contacts to notify them of the migration.
-5. After a transition period, Alice can delete her account on the old server.
-
-**When the old server is gone:**
-
-If Alice's old server goes offline (provider shut down, lost access), the alias can't be set up. Clients who contact the old address will get a DNS failure or 404. This is the same as losing an email provider — Alice needs to tell her contacts the new address out-of-band. When they look up her identity document on the new server, they'll see the same identity key they had pinned, confirming it's really her.
-
-**What doesn't migrate:**
-
-[TODO review]
-- Shared file co-membership. Other members of shared files have Alice's old address in the member list. Alice notifies co-members by sending them her new identity document (Section 7.4) so they update the address. Since membership is verified by identity key, the transition is seamless once addresses are updated.
-
-### 2.8 Multi-device support
-
-Alice uses a laptop and a phone. Multi-device support works differently depending on the recovery method:
-
-**Seed phrase:**
-
-- Alice records her seed phrase during the setup of her first device.
-- To add a second device, Alice enters the seed phrase on the new device (or transfers the private key via QR code / secure channel).
-- All devices derive the same identity keypair.
-
-**Passkey/password:**
-
-- Each device fetches and decrypts the identity key file with Alice's password or passkey to recover the private key.
-
-In both cases, all devices can decrypt all files and sign operations (they all have the same identity keypair).
-
-### 2.9 Ark account
-
-The `ark` account is a special account created when the server is first started. It is used to sign files or directories created or modified by the server itself.
+**Path mirroring.** A shared file lives at the same relative path on every co-member's server. `apps/notes/team/foo.md` on Alice's server is `apps/notes/team/foo.md` on Bob's. There is no rehoming layer.
 
 ---
 
-## 3 Files & Directories
+## 3. Client ⇄ Server contract
 
-Ark is - at it's core - a file server. Files managed by Ark are given additional metadata. Directories may optionally be given metadata (see 3.6 Directories). This metadata is not encrypted but is signed by the last modifier of the file or directory to prevent tampering. File content is encrypted by default but can be unencrypted by omitting the `encryption_algorithm` field. The [TODO] algorithm must be supported for encryption by all clients. Since the file metadata declares the encryption algorithm, any algorithm can be used, however clients may not support other algorithms (and will therefore be unable to decrypt the file).
+| Concern | Client | Server |
+|---|---|---|
+| **Identity keypair** | Owns the private key. Signs requests. Wraps and unwraps file keys. | Never sees the plaintext private key. Holds an **encrypted** copy of it (as `/.ark/identity.key`) only when password recovery is enabled (§11.2). |
+| **Metadata** | Constructs, signs, and sends `X-Ark-Meta-*` headers on PUT. Verifies signatures on GET. | Persists metadata as `user.ark.*` xattrs. Verifies the request signature and metadata signature. Does not construct metadata (except its own `ark@` account entries — §10). |
+| **Encryption** | Generates a fresh file key per encrypted PUT. Wraps it to each member's public key. Encrypts and decrypts bodies. | Stores ciphertext. Never sees a plaintext body. Never sees a file key. |
+| **Authorization** | Chooses the member list on new files/dirs. | Enforces the member list on every request. Rejects unauthorized writes and records them (§10). |
+| **Federation** | Sends **one** PUT to the account's own server with `X-Ark-Relay: full`. | Fans that PUT out to every co-member on every other host, at the identical path. |
+| **Public read** | Marks a file public by adding member `*` at `reader`. | Allows unauthenticated GET/HEAD on paths with a `*` member. Still rejects PUT/DELETE without a signed request. |
+| **Account creation** | PUTs the new identity to `/.ark/identity.json` on a server. | Creates the account when that path is unclaimed. Rejects claims to existing accounts. |
+| **Request log** | Owned by the account. Client reads and prunes it. | The server's `ark@<host>` account writes an entry per non-log request (§10). |
 
-Directory metadata never includes `encryption_algorithm` as directories have no body to encrypt. Directory metadata also omits `body_hash` entirely; the signature covers the metadata without it.
+---
 
-### 3.1 ID
+## 4. Endpoints
 
-The metadata includes a UUID used to identify the file or directory.
+### 4.1 URL shape
 
-### 3.2 Signature
+`https://<host>/ark/<account>/<path>`
 
-The metdata includes the address of the last modifier and is signed by their identity key. When Alice creates or modifies a file:
+- `<account>` matches the local part of the address; lowercase alphanumeric plus `.`, `-`, `_`; 1–64 chars; not pure dots.
+- `<path>` is the file or directory path within the account. `..` segments are rejected.
+- A trailing `/` is a hint that the request targets a directory; it is not authoritative. On PUT, dir-vs-file is decided by the presence of `body_hash` in the request metadata (§7). On GET, it is decided by what exists on disk at the resolved path.
+- Requests directly to `/ark`, `/ark/`, `/ark/<account>` (no subpath), or to any path outside `/ark/` are rejected.
+- Symlinks anywhere in the resolved path are rejected with 403.
 
-1. Alice computes a signature over the canonical serialization of the metadata fields as well as a SHA-256 [TODO alg agnostic] hash of the body.
-2. The signature is stored in the file metadata's `signature` field.
-3. Clients can verify by fetching Alice's identity key.
+### 4.2 Common conventions
 
-### 3.3 Membership
+**Signed request.** Every non-public request carries an `Authorization: ArkIdentity …` header (§5). A `Host` header is required and must match the server's own host.
 
-One or more members are listed in the metadata. For encrypted files, every member entry includes the file's private key encrypted (ECIES-wrapped) [TODO do we allow algorithm agnostic for all algorithms used?] by the member's encryption key. This means any member can decrypt the content.
+**Metadata.** File and directory metadata rides as `X-Ark-Meta-*` request/response headers. Kebab-case field names; base64url for binary values. Members are numbered — `X-Ark-Meta-Member-0-Address`, `X-Ark-Meta-Member-0-Permission`, `X-Ark-Meta-Member-0-Key-Algorithm`, `X-Ark-Meta-Member-0-Key-Value`. Unknown `X-Ark-Meta-*` headers are ignored. Servers MUST verify the metadata signature on every PUT before storing, rejecting with `403` on failure; the signature is checked against the public key of the identity named in `modified_by`, and for files `body_hash` MUST also be recomputed from the request body and compared. Clients SHOULD perform the same checks on every GET before trusting the data.
 
-**Member types:**
+**Content-Type on GET.** Not fixed by the protocol. The server picks a value; `application/octet-stream` is a safe default. Directory listings are `application/json`.
 
-| Type | Available permissions |
+**Content-Length.** Required on every request and response.
+
+**Errors.** All non-2xx responses have `Content-Type: text/plain` and a short human message as the body.
+
+### 4.3 `GET`
+
+**File.** Response body is the file's bytes exactly as stored (ciphertext for encrypted files, raw bytes for unencrypted). Response headers include the full `X-Ark-Meta-*` set. Membership is enforced (§6); a `*` member allows unauthenticated GET.
+
+**Directory (default).** Response body is `[DirectoryEntry]` (Appendix A.5) as JSON — `{type, name}` per entry, `type` in `dir | file | symlink`. If the directory itself has metadata, its `X-Ark-Meta-*` are also returned. No recursion.
+
+**Directory (SSE upgrade).** If the request carries `Accept: text/event-stream`, the response is a `text/event-stream` connection that stays open. Each event describes a filesystem change under the target directory. Payload:
+
+```
+id: <unix-ms>
+event: created | modified | deleted
+data: <DirectoryEntry JSON>
+```
+
+A `: keepalive` comment is emitted every 15 seconds. The stream ends when the client disconnects.
+
+### 4.4 `HEAD`
+
+Same as `GET` on the same path, without a body. `Content-Length` reports the body size the equivalent GET would return. Not valid with `Accept: text/event-stream` (use GET).
+
+### 4.5 `PUT`
+
+Creates or updates a file or directory. **Dir vs file is determined by whether the request metadata contains `body_hash`** — files must carry a `body_hash`, directories must not. The URL's trailing `/` is a hint only.
+
+**Required request headers.** Full `X-Ark-Meta-*` set. `Authorization` (unless the target is a fresh `/.ark/identity.json` — see below).
+
+**Request body.** For files: the body bytes as stored (ciphertext for encrypted, raw for unencrypted). For directories: empty.
+
+**Optional header: `X-Ark-Relay`.** Instructs the receiving server to fan out this PUT after storing locally (§9).
+| Value | Effect |
 |---|---|
-| Account (see 2 Accounts) | All. Any addressable identity, including password (4.5) and passkey (4.4) identities within an account. |
-| Group (see 4.2 Groups) | All |
-| Public (see below) | All |
+| `full` | Fan out to every unique remote host in the metadata member list, once per host. Same-host members are also written in-process. |
+| `internal` | Same-host members only. No outbound requests. Used to break relay loops. |
+| absent | No relay. Server stores locally only. |
 
-Public members are denoted by the wildcard address (`*`) and require identity verification to modify (all modifications require a verifiable author) but can read without being verified. This means that a file with a public member can be fetched without any form of authentication.
+**Response codes.** `201 Created` (new path), `204 No Content` (existing path updated), `400` (missing/bad metadata or body-vs-dir mismatch), `401` (bad signature), `403` (not authorized, or member change without owner), `409` (id mismatch on overwrite, or older `modified` than existing).
 
-**Member permissions:**
+**Bootstrap: `PUT /ark/<account>/.ark/identity.json`.** If no identity exists at that path, the request is unauthenticated and the body is the new account's `Identity` JSON. The request metadata must still be signed by the new account's key. This is how an account is created.
 
-| Permission | Can read | Can modify | Can modify members |
-|---|---|---|---|
-| `owner` | Yes | Yes | Yes |
-| `write` | Yes | Yes | No |
-| `read` | Yes | No | No |
+### 4.6 `DELETE`
 
-To determine directory membership, the ancestors of the directory will be traversed until a directory with metadata is found. Creating a new file is considered a `write` operation for the containing directory.
+Removes a file, or recursively removes a directory and its contents. Membership is enforced. Returns `204 No Content` on success, `404` if the path does not exist, `403` for insufficient permission or a symlinked target.
 
-**Adding or removing a member:**
+### 4.7 Response codes
 
-Must be performed by an existing member with the `owner` permission.
+| Code | Meaning |
+|---|---|
+| 200 | GET/HEAD success. |
+| 201 | PUT created a new path. |
+| 204 | PUT overwrote an existing path, or DELETE succeeded. |
+| 400 | Malformed request (bad metadata, dir-with-body, unparseable path). |
+| 401 | Missing / invalid `Authorization` (also: bad `Host`, stale timestamp, bad signature). |
+| 403 | Not a member with sufficient permission, member change without `owner`, symlink target, path outside `/ark/`. |
+| 404 | Target does not exist. |
+| 405 | Method not allowed at this path (e.g. PUT on `/ark/<account>`). |
+| 409 | id conflict, or `modified` older than existing. |
+| 500 | Server-side error (I/O, corrupt metadata). |
 
-To add a member:
+### 4.8 Reserved `/ark/<account>/.ark/` namespace
 
-1. Add an entry to the member list.
-2. Sign the updated metadata.
-3. Sync the updated metadata to all members.
+Everything under `/.ark/` is protocol-defined. Applications must not write arbitrary paths here.
 
-To remove a member:
+| Path | Content | Notes |
+|---|---|---|
+| `identity.json` | `Identity` (A.1) | Public. Self-signed. PUT unauthenticated only when creating the account. |
+| `identity.key` | Encrypted account private key, as a normal Ark file | Owner + recovery members with `reader`. Body is the base64url identity seed, encrypted under a per-file key like any other file (§8). |
+| `identities/<address>.json` | Cached peer `Identity` | **Client-local.** Not required or served by the server; documented so implementations agree on where clients keep their TOFU cache. |
+| `passwords/<name>.json` | `Identity` with `algorithm: argon2id-ed25519` | Publicly readable. GET/HEAD unauthenticated. See §11. |
+| `passkeys/<name>.json` | `Identity` with `algorithm: webauthn-prf-ed25519` | Publicly readable. **Status: not yet implemented.** |
+| `groups/<name>.json` | `Group` (A.8) | **Status: not yet implemented.** |
+| `groups/<name>.key` | Group private key file (Ark file, members-only) | **Status: not yet implemented.** |
+| `invitations/<token>.json` | `Invitation` (A.9) | **Status: not yet implemented.** |
+| `invitations/<token>.html` | Human landing page | **Status: not yet implemented.** |
+| `requests/<ts>_<seq>.http` | Request log entry | See §10. Owner reads; `ark@<host>` writes. |
+| `blocked/<address>.json` | Per-sender blocklist entry | **Status: not yet implemented.** |
 
-[TODO keep old and new key in member entry to avoid re-encrypting before modifications made?]
-More steps are required for encrypted files since the removed member still has the file's encryption key.
+Requests to `/ark/<account>/.ark/requests/` and its entries are **not** themselves logged.
 
-1. Remove the entry from the member list.
-2. Generate a new encryption key. 
-3. Update the remaining members' entries with the new encryption key.
-4. Re-encrypt the file with the new encryption key.
-5. Sync the updated file or directory to all members.
+---
 
-Steps 2-4 are skipped for directories and unencrypted files. The removed member still has their old copy (can't prevent this). New modifications use the new encryption key they don't have so they won't be able to access them.
+## 5. Authentication (`ArkIdentity`)
 
-### 3.4 Timestamps
-
-The metadata includes creation and modification timestamps. These are different to the local file timestamps, they represent when the file was first/most recently signed.
-
-### 3.5 Synchronization
-
-When a file or directory has multiple members, modifications need to propagate.
-
-**Paths mirror across accounts.** A shared file lives at the same path on every co-member's server. Alice's `apps/notes/team-alpha/foo.md` is Bob's `apps/notes/team-alpha/foo.md` — no rehoming, no path resolution.
-
-**Last-write-wins.** The modification timestamp is the tiebreaker. No merging, no conflict resolution. When Alice modifies a shared file:
-
-1. Alice modifies the content, re-encrypts with the encryption key, bumps `modified` and signs the metadata with her identity key.
-2. Alice's client writes the modified file to her server at the shared path.
-3. Alice's server relays the modified file to each co-member's server at the identical path.
-4. The receiving server locates the local file by path, verifies the sender is a current member, and if the incoming `modified` is newer updates the local copy in place. Older incoming modifications are discarded.
-5. If a co-member also made a modification concurrently, the higher modification timestamp wins. The losing modification is discarded.
-
-**Direct in-place delivery.** The full file is pushed directly to the shared path on each co-member's server. First contact between accounts (writing to a path where the sender is not yet authorized) is handled through the request log (Section 6).
-
-## 4 Ark files
-
-The following files are used by Ark.
-
-[TODO add section for identity/any key files?]
-### 4.1 Identities
-
-An identity file is a JSON file that identifies an Ark account. Each account has an identity file: `/ark/<account>/.ark/identity.json`.
-
-The Ed25519 algorithm must be supported for identity keys by all clients. Since the identity file declares the key algorithm, any algorithm can be used, however clients may not support other algorithms (and will therefore be unable to verify the account).
-
-The identity file is self-signed. The server hosts this document but cannot tamper with it — any modification invalidates the signature. This means:
-- A compromised server cannot swap in a different public key to intercept data.
-- A MITM attacker who compromises the TLS connection cannot forge the identity document.
-- The document is self-authenticating: anyone can verify it using only the public key it contains.
-
-See [TODO] for the full format of identity files.
-
-The identity files of other accounts are cached in the `/ark/<account>/.ark/identities/` directory. If verification of an account fails with the cached identity file, it is re-fetched (the key may have changed via transition) and verification is retried once with the new file. [TODO cache lifetime - should be shorter than key rotation lifetime?]
-
-### 4.2 Groups
-
-[TODO do we need to reference accounts by identity key? or both address and identity key?]
-A group file is a JSON file that contains a collection of members. They are stored in the `ark/<account>/.ark/groups/` directory.
-
-To address a group file such as `ark/<account>/.ark/groups/team-alpha.json` (e.g. as a file member) use the address `groups:team-alpha`. A group that is used to decrypt files also requires a group key file (same file name but with the `.key` extension) to be stored in the same directory. The group key file must have a member with the `read` permission for every group member. Members of the group file with the `write` or `owner` permission must have the `owner` permission for the group key file as well. [TODO could bad actor with "write" then remove others from group key file?]
-
-See [TODO] for the full format of group files.
-
-**To add a member:**
-
-1. Add an entry to the group file. 
-2. Add a corresponding member to the group key file.
-3. Sync both files to all members.
-
-Step 2 is skipped for groups without a group key file.
-
-**To remove a member:**
-
-More steps are required since the removed member still has the group's identity key.
-
-1. Remove the entry from the group file.
-2. Remove the member from the group key file (see 3.3 Membership).
-3. Generate a new identity key.
-4. Update the group file with the new identity key.
-5. Replace the content of the group key file with the new identity key.
-6. Sync both files to all members.
-
-Steps 2-5 are skipped for groups without a group key file.
-
-### 4.3 Invitations
-
-Invitations are JSON files that represent a pre-accepted share offer. They are an optional shortcut around the standard first-contact flow (Section 6): instead of the recipient explicitly accepting a proposal that appears in their request log, an invitation lets the inviter grant access up front so that a peer's first PUT is authorized directly. They are stored in the `ark/<account>/.ark/invitations/` directory.
-
-An invitation carries the target path, the permission being granted, and any expiry or use limits. It can include a public member (or a password member for password protection) with the `read` permission so it can be shared as a link or QR code. To redeem an invitation a `POST` request is sent to the invitation file with the redeemer's identity file as the body. On redemption the server:
-
-1. Materializes the target dir metadata with the redeemer added as a member at the declared permission (if the dir does not already exist).
-2. Deletes the invitation file (or decrements a use counter).
-3. Returns the inviting account's identity file so the redeemer can pin it.
-
-See [TODO] for the full format of invitation files.
-
-### 4.4 Passkeys
-
-A passkey file is an `Identity` (Appendix C.1) file whose keypair is derived from a WebAuthn passkey. They are stored in the `ark/<account>/.ark/passkeys/` directory. [TODO not yet implemented — mirrors 4.5 with WebAuthn PRF in place of Argon2id.]
-
-The passkey identity has:
-- `public_key.algorithm`: `webauthn-prf-ed25519`.
-- `public_key.value`: `credential_id || prf_salt || ed25519_public_key`. The ed25519 public key is derived from `HKDF-SHA256(WebAuthn-PRF(prf_salt), info: "ark-ed25519-v1")` used as an Ed25519 seed.
-- `address`: `<account>@<host>/.ark/passkeys/<name>.json` (see 2.1 Address).
-- `signature`: self-signed by the passkey identity's Ed25519 key.
-
-The file's file metadata lists a `*` member with `read` permission so it is publicly readable (like `identity.json`). A client with the authenticator can derive the private key and sign requests as the passkey identity via the `ArkIdentity` scheme (Section 5). Passkey identities are hardware-bound — the PRF secret never leaves the authenticator — and resist offline brute force.
-
-### 4.5 Passwords
-
-A password file is an `Identity` (Appendix C.1) file whose keypair is derived from a password using Argon2id + HKDF. They are stored in the `ark/<account>/.ark/passwords/` directory.
-
-The password identity has:
-- `public_key.algorithm`: `argon2id-ed25519`.
-- `public_key.value`: `verifier || salt || ed25519_public_key`. The verifier is `SHA-256(HKDF-SHA256(Argon2id(password, salt), info: "ark-auth-v1"))`. The ed25519 public key is derived from `HKDF-SHA256(Argon2id(password, salt), info: "ark-ed25519-v1")` used as an Ed25519 seed.
-- `address`: `<account>@<host>/.ark/passwords/<name>.json` (see 2.1 Address).
-- `signature`: self-signed by the password identity's Ed25519 key.
-
-The file's file metadata lists a `*` member with `read` permission so it is publicly readable (like `identity.json`).
-
-A client that knows the password can derive the Ed25519 private key and sign requests as the password identity via the `ArkIdentity` scheme (Section 5). A password identity can be a member of any other file — for example, `identity.key` lists a password identity as a `read` member so that a client with only the password can decrypt and recover the account's identity key (see 2.3 Recovery).
-
-A *compromised* server holding the identity file can brute-force a weak password offline (the verifier is derivable from any guess), so passwords are the weaker recovery method — prefer passkeys. The server cannot enforce strong passwords but it is strongly recommended that clients do.
-
-### 4.6 Requests
-
-A request file is a text file containing the raw HTTP request headers followed by a blank line followed by the raw HTTP response headers. Bodies of the request and response are excluded. They are created by the Ark account for every request made to the account and stored in the `/ark/<account>/.ark/requests/` directory as a flat listing. Requests made to the `/ark/<account>/.ark/requests/` directory or files within it are not stored.
-
-The name of the file is the timestamp when the request was received (with the `.http` extension). Concurrent requests within the same instant are disambiguated by an appended sequence counter.
-
-Example entry:
+Every non-public request carries:
 
 ```
-PUT /ark/bob/apps/notes/team-alpha/foo.md HTTP/1.1
-Host: y.com
-Authorization: ArkIdentity address="alice@x.com", timestamp="1721476800", signature="..."
+Authorization: ArkIdentity address="<address>", timestamp="<unix-ms>", signature="<base64url>"
+```
+
+- `address` — the requestor's identity address. May be the primary account identity or any sub-identity path (e.g. `alice@example.com/.ark/passwords/primary.json`).
+- `timestamp` — unix time in **milliseconds**. Requests outside a ±5 minute window (300 000 ms) are rejected `401`.
+- `signature` — signature over the request bytes below, using the requestor's identity private key, base64url-encoded (no padding).
+
+Parameter syntax follows RFC 7235; order is not significant.
+
+**Signed bytes.** Concatenation, no spaces, delimiter is LF (`0x0A`):
+
+```
+method || 0x0A || host || 0x0A || path || 0x0A || timestamp || 0x0A || body
+```
+
+- `method` — the ASCII request method (`GET`, `PUT`, `HEAD`, `DELETE`).
+- `host` — the `Host` request header, lower-cased ASCII.
+- `path` — the URL path, no query, percent-decoded.
+- `timestamp` — the decimal ASCII form of the `timestamp` param (unix ms).
+- `body` — the raw request body bytes, verbatim. Empty for GET/HEAD/DELETE.
+
+Binding `host` prevents replay against a different server. Binding `path` prevents redirection. Binding `body` prevents tampering — the body is signed in full rather than by hash because PUT bodies must be buffered by the server anyway (Content-Length is required), so streaming-signing offers no gain here.
+
+**Verification.** The server resolves the identity document at `address`, verifies the signature, and passes the resolved identity to authorization (§6). If resolution fails (identity file missing, self-signature invalid), the request is rejected `401`.
+
+**Sub-identity semantics.** Only the **primary** identity (address exactly `<name>@<host>`, at `/.ark/identity.json`) receives the implicit `owner` grant on its own account root. A sub-identity (password, passkey, other) is authenticated but is only granted the permissions it appears with in the target's member list.
+
+---
+
+## 6. Authorization
+
+The server derives an **effective member list** for the target:
+
+- File exists and has metadata → its own member list.
+- File does not exist (PUT to a new path) → walk up ancestor directories until one carries metadata; use its member list. Stops at the account root.
+- Directory exists and has metadata → its own member list.
+- Directory exists without metadata → walk up as above.
+
+**Permission decision.**
+
+1. If the request is unauthenticated and the effective list contains `*`, GET/HEAD succeed with `reader`; PUT/DELETE return `401`.
+2. Otherwise authenticate (§5), then compute the highest permission across:
+   - a direct match on `requestor_identity.address`,
+   - a match on the metadata's `modified_by` (for PUT — proving the request was signed on behalf of a member author),
+   - the `*` public member (read-only shortcut).
+3. If none match, `403`.
+
+**Method vs permission.**
+
+| Permission | GET / HEAD | PUT (body / metadata) | PUT (member change) | DELETE |
+|---|---|---|---|---|
+| `reader` | ✓ | ✗ (403) | ✗ (403) | ✗ (403) |
+| `writer` | ✓ | ✓ | ✗ (403) | ✓ |
+| `owner` | ✓ | ✓ | ✓ | ✓ |
+
+**Auto-owner on own account.** A request signed by the account's own primary identity is granted `owner` on anything under `/ark/<account>/`. Sub-identities do not receive this.
+
+**Member-change check.** On a PUT that would overwrite an existing file or directory, the server compares the incoming member list to the existing one. If they differ, the requestor must hold `owner`; otherwise `403`.
+
+---
+
+## 7. Metadata
+
+Every Ark file and directory has a `Metadata` record (Appendix A.2). Fields:
+
+| Field | Required for file | Required for dir | Description |
+|---|---|---|---|
+| `id` | ✓ | ✓ | UUID. Immutable after creation. |
+| `created` | ✓ | ✓ | RFC 3339 timestamp, millisecond precision, `Z`-terminated (e.g. `2026-07-24T10:00:00.000Z`). |
+| `modified` | ✓ | ✓ | RFC 3339, same format as `created`. Used for last-write-wins on relay. |
+| `modified_by` | ✓ | ✓ | Address of the identity that signed this metadata. |
+| `encryption_algorithm` | optional (omit for unencrypted; default per Appendix B.2) | must be omitted | See §8. |
+| `members` | ✓ (at least one `owner`) | ✓ (at least one `owner`) | Member list. |
+| `body_hash` | ✓ (hash algorithm per Appendix B) | must be omitted | Hash of `body_bytes_as_stored` under the named hash algorithm. |
+| `signature` | ✓ | ✓ | Signature by `modified_by`'s identity key over the JCS-canonical serialization of the other fields, with `signature.algorithm` and `signature.value` cleared before signing. |
+
+### 7.1 On the wire
+
+Transmitted as `X-Ark-Meta-*` HTTP headers, one field per header. Kebab-case. Members numbered from 0. Example:
+
+```
+X-Ark-Meta-Id: 5f3f...
+X-Ark-Meta-Created: 2026-07-24T10:00:00.000Z
+X-Ark-Meta-Modified: 2026-07-24T10:00:00.000Z
+X-Ark-Meta-Modified-By: alice@example.com
+X-Ark-Meta-Encryption-Algorithm: aes-256-gcm
+X-Ark-Meta-Body-Hash-Algorithm: sha-256
+X-Ark-Meta-Body-Hash-Value: <b64u>
+X-Ark-Meta-Signature-Algorithm: ed25519
+X-Ark-Meta-Signature-Value: <b64u>
+X-Ark-Meta-Member-0-Address: alice@example.com
+X-Ark-Meta-Member-0-Permission: owner
+X-Ark-Meta-Member-0-Key-Algorithm: hpke-x25519-hkdf-sha256-aes256gcm
+X-Ark-Meta-Member-0-Key-Value: <b64u>
+```
+
+Members must be contiguous from index 0. Sparse indexes are rejected `400`.
+
+### 7.2 At rest
+
+Each field is stored as its own extended attribute on the body file, under the `user.ark.` namespace. Names use snake_case: `user.ark.id`, `user.ark.modified_by`, `user.ark.member_0_address`, `user.ark.signature_value`, etc. Binary values are base64url. Ark requires a filesystem with xattr support (ext4, xfs, btrfs, apfs).
+
+Updates should be atomic: write body + xattrs to a temp file in the same directory, then rename over the target.
+
+### 7.3 Directories
+
+A directory may or may not carry metadata. A directory without metadata inherits member checks from its nearest metadata-bearing ancestor. A directory PUT with a body is rejected `400`. Directory metadata rejected if `encryption_algorithm` is set.
+
+---
+
+## 8. Encryption
+
+Every encrypted file uses two layers:
+
+- A **symmetric file key** encrypts the body under the file's AEAD (`encryption_algorithm`).
+- The file key is **wrapped** for each member under the wrap algorithm (`member.key.algorithm`) against the member's public key. Each member entry in the metadata carries its own wrapped copy.
+
+A fresh random file key is generated on every PUT of an encrypted file. Adding a member does not re-encrypt the body; removing a member does (§8.4).
+
+### 8.1 Modes
+
+| `encryption_algorithm` | Body layout | Member `key` field |
+|---|---|---|
+| present (AEAD id per Appendix B) | `nonce ‖ ciphertext ‖ tag` — sizes per the named AEAD | Present, wrapped file key |
+| absent | raw plaintext | Absent |
+
+When `encryption_algorithm` is absent, the body is stored verbatim. Integrity is provided by the metadata signature over `body_hash` — there is no AEAD tag.
+
+### 8.2 Key wrap suite
+
+The wrapped file key uses HPKE with X25519-HKDF-SHA256 as the KEM, HKDF-SHA256 as the KDF, and AES-256-GCM as the AEAD (RFC 9180, KEM `0x0020`, KDF `0x0001`, AEAD `0x0002`). The suite id emitted in `member.key.algorithm` is:
+
+```
+hpke-x25519-hkdf-sha256-aes256gcm
+```
+
+**KEM key material.** The recipient's public key is derived from their Ed25519 identity key by decompressing the Ed25519 point and mapping it to Montgomery form (X25519). The recipient's private key is derived by hashing the Ed25519 seed with SHA-512 and clamping the first 32 bytes (RFC 7748 clamp). This is a well-known Ed25519↔X25519 mapping.
+
+**HPKE `info`.** ASCII bytes `ark-hpke-v1`. `aad` is empty. Base-mode single-shot seal/open.
+
+**Wrapped format on disk / in headers.**
+
+```
+<32-byte encapsulated key> ‖ <ciphertext of the file key + AEAD tag>
+```
+
+### 8.3 Encrypted PUT (client)
+
+1. Generate a random file key of the size the AEAD requires.
+2. AEAD-encrypt the plaintext under `file_key` → body bytes.
+3. For each member, wrap the file key against the member's public key → `member.key`.
+4. Compute `body_hash` = hash of `body_bytes_as_stored` under the file's hash algorithm.
+5. Sign metadata; PUT.
+
+### 8.4 Removing a member
+
+The removed member already holds the previous file key. To prevent access to future edits:
+
+1. Remove the member entry.
+2. Generate a new file key.
+3. Re-encrypt the body under the new file key.
+4. Re-wrap the new file key for every remaining member.
+5. PUT the file.
+
+Steps 2–4 are skipped for directories and unencrypted files (they carry no wrapped key).
+
+### 8.5 Public `*` member
+
+The `*` public member never receives a wrapped key. Public files must therefore be unencrypted — encryption with a `*` member is a misconfiguration; the file would not be readable by the public. Clients should refuse to encrypt to `*`.
+
+---
+
+## 9. Federation & relay
+
+Ark makes federation a server responsibility. A client publishes once; the server distributes.
+
+**Client responsibility.** For any shared file or directory, the client sends **one** PUT — to its own account's server, at the shared path, with `X-Ark-Relay: full`.
+
+**Server responsibility.** On a PUT that carries `X-Ark-Relay: full`, after storing locally the server iterates the metadata's members and, for each member whose address is on a **different host**, sends the same PUT to `/ark/<member-account>/<same-path>` on that host — once per unique host. The outbound PUT carries `X-Ark-Relay: internal` so the receiving server does not fan out further. Members on the **same host** are handled in-process, once, and skip the origin account itself. Members whose address is not parseable, `*`, or `groups:…` are skipped.
+
+**Cross-server signing.** Outbound requests are signed by the relaying server's own `ark@<host>` account (see §10). The receiving server verifies that signature against `ark@<host>`'s identity document and then applies its normal member checks against the target account.
+
+**Conflict resolution.** Last-write-wins by `modified` timestamp. A PUT whose `modified` is older than the existing file returns `409`. A PUT whose `id` differs from the existing `id` returns `409`.
+
+**Failure.** Relay is fire-and-forget in v0. If the destination is unreachable, the write is dropped. Delivery retries, backoff, and bounces are **Status: not yet implemented**.
+
+**Unauthorized destination.** If the recipient server rejects with `403` (the sender is not a member of the target path), that response is recorded in the recipient's request log (§10). The recipient owner's client is free to build a "share proposal" UX on top of that log — the flow is not part of the protocol.
+
+---
+
+## 10. Request log
+
+Every server keeps a per-account append-only log of received requests. It is the record the account owner uses to see what happened to their account.
+
+**Location.** `/ark/<account>/.ark/requests/<timestamp>_<seq>.http`.
+
+- `<timestamp>` — RFC 3339 (millisecond precision, `Z`-terminated) with `:` replaced by `-` for filesystem safety, e.g. `2026-07-24T10-00-00.000Z`.
+- `<seq>` — zero-padded 3-digit sequence counter, disambiguating concurrent requests within the same instant.
+
+**Entry format.** The raw HTTP request line and headers, a blank line, then the raw HTTP response line and headers. **Bodies are excluded.** Entries are capped at 16 KiB; longer requests are truncated. Example:
+
+```
+PUT /ark/bob/apps/notes/team/foo.md HTTP/1.1
+Host: bob.example
+Authorization: ArkIdentity address="alice@x.example", timestamp="1721476800000", signature="..."
 X-Ark-Meta-Id: 3f2a...
-X-Ark-Meta-Modified-By: alice@x.com
-X-Ark-Meta-Members-0-Address: alice@x.com
-X-Ark-Meta-Members-0-Permission: owner
-X-Ark-Meta-Members-1-Address: bob@y.com
-X-Ark-Meta-Members-1-Permission: write
-X-Ark-Meta-Body-Hash: sha-256:...
+X-Ark-Meta-Modified-By: alice@x.example
+X-Ark-Meta-Member-0-Address: alice@x.example
+X-Ark-Meta-Member-0-Permission: owner
+X-Ark-Meta-Member-1-Address: bob@bob.example
+X-Ark-Meta-Member-1-Permission: writer
+X-Ark-Meta-Body-Hash-Algorithm: sha-256
+X-Ark-Meta-Body-Hash-Value: ...
+X-Ark-Meta-Signature-Algorithm: ed25519
 X-Ark-Meta-Signature-Value: ...
 Content-Length: 2048
 
 HTTP/1.1 403 Forbidden
-Content-Length: 0
+Content-Length: 9
 ```
 
-The log is the primary surface for the account owner to observe activity — including failed writes that represent first-contact share proposals from other accounts (Section 6). Since the log preserves the signed `X-Ark-Meta-*` headers from the original request, the owner has verifiable evidence of what any sender attempted.
+**Who writes.** The server's `ark@<host>` account signs each entry. The account under whose namespace the log lives is the entry's `owner`; `ark@<host>` is `writer`. That means the account owner (or a client acting for them) can read, list, and delete entries; the `ark` account can append.
 
-Servers should implement a retention policy (e.g. successful reads pruned after a short window, 4xx entries kept longer, 5xx retained for audit). Per-entry size is capped; entries exceeding the cap are truncated and marked with `X-Ark-Log-Truncated: true`.
+**When entries are written.** Every request handled by the server, **except** requests targeting `/.ark/requests/` themselves. This includes 2xx, 4xx, and 5xx responses. Entries are always signed by `ark@<host>`, giving the owner tamper-evident evidence of what any sender attempted.
+
+**Prerequisites.** For log writes to happen at all, `/ark/<account>/.ark/requests/` must exist and its metadata must grant `ark@<host>` at least `writer`. This is set up at account creation.
+
+**Retention.** Not specified. Clients or admins prune.
+
+**Share proposals note.** A client can watch the log for `403` PUT entries where the current account is a member of the incoming metadata's member list, and offer the user an "accept / reject" UI (accept = pull the file from the sender's server, PUT it locally; reject = delete the log entry). This is a client convention over the log, not a protocol feature — the server has no notion of a proposal.
+
+**`ark@<host>` account.** Created automatically when the server starts on a fresh directory. Its identity document lives at `/ark/ark/.ark/identity.json` and its private key at `/ark/ark/.ark/identity.key`. It is used to sign log entries and outbound relay requests. It should not be used by human users.
 
 ---
 
-## 4. System 3: Encryption — "Nobody else can read this"
+## 11. Recovery
 
-### 4.1 Concept
+An account's identity keypair is the only way in. If lost with no recovery configured, the account is gone.
 
-Every file's body is encrypted with a **symmetric file key** (AES-256-GCM). The file key is then wrapped (encrypted) to each member via ECIES against the member's identity public key (whether primary account, password identity, passkey identity, or group). This two-layer approach means:
+### 11.1 Seed phrase
 
-- Content is encrypted once, regardless of how members there are.
-- Adding a member only requires wrapping the existing file key — no re-encryption of content.
-- Removing a member requires generating a new file key and re-encrypting content (since the removed member knew the old key).
+The client generates a BIP-39 mnemonic covering the account's identity seed and displays it to the user at account creation. Storage is the user's responsibility. Re-entering the mnemonic on any device re-derives the same keypair and grants full account access. The server never sees the mnemonic or the private key.
 
-**A fresh file key is generated on every modification.** Each `put` of an encrypted body mints a new random file key, re-encrypts the body under it, and re-wraps it for every member. This means a file key never protects more than one version of the body, so leaking one version's key does not compromise other versions.
+**Status: seed phrase generation not yet implemented in the reference client.** The current client writes the raw seed to `.ark/identity.key` and expects the user to back that file up.
 
-### 4.2 Encryption modes
+### 11.2 Password identity
 
-The file metadata's `encryption_algorithm` field specifies whether and how the body is encrypted:
+The client creates a **password identity** — a sub-identity whose keypair is derived from a user-supplied password via Argon2id + HKDF-SHA256, and adds it as a `reader` member of `/.ark/identity.key`. The password identity file is published at `/.ark/passwords/<name>.json` and is publicly readable.
 
-| `encryption_algorithm` | Body | Wrapped keys | Use case |
-|---|---|---|---|
-| `aes-256-gcm` (default) | Encrypted | Yes — ECIES-wrapped per member | Private files, messages, shared documents |
-| `chacha20-poly1305` | Encrypted | Yes — ECIES-wrapped per member | Same, for devices without AES hardware acceleration |
-| _omitted_ | Unencrypted (raw bytes) | No — `wrapped_key` fields are omitted | Public content, websites, published documents |
+**Layout.** `Identity.public_key.value` = `verifier(32) ‖ salt(16) ‖ ed25519_public(32)`.
 
-When `encryption_algorithm` is omitted:
-- The body is stored as raw bytes (no nonce, no AEAD tag).
-- Member entries omit `ephemeral_key`, `key_nonce`, and `wrapped_key` fields.
-- The file signature still covers the body hash, providing integrity and authenticity (Section 5.2). This is the **only** integrity guarantee for unencrypted files — there is no AEAD tag to catch tampering.
+- `verifier = SHA-256( HKDF-SHA256(Argon2id(pw, salt), info: "ark-auth-v1", L=32) )`
+- `ed25519_seed = HKDF-SHA256(Argon2id(pw, salt), info: "ark-ed25519-v1", L=32)`
 
-### 4.3 File key generation
+`Identity.public_key.algorithm = "argon2id-ed25519"`. The identity file is self-signed by the derived Ed25519 key.
 
-When a file is created in static mode:
+**Recovery.** A second device with the password and address:
 
-1. The client generates a random 256-bit **file key**.
-2. The client encrypts the file body with the file key:
-   ```
-   nonce = random 12 bytes
-   ciphertext, tag = AES-256-GCM(file_key, nonce, payload)
-   ```
-3. For each member, the client wraps the file key using **ECIES**:
-   ```
-   ephemeral_key = random X25519 keypair
-   owner_x25519_key = convert(owner_identity_key, target: "x25519")
-   shared_secret = X25519(ephemeral_private, owner_x25519_key)
-   wrapping_key = HKDF-SHA256(
-     ikm: shared_secret,
-     salt: ephemeral_public || owner_x25519_key,
-     info: "file-key-wrap",
-     length: 32
-   )
-   wrapped_key = AES-256-GCM(wrapping_key, random_nonce, file_key)
-   ```
-4. Each member entry in the metadata stores the `ephemeral_public`, `nonce`, and `wrapped_key`.
+1. GETs `/.ark/passwords/<name>.json` (unauthenticated — public).
+2. Re-derives the Argon2id output; verifies against the `verifier`; if it matches, derives the Ed25519 seed.
+3. Signs `ArkIdentity` requests as the password identity to GET `/.ark/identity.key`.
+4. Uses its `reader` member entry to unwrap the file key; decrypts the body; obtains the account's Ed25519 seed; writes it locally.
 
-### 4.4 Decryption
+**Trust cost.** A server holding a password identity file can brute-force the password offline (the verifier is public). Weak passwords are catastrophic. Passkey-derived identities avoid this — **Status: not yet implemented.**
 
-When Alice decrypts a file:
+### 11.3 Key rotation and transition
 
-1. Alice finds her member entry in the metadata (matched by identity key).
-2. Alice computes the shared secret using her private key and the ephemeral public key in her member entry:
-   ```
-   shared_secret = X25519(alice_private, ephemeral_public)
-   ```
-3. Alice derives the wrapping key via HKDF (same parameters as encryption).
-4. Alice decrypts the wrapped file key.
-5. Alice decrypts the file body with the file key.
+**Status: not yet implemented.** `Identity` already reserves a `key_transition` field (A.7) that publishes both old and new public keys and cross-signatures so peers can pin the new key. Wire behavior is not specified in this version.
 
 ---
 
-## 5 Authentication & Authorization
+## 12. Threat model
 
-When receiving a request for a file, the server performs several authentication checks. The requestor is granted the highest permission granted by any of the checks.
-
-The Authorization header must be of the form `ArkIdentity address="<address>", timestamp="<unix-seconds>", signature="<base64url>"` — a signature over `method \n path \n timestamp \n body`, produced with the requestor's identity key. `address` identifies the requestor (so the server can look up the verifying key directly). `timestamp` is unix seconds; requests outside a ±5 minute window are rejected to prevent replay. Params follow RFC 7235 auth-param syntax; order is not significant.
-
-An `ArkIdentity` authorization header can identify the requestor as the **primary identity** of the account that is receiving the request (address exactly equal to the target account's `<name>@<host>`, i.e. the identity at `/.ark/identity.json`). In this case the requestor is granted the `owner` permission. Sub-identities of the same account — password identities (4.5), passkey identities (4.4), or any other identity file under a non-default path — do NOT get this automatic grant; they only receive the permission at which they appear in the file or directory's member list. Otherwise, the authorization is applied to the current member list of the file or directory and the requestor is given the highest permission of all the members it has been authenticated as. Creation of a file is considered an operation of the directory it is being created in.
-
-If authorization fails, the request is rejected with `401 Unauthorized`. If authorization succeeds but the permission granted is not sufficient for the operation requested, the request is rejected with `403 Forbidden`. The signature of the request is also verified to ensure the content and metadata has not been tampered with. If the signature is invalid, the request is rejected with `403 Forbidden`.
-
-[TODO rate limiting / PoW for password identity signing, account creation?]
-
----
-
-## 6. System 5: Delivery Control — "Who can reach you"
-
-### 6.1 Concept
-
-Authorization for every request is derived from the member list of the target file or directory (Section 5). If Alice is a member of Bob's `apps/notes/team-alpha/`, her writes there succeed directly. If she is not, her write is rejected.
-
-Rejected writes are not silent — every request is recorded in Bob's `.ark/requests/` log (Section 4.6) along with its response. Because the log preserves the signed `X-Ark-Meta-*` headers of the original request, a rejected PUT is a verifiable, actionable record of another account attempting to share something with Bob. This is how first contact happens: unauthorized PUTs become proposals.
-
-### 6.2 First contact via unauthorized PUT
-
-When Alice wants to share `apps/notes/team-alpha/foo.md` with Bob for the first time:
-
-1. Alice writes the file locally at `apps/notes/team-alpha/foo.md` with members `[alice@x.com=owner, bob@y.com=writer]`, and her server relays it to Bob's server at the identical path.
-2. Bob's server sees no local dir at that path (or the sender is not a member of the local dir) and returns `403 Forbidden`. The request body is discarded. The exchange is logged to `/ark/bob/.ark/requests/`.
-3. Bob's client watches the request log (via SSE or polling). It surfaces a share proposal derived from the log entry: sender, target path, proposed members, body hash and size of the intended file.
-4. Bob accepts by creating the target dir on his own server with the proposed members. His client then pulls the file directly from Alice's server (`GET https://x.com/ark/alice/apps/notes/team-alpha/foo.md` — Alice's server authorizes because Bob is a member) and PUTs it to his own server at the same path.
-5. Alice's next write to that path relays and lands directly — Bob's server now authorizes her.
-
-Bob rejects by taking no action. The 403 stays in the log as history; further attempts from Alice re-log but do not otherwise affect Bob's account.
-
-**Deduplication.** Bob's client groups log entries by `(sender, target_dir)` to present one proposal per subtree rather than one per file. Additional PUTs from Alice into the same dir before acceptance simply add more entries; on accept, Bob's client walks the dir on Alice's server and pulls the tree.
-
-**Rate limiting.** Servers should cap unauthorized PUTs from a given sender per unit time (log spam is the only remaining abuse surface). Beyond the cap, further attempts are rejected with `429` and not logged.
-
-**Blocking.** A blocklist file at `.ark/blocked/<sender>.json` causes the server to short-circuit unauthorized PUTs from that sender with `403` and no log entry. Deleting the file unblocks.
-
-### 6.3 Invitations (optional shortcut)
-
-An invitation (Section 4.3) skips step 3-4 of the first contact flow. Alice pre-creates the target dir with Bob as a member, then hands Bob an invitation URL/QR that adds him as a member of a specific subtree without further interaction from Alice. After redemption Bob's first PUT is already authorized and lands directly.
-
-Invitations are shared as regular HTTPS URLs: `https://example.com/ark/alice/.ark/invitations/<token>`
-
-- **QR code**: Encode the URL. Recipient scans, their client POSTs to redeem.
-- **Web fallback**: A GET to `invitations/<token>.html` serves an HTML page with a confirm button for users without a native client.
-
----
-
-## 7. System 6: Transport — "How data moves"
-
-### 7.1 Concept
-
-All communication happens over **HTTPS**. No custom protocols, no special ports. A server is a single binary with a single config file.
-
-Transport has three modes:
-1. **Local access** — client reads/writes files on its own server by path.
-2. **Cross-server delivery** — PUTting files to other users' servers at the shared path.
-3. **Cross-server sync** — keeping shared files in sync between co-members' servers.
-
-### 7.2 Local file access
-
-Alice's client communicates with her home server over HTTPS.
-
-**Authentication:** Every request is signed with an identity key using the `ArkIdentity` scheme (Section 5). The signing identity may be the primary account identity or an addressable sub-identity of the same account — e.g. a password identity (4.5) or passkey identity (4.4). The server verifies the signature against the identity document at the address in the header. Requests with timestamps outside the ±5 minute window are rejected (replay protection).
-
-**File operations:**
-
-| Method | Path | Purpose |
-|---|---|---|
-| `GET` | `/ark/alice/path/to/file` | Fetch body + `X-Ark-Metadata` |
-| `HEAD` | `/ark/alice/path/to/file` | Fetch `X-Ark-Metadata` only |
-| `PUT` | `/ark/alice/path/to/file` | Create or update a file |
-| `DELETE` | `/ark/alice/path/to/file` | Delete a file |
-| `GET` | `/ark/alice/path/to/dir/` | List directory contents; also returns directory `X-Ark-Metadata` if present |
-| `PUT` | `/ark/alice/path/to/dir/` | Create or update directory metadata (empty body; dir vs file is determined by the presence of `body_hash` in the request metadata, not by the URL) |
-| `DELETE` | `/ark/alice/path/to/dir/` | Delete a directory recursively |
-
-**GET response:**
-
-The raw body as the entity body (`Content-Type: application/x-ark`), with the metadata blob in the `X-Ark-Metadata` header (Section 8.3). The body is the file content itself — ciphertext for encrypted files, raw bytes when `encryption_algorithm` is omitted — so non-Ark clients can use it directly and ignore the header.
-
-**HEAD response:**
-
-`X-Ark-Metadata` (the full signed blob — member entries, wrapped keys, everything) plus `Content-Length`, with no body. The metadata blob is the authoritative source; servers may add convenience headers (e.g. `X-Ark-Modified`) but those are non-signed and derived.
-
-**Special endpoints:**
-
-| Method | Path | Purpose |
-|---|---|---|
-| `GET` | `/ark/alice/.ark/identity.json` | Identity document (JSON) |
-| `GET` | `/ark/alice/.ark/identity.key` | Identity private key, Mode B — credential-gated (Sections 2.11, 3.10) |
-| `GET` | `/ark/alice/.ark/identity.html` | Contact card (HTML) |
-| `PUT` | `/ark/alice/.ark/invitations/<token>.json` | Create invitation |
-| `POST` | `/ark/alice/.ark/invitations/<token>` | Redeem invitation |
-| `GET` | `/ark/alice/.ark/invitations/<token>.html` | Invitation page (HTML) |
-| `GET` | `/ark/alice/.ark/requests/` | List request log entries |
-| `GET` | `/ark/alice/.ark/stream` | Real-time event stream (WebSocket/SSE) |
-
-### 7.3 Cross-server delivery
-
-When Bob sends a file to Alice — whether a brand-new file or an update to one she already has:
-
-**Step 1: Store locally.** Bob's client creates or updates the file on Bob's server via PUT at the shared path (e.g. `apps/notes/team-alpha/foo.md`).
-
-**Step 2: Deliver.** Bob's server relays the file to Alice's server at the identical path, signed with Bob's `ArkIdentity` credentials:
-
-```
-PUT https://example.com/ark/alice/apps/notes/team-alpha/foo.md
-Authorization: ArkIdentity address="bob@bobserver.com", timestamp="...", signature="..."
-X-Ark-Meta-Id: ...
-X-Ark-Meta-Modified-By: bob@bobserver.com
-X-Ark-Meta-Members-0-Address: alice@example.com
-X-Ark-Meta-Members-0-Permission: owner
-X-Ark-Meta-Members-1-Address: bob@bobserver.com
-X-Ark-Meta-Members-1-Permission: write
-...
-
-<raw body>
-```
-
-Alice's server authorizes the request against the current member list of the local file (or, if the file does not exist, of the ancestor dir carrying metadata) exactly as it would for any request (Section 5). Outcomes:
-
-1. **Local file exists and Bob is a member with sufficient permission** — the server verifies the metadata signature, compares `modified` timestamps, and updates the local copy in place if the incoming version is newer. Older incoming modifications are discarded.
-2. **Local dir exists and Bob is a member of the dir with `write` or `owner` permission** — the file is created at the target path with the supplied metadata.
-3. **Bob is not authorized at the target path** — the server returns `403 Forbidden`, discards the body, and records the request in `.ark/requests/`. Alice's client surfaces the entry as a share proposal (Section 6.2). No file is written.
-
-Alice's server also rejects the file unless she is a member of the incoming metadata's member list. A redirected or misaddressed file is dropped rather than materializing an undecryptable blob at a path she cannot decrypt.
-
-**Response codes:**
-
-| Code | Meaning |
-|---|---|
-| `201 Created` | New file written at path. |
-| `204 No Content` | Existing file updated in place. |
-| `400 Bad Request` | Malformed file or metadata. |
-| `401 Unauthorized` | Missing or invalid `ArkIdentity` signature. |
-| `403 Forbidden` | Sender lacks permission at the target path. When the target does not exist locally the request is also recorded in the recipient's request log as a share proposal (Section 6.2); when the recipient is not a member of the incoming file, the request is dropped without logging. |
-| `404 Not Found` | Recipient account does not exist on this server. |
-| `429 Too Many Requests` | Rate limited. Includes `Retry-After` header. |
-| `507 Insufficient Storage` | Recipient's storage is full. |
-
-**Delivery retries:**
-- If delivery fails with a transient error (server down, network error, `5xx`), the sending server retries with exponential backoff (1 min, 5 min, 30 min, 2 hours, 8 hours) for up to 72 hours, then returns a bounce notification to the sender. Retries are idempotent — re-delivering the same file at the same path with unchanged `modified` is a no-op.
-- `403 Forbidden` is a terminal outcome — the sending server does not retry. If the target dir does not yet exist on the recipient's server the request has been logged as a proposal, and the recipient's acceptance flow (Section 6.2) pulls the file directly. Later modifications by the sender relay again; once the recipient has accepted, they succeed.
-
-### 7.4 Cross-server sync
-
-Updating a shared file uses the same delivery path as a new file (Section 7.3): the updated file is PUT to each co-member's server at the identical shared path. Each server applies it in place (newest-`modified`-wins, sender checked against the current local member list).
-
-**No path resolution needed.** Because paths are identical across accounts, the sender knows exactly where the file lives on the receiver's server — it is the same path.
-
-**Member moved notification:**
-
-When a member migrates to a new server (Section 2.9), they announce it by PUTting their **new identity document** to `/ark/<coaccount>/.ark/identities/<oldaddress>.json` on each co-member's server. This is a normal signed PUT authorized by the migrated member's identity key (which is unchanged). Each co-member's client picks up the update and rewrites the address in local file member lists.
-
-**Sync recovery (pull fallback):**
-
-If a server misses pushed updates (e.g. downtime exceeding the retry window), members can pull the latest version of a shared file directly from a co-member's server using the known shared path:
-
-```
-HEAD https://example.com/ark/alice/apps/notes/team-alpha/foo.md
-Authorization: ArkIdentity <signature>
-```
-
-Membership is enforced on the file read. If the remote `modified` is newer than the local copy, the requester GETs the file body and writes it locally.
-
-**Recovery flow:** On startup (or periodically), a client HEADs each shared file at its known path on each co-member's server. Newer remote versions are fetched via GET and applied locally.
-
-### 7.5 Real-time events
-
-```
-GET https://example.com/ark/alice/.ark/stream
-Authorization: ArkIdentity <signature>
-```
-
-WebSocket or SSE stream. Events:
-
-```json
-{"event": "created", "path": "/ark/alice/apps/notes/team-alpha/foo.md", "modified_by": "bob@example.com"}
-{"event": "modified", "path": "/ark/alice/apps/notes/todo.md", "modified_by": "alice@example.com"}
-{"event": "deleted", "path": "/ark/alice/apps/mail/trash/old-msg"}
-{"event": "logged", "path": "/ark/alice/.ark/requests/2026-04-11T12:00:00.000_042.http", "status": 403, "requestor": "bob@example.com"}
-```
-
-The `logged` event fires for every entry added to `.ark/requests/`. Clients watching for share proposals filter for `status: 403` and inspect the referenced log entry.
-
-### 7.6 Server architecture
-
-A server is a **single statically-linked binary** containing:
-
-```
-┌──────────────────────────────────────────────┐
-│              ark-server                      │
-├──────────────────────────────────────────────┤
-│  HTTPS Server                                │
-│  ├── File access (GET/HEAD/PUT/DELETE)       │
-│  ├── Request logging (.ark/requests/)        │
-│  └── WebSocket/SSE (.ark/stream)             │
-├──────────────────────────────────────────────┤
-│  Filesystem Storage                          │
-│  ├── /ark/<user>/ (encrypted files)          │
-│  ├── /ark/<user>/.ark/requests/ (req log)    │
-│  └── /ark/<user>/.ark/blocked/ (blocklist)   │
-├──────────────────────────────────────────────┤
-│  Outbound Relay                              │
-│  ├── Queue for outgoing deliveries           │
-│  ├── Retry logic (exponential backoff)       │
-│  └── Remote identity document cache          │
-├──────────────────────────────────────────────┤
-│  Sync Engine                                 │
-│  ├── Push updates to co-members at same path │
-│  ├── Receive updates in place                │
-│  └── Conflict resolution (last-write)        │
-├──────────────────────────────────────────────┤
-│  Admin CLI                                   │
-│  ├── user add/remove/list                    │
-│  ├── stats / diagnostics                     │
-│  └── config reload                           │
-└──────────────────────────────────────────────┘
-```
-
-**Configuration:**
-
-```toml
-# ark.toml — the entire configuration file
-
-domain = "example.com"
-storage = "./data"
-
-# Optional overrides (all have sensible defaults)
-# listen = "127.0.0.1:8080"
-# max_account_size = "1GB"
-# max_file_size = "100MB"
-# max_delivery_size = "25MB"
-```
-
-**Setup process:**
-1. Install the binary (single file, no dependencies).
-2. Point a domain to the server's IP (A/AAAA record).
-3. Create the config file (2 lines minimum).
-4. Terminate TLS with a reverse proxy (nginx, Caddy, etc.) in front of the server. See Section 7.7.
-5. Add users locally: `ark-server user add alice`.
-6. Or users self-register by PUTting their identity document to `/ark/<user>/.ark/identity.json`.
-7. Alice's client generates her keypair and registers her public key (`identity.json`); a Mode B client also uploads the encrypted `identity.key` (Section 2.11).
-
-**Storage:**
-- Filesystem (one that supports extended attributes). The body is stored on disk as the file's bytes; the signed metadata blob lives in the file's `user.ark` xattr (Section 8.3). The server is essentially an authenticated file server. No database required for user data.
-- The server may maintain a lightweight cache (e.g. SQLite) for directory listings and metadata queries, but the files (body + xattr) are the source of truth. No `file_id` → path index is needed since shared files live at identical paths across accounts.
-- Blocklists are stored as JSON files at `/ark/<user>/.ark/blocked/<address>.json`.
-
-### 7.7 Deployment: co-hosting with a website
-
-The protocol only uses paths under `/ark/`. It coexists with a website on the same domain.
-
-**Reverse proxy setup (recommended):**
-
-```nginx
-# nginx example
-server {
-    listen 443 ssl;
-    server_name example.com;
-
-    # Ark server
-    location /ark/ {
-        proxy_pass http://127.0.0.1:8080;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;  # WebSocket support
-        proxy_set_header Connection "upgrade";
-    }
-
-    # Your website (everything else)
-    location / {
-        root /var/www/example.com;
-        # or proxy_pass to your web app
-    }
-}
-```
-
-The Ark server runs on a local port (e.g., 8080) without TLS — the reverse proxy handles TLS termination:
-
-```toml
-domain = "example.com"
-storage = "./data"
-listen = "127.0.0.1:8080"
-tls = false  # reverse proxy handles TLS
-```
-
-### 7.8 Self-hosting comparison
-
-| Concern | Email | Ark |
-|---|---|---|
-| DNS records | A, MX, PTR, SPF, DKIM, DMARC | A (or AAAA) only |
-| IP reputation | Critical. New IPs go to spam for months. | Not a concept. |
-| Spam filtering | SpamAssassin, Bayesian filters, blocklists | Built-in: unauthorized writes rejected + logged as proposals; per-sender blocklist |
-| Deliverability | Gmail/Outlook may silently drop your mail | Guaranteed — cryptographic identity |
-| Software | Postfix + Dovecot + OpenDKIM + Rspamd + ... | Single binary |
-| Config files | Dozens across multiple services | One file |
-| Ports | 25 (SMTP), 465 (SMTPS), 587 (submission), 993 (IMAPS) | 443 (HTTPS) only |
-| Maintenance | Monitor blacklists, rotate DKIM, manage certs, update filter rules | Just cert renewal (same as any HTTPS site) |
-| Time to working setup | Hours to days (plus months for reputation) | Minutes |
-| Co-hosting with website | Separate IP or complex port routing | Shares port 443, just one `/ark/` location block |
-
----
-
-## 8. File Format
-
-### 8.1 File and metadata
-
-An Ark file is split into two parts that live and travel separately:
-
-- **Body** — the file content itself, stored as the file's bytes on disk:
-  - `encryption_algorithm` omitted: the raw file bytes (a public `.html` is stored and served verbatim).
-  - encrypted (`aes-256-gcm` / `chacha20-poly1305`): `nonce (12 bytes) ‖ ciphertext + tag`.
-- **Metadata** — a set of signed scalar fields (Section 8.2) holding everything else: `id`, timestamps, members + wrapped keys, permissions, algorithm, body hash, signature. It is **not** part of the body; it is stored and carried out-of-band (Section 8.3).
-
-Because the body is just the file content, a decrypted file (or a public unencrypted file) is a normal, directly usable file — no prefix to strip. The metadata accompanies it out-of-band.
-
-### 8.2 Metadata
-
-The metadata is a `Metadata` struct (Appendix C.13) — a small set of named scalar fields. The signature is computed over the JCS-canonical JSON serialization of the struct with the `signature.algorithm` and `signature.value` fields cleared. The body is bound through `body_hash` (`SHA-256(body)`), which is included in the signed fields.
-
-Directory metadata omits `encryption_algorithm` (directories have no body to encrypt) and `body_hash` (no body). File metadata always includes `body_hash`.
-
-### 8.3 Metadata storage and transport
-
-**At rest.** Each metadata field is stored as its own extended attribute on the body file, under the `user.ark.` namespace. Ark requires a filesystem that supports extended attributes; those without them are unsupported. Field names use snake_case (e.g. `user.ark.id`, `user.ark.modified_by`, `user.ark.signature_value`). Members are numbered (e.g. `user.ark.member_0_address`, `user.ark.member_0_permission`, `user.ark.member_0_key_algorithm`, `user.ark.member_0_key_value`). Binary values are base64url-encoded (RFC 4648, no padding).
-
-Updates are atomic: write the new body to a temporary file in the same directory, set its `user.ark.*` xattrs, `fsync`, then `rename` over the target. The rename swaps body and metadata together, so neither a concurrent reader nor a crash ever sees a body that disagrees with its metadata.
-
-**In transit.** Over HTTP the same fields travel as `X-Ark-Meta-*` response/request headers, one header per field (kebab-case, e.g. `X-Ark-Meta-Id`, `X-Ark-Meta-Modified-By`, `X-Ark-Meta-Member-0-Address`, `X-Ark-Meta-Signature-Value`).
-
-`GET` returns the body as the HTTP entity body plus the `X-Ark-Meta-*` headers; `HEAD` returns the headers with no body; `PUT` (whether local or cross-server) sends both. Because the entity body is always the raw file, there is no separate "raw" form — a non-Ark client (e.g. a browser fetching a public file) simply ignores the `X-Ark-Meta-*` headers.
-
-**Size budget.** Each field lives in its own xattr, so per-field limits (typically 64 KB on ext4) are not the binding constraint; the total `user.ark.*` xattr budget on ext4 is ~4 KB per inode. A file with a handful of members — or a single group member (Section 4.2) — sits far under it. Past ~25 direct members, use a group. The same budget keeps the aggregate `X-Ark-Meta-*` header size within typical proxy limits.
-
-### 8.4 Identity and contacts documents
-
-Identity documents and contacts are JSON (human-readable, easy to debug with curl). See Appendix C.1 for the identity document schema.
-
-### 8.5 Serialization rules
-
-- **Metadata:** scalar fields stored one-per-xattr under `user.ark.*` and transmitted as `X-Ark-Meta-*` headers (Section 8.3).
-- **Identity documents, contacts:** JSON. Human-readable.
-- **Signatures over structured values** (identity, metadata): computed over the JCS-canonical JSON serialization of the value with its own `signature` field cleared. Metadata additionally binds the body via `body_hash = SHA-256(body)`.
-- **All binary values in JSON:** base64url encoding (RFC 4648, no padding).
-
----
-
-## 9. Threat Model
-
-### 9.1 What is protected
+### 12.1 What is protected
 
 | Property | Guarantee |
 |---|---|
-| **Data confidentiality** | Only holders of the file key can read file content. Servers see only ciphertext (Mode A, and Mode B without a server recovery member). |
-| **Author authentication** | Files, identity, and group documents are signed by the author's identity key. Forgery requires the private key. |
-| **Integrity** | Any modification to a file invalidates the signature. Any modification to the ciphertext invalidates the AEAD tag. |
-| **Spam resistance** | Writes are only accepted from senders authorized by the target file or directory's member list. Unauthorized writes are rejected with `403` and logged (body discarded) so the account owner can review them as share proposals (Section 6.2). Per-sender rate limits and a blocklist bound log-spam. |
-| **Data persistence (static mode)** | All static-mode files can be decrypted with the single identity key (which unwraps file keys). No session state to lose. |
+| Data confidentiality | Only members holding the identity private key can unwrap the file key. Servers see only ciphertext. |
+| Author authenticity | Every file/directory is signed by `modified_by`'s identity key. Forging requires that private key. |
+| Body integrity | Encrypted files: AEAD tag catches ciphertext tampering. Unencrypted files: metadata signature over `body_hash`. |
+| Request integrity | The `ArkIdentity` signature covers method, host, path, timestamp, body. Redirection, tampering, cross-server replay all invalidate the signature. |
+| Spam resistance | Non-member writes are rejected with `403`. Log-spam bound requires per-sender rate limits and a blocklist — **Status: not yet implemented.** |
 
-### 9.2 What is NOT protected
+### 12.2 What is not protected
 
-| Risk | Details |
-|---|---|
-| **Metadata** | File paths, sizes, timestamps, member addresses, and cross-server delivery patterns are visible to the server and network observers. Path names may reveal content intent (e.g., `/notes/tax-2025`). |
-| **Forward secrecy** | If the identity private key is compromised, all file keys can be unwrapped, and all past and future data can be decrypted. This is a deliberate tradeoff for simplicity and recoverability. |
-| **Mode B server trust** | The key is client-generated and uploaded encrypted, so a Mode B server can read data only if it holds a credential — a **server recovery member** (Section 2.11). Without one it stores ciphertext it cannot read. Self-hosters mitigate either way by controlling the server. |
-| **Password brute force** | A password identity's `verifier` is derivable from any password guess, so a *compromised* server holding the password identity file can brute-force a weak password offline (Section 4.5). Once cracked, the attacker can sign as the password identity and unwrap `identity.key`. Passkey identities are hardware-bound and resist this. |
-| **Removed member's existing copy** | When a member is removed from a shared file, they retain any copy they already downloaded. Re-keying prevents access to future edits, not past content. |
-| **Path metadata** | File paths are unencrypted (the server needs them for routing). Because shared files live at identical paths across accounts, path names like `/apps/mail/` or `/apps/notes/secret-project/` are visible to every co-member's server as well as your own. For maximum privacy, use opaque paths. |
-| **Proposal metadata** | Unauthorized PUTs record the sender address, target path, proposed member list, body hash, and size in the recipient's request log before the recipient consents. This is deliberate — the recipient needs it to decide — but a hostile sender can force these facts into the recipient's log by attempting a PUT. Per-sender rate limits bound the volume; a blocklist eliminates it for a given sender. |
-| **Unencrypted files** | Files with no `encryption_algorithm` have no confidentiality protection. The body is readable by the server, network observers (if TLS is broken), and anyone with read access. Integrity and authenticity are still provided by the file signature. |
+- **Metadata visibility.** Paths, sizes, modification timestamps, member addresses are readable by the server and by any co-member's server.
+- **Forward secrecy.** If an identity key is compromised, all past and future files it can unwrap are exposed. Ratcheted sequences are **Status: not yet implemented.**
+- **Password brute force.** A compromised server holding a `passwords/<name>.json` file can attack a weak password offline.
+- **Removed member's stored copy.** Re-keying stops access to future writes, not to any local copy they downloaded.
+- **First-contact identity trust.** Fetching `identity.json` for the first time trusts TLS + the server. Clients should pin the public key on first use and warn on unexpected changes. Key-transparency style discovery is out of scope.
 
-### 9.3 Compromise scenarios
+### 12.3 Server compromise (single-key model)
 
-**Scenario: Alice's server is compromised (Mode A — client-managed key)**
-- Attacker can see metadata (paths, sizes, timestamps, who Alice shares with).
-- Attacker **cannot** read file content (doesn't have Alice's private key to unwrap file keys).
-- Attacker **cannot** forge files from Alice (doesn't have her signing key).
-- Attacker could serve a fake identity document with a different public key. Mitigations: (1) existing contacts have Alice's key pinned via TOFU, (2) verified contacts will see a safety number change warning.
-
-**Scenario: Alice's server is compromised (Mode B — server-hosted key)**
-- *With a server recovery member*: the attacker gets Alice's private key, **can** read all files (past and future, until the key is rotated), and **can** forge files from Alice. This is the tradeoff of opting into server recovery.
-- *Without a server recovery member*: the attacker holds the `identity.key` file and any password identity files in `/.ark/passwords/` (whose `public_key.value` contains `verifier || salt`), so they can brute-force a password identity offline (Section 4.5); passkey identities (Section 4.4) are not attackable this way. Until a password is cracked, the attacker **cannot** read files or forge as Alice.
-- Mitigation: omit the server recovery member, use passkey members, and choose a strong passphrase — or use Mode A for high-security needs.
-
-**Scenario: Alice's identity key is compromised (either mode)**
-- Worst case. Attacker can impersonate Alice and decrypt all data.
-- Mitigation: Alice performs a key transition (Section 2.7). After transition, new files use the new key and are safe.
-
-**Scenario: Shared file key is compromised**
-- Only the specific file is affected, not Alice's other data.
-- Mitigation: re-key the file (generate new file key, re-encrypt body, re-wrap for all members).
-
-**Scenario: Server-to-server traffic is intercepted (TLS broken)**
-- Attacker sees files in transit. They can see metadata (the metadata blob is plaintext).
-- Attacker **cannot** read file content (E2E encrypted independent of TLS).
-- Attacker **cannot** forge files (signatures are verified).
-- TLS is defense-in-depth for metadata, not the primary security layer.
-
-### 9.4 Trust assumptions
-
-| Assumption | Consequence if violated |
-|---|---|
-| Ed25519 is secure | All identity and authentication breaks. |
-| X25519 is secure | All encryption and key exchange breaks. |
-| AES-256-GCM / ChaCha20-Poly1305 is secure | Data confidentiality breaks. |
-| User's seed phrase / private key is stored securely | Attacker can decrypt all data and impersonate user. |
-| TOFU on first contact is not intercepted | MITM on first key fetch allows interception until detected. |
+- The compromised server sees all metadata and ciphertext but no plaintext.
+- It cannot forge signatures for existing files (no identity key).
+- It can serve a **different** `identity.json` to a new peer, so first-contact peers who don't verify out of band could be MITM'd. Pinned peers are safe.
+- If a password identity is configured, the server also holds `identity.key` encrypted under the password identity — see §12.2.
 
 ---
 
-## 10. Extensions
+## 13. Not yet implemented
 
-These are planned features not included in the core v1 protocol. They can be layered on top without breaking compatibility.
+The following spec sections describe intended behavior that the reference implementation does not yet ship. They remain in the spec so the wire format and semantics are settled before code lands.
 
-### 10.1 Forward Secrecy — Ratcheted Sequences
-
-An optional **ratcheted key derivation mode** for file sequences between two parties. Uses the Double Ratchet algorithm (as used in Signal) to provide forward secrecy: compromising the identity key does not expose past messages, and compromising a single message key does not expose other messages.
-
-This is opt-in. The default static mode (Section 4.2) remains unchanged. Both modes coexist — apps choose which to use based on the use case.
-
-#### 10.1.1 Concept
-
-A **ratcheted sequence** is an ordered collection of files between exactly two parties, where each file's key is derived from a ratchet chain rather than generated randomly and wrapped via ECIES. The sequence lives in a directory:
-
-```
-/ark/alice/mail/conversations/bob-abc123/
-  .ark/members              ← exactly 2 members
-  .ark/ratchet              ← ratchet session state (encrypted to self only, single device)
-  0001                      ← file, key derived from ratchet
-  0002                      ← file, key derived from ratchet
-  ...
-```
-
-Each file in the sequence is still a standard Ark file (same binary format, same transport, same path-mirrored delivery). The only difference is how the file key is derived — from the ratchet chain instead of random + ECIES.
-
-#### 10.1.2 Prekey bundles
-
-To establish a ratchet session without requiring both parties to be online simultaneously, the protocol uses **X3DH** (Extended Triple Diffie-Hellman) key agreement. This requires prekeys published in the identity document (Section 2.4):
-
-| Field | Purpose |
-|---|---|
-| `prekeys.signed_prekey` | X25519 public key, rotated periodically (e.g., weekly). Signed by the identity key to prove authenticity. |
-| `prekeys.signed_prekey_signature` | Ed25519 signature over the signed prekey. |
-| `prekeys.one_time_prekeys` | List of single-use X25519 public keys. The server removes each key after it is fetched by a sender. Provides one-time forward secrecy for session initiation. |
-
-Users who do not publish prekeys do not support ratcheted sequences. Senders fall back to static mode.
-
-**Prekey replenishment:** Clients should monitor their one-time prekey count and upload new keys when the supply runs low. If no one-time prekeys are available, X3DH proceeds without one (reduced forward secrecy for the initial message only).
-
-#### 10.1.3 Session establishment (X3DH)
-
-When Alice initiates a ratcheted sequence with Bob:
-
-1. Alice fetches Bob's identity document and extracts:
-   - Bob's identity key (`IK_B`) — converted using the `encryption_algorithm` (e.g., `"x25519"`)
-   - Bob's signed prekey (`SPK_B`)
-   - One of Bob's one-time prekeys (`OPK_B`), if available
-2. Alice verifies `signed_prekey_signature` against Bob's identity key.
-3. Alice generates an ephemeral X25519 keypair (`EK_A`).
-4. Alice computes four DH values:
-   ```
-   DH1 = X25519(IK_A_private, SPK_B)       # Alice's identity × Bob's signed prekey
-   DH2 = X25519(EK_A_private, IK_B)        # Alice's ephemeral × Bob's identity
-   DH3 = X25519(EK_A_private, SPK_B)       # Alice's ephemeral × Bob's signed prekey
-   DH4 = X25519(EK_A_private, OPK_B)       # Alice's ephemeral × Bob's one-time prekey (if available)
-   ```
-5. Alice derives the initial root key:
-   ```
-   root_key = HKDF-SHA256(
-     ikm: DH1 || DH2 || DH3 || DH4,
-     salt: 0 (32 zero bytes),
-     info: "ark-ratchet-init",
-     length: 32
-   )
-   ```
-6. Alice stores the ratchet state locally and sends the first file in the sequence with her ephemeral public key (`EK_A`) and the one-time prekey identifier in the file metadata, so Bob can compute the same root key.
-
-#### 10.1.4 Double Ratchet operation
-
-After session establishment, the Double Ratchet proceeds as follows:
-
-**Symmetric ratchet (per-message):** Each file in a sending chain advances a chain key:
-
-```
-chain_key[n+1] = HMAC-SHA256(chain_key[n], 0x02)
-message_key[n] = HMAC-SHA256(chain_key[n], 0x01)
-```
-
-The `message_key` is used as the file key for that file. It is used once and discarded.
-
-**DH ratchet (per-turn):** When the sending direction changes (Alice sends, then Bob sends), a new DH ratchet step occurs:
-
-1. The new sender generates a fresh X25519 ephemeral keypair.
-2. The new sender computes a DH shared secret with the other party's latest ratchet key.
-3. The root key advances:
-   ```
-   dh_output = X25519(new_private, other_ratchet_public)
-   root_key[n+1], chain_key = HKDF-SHA256(
-     ikm: dh_output,
-     salt: root_key[n],
-     info: "ark-ratchet-step",
-     length: 64
-   )
-   ```
-4. The sender's new ratchet public key is included in the file metadata's `ratchet_key` field.
-
-**Metadata fields for ratcheted files:**
-
-| Field | Purpose |
-|---|---|
-| `key_derivation` | `"ratchet"` |
-| `sequence_id` | Identifies the ratchet session (random 16 bytes, set at session creation) |
-| `message_index` | Monotonic counter — position in the ratchet chain |
-| `ratchet_key` | Sender's current DH ratchet public key (X25519, 32 bytes) |
-
-The `members` list still exists in the metadata but `wrapped_key` fields are empty — the file key is derived from the ratchet, not wrapped via ECIES.
-
-#### 10.1.5 Ratchet state storage
-
-Ratchet state is stored locally at `.ark/ratchets/<sequence_id>`, encrypted to self only. It contains:
-
-- Current root key
-- Sending and receiving chain keys
-- Current DH ratchet keypair
-- Other party's current DH ratchet public key
-- Message counters
-- Skipped message keys (for out-of-order delivery, capped and pruned)
-
-**Single device only.** Ratchet state is not synced across devices. This is a deliberate choice — ratchet security depends on state never being duplicated. Users who opt into ratcheted sequences accept that those sequences are tied to one device.
-
-**If ratchet state is lost** (device lost, storage failure), all messages in the sequence become unrecoverable. This is the fundamental tradeoff of forward secrecy. Users who need recoverability should use static mode.
-
-#### 10.1.6 Out-of-order delivery
-
-Files may arrive out of order (network delays, server queuing). The ratchet handles this:
-
-1. The recipient checks the `message_index` against their current chain position.
-2. If the index is ahead, the recipient advances the chain and stores skipped message keys (up to a configurable limit, default: 256).
-3. If the index matches a stored skipped key, the recipient uses it and deletes it.
-4. If the index is behind and the key was already deleted, the file is undecryptable.
-
-#### 10.1.7 Group ratchet (future)
-
-The Double Ratchet is fundamentally a 2-party protocol. Group forward secrecy (3+ members) can be layered on top using **sender keys**: each member maintains their own sending chain and distributes the sender key to the group via pairwise ratcheted channels. This is not specified in v1.
-
-#### 10.1.8 Upgrade path
-
-Nothing in the core protocol blocks adding ratcheted sequences later:
-
-- Ratcheted files are standard Ark files — same format, same transport, same path-mirrored delivery. The `Metadata` (Appendix C.13) is extended with `key_derivation`, `sequence_id`, `message_index`, and `ratchet_key` fields, transmitted as additional `X-Ark-Meta-*` headers.
-- The identity document is extended with a `prekeys` object.
-- Old clients that don't understand ratcheted files simply cannot decrypt them (they lack the ratchet state regardless).
-- Unknown `X-Ark-Meta-*` headers are ignored by old clients, so extension fields don't break them.
-
-### 10.2 Legacy Email Interop
-
-An optional system for communicating with legacy email users. There are two methods, which can be used independently or together.
-
-#### Method 1: Notification Link (outbound to email users)
-
-When a protocol user sends a message to a legacy email address, the server creates a temporary account for the recipient and sends them a notification email with a link to read the message.
-
-**How it works:**
-
-1. Bob sends a message to `carol@gmail.com` from the protocol.
-2. Bob's server computes a deterministic alias from the email address:
-   ```
-   alias = "x-" + base32_lowercase(sha256("carol@gmail.com")[:10])
-   → "x-a7f3k2m9p4q8r2"
-   ```
-3. Bob's server checks whether this alias already exists on the **gateway server**.
-4. If not, it requests account creation on the gateway:
-   - The gateway generates a keypair on the alias's behalf and holds it — the legacy recipient has no client of their own, so the gateway can display their messages. This is the legacy-interop trust trade-off (the gateway can read these messages).
-   - The gateway publishes a legacy email identity document for the alias.
-5. Bob's server encrypts the message to the new account's public key and delivers it.
-6. The gateway sends a notification email to `carol@gmail.com`:
-   ```
-   Subject: Bob sent you a message
-   
-   Read it here: https://gateway.example.com/read/a8Kx7mP2...
-   ```
-7. Carol clicks the link. A web client loads. She reads the message and can reply.
-
-**Legacy email identity document:**
-
-```
-GET https://gateway.example.com/ark/x-a7f3k2m9p4q8r2/.ark/identity
-```
-
-```json
-{
-  "version": 1,
-  "type": "legacy_email",
-  "address": "x-a7f3k2m9p4q8r2@gateway.example.com",
-  "legacy_email": "carol@gmail.com",
-  "public_key": {
-    "algorithm": "ed25519",
-    "value": "base64url-encoded"
-  },
-  "notify": true,
-  "modified": "2026-04-14T12:00:00Z",
-  "signature": {
-    "algorithm": "ed25519",
-    "value": "base64url-encoded"
-  }
-}
-```
-
-**Claiming the identity:**
-
-When Carol decides she wants a real address:
-1. Carol chooses a username (e.g., `carol`).
-2. The gateway creates a new identity document at `carol@gateway.example.com` (same keypair).
-3. The hash alias redirects to the new address.
-4. Carol can migrate to her own server later using a key transition (Section 2.7).
-
-**The gateway server:**
-
-The gateway is an Ark server that specializes in hosting accounts for legacy email recipients and sending notification emails via a transactional email API (SendGrid, Postmark, etc.).
-
-```toml
-domain = "example.com"
-storage = "./data"
-legacy_gateway = "gateway.ark.io"
-```
-
-#### Method 2: Email Bridge (inbound from email users)
-
-For protocol users who want to receive legacy email, a bridge service can forward incoming emails.
-
-1. Alice configures a forwarding rule in her email provider to a webhook handled by the bridge.
-2. The bridge receives the email, wraps the content in an Ark file, and delivers it to Alice's `apps/mail/inbox/` (or whatever path her mail app expects) as a file the bridge is authorized to write.
-3. The file is marked as "received via email (unencrypted)" in Alice's client.
-
-**Security note:** Bridged messages are not encrypted in transit. The bridge sees plaintext during processing. These files should be clearly distinguished from native Ark files in the client UI.
-
-### 10.3 Metadata Privacy
-
-A future version could add onion routing or mixnet support to hide metadata (sender/recipient/timing) from servers and network observers. The protocol's separation of transport from content makes this possible without changing the core file format.
-
-### 10.4 Collaborative Editing (CRDTs)
-
-V1 uses last-write-wins for shared files. A future extension could support real-time collaborative editing via CRDTs (Conflict-free Replicated Data Types):
-
-- File body would be an encrypted operation log instead of a snapshot.
-- Each edit appends an encrypted CRDT operation (e.g., Yjs or Automerge format).
-- Clients replay operations to reconstruct current state.
-- This would be opt-in per file and coexist with the default snapshot model.
+- Password recovery UX and seed-phrase display (§11.1) — the low-level password identity flow (§11.2) is implemented.
+- Passkey identities (§4.8 `passkeys/`).
+- Groups (§4.8 `groups/`, Appendix A.8).
+- Invitations (§4.8 `invitations/`, Appendix A.9).
+- Blocklists (§4.8 `blocked/`).
+- Per-sender rate limits (§12.1).
+- Key rotation with `key_transition` (§11.3, Appendix A.7).
+- Aliases and account migration between servers.
+- Relay retries, exponential backoff, and bounces (§9).
+- `allow_remote_registration` server config toggle for §4.5 bootstrap.
+- Ratcheted sequences (forward secrecy) and prekey bundles.
 
 ---
 
-## Appendix A: Configuration
+## Appendix A — Types
 
-### A.1 Server Configuration (`ark.toml`)
+Types below define the JSON shapes that ride in bodies and the field set that rides in `X-Ark-Meta-*` headers. All binary values are base64url (no padding).
 
-```toml
-domain = "example.com"
-listen = "127.0.0.1:8080"
-max_account_size = "1GB"
-max_file_size = "100MB"
-max_delivery_size = "25MB"
-allow_remote_registration = true
-legacy_gateway = ""
-```
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `domain` | string | Yes | Server's public hostname. |
-| `listen` | string | No | Bind address and port. Default `127.0.0.1:8080`. TLS is expected to terminate at a reverse proxy in front of the server (Section 7.7). |
-| `max_account_size` | string | No | Maximum storage per account. Default `1GB`. |
-| `max_file_size` | string | No | Maximum single file size. Default `100MB`. |
-| `max_delivery_size` | string | No | Maximum size of a file accepted via cross-server delivery. Default `25MB`. |
-| `allow_remote_registration` | boolean | No | Allow account creation via PUT `/ark/<user>/.ark/identity.json`. Default `true`. |
-| `legacy_gateway` | string | No | Gateway server address for legacy email interop (Section 10.2). Default empty. |
-
-## Appendix B: Endpoints
-
-All Ark endpoints are under `https://<domain>/ark/<user>/`.
-
-Most endpoints are standard file resource requests:
-
-| Endpoint | Body | Response | Purpose |
-|---|---|---|---|
-| `GET    /ark/<user>/<dir_path>/` | - | `DirectoryEntry[]` | List directory entries |
-| `HEAD   /ark/<user>/<dir_path>/` | - | - | Fetch metadata (`X-Ark-Meta-*`) |
-| `PUT    /ark/<user>/<dir_path>/` | - | - | Create or update directory metadata |
-| `DELETE /ark/<user>/<dir_path>/` | - | - | Delete directory recursively |
-| `HEAD   /ark/<user>/<file_path>` | - | - | Fetch metadata (`X-Ark-Meta-*`) |
-| `GET    /ark/<user>/<file_path>` | - | `File` | Fetch file |
-| `PUT    /ark/<user>/<file_path>` | `File` | - | Create or update file |
-| `DELETE /ark/<user>/<file_path>` | - | - | Delete file |
-
-The `/ark/<user>/.ark/` directory is a special directory that is limited to specific Ark files. These files are of the format specified instead of the standard `File` format:
-
-- `/ark/<user>/.ark/blocked/<address>.json`: blocklist entry. When present, unauthorized PUTs from `<address>` are rejected with `403` and not logged. Owner-only.
-- `/ark/<user>/.ark/groups/<name>.json`: `Group` (Section C.7).
-- `/ark/<user>/.ark/groups/<name>.key`: group private key, wrapped per member. Members-only.
-- `/ark/<user>/.ark/identity.html`: Contact HTML page, auto-generated, HEAD/GET only, no authentication required. This should contain a link to add the user's identity to your contacts.
-- `/ark/<user>/.ark/identity.json`: `Identity`, no authentication required for PUT if creating new file. The creation of this file creates a new user.
-- `/ark/<user>/.ark/identity.key`: `File` (Section 8, C.12) whose body is the identity private key. Members are the account (`owner`) plus one or more recovery identities under `/.ark/passwords/` or `/.ark/passkeys/` (`read`). GET/HEAD/PUT use the standard `ArkIdentity` authorization (Section 5) as signed by any member.
-- `/ark/<user>/.ark/invitations/<token>.html`: Invitation HTML page, auto-generated, no authentication required. This should contain a link to redeem the invitation (HEAD/GET only, no authentication required).
-- `/ark/<user>/.ark/invitations/<token>.json`: `Invitation`
-- `/ark/<user>/.ark/passkeys/<name>.json`: `Identity` (C.1) whose keypair is derived from a WebAuthn passkey (Section 4.4). Publicly readable; HEAD/GET require no authentication. PUT requires the account (owner) key.
-- `/ark/<user>/.ark/passwords/<name>.json`: `Identity` (C.1) whose keypair is derived from a password (Section 4.5). Publicly readable; HEAD/GET require no authentication. PUT requires the account (owner) key.
-- `/ark/<user>/.ark/requests/<timestamp>_<seq>.http`: request log entry, raw HTTP request headers + blank line + raw HTTP response headers (bodies excluded). Auto-generated by the Ark account; owner-only read.
-
-The following are special requests that do not fit the standard file resource model:
-
-| Endpoint | Body | Response | Purpose |
-|---|---|---|---|
-| `POST   /ark/<user>/.ark/invitations/<token>` | `Identity` | `Identity` | Redeem an invitation. The body is the identity of the redeemer, the response is the identity of `<user>`. |
-| `GET    /ark/<user>/.ark/stream` | - | `Event` stream | Subscribe to a real-time event stream |
-
----
-
-## Appendix C: Types
-
-### C.1 Identity
+### A.1 Identity
 
 ```json
 {
   "public_key": Key,
   "address": "alice@example.com",
-  "modified": "2026-04-11T12:00:00Z",
-  "key_transition": KeyTransition,
-  "signature": Signature,
-}
-```
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `public_key` | Key | Yes | The key that identifies the user. |
-| `address` | string | Yes | Full `user@domain` address. |
-| `modified` | string | Yes | RFC 3339 timestamp of last update. |
-| `key_transition` | KeyTransition | No | The most recent key transition. |[TODO list all?]
-| `signature` | Signature | Yes | A signature over all fields above by the identified user. |
-
-**Optional extension fields (Section 10.1):**
-
-| Field | Type | Description |
-|---|---|---|
-| `prekeys.signed_prekey` | string | Base64url X25519 public key for ratchet session establishment. |
-| `prekeys.signed_prekey_signature` | string | Ed25519 signature over the signed prekey. |
-| `prekeys.one_time_prekeys` | string[] | List of single-use base64url X25519 public keys. |
-
-### C.2 Legacy Email Identity Document (Section 10.2)
-
-```json
-{
-  "version": 1,
-  "type": "legacy_email",
-  "address": "x-a7f3k2m9p4q8r2@gateway.example.com",
-  "legacy_email": "carol@gmail.com",
-  "public_key": {
-    "algorithm": "ed25519",
-    "value": "<base64url>"
-  },
-  "notify": true,
-  "modified": "2026-04-14T12:00:00Z",
-  "signature": {
-    "algorithm": "ed25519",
-    "value": "<base64url>"
-  }
-}
-```
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `type` | string | Yes | `"legacy_email"`. |
-| `legacy_email` | string | Yes | Original email address this account represents. |
-| `notify` | boolean | Yes | Whether notification emails are sent on delivery. |
-
-### C.3 KeyTransition
-
-```json
-{
-  "old_key": "<base64url>",
-  "new_key": "<base64url>",
-  "old_signs_new": "<base64url>",
-  "new_signs_old": "<base64url>",
-  "reason": "scheduled_rotation",
-  "timestamp": "2026-04-11T12:00:00Z"
-}
-```
-
-[TODO review what is needed to prove the owner had access to both keys]
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `old_key` | string | Yes | Base64url old identity public key. |
-| `new_key` | string | Yes | Base64url new identity public key. |
-| `old_signs_new` | string | Yes | Signature of new key by old key. |
-| `new_signs_old` | string | Yes | Signature of old key by new key. |
-| `reason` | string | No | Human-readable reason (e.g., `"scheduled_rotation"`, `"key_compromise"`). |
-| `timestamp` | string | Yes | RFC 3339 timestamp. |
-
-### C.4 Invitation
-
-[TODO remove max_uses? - server cannot modify files...]
-
-```json
-{
-  "max_uses": 1,
-  "expires": "2026-05-10T00:00:00Z"
-}
-```
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `max_uses` | integer | No | Maximum redemptions. Default: `1`. |
-| `expires` | string | No | RFC 3339 expiry. Default: no expiry. |
-
-### C.5 DirectoryEntry
-
-```json
-{
-  "type": "file",
-  "name": "todo",
-  "size": 4096,
-  "modified": "2026-04-11T12:00:00Z",
-  "modified_by": "alice@example.com"
-}
-```
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `type` | string | Yes | `"directory"` for subdirectories, `"file"` for files. |
-| `name` | string | Yes | Entry name. |
-| `size` | integer | No | File size in bytes. Absent for directories. |
-| `modified` | string | No | RFC 3339 last modification time. Absent for directories. |
-| `modified_by` | string | No | Address of last modifier. Absent for directories. |
-
-### C.6 Group
-
-Like an identity document, but identifies a set of members instead of a single address. This is the public group document; the matching private key lives in the members-only `.key` file. Addressed by its local path (Section 2.2).
-
-```json
-{
-  "version": 1,
-  "members": Member[],
-  "key": Key,
-  "updated": "2026-04-11T12:00:00Z",
+  "modified": "2026-07-24T10:00:00.000Z",
   "signature": Signature
 }
 ```
 
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `version` | integer | Yes | Protocol version. |
-| `members` | array | Yes | Group members (`Member[]`), each with a permission within the group. |
-| `key` | Key | No | Current group public key. Present when the group is used as an encryption member of a file (so its private key is needed to unwrap the file key); absent when the group is only used for authorization (as a member in metadata) without decryption. |
-| `updated` | string | Yes | RFC 3339 timestamp of last update. |
-| `signature` | Signature | Yes | An `owner` member's signature over all fields above. |
+| Field | Required | Notes |
+|---|---|---|
+| `public_key` | ✓ | The identity's public key. Must be a signing algorithm (Appendix B). |
+| `address` | ✓ | Full address (may include a sub-identity path). |
+| `modified` | ✓ | RFC 3339 timestamp, millisecond precision, `Z`-terminated. |
+| `signature` | ✓ | Self-signature over the JCS-canonical serialization with `signature.algorithm` and `signature.value` cleared. |
+| `key_transition` | optional | See A.7. **Status: not yet implemented.** |
 
-### C.7 Event
-
-```json
-{"event": "created", "path": "/ark/alice/apps/notes/team-alpha/foo.md", "modified_by": "bob@example.com"}
-{"event": "modified", "path": "/ark/alice/apps/notes/todo.md", "modified_by": "alice@example.com"}
-{"event": "deleted", "path": "/ark/alice/apps/mail/trash/old-msg"}
-{"event": "logged", "path": "/ark/alice/.ark/requests/2026-04-11T12:00:00.000_042.http", "status": 403, "requestor": "bob@example.com"}
-```
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `event` | string | Yes | `"created"`, `"modified"`, `"deleted"`, or `"logged"`. |
-| `path` | string | Yes | Path of affected file (for created/modified/deleted) or of the log entry (for logged). |
-| `modified_by` | string | No | Modifier address (for `created` and `modified` events). |
-| `status` | integer | No | HTTP status code (for `logged` events). |
-| `requestor` | string | No | Requestor address (for `logged` events). |
-
-### C.8 Key
+### A.2 Metadata
 
 ```json
 {
-  "algorithm": "ed25519",
-  "value": "<base64url>"
+  "id": "<uuid>",
+  "created": "2026-07-24T10:00:00.000Z",
+  "modified": "2026-07-24T10:00:00.000Z",
+  "modified_by": "alice@example.com",
+  "encryption_algorithm": "aes-256-gcm",
+  "members": [Member],
+  "body_hash": Hash,
+  "signature": Signature
 }
 ```
 
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `algorithm` | string | Yes | Signing algorithm e.g. `"ed25519"`. |
-| `value` | string | Yes | Base64url-encoded public key bytes. |
+Field rules per §7. Signature computed over the JCS-canonical serialization with `signature.algorithm` and `signature.value` cleared. Files have `body_hash`; directories do not. Directories must omit `encryption_algorithm`.
 
-### C.9 Signature
-
-```json
-{
-  "algorithm": "ed25519",
-  "value": "<base64url>"
-}
-```
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `algorithm` | string | Yes | Signing algorithm e.g. `"ed25519"`. |
-| `value` | string | Yes | Base64url-encoded signature bytes. |
-
-### C.10 Hash
-
-```json
-{
-  "algorithm": "sha-256",
-  "value": "<base64url>"
-}
-```
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `algorithm` | string | Yes | Hash algorithm e.g. `"sha-256"`. |
-| `value` | string | Yes | Base64url-encoded hash bytes. |
-
-### C.11 Member
+### A.3 Member
 
 ```json
 {
@@ -1406,168 +559,85 @@ Like an identity document, but identifies a set of members instead of a single a
 }
 ```
 
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `address` | string | Yes | Member's full address (Section 2.1). May be a primary account (`alice@example.com`), a sub-identity path (e.g. `alice@example.com/.ark/passwords/primary.json`), a local group path (Section 4.2), or `*` for public. |
-| `permission` | string | Yes | `"owner"`, `"write"`, or `"read"`. |
-| `key` | Key | No | The file key wrapped (ECIES via HPKE) to this member's public key. Omitted for files with no `encryption_algorithm`, for the `*` (public) member, and for group members without a group key. |
+| Field | Required | Notes |
+|---|---|---|
+| `address` | ✓ | Full address, a group local path (not yet implemented), or `*`. |
+| `permission` | ✓ | `owner` / `writer` / `reader`. |
+| `key` | when encrypted | The file key wrapped for this member under the wrap algorithm (§8.2). Omitted for `*`, for group members without a group key, and for unencrypted files. |
 
-### C.12 Identity key file (`identity.key`)
+### A.4 Key
 
-Not a distinct document type — an ordinary Ark **File** (Section 8) served at `/ark/<user>/.ark/identity.key`:
+```json
+{ "algorithm": "ed25519", "value": "<b64u>" }
+```
 
-- **Body:** the identity's Ed25519 private key (base64url-encoded), encrypted with a per-file key like any file body.
-- **Members:** the account identity itself as an `owner` member, plus one or more recovery members with `read` permission whose addresses point to password identities (Section 4.5) or passkey identities (Section 4.4) — e.g. `alice@example.com/.ark/passwords/primary.json`. Each such member's `key` field wraps the file key to that identity's public key via the standard ECIES path.
-- **Metadata / signature:** standard file metadata (Section 8.2), signed by the account's identity key. The signature binds the member list, so a malicious server cannot strip a recovery member to force a downgrade.
+Algorithm ids are registered in Appendix B.1.
 
-A client with only a password (or passkey) resolves the password identity file, derives the sub-identity's private key from the credential, signs an `ArkIdentity` request as that sub-identity to fetch the encrypted body, unwraps the file key using its member entry, then decrypts the body to recover the account's Ed25519 private key.
+### A.5 DirectoryEntry
 
-### C.13 Metadata
+```json
+{ "type": "file", "name": "todo.md" }
+```
 
-The signed metadata attached to every Ark file or directory. Stored as `user.ark.*` xattrs and transmitted as `X-Ark-Meta-*` headers (Section 8.3). The JSON form below is the canonical shape used for signing (JCS-canonical, with `signature.algorithm`/`signature.value` cleared before signing).
+`type` ∈ `dir | file | symlink`. Symlink entries are listed for inspection; the server rejects requests that actually traverse a symlink with `403`.
+
+### A.6 Signature / Hash
+
+```json
+{ "algorithm": "ed25519", "value": "<b64u>" }
+{ "algorithm": "sha-256", "value": "<b64u>" }
+```
+
+### A.7 KeyTransition — **Status: not yet implemented**
 
 ```json
 {
-  "id": "<uuid>",
-  "created": "2026-04-11T12:00:00Z",
-  "modified": "2026-04-11T12:00:00Z",
-  "modified_by": "alice@example.com",
-  "encryption_algorithm": "aes-256-gcm",
-  "members": Member[],
-  "body_hash": Hash,
+  "old_key": "<b64u>",
+  "new_key": "<b64u>",
+  "old_signs_new": "<b64u>",
+  "new_signs_old": "<b64u>",
+  "reason": "scheduled_rotation",
+  "timestamp": "2026-07-24T10:00:00.000Z"
+}
+```
+
+Cross-signatures prove both keys authorized the transition. Verification and lifetime rules TBD.
+
+### A.8 Group — **Status: not yet implemented**
+
+```json
+{
+  "version": 1,
+  "members": [Member],
+  "key": Key,
+  "updated": "2026-07-24T10:00:00.000Z",
   "signature": Signature
 }
 ```
 
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `id` | string | Yes | UUID identifying the file or directory. Immutable after creation. |
-| `created` | string | Yes | RFC 3339 timestamp of creation. |
-| `modified` | string | Yes | RFC 3339 timestamp of last modification. |
-| `modified_by` | string | Yes | Address of the identity that last signed this metadata. |
-| `encryption_algorithm` | string | No | e.g. `"aes-256-gcm"`, `"chacha20-poly1305"`. Omitted for unencrypted files and for directories. |
-| `members` | Member[] | Yes | Member entries (Appendix C.11). At least one must have `owner` permission. |
-| `body_hash` | Hash | No | `SHA-256(body)`. Required for files; omitted for directories (they have no body). |
-| `signature` | Signature | Yes | Signature by `modified_by`'s identity key over the JCS-canonical serialization of the fields above with `signature.algorithm` and `signature.value` cleared. |
+Addressed by local path, e.g. `groups:team-alpha` (short form of `/.ark/groups/team-alpha.json`). Group `key` is present when the group encrypts files (its private key lives in the companion members-only `.key` file); absent when the group is only used for authorization.
+
+### A.9 Invitation — **Status: not yet implemented**
+
+```json
+{
+  "expires": "2026-08-01T00:00:00.000Z"
+}
+```
+
+A share proposal pre-accepted by the inviter. Redemption creates the target directory with the redeemer added as a member.
 
 ---
 
-## Appendix D: Cryptographic Algorithms
+## Appendix B — Algorithms
 
-| Purpose | Algorithm | Key Size | Output Size |
-|---|---|---|---|
-| Identity / signing | Ed25519 | 256-bit | 512-bit signature |
-| Encryption key exchange | X25519 | 256-bit | 256-bit shared secret |
-| Key derivation | HKDF-SHA256 | variable | variable |
-| File key wrapping | AES-256-GCM | 256-bit | ciphertext + 128-bit tag |
-| File body encryption | AES-256-GCM | 256-bit | ciphertext + 128-bit tag |
-| Alt. body encryption | ChaCha20-Poly1305 | 256-bit | ciphertext + 128-bit tag |
-| No encryption | None | — | raw bytes |
-| Seed phrase | BIP-39 | 256-bit entropy | 24 words |
-| Password identity seed (Section 4.5) | Argon2id + HKDF-SHA256 | — | 256-bit Ed25519 seed |
-| Passkey identity seed (Section 4.4) | WebAuthn PRF (`hmac-secret`) + HKDF-SHA256 | — | 256-bit Ed25519 seed |
+Every implementation MUST support the algorithms below; a message that uses only these is guaranteed to interoperate. Other algorithms may appear on the wire, but interop is not guaranteed.
 
-[TODO review everything below here]
-
-**Why Ed25519?**
-- Fast signing and verification (important for per-file signatures).
-- Small keys (32 bytes) and signatures (64 bytes).
-- Deterministic — same input always produces the same signature (no nonce-reuse vulnerabilities).
-- Well-audited, widely implemented, no known weaknesses.
-- Easily converted to X25519 for encryption operations.
-
-
-| Operation | Algorithm | Parameters |
+| ID | Role | Notes |
 |---|---|---|
-| Identity keys (signing) | Ed25519 | — |
-| Encryption key exchange | X25519 | — |
-| Key derivation | HKDF-SHA256 | ��� |
-| File key wrapping | AES-256-GCM | 96-bit nonce, 128-bit tag |
-| File body encryption | AES-256-GCM | 96-bit nonce, 128-bit tag |
-| Alternative body encryption | ChaCha20-Poly1305 | 96-bit nonce, 128-bit tag |
-| Unencrypted body | None | Raw bytes, no nonce or tag |
-
-Clients MUST support AES-256-GCM and `none` (unencrypted). ChaCha20-Poly1305 is recommended as an alternative (faster on devices without AES hardware acceleration). The algorithm used is indicated in the file metadata.
-
----
-
-## Appendix E: Example Usage
-
-### First contact flow (Bob shares a file with Alice for the first time)
-
-The file lives at the same path on both servers. Bob is not yet authorized on Alice's account, so his first PUT is logged as a proposal; Alice accepts by materializing the dir and pulling.
-
-```
-Bob's Client              Bob's Server              Alice's Server             Alice's Client
-    |                          |                          |                          |
-    |  1. Fetch Alice's        |                          |                          |
-    |     identity doc ------->|------- HTTPS GET ------->|                          |
-    |  2. Receive public key   |<------ JSON response ----|                          |
-    |                          |                          |                          |
-    |  3. Generate file key,   |                          |                          |
-    |     encrypt content,     |                          |                          |
-    |     wrap key for self    |                          |                          |
-    |     and Alice, sign      |                          |                          |
-    |                          |                          |                          |
-    |  4. PUT file at shared   |                          |                          |
-    |     path on home ------->|                          |                          |
-    |     server               |                          |                          |
-    |                          |  5. Relay via HTTPS PUT  |                          |
-    |                          |  at identical path ----->|                          |
-    |                          |                          |  6. Verify signature      |
-    |                          |                          |  7. Bob not authorized:   |
-    |                          |                          |     403 Forbidden;        |
-    |                          |                          |     body discarded;       |
-    |                          |                          |     entry appended to     |
-    |                          |                          |     .ark/requests/        |
-    |                          |                          |                          |
-    |                          |                          |  8. SSE 'logged' -------->|
-    |                          |                          |     event                 |
-    |                          |                          |                          |
-    |                          |                          |                     9. User accepts
-    |                          |                          |                          |
-    |                          |                          |  10. PUT dir metadata <---|
-    |                          |                          |      w/ proposed members  |
-    |                          |                          |                          |
-    |                          |  11. GET file <----------|--------------------------|
-    |                          |------- file ------------>|                          |
-    |                          |                          |  12. PUT locally <--------|
-    |                          |                          |                          |
-    |                          |                          |                    13. Decrypt with
-    |                          |                          |                        private key
-```
-
-Subsequent modifications by Bob relay to the same path and land directly (step 7 succeeds instead of 403).
-
-### Example use cases
-
-The protocol defines no directory structure — apps do. Ark suggests grouping app data under `apps/<app-id>/` so that different apps do not collide. Since shared files live at identical paths across accounts, apps can hardcode paths and expect them to be the same on every co-member's server.
-
-**Mail app:**
-```
-/ark/alice/apps/mail/inbox/2026-04-11-hello       ← received message
-/ark/alice/apps/mail/sent/2026-04-11-reply        ← sent message
-/ark/alice/apps/mail/drafts/note                  ← draft
-/ark/alice/apps/mail/archive/2026/jkl012          ← archived message
-```
-
-**Notes app:**
-```
-/ark/alice/apps/notes/personal/todo.md            ← personal note
-/ark/alice/apps/notes/team-alpha/meeting-notes.md ← shared with coworkers (same path on their accounts)
-```
-
-**File storage:**
-```
-/ark/alice/apps/files/photos/vacation.jpg         ← personal photo
-/ark/alice/apps/files/documents/tax-2025.pdf      ← tax document
-/ark/alice/apps/files/shared/project-plan.md      ← shared with collaborators
-```
-
-**Calendar app:**
-```
-/ark/alice/apps/calendar/2026-04-28-standup       ← calendar event
-/ark/alice/apps/calendar/2026-05-01-birthday      ← recurring event
-```
-
-All of these are the same thing underneath: encrypted files with members at fixed paths. The path and organization are conventions between the app and the user.
+| `ed25519` | signature | 32-byte private, 32-byte public, 64-byte signature. |
+| `aes-256-gcm` | encryption | 96-bit nonce, 128-bit tag. Body = `nonce ‖ ciphertext ‖ tag`. |
+| `hpke-x25519-hkdf-sha256-aes256gcm` | wrap | HPKE base mode (RFC 9180), KEM `0x0020`, KDF `0x0001`, AEAD `0x0002`. `info = "ark-hpke-v1"`, empty aad. Wire form = `encapped_key(32) ‖ ciphertext ‖ tag`. Recipient key derived from the Ed25519 identity key — public: point decompress → Montgomery form; private: SHA-512(seed) → RFC 7748 clamp of first 32 bytes. |
+| `sha-256` | hash | 32-byte output. |
+| `argon2id-ed25519` | identity derivation | Derives an Ed25519 keypair from a password. Argon2id (default params) + HKDF-SHA256. Two HKDF branches: `ark-auth-v1` for the verifier, `ark-ed25519-v1` for the derived Ed25519 seed. `public_key.value` = `verifier(32) ‖ salt(16) ‖ ed25519_public(32)`. |
+| — | canonicalization | JCS (RFC 8785). Applied to a signed structure with its `signature.algorithm` and `signature.value` cleared before signing. |

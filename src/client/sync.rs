@@ -12,8 +12,8 @@ use crate::client::request::request;
 use crate::identity::parse_address;
 use crate::metadata::{has_metadata_attributes, read_local_metadata_attributes, read_metadata_attributes, read_metadata_headers, remove_local_metadata_attributes, write_local_metadata_attributes, write_metadata_attributes};
 use crate::types::{DirectoryEntry, DirectoryEntryKind, IdentityContext, Metadata, WatchAction};
+use crate::client::watch::{watch_local, watch_remote};
 use crate::util::{now_iso_fs, io_err, parse_request_entry, resolve_client_url, sha256};
-use crate::watch;
 
 struct SyncEntry {
     relative_path: String,
@@ -32,49 +32,20 @@ pub fn sync_io(ctx: &IdentityContext, watch: bool, decrypt: bool) -> io::Result<
 /// Reconcile local and remote state under `path` in a single pass. `path`
 /// must be `ctx.root` or a descendant.
 ///
-/// Fetches `.ark/requests/` — the server-signed request log — for entries
-/// newer than the checkpoint in `.ark/last_sync_request` and builds a map of
-/// `rel_path → latest successful PUT`. Then walks the local tree under
-/// `path` once and compares each log entry against local state:
+/// Per tracked file/dir: push if only local changed; pull if only remote
+/// changed; pull metadata alone when only permissions/members diverged; write
+/// a `<name>.conflict-<iso>` sidecar carrying the remote copy (body plus
+/// metadata) when both sides diverged, leaving the local copy untouched. The
+/// sidecar is not sync-tracked itself.
 ///
-/// - `local_body_modified` = current SHA-256 differs from stored `sync_body_hash`
-///   (files only).
-/// - `remote_body_modified` = log entry's `body_hash` differs from local
-///   `body_hash` (files only).
-/// - `remote_metadata_modified` = log entry's `modified` timestamp differs
-///   from local's.
+/// Only items with sync markers (tracked via [`track_io`](super::track_io) or
+/// previously synced) are considered. Symlinks, untracked local files, and
+/// files encrypted at rest are left alone. Remote changes authored by the
+/// current account are ignored.
 ///
-/// Dispatch per entry: push body when only local changed; pull body when
-/// only remote body changed; pull metadata-only (via HEAD) when just
-/// timestamps diverge; conflict when both bodies changed — pull remote
-/// into `<name>.conflict-<iso>` sidecar carrying remote body plus remote
-/// `user.ark.*` metadata (with `user.ark_local.*` sync attributes
-/// stripped so the sidecar is not itself sync-tracked), leaving the
-/// local edit at the original path untouched. Metadata-only conflict
-/// (both sides bumped timestamps but bodies match) writes a similar
-/// sidecar: files copy the local body (bytes match remote), dirs get an
-/// empty sidecar dir, both carrying remote metadata for side-by-side
-/// comparison. Directories carry only metadata; a divergent dir
-/// triggers a metadata pull (creating the local dir if missing).
-/// `.ark/` targets, log entries outside `path`, and entries authored by
-/// self are ignored. When `path` equals `ctx.root` the last seen log
-/// entry filename is written back to `.ark/last_sync_request` so the
-/// next full sync skips it; subdirectory syncs do not advance the
-/// checkpoint (they would otherwise drop entries outside the subtree).
-///
-/// Symlinks, `.ark/` dirs, and files without `sync_body_hash` (untracked or
-/// encrypted-at-rest) are skipped by the push side; the pull side leaves
-/// untracked local files alone rather than clobbering them. Metadata
-/// changes made via [`chmod_io`](super::chmod_io) are local-only and do
-/// not auto-propagate — a manual PUT is required to publish them.
-///
-/// When `watch` is true, spawns both the remote SSE watcher and the local FS
-/// watcher before the initial reconciliation so events landing during
-/// catchup are still delivered (operations are idempotent, so duplicates
-/// from watchers firing during the initial pass are harmless), then runs
-/// the initial pass and blocks until either watcher exits. Watchers are
-/// scoped to `path` too. `decrypt` controls whether pulled files are
-/// decrypted on write.
+/// With `watch=true`, blocks and continues syncing as local FS events and
+/// remote SSE events arrive under `path`, in addition to the initial pass.
+/// `decrypt` controls whether pulled files are decrypted on write.
 pub fn sync(ctx: &IdentityContext, path: &Path, watch: bool, decrypt: bool) -> io::Result<()> {
     if watch {
         thread::scope(|s| {
@@ -108,10 +79,10 @@ fn initial_sync(ctx: &IdentityContext, path: &Path, decrypt: bool) -> io::Result
         }
     }
 
-    if path == ctx.root {
-        if let Some(cp) = last_sync_request {
-            fs::write(ctx.root.join(".ark").join("last_sync_request"), &cp)?;
-        }
+    if let Some(l) = last_sync_request {
+        let ark_dir = path.join(".ark");
+        fs::create_dir_all(&ark_dir)?;
+        fs::write(ark_dir.join("last_sync_request"), &l)?;
     }
 
     Ok(())
@@ -121,7 +92,7 @@ fn pull_watch(ctx: &IdentityContext, path: &Path, decrypt: bool) -> io::Result<(
     let rel_prefix = to_relative_path(ctx, path)?;
     let url = resolve_client_url(ctx, &format!("/{}", rel_prefix))?;
 
-    watch::watch_remote(ctx, &url, |event| {
+    watch_remote(ctx, &url, |event| {
         let subpath = event.path.to_string_lossy();
         let relative_path = if rel_prefix.is_empty() {
             subpath.into_owned()
@@ -160,7 +131,7 @@ fn pull_watch(ctx: &IdentityContext, path: &Path, decrypt: bool) -> io::Result<(
 }
 
 fn push_watch(ctx: &IdentityContext, path: &Path) -> io::Result<()> {
-    watch::watch_local(path, |event| {
+    watch_local(path, |event| {
         match event.action {
             WatchAction::Created | WatchAction::Modified => {}
             _ => return false,
@@ -184,15 +155,13 @@ fn push_watch(ctx: &IdentityContext, path: &Path) -> io::Result<()> {
 }
 
 fn check(ctx: &IdentityContext, path: &Path) -> io::Result<(Vec<SyncEntry>, Option<String>)> {
-    let (log_map, last_sync_request) = fetch_log_map(ctx)?;
-    let rel_prefix = to_relative_path(ctx, path)?;
+    let (log_map, last_sync_request) = fetch_log_map(ctx, path)?;
 
     let mut entries: HashMap<String, SyncEntry> = HashMap::new();
     check_dir(ctx, path, &mut entries)?;
 
     for (rel, log) in &log_map {
         if log.modified_by == ctx.identity.address { continue; }
-        if !under_prefix(rel, &rel_prefix) { continue; }
 
         let is_dir = log.body_hash.is_none();
         let local_path = ctx.root.join(rel);
@@ -356,12 +325,14 @@ fn sync_entry(ctx: &IdentityContext, entry: &SyncEntry, decrypt: bool) -> io::Re
     Ok(())
 }
 
-fn fetch_log_map(ctx: &IdentityContext) -> io::Result<(HashMap<String, Metadata>, Option<String>)> {
-    let last_sync_request = match fs::read_to_string(ctx.root.join(".ark").join("last_sync_request")) {
+fn fetch_log_map(ctx: &IdentityContext, path: &Path) -> io::Result<(HashMap<String, Metadata>, Option<String>)> {
+    let last_sync_request = match fs::read_to_string(path.join(".ark").join("last_sync_request")) {
         Ok(s) => Some(s.trim().to_string()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => None,
         Err(e) => return Err(e),
     };
+
+    let rel_prefix = to_relative_path(ctx, path)?;
 
     let requests_path = "/.ark/requests/";
     let requests_url = resolve_client_url(ctx, requests_path)?;
@@ -405,6 +376,8 @@ fn fetch_log_map(ctx: &IdentityContext) -> io::Result<(HashMap<String, Metadata>
             Ok(None) => continue,
             Err(e) => { eprintln!("bad log entry: {}", e); continue; }
         };
+
+        if !under_prefix(&relative_path, &rel_prefix) { continue; }
 
         match map.get(&relative_path) {
             Some(existing) if metadata.modified < existing.modified => {}
@@ -454,7 +427,7 @@ mod tests {
     use std::env;
 
     use super::*;
-    use crate::client::{chmod_io, get::get_io, init, put::put_io, track_io};
+    use crate::client::{chmod_io, get::get_io, init_io, put::put_io, track_io};
     use crate::context::create_client_context;
     use crate::server::start_test_server;
     use crate::util::test::{in_test_dir, init_with_server, write_encrypted_test_file, write_plain_test_file};
@@ -471,11 +444,11 @@ mod tests {
         fs::create_dir_all(&bob_dir).unwrap();
 
         env::set_current_dir(&alice_dir).unwrap();
-        init(&format!("alice@127.0.0.1:{}", port), None).unwrap();
+        init_io(&format!("alice@127.0.0.1:{}", port), None).unwrap();
         let alice_ctx = create_client_context().unwrap();
 
         env::set_current_dir(&bob_dir).unwrap();
-        init(&format!("bob@127.0.0.1:{}", port), None).unwrap();
+        init_io(&format!("bob@127.0.0.1:{}", port), None).unwrap();
         let bob_ctx = create_client_context().unwrap();
 
         (alice_ctx, bob_ctx)
@@ -782,7 +755,7 @@ mod tests {
             let alice_dir = temp_dir.join("alice_client");
             fs::create_dir_all(&alice_dir).unwrap();
             env::set_current_dir(&alice_dir).unwrap();
-            init(&format!("alice@127.0.0.1:{}", port), None).unwrap();
+            init_io(&format!("alice@127.0.0.1:{}", port), None).unwrap();
             let alice_ctx = create_client_context().unwrap();
 
             let local = alice_dir.join("notes.txt");
@@ -834,7 +807,7 @@ mod tests {
             let alice_dir = temp_dir.join("alice_client");
             fs::create_dir_all(&alice_dir).unwrap();
             env::set_current_dir(&alice_dir).unwrap();
-            init(&format!("alice@127.0.0.1:{}", port), None).unwrap();
+            init_io(&format!("alice@127.0.0.1:{}", port), None).unwrap();
             let alice_ctx = create_client_context().unwrap();
 
             let local = alice_dir.join("notes.txt");

@@ -34,9 +34,9 @@ use self::relay::relay;
 
 pub const MAX_CLOCK_SKEW_MS: u64 = 300_000;
 
-/// Bind `0.0.0.0:<port>` and serve the current working directory as the ark
-/// server root. Blocks. Bootstraps the server's `ark@<host>` identity on
-/// first run.
+/// Serve the current working directory as an ark server root on
+/// `0.0.0.0:<port>` for `host`. Blocks. On first run, creates the server's
+/// `ark@<host>` identity.
 ///
 /// Panics if the current directory can't be read, the port can't be bound, or
 /// the server identity can't be initialized.
@@ -217,9 +217,9 @@ fn handle_parsed_inner(
         Err(e) => return write_text(stream, 403, e.to_string().as_bytes())
     };
 
-    if permission == Permission::Read {
+    if permission == Permission::Reader {
         match method {
-            "PUT" | "DELETE" => return write_text(stream, 403, b"write permission required"),
+            "PUT" | "DELETE" => return write_text(stream, 403, b"writer permission required"),
             _ => {}
         }
     }

@@ -406,7 +406,7 @@ mod tests {
             let bob_identity_path = bob_dir.join(".ark/identity.json");
             let body = fs::read(&bob_identity_path).unwrap();
             let mut meta = create_metadata(&bob_address, None);
-            meta.members.push(Member { address: "*".to_string(), permission: Permission::Read, key: None });
+            meta.members.push(Member { address: "*".to_string(), permission: Permission::Reader, key: None });
             sign_metadata(&bob_key, &mut meta, Some(&body)).unwrap();
             write_metadata_attributes(&bob_identity_path, &meta).unwrap();
             let expected = read_identity(&bob_identity_path).unwrap();

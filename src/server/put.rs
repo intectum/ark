@@ -242,7 +242,7 @@ mod tests {
             let (writer_identity, writer_key, _) = create_test_account(temp_dir, "writer@example.com");
 
             let file = seed_shared_file(temp_dir, &owner_identity, &owner_key, "ark/owner/file.txt", b"v1", vec![
-                Member { address: writer_identity.address.clone(), permission: Permission::Write, key: None },
+                Member { address: writer_identity.address.clone(), permission: Permission::Writer, key: None },
             ]);
             let existing_id = read_metadata_attributes(&file).unwrap().id;
 
@@ -253,7 +253,7 @@ mod tests {
             new_meta.encryption_algorithm = None;
             new_meta.members = vec![
                 Member { address: owner_identity.address.clone(), permission: Permission::Owner, key: None },
-                Member { address: writer_identity.address.clone(), permission: Permission::Write, key: None },
+                Member { address: writer_identity.address.clone(), permission: Permission::Writer, key: None },
             ];
             sign_metadata(&writer_key, &mut new_meta, Some(b"v2")).unwrap();
 
@@ -270,7 +270,7 @@ mod tests {
             let (reader_identity, reader_key, _) = create_test_account(temp_dir, "reader@example.com");
 
             seed_shared_file(temp_dir, &owner_identity, &owner_key, "ark/owner/file.txt", b"v1", vec![
-                Member { address: reader_identity.address.clone(), permission: Permission::Read, key: None },
+                Member { address: reader_identity.address.clone(), permission: Permission::Reader, key: None },
             ]);
 
             let port = start_test_server(temp_dir.to_path_buf());
@@ -279,7 +279,7 @@ mod tests {
             new_meta.encryption_algorithm = None;
             new_meta.members = vec![
                 Member { address: owner_identity.address.clone(), permission: Permission::Owner, key: None },
-                Member { address: reader_identity.address.clone(), permission: Permission::Read, key: None },
+                Member { address: reader_identity.address.clone(), permission: Permission::Reader, key: None },
             ];
             sign_metadata(&reader_key, &mut new_meta, Some(b"v2")).unwrap();
 
@@ -320,7 +320,7 @@ mod tests {
             let (outsider_identity, _, _) = create_test_account(temp_dir, "outsider@example.com");
 
             let file = seed_shared_file(temp_dir, &owner_identity, &owner_key, "ark/owner/file.txt", b"v1", vec![
-                Member { address: writer_identity.address.clone(), permission: Permission::Write, key: None },
+                Member { address: writer_identity.address.clone(), permission: Permission::Writer, key: None },
             ]);
             let existing_id = read_metadata_attributes(&file).unwrap().id;
 
@@ -331,8 +331,8 @@ mod tests {
             new_meta.encryption_algorithm = None;
             new_meta.members = vec![
                 Member { address: owner_identity.address.clone(), permission: Permission::Owner, key: None },
-                Member { address: writer_identity.address.clone(), permission: Permission::Write, key: None },
-                Member { address: outsider_identity.address.clone(), permission: Permission::Read, key: None },
+                Member { address: writer_identity.address.clone(), permission: Permission::Writer, key: None },
+                Member { address: outsider_identity.address.clone(), permission: Permission::Reader, key: None },
             ];
             sign_metadata(&writer_key, &mut new_meta, Some(b"v2")).unwrap();
 
@@ -362,7 +362,7 @@ mod tests {
             new_meta.members = vec![
                 Member { address: owner_identity.address.clone(), permission: Permission::Owner, key: None },
                 Member { address: co_owner_identity.address.clone(), permission: Permission::Owner, key: None },
-                Member { address: newbie_identity.address.clone(), permission: Permission::Read, key: None },
+                Member { address: newbie_identity.address.clone(), permission: Permission::Reader, key: None },
             ];
             sign_metadata(&co_owner_key, &mut new_meta, Some(b"v2")).unwrap();
 
@@ -415,7 +415,7 @@ mod tests {
             let (writer_identity, writer_key, _) = create_test_account(temp_dir, "writer@example.com");
 
             seed_shared_dir(temp_dir, &owner_identity, &owner_key, "ark/owner/shared", vec![
-                Member { address: writer_identity.address.clone(), permission: Permission::Write, key: None },
+                Member { address: writer_identity.address.clone(), permission: Permission::Writer, key: None },
             ]);
 
             let port = start_test_server(temp_dir.to_path_buf());
@@ -432,7 +432,7 @@ mod tests {
             let (reader_identity, reader_key, _) = create_test_account(temp_dir, "reader@example.com");
 
             seed_shared_dir(temp_dir, &owner_identity, &owner_key, "ark/owner/shared", vec![
-                Member { address: reader_identity.address.clone(), permission: Permission::Read, key: None },
+                Member { address: reader_identity.address.clone(), permission: Permission::Reader, key: None },
             ]);
 
             let port = start_test_server(temp_dir.to_path_buf());
@@ -469,7 +469,7 @@ mod tests {
             let (outsider_identity, _, _) = create_test_account(temp_dir, "outsider@example.com");
 
             let dir = seed_shared_dir(temp_dir, &owner_identity, &owner_key, "ark/owner/shared", vec![
-                Member { address: writer_identity.address.clone(), permission: Permission::Write, key: None },
+                Member { address: writer_identity.address.clone(), permission: Permission::Writer, key: None },
             ]);
             let existing_id = read_metadata_attributes(&dir).unwrap().id;
 
@@ -479,8 +479,8 @@ mod tests {
             new_meta.encryption_algorithm = None;
             new_meta.members = vec![
                 Member { address: owner_identity.address.clone(), permission: Permission::Owner, key: None },
-                Member { address: writer_identity.address.clone(), permission: Permission::Write, key: None },
-                Member { address: outsider_identity.address.clone(), permission: Permission::Read, key: None },
+                Member { address: writer_identity.address.clone(), permission: Permission::Writer, key: None },
+                Member { address: outsider_identity.address.clone(), permission: Permission::Reader, key: None },
             ];
             sign_metadata(&writer_key, &mut new_meta, None).unwrap();
             let code = signed_put_dir_metadata(port, &writer_identity, &writer_key, "/ark/owner/shared/", &new_meta);
@@ -495,7 +495,7 @@ mod tests {
             let (writer_identity, writer_key, _) = create_test_account(temp_dir, "writer@example.com");
 
             seed_shared_dir(temp_dir, &owner_identity, &owner_key, "ark/owner/shared", vec![
-                Member { address: writer_identity.address.clone(), permission: Permission::Write, key: None },
+                Member { address: writer_identity.address.clone(), permission: Permission::Writer, key: None },
             ]);
             fs::create_dir_all(temp_dir.join("ark/owner/shared/sub")).unwrap();
 
@@ -512,7 +512,7 @@ mod tests {
             let (owner_identity, owner_key, _) = create_test_account(temp_dir, "owner@example.com");
 
             seed_shared_file(temp_dir, &owner_identity, &owner_key, "ark/owner/public.txt", b"open", vec![
-                Member { address: "*".to_string(), permission: Permission::Read, key: None },
+                Member { address: "*".to_string(), permission: Permission::Reader, key: None },
             ]);
 
             let port = start_test_server(temp_dir.to_path_buf());

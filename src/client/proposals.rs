@@ -9,14 +9,12 @@ use crate::metadata::{get_member, read_metadata_headers, write_metadata_headers}
 use crate::types::{DirectoryEntry, IdentityContext, Metadata, Permission, Proposal};
 use crate::util::{io_err, io_invalid_input, parse_request_entry, resolve_client_url, sha256};
 
-/// List pending share proposals — request-log entries where another account's
-/// PUT was rejected with `403` at a path the current account owns. Each entry
-/// is fetched from `.ark/requests/`, parsed, and returned in filename
-/// (chronological) order.
+/// List pending share proposals — requests where another account's PUT was
+/// rejected with `403` at a path the current account owns. Returned in
+/// chronological order.
 ///
-/// Missing `.ark/requests/` returns an empty list — request logging is only
-/// enabled when the Ark server account has been granted write access to the
-/// directory (see [`crate::client::init`]).
+/// Empty when the account has no request log (see [`crate::client::init`],
+/// which sets it up).
 pub fn list_proposals(ctx: &IdentityContext) -> io::Result<Vec<Proposal>> {
     let requests_url = resolve_client_url(ctx, "/.ark/requests/")?;
     let (code, _, body) = request(Some(ctx), "GET", &requests_url, &[], &[])?;
@@ -79,23 +77,23 @@ pub fn list_proposals_io(ctx: &IdentityContext) -> io::Result<()> {
     Ok(())
 }
 
-/// Accept a share proposal by log entry id.
+/// Accept a share proposal. `index_or_id`: 1-based index (from
+/// [`list_proposals`]) or a log entry filename.
 ///
-/// Fetches the current file/dir from the modifier's server (HEAD for dirs, GET
-/// for files), verifies fetched metadata against the proposal snapshot (id
-/// match, no unauthorised member additions/upgrades, self not downgraded),
-/// verifies the fetched body against the current `body_hash`, and PUTs the
-/// verified metadata + body to the target path on the current account. On
-/// success the log entry is deleted.
+/// Pulls the current file/dir from the modifier's server, checks it has not
+/// been maliciously altered since the proposal (id unchanged, no unauthorised
+/// member additions/upgrades, current account not downgraded), and applies it
+/// to the target path on the current account. The log entry is removed on
+/// success.
 ///
-/// When `force` is true, the metadata-change verification is skipped — the
-/// current metadata is trusted as-is even if members were added or the current
-/// user was downgraded since the proposal was made.
-pub fn accept_proposal(ctx: &IdentityContext, id: &str, force: bool) -> io::Result<()> {
+/// With `force=true`, accepts the current metadata as-is even if members were
+/// added or the current account was downgraded since the proposal.
+pub fn accept_proposal(ctx: &IdentityContext, index_or_id: &str, force: bool) -> io::Result<()> {
+    let id = resolve_id(ctx, index_or_id)?;
     let entry_path = format!("/.ark/requests/{}", id);
     let mut entry_body: Vec<u8> = Vec::new();
     get(ctx, &entry_path, &mut entry_body, false)?;
-    let proposal = parse_proposal(id, &entry_body)
+    let proposal = parse_proposal(&id, &entry_body)
         .ok_or_else(|| io_invalid_input("entry is not a valid proposal"))?;
 
     let (account_name, _, _) = parse_address(&ctx.identity.address)?;
@@ -149,28 +147,16 @@ pub fn accept_proposal(ctx: &IdentityContext, id: &str, force: bool) -> io::Resu
     Ok(())
 }
 
-/// CLI wrapper for [`accept_proposal`]. `index_or_id` may be a 1-based index
-/// (as printed by [`list_proposals_io`]) or a log entry filename.
-pub fn accept_proposal_io(ctx: &IdentityContext, index_or_id: &str, force: bool) -> io::Result<()> {
+/// Reject a share proposal by deleting its log entry. `index_or_id` may be a
+/// 1-based index (as returned by [`list_proposals`]) or a log entry filename.
+/// The current file/dir on the modifier's server is untouched; any future
+/// attempt by the same account will simply produce a new log entry.
+pub fn reject_proposal(ctx: &IdentityContext, index_or_id: &str) -> io::Result<()> {
     let id = resolve_id(ctx, index_or_id)?;
-    accept_proposal(ctx, &id, force)
-}
-
-/// Reject a share proposal by deleting its log entry. The current file/dir on
-/// the modifier's server is untouched; any future attempt by the same account
-/// will simply produce a new log entry.
-pub fn reject_proposal(ctx: &IdentityContext, id: &str) -> io::Result<()> {
     let entry_path = format!("/.ark/requests/{}", id);
     delete(ctx, &entry_path)?;
 
     Ok(())
-}
-
-/// CLI wrapper for [`reject_proposal`]. `index_or_id` may be a 1-based index
-/// (as printed by [`list_proposals_io`]) or a log entry filename.
-pub fn reject_proposal_io(ctx: &IdentityContext, index_or_id: &str) -> io::Result<()> {
-    let id = resolve_id(ctx, index_or_id)?;
-    reject_proposal(ctx, &id)
 }
 
 fn resolve_id(ctx: &IdentityContext, index_or_id: &str) -> io::Result<String> {
@@ -255,7 +241,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::client::{init, put_io};
+    use crate::client::{init_io, put_io};
     use crate::context::create_client_context;
     use crate::server::start_test_server;
     use crate::util::test::in_test_dir;
@@ -267,11 +253,11 @@ mod tests {
         std::fs::create_dir_all(&bob_dir).unwrap();
 
         env::set_current_dir(&alice_dir).unwrap();
-        init(&format!("alice@127.0.0.1:{}", port), None).unwrap();
+        init_io(&format!("alice@127.0.0.1:{}", port), None).unwrap();
         let alice_ctx = create_client_context().unwrap();
 
         env::set_current_dir(&bob_dir).unwrap();
-        init(&format!("bob@127.0.0.1:{}", port), None).unwrap();
+        init_io(&format!("bob@127.0.0.1:{}", port), None).unwrap();
         let bob_ctx = create_client_context().unwrap();
 
         (alice_ctx, bob_ctx)

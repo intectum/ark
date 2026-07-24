@@ -2,7 +2,7 @@ use std::env;
 
 use clap::{Parser, Subcommand};
 
-use ark::client::{accept_proposal_io, chmod_io, decrypt_io, delete, encrypt_io, get_io, head_io, init, list_proposals_io, put_io, reject_proposal_io, sync_io, track_io};
+use ark::client::{accept_proposal, chmod_io, decrypt_io, delete, encrypt_io, get_io, head_io, init_io, list_proposals_io, put_io, reject_proposal, sync_io, track_io};
 use ark::context::create_client_context;
 use ark::server::start_server;
 
@@ -74,22 +74,21 @@ enum Cmd {
         /// Ark URL or path.
         path: String,
     },
-    /// Change members and permissions on a local file's metadata. Use `put` to sync.
+    /// Change members and permissions on a local file. Use `put` to sync.
     ///
-    /// Only updates the file's local xattrs. For encrypted files, adding a
-    /// member re-wraps the current file key for them. Removing a member does
-    /// NOT rotate the file key — the next `put` will. Follow `chmod` with
-    /// `ark put -i <FILE> <PATH>` to upload the change.
+    /// For encrypted files, adding a member grants them access immediately.
+    /// Removing a member does NOT rotate the file key — the next `put` will.
+    /// Follow `chmod` with `ark put -i <FILE> <PATH>` to upload the change.
     Chmod {
-        /// Add or promote an owner (repeatable). Use "public" for wildcard `*`.
+        /// Grant `owner` (repeatable). Use "public" for wildcard `*`.
         #[arg(short = 'o', long = "owner", value_name = "ADDR")]
         owner: Vec<String>,
-        /// Add or promote a writer (repeatable). Use "public" for wildcard `*`.
-        #[arg(short = 'w', long = "write", value_name = "ADDR")]
-        write: Vec<String>,
-        /// Add or promote a reader (repeatable). Use "public" for wildcard `*`.
-        #[arg(short = 'r', long = "read", value_name = "ADDR")]
-        read: Vec<String>,
+        /// Grant `writer` (repeatable). Use "public" for wildcard `*`.
+        #[arg(short = 'w', long = "writer", value_name = "ADDR")]
+        writer: Vec<String>,
+        /// Grant `reader` (repeatable). Use "public" for wildcard `*`.
+        #[arg(short = 'r', long = "reader", value_name = "ADDR")]
+        reader: Vec<String>,
         /// Drop a member (repeatable).
         #[arg(short = 'd', long = "drop", value_name = "ADDR")]
         drop: Vec<String>,
@@ -115,10 +114,8 @@ enum Cmd {
     /// Encrypt and upload a file.
     ///
     /// If INPUT is a directory, creates or updates a directory (empty body).
-    /// A fresh file key is minted on every encrypted put and wrapped for every
-    /// member. If the input file already has user.ark_local.encrypted=true
-    /// (e.g. after `ark encrypt`), the body is uploaded as-is. The server
-    /// relays the write to co-members' inboxes automatically.
+    /// Every encrypted put rotates the file key. If INPUT is already
+    /// encrypted (e.g. after `ark encrypt`), the body is uploaded as-is.
     Put {
         /// Read body from FILE instead of stdin.
         #[arg(short, long, value_name = "FILE")]
@@ -132,15 +129,11 @@ enum Cmd {
     },
     /// Reconcile local and remote state in one pass.
     ///
-    /// Fetches new entries from the server's request log (`.ark/requests/`)
-    /// since the checkpoint in `.ark/last_sync_request`, then walks the local tree.
-    /// Per tracked file, compares local SHA-256 to `sync_body_hash`
-    /// (local_modified?) and local `body_hash` to the log's `body_hash`
-    /// (remote_modified?). Pure local edits push; pure remote changes pull;
-    /// concurrent changes on both sides rename the local copy to
-    /// `<name>.conflict-<iso>` and pull remote. Untracked local files, symlinks, and `.ark/` are left alone.
-    /// With --watch, spawns the SSE watcher before the initial pass, then
-    /// blocks on the local FS watcher for continuous sync.
+    /// Per tracked file, pure local edits push; pure remote changes pull;
+    /// concurrent changes on both sides write the remote copy to a
+    /// `<name>.conflict-<iso>` sidecar and leave the local copy untouched.
+    /// Untracked local files and symlinks are left alone. With --watch, keeps
+    /// syncing continuously.
     Sync {
         /// Watch for changes and re-sync continuously.
         #[arg(short, long)]
@@ -149,10 +142,9 @@ enum Cmd {
         #[arg(short, long)]
         decrypt: bool,
     },
-    /// Seed ark metadata on a local file or directory.
+    /// Seed ark metadata on a local file or directory so `sync` picks it up.
     ///
-    /// Signs and writes user.ark.* xattrs. For files, also sets sync_body_hash so
-    /// `sync` will consider the file. Errors if metadata already exists.
+    /// Errors if the path is already tracked.
     Track {
         /// Encryption algorithm; use "none" for plaintext. Files only.
         #[arg(short, long, value_name = "NAME")]
@@ -164,7 +156,7 @@ enum Cmd {
     ///
     /// If the source has ark metadata, its file key and algorithm are reused
     /// and --key/--encryption-algorithm are rejected. Otherwise --key is
-    /// required. Refuses to run when user.ark_local.encrypted=false.
+    /// required. Refuses to run on files that are not currently encrypted.
     Decrypt {
         /// Read ciphertext from FILE (otherwise stdin).
         #[arg(short, long, value_name = "FILE", conflicts_with = "in_place")]
@@ -184,11 +176,10 @@ enum Cmd {
     },
     /// Review and act on pending share proposals.
     ///
-    /// A proposal is any 403 PUT recorded in .ark/requests/ — another account
-    /// tried to write to your server at a path where they are not yet
-    /// authorized. Accepting materializes the target dir with the proposed
-    /// members and pulls the file from the sender. Rejecting deletes the log
-    /// entry.
+    /// A proposal is another account attempting to share a file with you at a
+    /// path where they are not yet authorized. Accepting materializes the
+    /// target directory with the proposed members and pulls the file from the
+    /// sender. Rejecting discards the proposal.
     Proposals {
         #[command(subcommand)]
         cmd: ProposalsCmd,
@@ -197,7 +188,7 @@ enum Cmd {
     ///
     /// If the source has ark metadata, its file key and algorithm are reused
     /// and --key/--encryption-algorithm are rejected. Otherwise --key is
-    /// required. Refuses to run when user.ark_local.encrypted=true.
+    /// required. Refuses to run on files that are already encrypted.
     Encrypt {
         /// Read plaintext from FILE (otherwise stdin).
         #[arg(short, long, value_name = "FILE", conflicts_with = "in_place")]
@@ -228,15 +219,15 @@ fn main() {
             start_server(port, &resolved_host);
             Ok(())
         },
-        Cmd::Init { address, password } => init(&address, password.as_deref()),
-        Cmd::Chmod { owner, write, read, drop, file } => create_client_context().and_then(|c| chmod_io(&c, &file, &owner, &write, &read, &drop)),
+        Cmd::Init { address, password } => init_io(&address, password.as_deref()),
+        Cmd::Chmod { owner, writer, reader, drop, file } => create_client_context().and_then(|c| chmod_io(&c, &file, &owner, &writer, &reader, &drop)),
         Cmd::Head { path } => create_client_context().and_then(|c| head_io(&c, &path)),
         Cmd::Delete { path } => create_client_context().and_then(|c| delete(&c, &path)),
         Cmd::Get { output, decrypt, path } => create_client_context().and_then(|c| get_io(&c, &path, output.as_deref(), decrypt)),
         Cmd::Proposals { cmd } => create_client_context().and_then(|c| match cmd {
             ProposalsCmd::List => list_proposals_io(&c),
-            ProposalsCmd::Accept { id, force } => accept_proposal_io(&c, &id, force),
-            ProposalsCmd::Reject { id } => reject_proposal_io(&c, &id),
+            ProposalsCmd::Accept { id, force } => accept_proposal(&c, &id, force),
+            ProposalsCmd::Reject { id } => reject_proposal(&c, &id),
         }),
         Cmd::Put { input, encryption_algorithm, path } => create_client_context().and_then(|c| put_io(&c, &path, input.as_deref(), encryption_algorithm.as_deref())),
         Cmd::Sync { watch, decrypt } => create_client_context().and_then(|c| sync_io(&c, watch, decrypt)),

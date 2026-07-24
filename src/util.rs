@@ -44,12 +44,17 @@ pub fn resolve_client_url_raw(root: &Path, path: &str, address: &str) -> io::Res
         }
         s = format!("{}{}", address, s);
     }
-    if !s.contains("://") {
+    let had_scheme = s.contains("://");
+    if !had_scheme {
         s = format!("https://{}", s);
     }
 
     let mut url = Url::parse(&s)
         .map_err(|e| io_invalid_input(&format!("invalid URL {}: {}", path, e)))?;
+
+    if !had_scheme && url.host_str().map(is_loopback_host).unwrap_or(false) {
+        url.set_scheme("http").expect("http is a valid scheme");
+    }
 
     url.set_path(&format!("/ark/{}{}", url.username(), url.path()));
 
@@ -65,6 +70,10 @@ pub fn resolve_server_url(path: &str) -> io::Result<Url> {
     reject_path_traversal(&url)?;
 
     Ok(url)
+}
+
+pub fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
 fn reject_path_traversal(url: &Url) -> io::Result<()> {
@@ -167,8 +176,6 @@ pub fn now_iso() -> String {
     )
 }
 
-/// ISO 8601 timestamp with filename-safe substitutions (`:` → `-`).
-/// NTFS and other filesystems reject `:` in filenames.
 pub fn now_iso_fs() -> String {
     now_iso().replace(':', "-")
 }
@@ -278,7 +285,7 @@ mod tests {
         let cwd = env::current_dir().unwrap();
         let account_dir = cwd.parent().unwrap();
         let url = resolve_client_url_raw(Path::new(account_dir), "/path/to/file.txt", "gyan@127.0.0.1:8080").unwrap();
-        assert_eq!(url.scheme(), "https");
+        assert_eq!(url.scheme(), "http");
         assert_eq!(url.host_str(), Some("127.0.0.1"));
         assert_eq!(url.port(), Some(8080));
         assert_eq!(url.path(), "/ark/gyan/path/to/file.txt");
@@ -288,7 +295,7 @@ mod tests {
     fn resolve_url_relative_at_account_root() {
         let account_dir = env::current_dir().unwrap();
         let url = resolve_client_url_raw(&account_dir, "path/to/file.txt", "gyan@127.0.0.1:8080").unwrap();
-        assert_eq!(url.scheme(), "https");
+        assert_eq!(url.scheme(), "http");
         assert_eq!(url.host_str(), Some("127.0.0.1"));
         assert_eq!(url.port(), Some(8080));
         assert_eq!(url.path(), "/ark/gyan/path/to/file.txt");
@@ -300,7 +307,7 @@ mod tests {
         let account_dir = cwd.parent().unwrap();
         let dir = cwd.file_name().unwrap();
         let url = resolve_client_url_raw(account_dir, "path/to/file.txt", "gyan@127.0.0.1:8080").unwrap();
-        assert_eq!(url.scheme(), "https");
+        assert_eq!(url.scheme(), "http");
         assert_eq!(url.host_str(), Some("127.0.0.1"));
         assert_eq!(url.port(), Some(8080));
         assert_eq!(url.path(), format!("/ark/gyan/{}{}", dir.to_string_lossy(), "/path/to/file.txt"));
@@ -337,6 +344,25 @@ mod tests {
         assert_eq!(url.host_str(), Some("example.com"));
         assert_eq!(url.port(), None);
         assert_eq!(url.path(), "/ark/alice/");
+    }
+
+    #[test]
+    fn resolve_url_loopback_address_defaults_to_http() {
+        let cwd = env::current_dir().unwrap();
+        let account_dir = cwd.parent().unwrap();
+        let url = resolve_client_url_raw(account_dir, "alice@localhost:9000/x", "gyan@example.com").unwrap();
+        assert_eq!(url.scheme(), "http");
+        assert_eq!(url.host_str(), Some("localhost"));
+        assert_eq!(url.port(), Some(9000));
+    }
+
+    #[test]
+    fn resolve_url_explicit_https_on_loopback_preserved() {
+        let cwd = env::current_dir().unwrap();
+        let account_dir = cwd.parent().unwrap();
+        let url = resolve_client_url_raw(account_dir, "https://alice@127.0.0.1:9000/x", "gyan@example.com").unwrap();
+        assert_eq!(url.scheme(), "https");
+        assert_eq!(url.host_str(), Some("127.0.0.1"));
     }
 
     #[test]

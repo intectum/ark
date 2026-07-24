@@ -10,7 +10,7 @@
 //! # Entrypoints
 //!
 //! - [`client`] — `get`, `put`, `head`, `delete`, `chmod_io`, `encrypt`,
-//!   `decrypt`, `track_io`, `sync_io`, `init`, low-level `request`.
+//!   `decrypt`, `track_io`, `sync_io`, `init`, `init_io`, low-level `request`.
 //! - [`server`] — [`server::start_server`] runs a listener on the current
 //!   working directory.
 //! - [`context`] — build the [`types::IdentityContext`] passed to every client
@@ -34,4 +34,3 @@ pub mod metadata;
 pub mod server;
 pub mod types;
 pub mod util;
-pub mod watch;

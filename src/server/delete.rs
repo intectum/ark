@@ -102,7 +102,7 @@ mod tests {
             let (writer_identity, writer_key, _) = create_test_account(temp_dir, "writer@example.com");
 
             let file = seed_shared_file(temp_dir, &owner_identity, &owner_key, "ark/owner/file.txt", b"v1", vec![
-                Member { address: writer_identity.address.clone(), permission: Permission::Write, key: None },
+                Member { address: writer_identity.address.clone(), permission: Permission::Writer, key: None },
             ]);
 
             let port = start_test_server(temp_dir.to_path_buf());
@@ -119,7 +119,7 @@ mod tests {
             let (reader_identity, reader_key, _) = create_test_account(temp_dir, "reader@example.com");
 
             let file = seed_shared_file(temp_dir, &owner_identity, &owner_key, "ark/owner/file.txt", b"v1", vec![
-                Member { address: reader_identity.address.clone(), permission: Permission::Read, key: None },
+                Member { address: reader_identity.address.clone(), permission: Permission::Reader, key: None },
             ]);
 
             let port = start_test_server(temp_dir.to_path_buf());
@@ -135,7 +135,7 @@ mod tests {
             let (owner_identity, owner_key, _) = create_test_account(temp_dir, "owner@example.com");
 
             let file = seed_shared_file(temp_dir, &owner_identity, &owner_key, "ark/owner/public.txt", b"open", vec![
-                Member { address: "*".to_string(), permission: Permission::Read, key: None },
+                Member { address: "*".to_string(), permission: Permission::Reader, key: None },
             ]);
 
             let port = start_test_server(temp_dir.to_path_buf());

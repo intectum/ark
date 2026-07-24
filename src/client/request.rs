@@ -1,7 +1,10 @@
 use std::io;
 use std::net::TcpStream;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
+use rustls::pki_types::ServerName;
 use url::Url;
 
 use crate::types::IdentityContext;
@@ -28,11 +31,38 @@ pub fn request(ctx: Option<&IdentityContext>, method: &str, url: &Url, headers: 
 
     final_headers.push(("Connection", "close"));
 
-    let mut stream = TcpStream::connect((host, url.port().unwrap_or(80)))?;
+    let https = url.scheme() == "https";
+    let default_port = if https { 443 } else { 80 };
+    let port = url.port().unwrap_or(default_port);
+    let mut stream = TcpStream::connect((host, port))?;
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
 
-    write_request(&mut stream, url, method, &final_headers, body)?;
-    read_response(&mut stream, method == "HEAD")
+    if https {
+        let server_name = ServerName::try_from(host.to_string())
+            .map_err(|e| io_err(&format!("invalid TLS server name {}: {}", host, e)))?;
+        let connection = ClientConnection::new(tls_config(), server_name)
+            .map_err(|e| io_err(&format!("TLS setup failed: {}", e)))?;
+        let mut tls_stream = StreamOwned::new(connection, stream);
+        write_request(&mut tls_stream, url, method, &final_headers, body)?;
+        read_response(&mut tls_stream, method == "HEAD")
+    } else {
+        write_request(&mut stream, url, method, &final_headers, body)?;
+        read_response(&mut stream, method == "HEAD")
+    }
+}
+
+fn tls_config() -> Arc<ClientConfig> {
+    static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
+    CONFIG.get_or_init(|| {
+        let mut roots = RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .expect("rustls default protocol versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        Arc::new(config)
+    }).clone()
 }
 
 #[cfg(test)]

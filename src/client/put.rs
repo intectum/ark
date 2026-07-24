@@ -22,8 +22,7 @@ use crate::util::{io_err, io_invalid_input, now_iso, resolve_client_url, sha256}
 ///
 /// A fresh file key is generated on every encrypted put and wrapped for every
 /// member. If `existing_local.encrypted == Some(true)`, the body is uploaded
-/// as-is without re-encryption. The request adds `X-Ark-Relay: full` so the
-/// server relays the write to co-members.
+/// as-is without re-encryption. Writes are relayed to co-members.
 pub fn put(
     ctx: &IdentityContext,
     path: &str,
@@ -114,10 +113,9 @@ pub fn put(
     Ok((metadata, local_metadata))
 }
 
-/// CLI-shaped [`put`]. Reads the body from `input` (or stdin when `None`),
-/// pulls existing `user.ark.*` xattrs from the input file if present, and
-/// writes back updated metadata + local metadata xattrs after a successful
-/// upload.
+/// CLI-shaped [`put`]. Reads the body from `input` (or stdin when `None`). If
+/// the input file already has ark metadata, it is reused for the upload. On
+/// success, the updated metadata is written back to the input file.
 pub fn put_io(ctx: &IdentityContext, path: &str, input: Option<&str>, encryption_algorithm: Option<&str>) -> io::Result<()> {
     let input_path: Option<PathBuf> = input.map(PathBuf::from);
     if let Some(i) = input_path.as_deref() {

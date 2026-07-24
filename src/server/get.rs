@@ -181,7 +181,7 @@ mod tests {
         in_test_dir("ark_server_test", |temp_dir| {
             let (identity, secret_key, _) = create_test_account(temp_dir, TEST_ADDRESS);
             seed_shared_dir(temp_dir, &identity, &secret_key, "ark/test/shared", vec![
-                Member { address: "friend@example.com".to_string(), permission: Permission::Write, key: None },
+                Member { address: "friend@example.com".to_string(), permission: Permission::Writer, key: None },
             ]);
             let port = start_test_server(temp_dir.to_path_buf());
             let (code, _, headers) = signed_request(port, &identity, &secret_key, "GET", "/ark/test/shared/", &[]);
@@ -292,7 +292,7 @@ mod tests {
             let (reader_identity, reader_key, _) = create_test_account(temp_dir, "reader@example.com");
 
             seed_shared_file(temp_dir, &owner_identity, &owner_key, "ark/owner/file.txt", b"secret", vec![
-                Member { address: reader_identity.address.clone(), permission: Permission::Read, key: None },
+                Member { address: reader_identity.address.clone(), permission: Permission::Reader, key: None },
             ]);
 
             let port = start_test_server(temp_dir.to_path_buf());
@@ -322,7 +322,7 @@ mod tests {
             let (owner_identity, owner_key, _) = create_test_account(temp_dir, "owner@example.com");
 
             seed_shared_file(temp_dir, &owner_identity, &owner_key, "ark/owner/public.txt", b"open", vec![
-                Member { address: "*".to_string(), permission: Permission::Read, key: None },
+                Member { address: "*".to_string(), permission: Permission::Reader, key: None },
             ]);
 
             let port = start_test_server(temp_dir.to_path_buf());
@@ -338,7 +338,7 @@ mod tests {
             let (owner_identity, owner_key, _) = create_test_account(temp_dir, "owner@example.com");
 
             seed_shared_file(temp_dir, &owner_identity, &owner_key, "ark/owner/public.txt", b"open", vec![
-                Member { address: "*".to_string(), permission: Permission::Read, key: None },
+                Member { address: "*".to_string(), permission: Permission::Reader, key: None },
             ]);
 
             let port = start_test_server(temp_dir.to_path_buf());
@@ -355,7 +355,7 @@ mod tests {
             let (owner_identity, owner_key, _) = create_test_account(temp_dir, "owner@example.com");
 
             seed_shared_file(temp_dir, &owner_identity, &owner_key, "ark/owner/public.txt", b"open", vec![
-                Member { address: "*".to_string(), permission: Permission::Read, key: None },
+                Member { address: "*".to_string(), permission: Permission::Reader, key: None },
             ]);
 
             let port = start_test_server(temp_dir.to_path_buf());
