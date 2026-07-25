@@ -172,7 +172,7 @@ fn read_message(stream: &mut dyn Read, skip_body: bool) -> Result<(String, Vec<(
     if !skip_body {
         let content_length_value: usize = match content_length {
             Some(t) => t.parse().unwrap_or(0),
-            None => return Err(io_err("Content-Length required")),
+            None => 0,
         };
 
         if content_length_value > 0 {
