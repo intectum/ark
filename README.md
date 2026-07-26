@@ -19,8 +19,9 @@ See [`spec.md`](spec.md) for the wire protocol.
 2. [Install](#install)
 3. [CLI quickstart](#cli-quickstart)
 4. [Rust library quickstart](#rust-library-quickstart)
-7. [Capabilities](#capabilities)
-8. [Roadmap](#roadmap)
+5. [Capabilities](#capabilities)
+6. [FAQ](#faq)
+7. [Roadmap](#roadmap)
 
 ---
 
@@ -201,6 +202,52 @@ Every CLI command has a corresponding library function. Two shapes:
 | Sync | One-shot or watch mode (push + pull). |
 | Transport | Server binds plain HTTP. Client URLs default to `https://` (put a reverse proxy in front for TLS); prefix an address with `http://` to override for dev. |
 | Authentication | `ArkIdentity` signed requests. No tokens, no sessions. |
+
+---
+
+## FAQ
+
+**Can I build a real app without server-side code?**
+
+More than you'd think. Clients hold every file shared with them plus the keys to decrypt it, so most "backend" work — filtering, aggregating, joining, rendering — happens locally against files the client already has. Writes are signed by the client and federated to co-members automatically. Reach for a server-side component only when you need something clients genuinely can't do: authoritative ordering between mutually distrusting users, secrets no client should hold, or heavy compute over data one client shouldn't pull in full.
+
+**What if I really do need server-side logic?**
+
+Ark servers only store files — no functions, no queries, no compute. Instead, run your logic as a **bot user**: a long-running process with its own Ark identity that users share the relevant files with. It reacts to changes (via watch), does the work, and writes results back as files the users already have permission to read. Same auth, same sharing, same federation as any other user — no special server-side runtime to learn.
+
+**Can I trust the files?**
+
+Two separate questions.
+
+*Provenance* — yes. Every file is signed by its author's identity keypair, and clients verify the signature on read. A server that tampers with ciphertext, swaps files, or forges an author will fail verification. Encrypted files are also unreadable to the server — it stores ciphertext plus per-member wrapped keys.
+
+*Content* — no, not automatically. A valid signature only proves *who* wrote the bytes, not that the bytes are well-formed or benign. A buggy client, a malicious member with write access, or a compromised key can all produce properly signed garbage. Treat file contents the same way you'd treat any untrusted input: validate schema, bound sizes, sanitize before rendering. Ark gives you authenticity; correctness is your app's job.
+
+**What happens if my server goes down?**
+
+While it's down, readers can't fetch files that only live on your server. Anything you've shared already exists on co-members' servers too — federation pushed them a copy at write time — so those files stay reachable via their hosts. There is no central service to fail; other users' servers keep working. Files are just directories on disk, so back them up like any other data.
+
+**What if a user loses their key?**
+
+Depends on whether they set a password at `ark init`. With a password, the encrypted private key lives on the server and can be re-downloaded and unlocked on a new device. Without one, the key exists only on the original machine — lose it and encrypted files become unrecoverable, and the identity itself can't be reused. Treat it like an SSH key: back it up, or set a password.
+
+**Can non-Ark clients read the files?**
+
+Only public plaintext files (any HTTP client can `GET` them). Encrypted files require an Ark client with the right identity key to unwrap the per-member key.
+
+**Does Ark work on Windows?**
+
+Not yet. Ark stores metadata in filesystem extended attributes; NTFS support isn't wired up. Linux, macOS, and FreeBSD on ext4/xfs/btrfs/apfs work today.
+
+**How does Ark compare to Solid / IPFS / Nostr?**
+
+- **Solid** — closest in spirit: user-owned personal data pods addressed by URL. Ark differs by encrypting end-to-end by default, pushing writes between servers automatically (federation), and shipping as a single Rust binary rather than a spec with many implementations.
+- **IPFS** — content-addressed and public by default; great for immutable, shareable blobs. Ark is location-addressed (`user@host/path`), mutable, and private by default, with per-file ACLs.
+- **Nostr** — relay-based event stream for messaging. Ark is file-oriented with directories, permissions, and encrypted content; messaging is one thing you can build on top, not the primitive.
+
+**Is Ark production-ready?**
+
+No — treat it as early / experimental. Core storage, auth, sharing, and federation work, but several items in the [Roadmap](#roadmap) (passkeys, groups, key rotation, ratcheted messaging) are unbuilt, and the wire protocol may still change. Fine for prototypes, self-hosting, and small trusted groups; not yet for high-stakes production.
 
 ---
 
