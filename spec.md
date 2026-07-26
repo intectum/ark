@@ -75,7 +75,7 @@ An Ark **server** is an authenticated file server rooted at `/ark/<account>/…`
 | **Metadata** | Constructs, signs, and sends `X-Ark-Meta-*` headers on PUT. Verifies signatures on GET. | Persists metadata as `user.ark.*` xattrs. Verifies the request signature and metadata signature. Does not construct metadata (except its own `ark@` account entries — §10). |
 | **Encryption** | Generates a fresh file key per encrypted PUT. Wraps it to each member's public key. Encrypts and decrypts bodies. | Stores ciphertext. Never sees a plaintext body. Never sees a file key. |
 | **Authorization** | Chooses the member list on new files/dirs. | Enforces the member list on every request. Rejects unauthorized writes and records them (§10). |
-| **Federation** | Sends **one** PUT to the account's own server with `X-Ark-Relay: full`. | Fans that PUT out to every co-member on every other host, at the identical path. |
+| **Federation** | Sends **one** PUT to the account's own server with `?relay=full`. | Fans that PUT out to every co-member on every other host, at the identical path. |
 | **Public read** | Marks a file public by adding member `*` at `reader`. | Allows unauthenticated GET/HEAD on paths with a `*` member. Still rejects PUT/DELETE without a signed request. |
 | **Account creation** | PUTs the new identity to `/.ark/identity.json` on a server. | Creates the account when that path is unclaimed. Rejects claims to existing accounts. |
 | **Request log** | Owned by the account. Client reads and prunes it. | The server's `ark@<host>` account writes an entry per non-log request (§10). |
@@ -134,14 +134,16 @@ Creates or updates a file or directory. **Dir vs file is determined by whether t
 
 **Request body.** For files: the body bytes as stored (ciphertext for encrypted, raw for unencrypted). For directories: empty.
 
-**Optional header: `X-Ark-Relay`.** Instructs the receiving server to fan out this PUT after storing locally (§9).
+**Optional query param: `relay`.** Instructs the receiving server to fan out this PUT after storing locally (§9).
 | Value | Effect |
 |---|---|
 | `full` | Fan out to every unique remote host in the metadata member list, once per host. Same-host members are also written in-process. |
 | `internal` | Same-host members only. No outbound requests. Used to break relay loops. |
 | absent | No relay. Server stores locally only. |
 
-**Response codes.** `201 Created` (new path), `204 No Content` (existing path updated), `400` (missing/bad metadata or body-vs-dir mismatch), `401` (bad signature), `403` (not authorized, or member change without owner), `409` (id mismatch on overwrite, or older `modified` than existing).
+**Optional query param: `metadata`.** Metadata-only PUT. The request body is ignored and the file body on disk is left unchanged; only the `X-Ark-Meta-*` xattrs are rewritten. The new metadata's `body_hash` MUST equal the existing file's `body_hash`; otherwise `400`. The target file MUST already exist; otherwise `409`. Query params combine (e.g. `?relay=full&metadata`) — relay carries the flag forward.
+
+**Response codes.** `201 Created` (new path), `204 No Content` (existing path updated), `400` (missing/bad metadata, body-vs-dir mismatch, or metadata-only body_hash mismatch), `401` (bad signature), `403` (not authorized, or member change without owner), `409` (id mismatch on overwrite, older `modified` than existing, or metadata-only PUT on nonexistent file).
 
 **Bootstrap: `PUT /ark/<account>/.ark/identity.json`.** If no identity exists at that path, the request is unauthenticated and the body is the new account's `Identity` JSON. The request metadata must still be signed by the new account's key. This is how an account is created.
 
@@ -367,9 +369,9 @@ The `*` public member never receives a wrapped key. Public files must therefore 
 
 Ark makes federation a server responsibility. A client publishes once; the server distributes.
 
-**Client responsibility.** For any shared file or directory, the client sends **one** PUT — to its own account's server, at the shared path, with `X-Ark-Relay: full`.
+**Client responsibility.** For any shared file or directory, the client sends **one** PUT — to its own account's server, at the shared path, with `?relay=full`.
 
-**Server responsibility.** On a PUT that carries `X-Ark-Relay: full`, after storing locally the server iterates the metadata's members and, for each member whose address is on a **different host**, sends the same PUT to `/ark/<member-account>/<same-path>` on that host — once per unique host. The outbound PUT carries `X-Ark-Relay: internal` so the receiving server does not fan out further. Members on the **same host** are handled in-process, once, and skip the origin account itself. Members whose address is not parseable, `*`, or `groups:…` are skipped.
+**Server responsibility.** On a PUT that carries `?relay=full`, after storing locally the server iterates the metadata's members and, for each member whose address is on a **different host**, sends the same PUT to `/ark/<member-account>/<same-path>` on that host — once per unique host. The outbound PUT carries `?relay=internal` so the receiving server does not fan out further. Members on the **same host** are handled in-process, once, and skip the origin account itself. Members whose address is not parseable, `*`, or `groups:…` are skipped. A `?metadata` flag on the incoming PUT is carried through to every relayed request.
 
 **Cross-server signing.** Outbound requests are signed by the relaying server's own `ark@<host>` account (see §10). The receiving server verifies that signature against `ark@<host>`'s identity document and then applies its normal member checks against the target account.
 

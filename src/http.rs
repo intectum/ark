@@ -28,7 +28,11 @@ pub fn read_request(stream: &mut dyn Read, skip_body: bool) -> io::Result<(Strin
 
 pub fn write_request(stream: &mut dyn Write, url: &Url, method: &str, headers: &[(&str, &str)], body: &[u8]) -> io::Result<()> {
     let host = url.host_str().ok_or_else(|| io_err("URL missing host"))?;
-    let request_line = format!("{} {} HTTP/1.1\r\n", method, utf8_percent_encode(url.path(), PATH_ENCODE_SET));
+    let target = match url.query() {
+        Some(q) => format!("{}?{}", utf8_percent_encode(url.path(), PATH_ENCODE_SET), q),
+        None => utf8_percent_encode(url.path(), PATH_ENCODE_SET).to_string(),
+    };
+    let request_line = format!("{} {} HTTP/1.1\r\n", method, target);
 
     let mut final_headers = headers.to_vec();
 

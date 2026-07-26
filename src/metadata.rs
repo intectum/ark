@@ -312,10 +312,12 @@ pub fn extract_key_from_metadata(ctx: &IdentityContext, metadata: &Metadata) -> 
 }
 
 pub fn sign_metadata(secret_key: &Key, metadata: &mut Metadata, body: Option<&[u8]>) -> io::Result<()> {
-    metadata.body_hash = body.map(|b| Hash {
-        algorithm: DEFAULT_HASH_ALGORITHM.to_string(),
-        value: sha256(b),
-    });
+    if let Some(b) = body {
+        metadata.body_hash = Some(Hash {
+            algorithm: DEFAULT_HASH_ALGORITHM.to_string(),
+            value: sha256(b),
+        });
+    }
 
     let json = serde_json::to_value(metadata_for_signing(metadata)).expect("serialize metadata");
     metadata.signature = sign_json(secret_key, &json)?;

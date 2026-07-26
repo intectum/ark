@@ -3,10 +3,10 @@ use std::io;
 use std::path::Path;
 use std::str::from_utf8;
 
-use super::{decrypt_stream, put, request};
+use super::{chmod, decrypt_stream, put, request};
 use crate::context::create_client_context;
 use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, DEFAULT_PASSWORD_ALGORITHM, create_secret_key_from_password, restore_secret_key_from_password, to_public_key};
-use crate::identity::{create_identity, parse_address, resolve_identity, sign_identity, validate_identity, write_identity, write_identity_key};
+use crate::identity::{create_identity, parse_address, sign_identity, validate_identity, write_identity, write_identity_key};
 use crate::metadata::{create_metadata, read_metadata_headers, sign_metadata, write_metadata_attributes};
 use crate::types::{Identity, IdentityContext, Key, Member, Permission, Signature};
 use crate::util::{decode_base64url, io_err, io_invalid_input, now_iso, resolve_client_url_raw};
@@ -79,9 +79,15 @@ pub fn init(root: &Path, address: &str, password: Option<&str>, local_only: bool
             write_metadata_attributes(&identity_path, &metadata)?;
 
             let ctx = create_client_context()?;
-            put(&ctx, "/.ark/identity.json", identity_path.to_str(), None)?;
+            put(&ctx, "/.ark/identity.json", identity_path.to_str(), None, false)?;
 
-            grant_requests_write(&ctx)?;
+            let (_, host, _) = parse_address(&ctx.identity.address)?;
+            let ark_address = format!("ark@{}", host);
+
+            let requests_dir = ctx.root.join(".ark").join("requests");
+            fs::create_dir_all(&requests_dir)?;
+
+            chmod(&ctx, requests_dir.to_str().unwrap(), &[], &[ark_address], &[], &[], false, None)?;
 
             if let Some(pw) = password {
                 push_secret_key_with_password(&ctx, pw)?;
@@ -105,28 +111,6 @@ pub fn init_local(root: &Path, address: &str) -> io::Result<(Identity, Key)> {
     write_identity_key(&dot_ark_dir.join("identity.key"), &secret_key.value)?;
 
     Ok((identity, secret_key))
-}
-
-fn grant_requests_write(ctx: &IdentityContext) -> io::Result<()> {
-    let (_, host, _) = parse_address(&ctx.identity.address)?;
-    let ark_identity = resolve_identity(ctx, &format!("ark@{}", host))?;
-
-    let requests_dir = ctx.root.join(".ark").join("requests");
-    fs::create_dir_all(&requests_dir)?;
-
-    let mut metadata = create_metadata(&ctx.identity.address, None);
-    metadata.members.push(Member {
-        address: ark_identity.address,
-        permission: Permission::Writer,
-        key: None,
-    });
-    let secret_key = ctx.identity_key.as_ref().expect("client context missing identity_key");
-    sign_metadata(secret_key, &mut metadata, None)?;
-    write_metadata_attributes(&requests_dir, &metadata)?;
-
-    put(ctx, "/.ark/requests/", requests_dir.to_str(), None)?;
-
-    Ok(())
 }
 
 fn pull_secret_key_with_password(
@@ -209,7 +193,7 @@ fn push_secret_key_with_password(
     sign_metadata(secret_key, &mut password_metadata, Some(&password_body))?;
     write_metadata_attributes(&password_path, &password_metadata)?;
 
-    put(ctx, "/.ark/passwords/primary.json", password_path.to_str(), None)?;
+    put(ctx, "/.ark/passwords/primary.json", password_path.to_str(), None, false)?;
 
     let identity_key_path = dot_ark_dir.join("identity.key");
     let mut key_metadata = create_metadata(&ctx.identity.address, Some(DEFAULT_ENCRYPTION_ALGORITHM));
@@ -220,7 +204,7 @@ fn push_secret_key_with_password(
     });
     write_metadata_attributes(&identity_key_path, &key_metadata)?;
 
-    put(ctx, "/.ark/identity.key", identity_key_path.to_str(), None)?;
+    put(ctx, "/.ark/identity.key", identity_key_path.to_str(), None, false)?;
 
     Ok(())
 }

@@ -27,7 +27,13 @@ use crate::util::{io_err, io_invalid_input, now_iso, resolve_client_url, sha256}
 /// upload; on success the updated signed metadata is written back as
 /// `user.ark.*` xattrs plus local metadata as `user.ark_local.*` xattrs.
 /// Writes are relayed to co-members.
-pub fn put(ctx: &IdentityContext, path: &str, input: Option<&str>, encryption_algorithm: Option<&str>) -> io::Result<()> {
+///
+/// With `metadata_only = true`, the body is not read or uploaded; only the
+/// metadata (including any member/permission changes) is sent to the server
+/// and the request is marked with the `metadata` query parameter. The
+/// existing metadata's `body_hash` is preserved. Requires the file to exist
+/// on the server. Rejects any `encryption_algorithm`.
+pub fn put(ctx: &IdentityContext, path: &str, input: Option<&str>, encryption_algorithm: Option<&str>, metadata_only: bool) -> io::Result<()> {
     let input_path: Option<PathBuf> = input.map(PathBuf::from);
     if let Some(i) = input_path.as_deref() {
         if !fs::exists(i)? {
@@ -46,15 +52,15 @@ pub fn put(ctx: &IdentityContext, path: &str, input: Option<&str>, encryption_al
         None => None,
     };
 
-    let (metadata, local_metadata) = if is_dir {
-        put_stream(ctx, path, None, encryption_algorithm, existing_metadata, existing_local_metadata)?
+    let (metadata, local_metadata) = if is_dir || metadata_only {
+        put_stream(ctx, path, None, encryption_algorithm, existing_metadata, existing_local_metadata, metadata_only)?
     } else if let Some(p) = input_path.as_deref() {
         let mut f = fs::File::open(p)?;
-        put_stream(ctx, path, Some(&mut f), encryption_algorithm, existing_metadata, existing_local_metadata)?
+        put_stream(ctx, path, Some(&mut f), encryption_algorithm, existing_metadata, existing_local_metadata, metadata_only)?
     } else {
         let stdin = io::stdin();
         let mut lock = stdin.lock();
-        put_stream(ctx, path, Some(&mut lock), encryption_algorithm, existing_metadata, existing_local_metadata)?
+        put_stream(ctx, path, Some(&mut lock), encryption_algorithm, existing_metadata, existing_local_metadata, metadata_only)?
     };
 
     if let Some(i) = input_path.as_deref() {
@@ -74,6 +80,10 @@ pub fn put(ctx: &IdentityContext, path: &str, input: Option<&str>, encryption_al
 ///   Directories reject any `encryption_algorithm`.
 /// - `existing_metadata` / `existing_local_metadata`: when present, update in
 ///   place rather than minting a new [`Metadata`].
+/// - `metadata_only`: when true, `body` is ignored and the request is sent
+///   with the `metadata` query parameter. Requires `existing_metadata`, whose
+///   `body_hash` is preserved. Keys are not rotated and the body is not
+///   re-encrypted. Rejects any `encryption_algorithm`.
 ///
 /// A fresh file key is generated on every encrypted put and wrapped for every
 /// member. If `existing_local_metadata.encrypted == Some(true)`, the body is
@@ -85,22 +95,20 @@ pub fn put_stream(
     encryption_algorithm: Option<&str>,
     existing_metadata: Option<Metadata>,
     existing_local_metadata: Option<LocalMetadata>,
+    metadata_only: bool,
 ) -> io::Result<(Metadata, LocalMetadata)> {
-    let url = resolve_client_url(ctx, path)?;
+    let mut url = resolve_client_url(ctx, path)?;
+    let query = if metadata_only { "relay=full&metadata" } else { "relay=full" };
+    url.set_query(Some(query));
 
-    let is_dir = body.is_none();
+    let is_dir = body.is_none() && !metadata_only;
 
     if is_dir && encryption_algorithm.is_some() {
         return Err(io_invalid_input("--encryption-algorithm not supported for directories"));
     }
-
-    let body_bytes = if let Some(r) = body {
-        let mut buf = Vec::new();
-        r.read_to_end(&mut buf)?;
-        buf
-    } else {
-        Vec::new()
-    };
+    if metadata_only && encryption_algorithm.is_some() {
+        return Err(io_invalid_input("--encryption-algorithm not supported for metadata-only puts"));
+    }
 
     let mut metadata = match existing_metadata {
         Some(mut m) => {
@@ -109,7 +117,12 @@ pub fn put_stream(
             }
             m
         }
-        None => create_metadata(&ctx.identity.address, Some(encryption_algorithm.unwrap_or(DEFAULT_ENCRYPTION_ALGORITHM))),
+        None => {
+            if metadata_only {
+                return Err(io_err("metadata-only put requires existing metadata"));
+            }
+            create_metadata(&ctx.identity.address, Some(encryption_algorithm.unwrap_or(DEFAULT_ENCRYPTION_ALGORITHM)))
+        }
     };
 
     if get_member(&metadata.members, &ctx.identity.address).is_none() {
@@ -122,43 +135,54 @@ pub fn put_stream(
 
     let mut local_metadata = existing_local_metadata.unwrap_or_default();
 
-    let skip_encrypt = metadata.encryption_algorithm.is_none();
-    let already_encrypted = local_metadata.encrypted == Some(true);
-
-    local_metadata.sync_body_hash = if !is_dir && !already_encrypted {
-        Some(Hash { algorithm: DEFAULT_HASH_ALGORITHM.to_string(), value: sha256(&body_bytes) })
+    let final_body = if is_dir || metadata_only {
+        Vec::new()
     } else {
-        None
-    };
+        let body_bytes = if let Some(r) = body {
+            let mut buf = Vec::new();
+            r.read_to_end(&mut buf)?;
+            buf
+        } else {
+            Vec::new()
+        };
 
-    let final_body = if already_encrypted || skip_encrypt {
-        if skip_encrypt {
-            for member in metadata.members.iter_mut() {
-                member.key = None;
+        let skip_encrypt = metadata.encryption_algorithm.is_none();
+        let already_encrypted = local_metadata.encrypted == Some(true);
+
+        local_metadata.sync_body_hash = if !already_encrypted {
+            Some(Hash { algorithm: DEFAULT_HASH_ALGORITHM.to_string(), value: sha256(&body_bytes) })
+        } else {
+            None
+        };
+
+        if already_encrypted || skip_encrypt {
+            if skip_encrypt {
+                for member in metadata.members.iter_mut() {
+                    member.key = None;
+                }
             }
+            body_bytes
+        } else {
+            let encryption_algorithm = metadata.encryption_algorithm.as_deref().unwrap();
+            let file_key = create_secret_key(encryption_algorithm)?;
+            apply_key_to_metadata(ctx, &mut metadata, &file_key)?;
+            let mut ciphertext = Vec::new();
+            encrypt_stream(ctx, &metadata, &mut body_bytes.as_slice(), &mut ciphertext)?;
+            local_metadata.encrypted = Some(false);
+            ciphertext
         }
-        body_bytes
-    } else {
-        let encryption_algorithm = metadata.encryption_algorithm.as_deref().unwrap();
-        let file_key = create_secret_key(encryption_algorithm)?;
-        apply_key_to_metadata(ctx, &mut metadata, &file_key)?;
-        let mut ciphertext = Vec::new();
-        encrypt_stream(ctx, &metadata, &mut body_bytes.as_slice(), &mut ciphertext)?;
-        local_metadata.encrypted = Some(false);
-        ciphertext
     };
 
     metadata.modified = now_iso();
     metadata.modified_by = ctx.identity.address.clone();
 
-    let sign_body = if is_dir { None } else { Some(final_body.as_slice()) };
+    let sign_body = if is_dir || metadata_only { None } else { Some(final_body.as_slice()) };
     sign_metadata(ctx.identity_key.as_ref().expect("client context missing identity_key"), &mut metadata, sign_body)?;
 
     local_metadata.sync_modified = Some(metadata.modified.clone());
 
     let metadata_headers = write_metadata_headers(&metadata);
-    let mut headers: Vec<(&str, &str)> = metadata_headers.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
-    headers.push(("X-Ark-Relay", "full"));
+    let headers: Vec<(&str, &str)> = metadata_headers.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
 
     let (response_code, _, response_body) = request(Some(ctx), "PUT", &url, &headers, &final_body)?;
     if response_code != 201 && response_code != 204 {
@@ -192,7 +216,7 @@ mod tests {
         fs::create_dir_all(&cwd).unwrap();
         set_current_dir(&cwd).unwrap();
         let ctx = create_client_context().unwrap();
-        put(&ctx, arg, Some(input.to_str().unwrap()), None).unwrap();
+        put(&ctx, arg, Some(input.to_str().unwrap()), None, false).unwrap();
         input
     }
 
@@ -254,7 +278,7 @@ mod tests {
             sign_metadata(ctx.identity_key.as_ref().unwrap(), &mut preset_meta, Some(b"hello")).unwrap();
             write_metadata_attributes(&input, &preset_meta).unwrap();
 
-            put(&ctx, "notes.txt", Some(input.to_str().unwrap()), None).unwrap();
+            put(&ctx, "notes.txt", Some(input.to_str().unwrap()), None, false).unwrap();
 
             let server_path = temp_dir.join("ark/gyan/notes.txt");
             let server_key = unwrap_first_member_key(&server_path, &ctx.identity_key.as_ref().unwrap().value);
@@ -276,11 +300,11 @@ mod tests {
 
             let input = temp_dir.join("input.bin");
             fs::write(&input, b"v1").unwrap();
-            put(&ctx, "notes.txt", Some(input.to_str().unwrap()), None).unwrap();
+            put(&ctx, "notes.txt", Some(input.to_str().unwrap()), None, false).unwrap();
             let key1 = unwrap_first_member_key(&input, &account_key);
 
             fs::write(&input, b"v2").unwrap();
-            put(&ctx, "notes.txt", Some(input.to_str().unwrap()), None).unwrap();
+            put(&ctx, "notes.txt", Some(input.to_str().unwrap()), None, false).unwrap();
             let key2 = unwrap_first_member_key(&input, &account_key);
 
             assert_ne!(key1, key2);
@@ -314,9 +338,9 @@ mod tests {
 
             let input = temp_dir.join("input.bin");
             fs::write(&input, b"old").unwrap();
-            put(&ctx, "x.txt", Some(input.to_str().unwrap()), None).unwrap();
+            put(&ctx, "x.txt", Some(input.to_str().unwrap()), None, false).unwrap();
             fs::write(&input, b"new plaintext").unwrap();
-            put(&ctx, "x.txt", Some(input.to_str().unwrap()), None).unwrap();
+            put(&ctx, "x.txt", Some(input.to_str().unwrap()), None, false).unwrap();
 
             let on_disk = fs::read(temp_dir.join("ark/gyan/x.txt")).unwrap();
             assert_ne!(on_disk, b"old");
@@ -383,7 +407,7 @@ mod tests {
             write_metadata_attributes(&input, &m).unwrap();
             write_local_metadata_attributes(&input, &LocalMetadata { encrypted: Some(true), sync_body_hash: None, sync_modified: None }).unwrap();
 
-            put(&ctx, "file.bin", Some(input.to_str().unwrap()), None).unwrap();
+            put(&ctx, "file.bin", Some(input.to_str().unwrap()), None, false).unwrap();
 
             let server_path = temp_dir.join("ark/gyan/file.bin");
             let server_body = fs::read(&server_path).unwrap();
@@ -425,7 +449,7 @@ mod tests {
             sign_metadata(ctx.identity_key.as_ref().unwrap(), &mut m, Some(b"plain bytes")).unwrap();
             write_metadata_attributes(&input, &m).unwrap();
 
-            put(&ctx, "raw.bin", Some(input.to_str().unwrap()), None).unwrap();
+            put(&ctx, "raw.bin", Some(input.to_str().unwrap()), None, false).unwrap();
 
             let server_path = temp_dir.join("ark/gyan/raw.bin");
             assert_eq!(fs::read(&server_path).unwrap(), b"plain bytes");
@@ -443,7 +467,7 @@ mod tests {
 
             let input_dir = temp_dir.join("shared_input");
             fs::create_dir_all(&input_dir).unwrap();
-            put(&ctx, "shared", Some(input_dir.to_str().unwrap()), None).unwrap();
+            put(&ctx, "shared", Some(input_dir.to_str().unwrap()), None, false).unwrap();
 
             let dir = temp_dir.join("ark/gyan/shared");
             assert!(dir.is_dir());
@@ -463,7 +487,7 @@ mod tests {
 
             let input_dir = temp_dir.join("shared_input");
             fs::create_dir_all(&input_dir).unwrap();
-            let err = put(&ctx, "shared", Some(input_dir.to_str().unwrap()), Some(DEFAULT_ENCRYPTION_ALGORITHM)).unwrap_err();
+            let err = put(&ctx, "shared", Some(input_dir.to_str().unwrap()), Some(DEFAULT_ENCRYPTION_ALGORITHM), false).unwrap_err();
             assert_eq!(err.kind(), ErrorKind::InvalidInput);
         });
     }
@@ -477,7 +501,7 @@ mod tests {
 
             let input = temp_dir.join("input.bin");
             fs::write(&input, b"plain bytes").unwrap();
-            put(&ctx, "raw.bin", Some(input.to_str().unwrap()), Some("none")).unwrap();
+            put(&ctx, "raw.bin", Some(input.to_str().unwrap()), Some("none"), false).unwrap();
 
             let server_path = temp_dir.join("ark/gyan/raw.bin");
             assert_eq!(fs::read(&server_path).unwrap(), b"plain bytes");
@@ -493,7 +517,7 @@ mod tests {
             let ctx = init_with_server(temp_dir, &address);
 
             let missing = temp_dir.join("does_not_exist.bin");
-            let err = put(&ctx, "notes.txt", Some(missing.to_str().unwrap()), None).unwrap_err();
+            let err = put(&ctx, "notes.txt", Some(missing.to_str().unwrap()), None, false).unwrap_err();
             assert_eq!(err.kind(), ErrorKind::InvalidInput);
             assert!(format!("{}", err).contains("input does not exist"));
         });
@@ -508,7 +532,7 @@ mod tests {
 
             let input_dir = temp_dir.join("input_dir");
             fs::create_dir_all(&input_dir).unwrap();
-            let err = put(&ctx, "shared", Some(input_dir.to_str().unwrap()), Some(DEFAULT_ENCRYPTION_ALGORITHM)).unwrap_err();
+            let err = put(&ctx, "shared", Some(input_dir.to_str().unwrap()), Some(DEFAULT_ENCRYPTION_ALGORITHM), false).unwrap_err();
             assert_eq!(err.kind(), ErrorKind::InvalidInput);
         });
     }

@@ -21,6 +21,7 @@ pub fn relay(
     body: &[u8],
     metadata: &Metadata,
     mode: RelayMode,
+    metadata_only: bool,
     verbose: bool,
 ) -> io::Result<()> {
     let (_, server_host, _) = parse_address(&server_ctx.identity.address)?;
@@ -42,8 +43,6 @@ pub fn relay(
             Err(_) => continue,
         };
 
-        let member_path = build_member_path(&member_name, &relative_path);
-
         let same_host = member_host.eq_ignore_ascii_case(&server_host);
         if same_host {
             if member_name == source_name {
@@ -53,9 +52,11 @@ pub fn relay(
             continue;
         }
 
+        let outbound_relay = if same_host { None } else { Some(RelayMode::Internal) };
+        let member_target = build_member_target(&member_name, &relative_path, outbound_relay, metadata_only);
+
         let mut final_headers: Vec<(String, String)> = headers.iter()
-            .filter(|(key, _)| !key.eq_ignore_ascii_case("x-ark-relay")
-                && !key.eq_ignore_ascii_case("authorization")
+            .filter(|(key, _)| !key.eq_ignore_ascii_case("authorization")
                 && !key.eq_ignore_ascii_case("host")
                 && !key.eq_ignore_ascii_case("content-length")
                 && !key.eq_ignore_ascii_case("connection"))
@@ -63,23 +64,21 @@ pub fn relay(
             .collect();
 
         if same_host {
-            let authorization = create_authorization_header(server_ctx, method, &server_host, &member_path, now(), body)?;
+            let authorization = create_authorization_header(server_ctx, method, &server_host, &member_target, now(), body)?;
             final_headers.push(("Authorization".to_string(), authorization));
             final_headers.push(("Host".to_string(), server_host.clone()));
-        } else {
-            final_headers.push(("X-Ark-Relay".to_string(), RelayMode::Internal.as_str().to_string()));
         }
 
         let result = if same_host {
-            println!("{}(relay) {}", method, member_path);
+            println!("{}(relay) {}", method, member_target);
 
             let mut buf: Vec<u8> = Vec::new();
-            handle_parsed(&mut buf, server_ctx, method, &member_path, &final_headers, body, false)?;
+            handle_parsed(&mut buf, server_ctx, method, &member_target, &final_headers, body, false)?;
             read_response(&mut buf.as_slice(), method == "HEAD")
         } else {
             let bare_host = member_host.split(':').next().unwrap_or(&member_host);
             let scheme = if is_loopback_host(bare_host) { "http" } else { "https" };
-            let url_string = format!("{}://{}{}", scheme, member_host, member_path);
+            let url_string = format!("{}://{}{}", scheme, member_host, member_target);
             println!("{}(relay) {}", method, url_string);
 
             let url = Url::parse(&url_string).map_err(|e| io_err(&format!("invalid remote URL {}: {}", url_string, e)))?;
@@ -102,13 +101,27 @@ pub fn relay(
     Ok(())
 }
 
-fn build_member_path(member_name: &str, rel: &[&str]) -> String {
-    let mut member_path = format!("/ark/{}", member_name);
+fn build_member_target(member_name: &str, rel: &[&str], relay_mode: Option<RelayMode>, metadata_only: bool) -> String {
+    let mut target = format!("/ark/{}", member_name);
     for seg in rel {
-        member_path.push('/');
-        member_path.push_str(seg);
+        target.push('/');
+        target.push_str(seg);
     }
-    member_path
+
+    let mut params: Vec<String> = Vec::new();
+    if let Some(mode) = relay_mode {
+        params.push(format!("relay={}", mode.as_str()));
+    }
+    if metadata_only {
+        params.push("metadata".to_string());
+    }
+
+    if !params.is_empty() {
+        target.push('?');
+        target.push_str(&params.join("&"));
+    }
+
+    target
 }
 
 #[cfg(test)]
@@ -167,7 +180,7 @@ mod tests {
             m.members.push(Member { address: bob_id.address.clone(), permission: Permission::Writer, key: None });
             sign_metadata(&alice_key, &mut m, Some(b"todo body")).unwrap();
 
-            let code = signed_put_metadata_with_headers(port, &alice_id, &alice_key, "/ark/alice/shared/todo.txt", b"todo body", &m, &[("X-Ark-Relay", "full")]);
+            let code = signed_put_metadata_with_headers(port, &alice_id, &alice_key, "/ark/alice/shared/todo.txt?relay=full", b"todo body", &m, &[]);
             assert_eq!(code, 201);
 
             let alice_path = temp_dir.join("ark/alice/shared/todo.txt");
@@ -194,7 +207,7 @@ mod tests {
             m.members.push(Member { address: bob_id.address.clone(), permission: Permission::Writer, key: None });
             sign_metadata(&alice_key, &mut m, Some(b"body")).unwrap();
 
-            let code = signed_put_metadata_with_headers(port, &alice_id, &alice_key, "/ark/alice/shared/todo.txt", b"body", &m, &[("X-Ark-Relay", "full")]);
+            let code = signed_put_metadata_with_headers(port, &alice_id, &alice_key, "/ark/alice/shared/todo.txt?relay=full", b"body", &m, &[]);
             assert_eq!(code, 201);
 
             assert!(temp_dir.join("ark/alice/shared/todo.txt").exists());
@@ -218,9 +231,10 @@ mod tests {
             m.encryption_algorithm = None;
             m.members[0].key = None;
             m.members.push(Member { address: bob_id.address.clone(), permission: Permission::Writer, key: None });
+            m.body_hash = None;
             sign_metadata(&alice_key, &mut m, None).unwrap();
 
-            let code = signed_put_dir_metadata_with_headers(port, &alice_id, &alice_key, "/ark/alice/shared/sub/", &m, &[("X-Ark-Relay", "full")]);
+            let code = signed_put_dir_metadata_with_headers(port, &alice_id, &alice_key, "/ark/alice/shared/sub/?relay=full", &m, &[]);
             assert_eq!(code, 201);
 
             assert!(temp_dir.join("ark/alice/shared/sub").is_dir());
@@ -241,7 +255,7 @@ mod tests {
             m.members.push(Member { address: "groups:contacts".to_string(), permission: Permission::Reader, key: None });
             sign_metadata(&alice_key, &mut m, Some(b"pub")).unwrap();
 
-            let code = signed_put_metadata_with_headers(port, &alice_id, &alice_key, "/ark/alice/public.txt", b"pub", &m, &[("X-Ark-Relay", "full")]);
+            let code = signed_put_metadata_with_headers(port, &alice_id, &alice_key, "/ark/alice/public.txt?relay=full", b"pub", &m, &[]);
             assert_eq!(code, 201);
             assert!(temp_dir.join("ark/alice/public.txt").exists());
         });
@@ -282,7 +296,7 @@ mod tests {
             m.members.push(Member { address: carol_id.address.clone(), permission: Permission::Writer, key: None });
             sign_metadata(&alice_key, &mut m, Some(b"hello")).unwrap();
 
-            let code = signed_put_metadata_with_headers(port_a, &alice_id, &alice_key, "/ark/alice/shared/todo.txt", b"hello", &m, &[("X-Ark-Relay", "full")]);
+            let code = signed_put_metadata_with_headers(port_a, &alice_id, &alice_key, "/ark/alice/shared/todo.txt?relay=full", b"hello", &m, &[]);
             assert_eq!(code, 201);
 
             assert_eq!(fs::read(server_a_root.join("ark/alice/shared/todo.txt")).unwrap(), b"hello");
@@ -320,7 +334,7 @@ mod tests {
             m.members.push(Member { address: bob_id.address.clone(), permission: Permission::Writer, key: None });
             sign_metadata(&alice_key, &mut m, Some(b"hello")).unwrap();
 
-            let code = signed_put_metadata_with_headers(port_a, &alice_id, &alice_key, "/ark/alice/shared/todo.txt", b"hello", &m, &[("X-Ark-Relay", "internal")]);
+            let code = signed_put_metadata_with_headers(port_a, &alice_id, &alice_key, "/ark/alice/shared/todo.txt?relay=internal", b"hello", &m, &[]);
             assert_eq!(code, 201);
 
             assert!(server_a_root.join("ark/alice/shared/todo.txt").exists());

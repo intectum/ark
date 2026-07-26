@@ -147,6 +147,10 @@ enum Cmd {
         /// existing metadata's algorithm, else aes-256-gcm.
         #[arg(short, long, value_name = "NAME")]
         encryption_algorithm: Option<String>,
+        /// Send only metadata; server keeps the existing body. Requires the
+        /// file to exist on the server.
+        #[arg(short, long)]
+        metadata: bool,
         /// Ark URL or path.
         path: String,
     },
@@ -242,7 +246,7 @@ fn main() {
             ProposalsCmd::Accept { id, force } => accept_proposal(&c, &id, force),
             ProposalsCmd::Reject { id } => reject_proposal(&c, &id),
         }),
-        Cmd::Put { input, encryption_algorithm, path } => create_client_context().and_then(|c| put(&c, &path, input.as_deref(), encryption_algorithm.as_deref())),
+        Cmd::Put { input, encryption_algorithm, metadata, path } => create_client_context().and_then(|c| put(&c, &path, input.as_deref(), encryption_algorithm.as_deref(), metadata)),
         Cmd::Sync { watch, decrypt } => create_client_context().and_then(|c| current_dir().and_then(|d| sync(&c, &d, watch, decrypt))),
         Cmd::Decrypt { input, output, in_place, key, encryption_algorithm } => {
             create_client_context().and_then(|c| decrypt(&c, input.as_deref(), output.as_deref(), in_place.as_deref(), key.as_deref(), encryption_algorithm.as_deref()))

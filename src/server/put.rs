@@ -4,7 +4,7 @@ use std::path::Path;
 
 use crate::http::write_text;
 use crate::identity::validate_identity;
-use crate::metadata::{members_changed, verify_metadata, write_metadata_attributes};
+use crate::metadata::{members_changed, verify_metadata, verify_metadata_signature, write_metadata_attributes};
 use crate::types::{Identity, Metadata, Permission};
 
 pub fn serve_put_init(
@@ -22,10 +22,10 @@ pub fn serve_put_init(
         return write_text(stream, 400, e.to_string().as_bytes());
     }
 
-    serve_put(target_path, stream, body, metadata, &body_identity, None, Permission::Owner)
+    serve_put(target_path, stream, body, metadata, &body_identity, None, Permission::Owner, false)
 }
 
-pub fn serve_put(fs_path: &Path, stream: &mut dyn Write, body: &[u8], metadata: &Metadata, modifier_identity: &Identity, existing_metadata: Option<&Metadata>, permission: Permission) -> io::Result<()> {
+pub fn serve_put(fs_path: &Path, stream: &mut dyn Write, body: &[u8], metadata: &Metadata, modifier_identity: &Identity, existing_metadata: Option<&Metadata>, permission: Permission, metadata_only: bool) -> io::Result<()> {
     let is_dir = metadata.body_hash.is_none();
 
     if is_dir {
@@ -37,9 +37,24 @@ pub fn serve_put(fs_path: &Path, stream: &mut dyn Write, body: &[u8], metadata: 
         }
     }
 
-    let verify_body = if is_dir { None } else { Some(body) };
-    if let Err(e) = verify_metadata(&modifier_identity.public_key, metadata, verify_body) {
-        return write_text(stream, 403, e.to_string().as_bytes());
+    if metadata_only && !is_dir {
+        let existing = match existing_metadata {
+            Some(m) => m,
+            None => return write_text(stream, 409, b"metadata put requires existing file"),
+        };
+        let new_hash = metadata.body_hash.as_ref().map(|h| &h.value);
+        let old_hash = existing.body_hash.as_ref().map(|h| &h.value);
+        if new_hash != old_hash {
+            return write_text(stream, 400, b"metadata put must not change body_hash");
+        }
+        if let Err(e) = verify_metadata_signature(&modifier_identity.public_key, metadata) {
+            return write_text(stream, 403, e.to_string().as_bytes());
+        }
+    } else {
+        let verify_body = if is_dir { None } else { Some(body) };
+        if let Err(e) = verify_metadata(&modifier_identity.public_key, metadata, verify_body) {
+            return write_text(stream, 403, e.to_string().as_bytes());
+        }
     }
 
     if let Some(old) = existing_metadata {
@@ -58,7 +73,7 @@ pub fn serve_put(fs_path: &Path, stream: &mut dyn Write, body: &[u8], metadata: 
 
     if is_dir {
         fs::create_dir_all(fs_path)?;
-    } else {
+    } else if !metadata_only {
         if let Some(parent) = fs_path.parent() { fs::create_dir_all(parent)?; }
         let mut file = fs::File::create(fs_path)?;
         file.write_all(body)?;
@@ -381,6 +396,7 @@ mod tests {
             let mut meta = create_plain_test_metadata(&identity, &secret_key, b"");
             meta.encryption_algorithm = None;
             meta.members[0].key = None;
+            meta.body_hash = None;
             sign_metadata(&secret_key, &mut meta, None).unwrap();
             let code = signed_put_dir_metadata(port, &identity, &secret_key, "/ark/test/notes/", &meta);
             assert_eq!(code, 201);
@@ -504,6 +520,57 @@ mod tests {
             let (code, _, _) = signed_put_with_default_metadata(port, &writer_identity, &writer_key, "/ark/owner/shared/sub/x.txt", b"hi");
             assert_eq!(code, 201);
             assert!(temp_dir.join("ark/owner/shared/sub/x.txt").exists());
+        });
+    }
+
+    #[test]
+    fn put_metadata_only_preserves_body_and_rewrites_xattrs() {
+        in_test_dir("ark_server_test", |temp_dir| {
+            let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
+            let file = account_dir.join("x");
+            write_plain_test_file(&file, &identity, &secret_key, b"body");
+            let existing = read_metadata_attributes(&file).unwrap();
+
+            let mut new_meta = create_plain_test_metadata(&identity, &secret_key, b"body");
+            new_meta.id = existing.id.clone();
+            sign_metadata(&secret_key, &mut new_meta, Some(b"body")).unwrap();
+
+            let port = start_test_server(temp_dir.to_path_buf());
+            let code = signed_put_metadata(port, &identity, &secret_key, "/ark/test/x?metadata", b"", &new_meta);
+            assert_eq!(code, 204);
+            assert_eq!(fs::read(temp_dir.join("ark/test/x")).unwrap(), b"body");
+            let after = read_metadata_attributes(&file).unwrap();
+            assert_eq!(after.modified, new_meta.modified);
+        });
+    }
+
+    #[test]
+    fn put_metadata_only_rejects_body_hash_change() {
+        in_test_dir("ark_server_test", |temp_dir| {
+            let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
+            let file = account_dir.join("x");
+            write_plain_test_file(&file, &identity, &secret_key, b"body");
+            let existing = read_metadata_attributes(&file).unwrap();
+
+            let mut new_meta = create_plain_test_metadata(&identity, &secret_key, b"different");
+            new_meta.id = existing.id.clone();
+            sign_metadata(&secret_key, &mut new_meta, Some(b"different")).unwrap();
+
+            let port = start_test_server(temp_dir.to_path_buf());
+            let code = signed_put_metadata(port, &identity, &secret_key, "/ark/test/x?metadata", b"", &new_meta);
+            assert_eq!(code, 400);
+            assert_eq!(fs::read(temp_dir.join("ark/test/x")).unwrap(), b"body");
+        });
+    }
+
+    #[test]
+    fn put_metadata_only_on_nonexistent_returns_409() {
+        in_test_dir("ark_server_test", |temp_dir| {
+            let (identity, secret_key, _) = create_test_account(temp_dir, TEST_ADDRESS);
+            let port = start_test_server(temp_dir.to_path_buf());
+            let meta = create_plain_test_metadata(&identity, &secret_key, b"body");
+            let code = signed_put_metadata(port, &identity, &secret_key, "/ark/test/missing?metadata", b"", &meta);
+            assert_eq!(code, 409);
         });
     }
 

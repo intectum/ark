@@ -60,13 +60,14 @@ pub fn signed_request(port: u16, requestor: &Identity, secret_key: &Key, method:
     signed_request_with_headers(port, requestor, secret_key, method, path, body, &[])
 }
 
-pub fn signed_request_with_headers(port: u16, requestor: &Identity, secret_key: &Key, method: &str, path: &str, body: &[u8], extra: &[(&str, &str)]) -> (u16, Vec<u8>, Vec<(String, String)>) {
+pub fn signed_request_with_headers(port: u16, requestor: &Identity, secret_key: &Key, method: &str, target: &str, body: &[u8], extra: &[(&str, &str)]) -> (u16, Vec<u8>, Vec<(String, String)>) {
+    let sign_path = target.split_once('?').map(|(p, _)| p).unwrap_or(target);
     let timestamp = now();
-    let sig_b64 = sign(&secret_key.value, port, method, path, timestamp, body);
+    let sig_b64 = sign(&secret_key.value, port, method, sign_path, timestamp, body);
     let auth = build_auth(&requestor.address, timestamp, &sig_b64);
     let mut headers: Vec<(&str, &str)> = vec![("Authorization", &auth)];
     headers.extend_from_slice(extra);
-    request(port, method, path, body, &headers)
+    request(port, method, target, body, &headers)
 }
 
 pub fn signed_put_with_default_metadata(port: u16, requestor: &Identity, secret_key: &Key, path: &str, body: &[u8]) -> (u16, Vec<u8>, Vec<(String, String)>) {

@@ -292,7 +292,7 @@ mod tests {
             m.members.push(Member { address: bob_identity.address.clone(), permission: Permission::Writer, key: None });
             sign_metadata(&alice_key, &mut m, Some(b"body")).unwrap();
 
-            let code = signed_put_metadata_with_headers(port, &alice_identity, &alice_key, "/ark/alice/shared/todo.txt", b"body", &m, &[("X-Ark-Relay", "full")]);
+            let code = signed_put_metadata_with_headers(port, &alice_identity, &alice_key, "/ark/alice/shared/todo.txt?relay=full", b"body", &m, &[]);
             assert_eq!(code, 201);
 
             let deadline = Instant::now() + Duration::from_secs(5);

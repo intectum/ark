@@ -239,10 +239,19 @@ fn handle_parsed_inner(
         "PUT" => {
             let metadata = metadata.as_ref().expect("metadata presence checked above");
             let modifier = modifier_identity.as_ref().expect("modifier presence checked above");
-            serve_put(&fs_path, stream, body, metadata, modifier, existing_metadata.as_ref(), permission)?;
 
-            let relay_mode = headers.iter()
-                .find_map(|(name, value)| if name.eq_ignore_ascii_case("x-ark-relay") { RelayMode::parse(value) } else { None });
+            let mut relay_mode: Option<RelayMode> = None;
+            let mut metadata_only = false;
+            for (key, value) in url.query_pairs() {
+                match key.as_ref() {
+                    "relay" => relay_mode = RelayMode::parse(value.as_ref()),
+                    "metadata" => metadata_only = true,
+                    _ => {}
+                }
+            }
+
+            serve_put(&fs_path, stream, body, metadata, modifier, existing_metadata.as_ref(), permission, metadata_only)?;
+
             if let Some(mode) = relay_mode {
                 let server_ctx = Arc::clone(server_ctx);
                 let method = method.to_string();
@@ -251,7 +260,7 @@ fn handle_parsed_inner(
                 let body = body.to_vec();
                 let metadata = metadata.clone();
                 thread::spawn(move || {
-                    if let Err(e) = relay(&server_ctx, &method, &url, &headers, &body, &metadata, mode, verbose) {
+                    if let Err(e) = relay(&server_ctx, &method, &url, &headers, &body, &metadata, mode, metadata_only, verbose) {
                         if verbose {
                             eprintln!("ERROR(relay) {}", e);
                         }

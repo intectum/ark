@@ -151,9 +151,11 @@ fn parse_proposal(filename: &str, entry_bytes: &[u8]) -> Option<Proposal> {
         .map_err(|e| eprintln!("bad log entry metadata: {}", e))
         .ok()?;
 
+    let target = entry.target.split_once('?').map(|(p, _)| p.to_string()).unwrap_or(entry.target);
+
     Some(Proposal {
         id: filename.to_string(),
-        target: entry.target,
+        target,
         metadata,
     })
 }
@@ -249,7 +251,7 @@ mod tests {
             set_current_dir(temp_dir.join("bob_client")).unwrap();
             let payload = write_payload(&temp_dir.join("bob_client"), "payload.bin", b"hello");
             let target = format!("alice@127.0.0.1:{}/apps/notes/foo.md", port);
-            let _ = put(&bob_ctx, &target, Some(payload.to_str().unwrap()), Some("none"));
+            let _ = put(&bob_ctx, &target, Some(payload.to_str().unwrap()), Some("none"), false);
 
             set_current_dir(temp_dir.join("alice_client")).unwrap();
             let alice_ctx = create_client_context().unwrap();
@@ -270,7 +272,7 @@ mod tests {
             set_current_dir(temp_dir.join("bob_client")).unwrap();
             let payload = write_payload(&temp_dir.join("bob_client"), "payload.bin", b"hello");
             let target = format!("alice@127.0.0.1:{}/apps/notes/foo.md", port);
-            let _ = put(&bob_ctx, &target, Some(payload.to_str().unwrap()), Some("none"));
+            let _ = put(&bob_ctx, &target, Some(payload.to_str().unwrap()), Some("none"), false);
 
             set_current_dir(temp_dir.join("alice_client")).unwrap();
             let alice_ctx = create_client_context().unwrap();
@@ -293,11 +295,11 @@ mod tests {
 
             set_current_dir(temp_dir.join("bob_client")).unwrap();
             let payload = write_payload(&temp_dir.join("bob_client"), "payload.bin", b"hello alice");
-            put(&bob_ctx, "apps/notes/foo.md", Some(payload.to_str().unwrap()), Some("none")).unwrap();
+            put(&bob_ctx, "apps/notes/foo.md", Some(payload.to_str().unwrap()), Some("none"), false).unwrap();
 
             let alice_addr = format!("alice@127.0.0.1:{}", port);
             chmod(&bob_ctx, payload.to_str().unwrap(), &[], &[], &[alice_addr.clone()], &[], true, None).unwrap();
-            put(&bob_ctx, "apps/notes/foo.md", Some(payload.to_str().unwrap()), Some("none")).unwrap();
+            put(&bob_ctx, "apps/notes/foo.md", Some(payload.to_str().unwrap()), Some("none"), false).unwrap();
 
             set_current_dir(temp_dir.join("alice_client")).unwrap();
             let alice_ctx = create_client_context().unwrap();

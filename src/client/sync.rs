@@ -275,7 +275,7 @@ fn sync_entry(ctx: &IdentityContext, entry: &SyncEntry, decrypt: bool) -> io::Re
         eprintln!("conflict: remote kept at {}", sidecar_path.display());
     } else if entry.modified_local_body {
         eprintln!("push: {}", entry.relative_path);
-        put(ctx, &target, local_path.to_str(), None)?;
+        put(ctx, &target, local_path.to_str(), None, false)?;
     } else if entry.modified_remote_body {
         eprintln!("pull: {}", entry.relative_path);
         get(ctx, &target, local_path.to_str(), decrypt)?;
@@ -293,7 +293,7 @@ fn sync_entry(ctx: &IdentityContext, entry: &SyncEntry, decrypt: bool) -> io::Re
         eprintln!("conflict: remote kept at {}", sidecar_path.display());
     } else if entry.modified_local_metadata {
         eprintln!("push: {}", entry.relative_path);
-        put(ctx, &target, local_path.to_str(), None)?;
+        put(ctx, &target, local_path.to_str(), None, false)?;
     } else if entry.modified_remote_metadata {
         eprintln!("pull: {}", entry.relative_path);
         let (_, metadata) = head(ctx, &target)?;
@@ -383,7 +383,8 @@ fn parse_put(entry_bytes: &[u8], account_prefix: &str) -> io::Result<Option<(Str
     if entry.method != "PUT" { return Ok(None); }
     if entry.status != 201 && entry.status != 204 { return Ok(None); }
 
-    let Some(relative_path) = entry.target.strip_prefix(account_prefix) else { return Ok(None); };
+    let target = entry.target.split_once('?').map(|(p, _)| p).unwrap_or(&entry.target);
+    let Some(relative_path) = target.strip_prefix(account_prefix) else { return Ok(None); };
 
     let metadata = read_metadata_headers(&entry.request_headers)?;
 
@@ -423,7 +424,7 @@ mod tests {
 
     fn prime_plain(ctx: &IdentityContext, path: &Path, target: &str, body: &[u8]) {
         fs::write(path, body).unwrap();
-        put(ctx, target, path.to_str(), Some("none")).unwrap();
+        put(ctx, target, path.to_str(), Some("none"), false).unwrap();
     }
 
     fn init_two_accounts(temp_dir: &Path, port: u16) -> (IdentityContext, IdentityContext) {
@@ -447,7 +448,7 @@ mod tests {
         let shared = alice_dir.join("shared");
         fs::create_dir(&shared).unwrap();
         chmod(alice_ctx, shared.to_str().unwrap(), &[], &[writer_addr.to_string()], &[], &[], true, None).unwrap();
-        put(alice_ctx, "shared/", Some(shared.to_str().unwrap()), None).unwrap();
+        put(alice_ctx, "shared/", Some(shared.to_str().unwrap()), None, false).unwrap();
     }
 
     #[test]
@@ -649,7 +650,7 @@ mod tests {
             let payload = bob_dir.join("payload.bin");
             fs::write(&payload, b"hello alice").unwrap();
             let target = format!("alice@127.0.0.1:{}/shared/foo.txt", port);
-            put(&bob_ctx, &target, Some(payload.to_str().unwrap()), Some("none")).unwrap();
+            put(&bob_ctx, &target, Some(payload.to_str().unwrap()), Some("none"), false).unwrap();
 
             set_current_dir(&alice_dir).unwrap();
             let alice_ctx = create_client_context().unwrap();
@@ -673,13 +674,13 @@ mod tests {
             let shared = alice_dir.join("shared");
             fs::create_dir(&shared).unwrap();
             chmod(&alice_ctx, shared.to_str().unwrap(), &[bob_ctx.identity.address.clone()], &[], &[], &[], true, None).unwrap();
-            put(&alice_ctx, "shared/", Some(shared.to_str().unwrap()), None).unwrap();
+            put(&alice_ctx, "shared/", Some(shared.to_str().unwrap()), None, false).unwrap();
 
             set_current_dir(&bob_dir).unwrap();
             let bob_local = bob_dir.join("payload.bin");
             fs::write(&bob_local, b"v1").unwrap();
             let target = format!("alice@127.0.0.1:{}/shared/foo.txt", port);
-            put(&bob_ctx, &target, Some(bob_local.to_str().unwrap()), Some("none")).unwrap();
+            put(&bob_ctx, &target, Some(bob_local.to_str().unwrap()), Some("none"), false).unwrap();
 
             set_current_dir(&alice_dir).unwrap();
             let alice_ctx = create_client_context().unwrap();
@@ -692,7 +693,7 @@ mod tests {
 
             set_current_dir(&bob_dir).unwrap();
             chmod(&bob_ctx, bob_local.to_str().unwrap(), &[], &[], &["public".to_string()], &[], true, None).unwrap();
-            put(&bob_ctx, &target, Some(bob_local.to_str().unwrap()), Some("none")).unwrap();
+            put(&bob_ctx, &target, Some(bob_local.to_str().unwrap()), Some("none"), false).unwrap();
 
             set_current_dir(&alice_dir).unwrap();
             let alice_ctx = create_client_context().unwrap();
@@ -721,7 +722,7 @@ mod tests {
             let local_dir = bob_dir.join("sub");
             fs::create_dir_all(&local_dir).unwrap();
             let target = format!("alice@127.0.0.1:{}/shared/sub", port);
-            put(&bob_ctx, &target, Some(local_dir.to_str().unwrap()), None).unwrap();
+            put(&bob_ctx, &target, Some(local_dir.to_str().unwrap()), None, false).unwrap();
 
             set_current_dir(&alice_dir).unwrap();
             let alice_ctx = create_client_context().unwrap();
@@ -747,7 +748,7 @@ mod tests {
 
             let local = alice_dir.join("notes.txt");
             fs::write(&local, b"body").unwrap();
-            put(&alice_ctx, "notes.txt", Some(local.to_str().unwrap()), Some("none")).unwrap();
+            put(&alice_ctx, "notes.txt", Some(local.to_str().unwrap()), Some("none"), false).unwrap();
 
             sync(&alice_ctx, &current_dir().unwrap(), false, false).unwrap();
 
@@ -774,7 +775,7 @@ mod tests {
             let payload = bob_dir.join("payload.bin");
             fs::write(&payload, b"first").unwrap();
             let target = format!("alice@127.0.0.1:{}/shared/foo.txt", port);
-            put(&bob_ctx, &target, Some(payload.to_str().unwrap()), Some("none")).unwrap();
+            put(&bob_ctx, &target, Some(payload.to_str().unwrap()), Some("none"), false).unwrap();
 
             set_current_dir(&alice_dir).unwrap();
             let alice_ctx = create_client_context().unwrap();
@@ -799,7 +800,7 @@ mod tests {
 
             let local = alice_dir.join("notes.txt");
             fs::write(&local, b"self body").unwrap();
-            put(&alice_ctx, "notes.txt", Some(local.to_str().unwrap()), Some("none")).unwrap();
+            put(&alice_ctx, "notes.txt", Some(local.to_str().unwrap()), Some("none"), false).unwrap();
             fs::remove_file(&local).unwrap();
 
             sync(&alice_ctx, &current_dir().unwrap(), false, false).unwrap();
@@ -823,9 +824,9 @@ mod tests {
             let local = alice_dir.join("shared/foo.txt");
             fs::create_dir_all(local.parent().unwrap()).unwrap();
             fs::write(&local, b"alice-v1").unwrap();
-            put(&alice_ctx, "/shared/foo.txt", Some(local.to_str().unwrap()), Some("none")).unwrap();
+            put(&alice_ctx, "/shared/foo.txt", Some(local.to_str().unwrap()), Some("none"), false).unwrap();
             chmod(&alice_ctx, local.to_str().unwrap(), &[], &[bob_ctx.identity.address.clone()], &[], &[], true, None).unwrap();
-            put(&alice_ctx, "/shared/foo.txt", Some(local.to_str().unwrap()), Some("none")).unwrap();
+            put(&alice_ctx, "/shared/foo.txt", Some(local.to_str().unwrap()), Some("none"), false).unwrap();
 
             let alice_ctx = create_client_context().unwrap();
             sync(&alice_ctx, &current_dir().unwrap(), false, false).unwrap();
@@ -835,7 +836,7 @@ mod tests {
             let target = format!("alice@127.0.0.1:{}/shared/foo.txt", port);
             get(&bob_ctx, &target, Some(bob_payload.to_str().unwrap()), false).unwrap();
             fs::write(&bob_payload, b"bob-v2").unwrap();
-            put(&bob_ctx, &target, Some(bob_payload.to_str().unwrap()), Some("none")).unwrap();
+            put(&bob_ctx, &target, Some(bob_payload.to_str().unwrap()), Some("none"), false).unwrap();
 
             set_current_dir(&alice_dir).unwrap();
             fs::write(&local, b"alice-v2-unpushed").unwrap();
@@ -930,7 +931,7 @@ mod tests {
             let payload = bob_dir.join("payload.bin");
             fs::write(&payload, b"bob body").unwrap();
             let target = format!("alice@127.0.0.1:{}/shared/foo.txt", port);
-            put(&bob_ctx, &target, Some(payload.to_str().unwrap()), Some("none")).unwrap();
+            put(&bob_ctx, &target, Some(payload.to_str().unwrap()), Some("none"), false).unwrap();
 
             set_current_dir(&alice_dir).unwrap();
             let alice_ctx = create_client_context().unwrap();
@@ -952,13 +953,13 @@ mod tests {
             let shared = alice_dir.join("shared");
             fs::create_dir(&shared).unwrap();
             chmod(&alice_ctx, shared.to_str().unwrap(), &[bob_ctx.identity.address.clone()], &[], &[], &[], true, None).unwrap();
-            put(&alice_ctx, "shared/", Some(shared.to_str().unwrap()), None).unwrap();
+            put(&alice_ctx, "shared/", Some(shared.to_str().unwrap()), None, false).unwrap();
 
             let alice_local = alice_dir.join("shared/foo.txt");
             fs::write(&alice_local, b"v1").unwrap();
-            put(&alice_ctx, "/shared/foo.txt", Some(alice_local.to_str().unwrap()), Some("none")).unwrap();
+            put(&alice_ctx, "/shared/foo.txt", Some(alice_local.to_str().unwrap()), Some("none"), false).unwrap();
             chmod(&alice_ctx, alice_local.to_str().unwrap(), &[bob_ctx.identity.address.clone()], &[], &[], &[], true, None).unwrap();
-            put(&alice_ctx, "/shared/foo.txt", Some(alice_local.to_str().unwrap()), Some("none")).unwrap();
+            put(&alice_ctx, "/shared/foo.txt", Some(alice_local.to_str().unwrap()), Some("none"), false).unwrap();
 
             let alice_ctx = create_client_context().unwrap();
             sync(&alice_ctx, &current_dir().unwrap(), false, false).unwrap();
@@ -971,7 +972,7 @@ mod tests {
             chmod(&alice_ctx, alice_local.to_str().unwrap(), &[], &[], &["public".to_string()], &[], true, None).unwrap();
 
             chmod(&bob_ctx, bob_payload.to_str().unwrap(), &[], &["carol@host".to_string()], &[], &[], true, None).unwrap();
-            put(&bob_ctx, &target, Some(bob_payload.to_str().unwrap()), Some("none")).unwrap();
+            put(&bob_ctx, &target, Some(bob_payload.to_str().unwrap()), Some("none"), false).unwrap();
 
             set_current_dir(&alice_dir).unwrap();
             let alice_ctx = create_client_context().unwrap();
@@ -1006,12 +1007,12 @@ mod tests {
             let shared = alice_dir.join("shared");
             fs::create_dir(&shared).unwrap();
             chmod(&alice_ctx, shared.to_str().unwrap(), &[bob_ctx.identity.address.clone()], &[], &[], &[], true, None).unwrap();
-            put(&alice_ctx, "shared/", Some(shared.to_str().unwrap()), None).unwrap();
+            put(&alice_ctx, "shared/", Some(shared.to_str().unwrap()), None, false).unwrap();
 
             let alice_sub = alice_dir.join("shared/sub");
             fs::create_dir(&alice_sub).unwrap();
             chmod(&alice_ctx, alice_sub.to_str().unwrap(), &[bob_ctx.identity.address.clone()], &[], &[], &[], true, None).unwrap();
-            put(&alice_ctx, "/shared/sub", Some(alice_sub.to_str().unwrap()), None).unwrap();
+            put(&alice_ctx, "/shared/sub", Some(alice_sub.to_str().unwrap()), None, false).unwrap();
 
             let alice_ctx = create_client_context().unwrap();
             sync(&alice_ctx, &current_dir().unwrap(), false, false).unwrap();
@@ -1027,7 +1028,7 @@ mod tests {
             chmod(&alice_ctx, alice_sub.to_str().unwrap(), &[], &[], &["public".to_string()], &[], true, None).unwrap();
 
             chmod(&bob_ctx, bob_sub.to_str().unwrap(), &[], &["carol@host".to_string()], &[], &[], true, None).unwrap();
-            put(&bob_ctx, &target, Some(bob_sub.to_str().unwrap()), None).unwrap();
+            put(&bob_ctx, &target, Some(bob_sub.to_str().unwrap()), None, false).unwrap();
 
             set_current_dir(&alice_dir).unwrap();
             let alice_ctx = create_client_context().unwrap();

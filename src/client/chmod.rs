@@ -107,23 +107,24 @@ pub fn chmod(
     metadata.modified = now_iso();
     metadata.modified_by = ctx.identity.address.clone();
 
-    let body = if is_dir { Vec::new() } else { fs::read(input_path)? };
-    let sign_body = if is_dir { None } else { Some(body.as_slice()) };
-    sign_metadata(ctx.identity_key.as_ref().expect("client context missing identity_key"), &mut metadata, sign_body)?;
-
-    write_metadata_attributes(input_path, &metadata)?;
-
+    let secret_key = ctx.identity_key.as_ref().expect("client context missing identity_key");
     if creating && !is_dir {
+        let body = fs::read(input_path)?;
+        sign_metadata(secret_key, &mut metadata, Some(&body))?;
+        write_metadata_attributes(input_path, &metadata)?;
         write_local_metadata_attributes(input_path, &LocalMetadata {
             encrypted: Some(false),
             sync_body_hash: Some(Hash { algorithm: DEFAULT_HASH_ALGORITHM.to_string(), value: sha256(&body) }),
             sync_modified: Some(metadata.modified.clone()),
         })?;
+    } else {
+        sign_metadata(secret_key, &mut metadata, None)?;
+        write_metadata_attributes(input_path, &metadata)?;
     }
 
     if !local_only {
         let url_path = url_path_for(ctx, input_path)?;
-        put(ctx, &url_path, Some(path), None)?;
+        put(ctx, &url_path, Some(path), None, !creating)?;
     }
 
     Ok(())
