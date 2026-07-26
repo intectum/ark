@@ -8,46 +8,28 @@ use crate::metadata::{apply_key_to_metadata, create_metadata, extract_key_from_m
 use crate::types::{Hash, IdentityContext, Key, LocalMetadata, Metadata};
 use crate::util::{decode_base64url, io_err, io_invalid_input, sha256};
 
-/// Encrypt `plaintext` to `ciphertext` using the file key wrapped in
-/// `metadata` for the current account. The metadata's
-/// `encryption_algorithm` selects the AEAD.
-pub fn encrypt(
-    ctx: &IdentityContext,
-    metadata: &Metadata,
-    plaintext: &mut dyn Read,
-    ciphertext: &mut dyn Write,
-) -> io::Result<()> {
-    let file_key = extract_key_from_metadata(ctx, metadata)?;
-
-    let encryption_algorithm = metadata.encryption_algorithm.clone()
-        .ok_or_else(|| io_err("metadata missing encryption_algorithm"))?;
-
-    let mut plaintext_bytes = Vec::new();
-    plaintext.read_to_end(&mut plaintext_bytes)?;
-
-    let (_, ciphertext_bytes) = encrypt_bytes(&Key { algorithm: encryption_algorithm, value: file_key }, &plaintext_bytes)?;
-    ciphertext.write_all(&ciphertext_bytes)?;
-
-    Ok(())
-}
-
-/// CLI-shaped [`encrypt`]. Rewrites `in_place` or reads `input` → writes
-/// `output` (each side defaults to stdio when the corresponding option is
-/// `None`). `in_place` is mutually exclusive with `input`/`output`.
+/// Encrypt a file with an ark file key.
+///
+/// Rewrites `in_place` or reads `input` → writes `output` (each side defaults
+/// to stdio when the corresponding option is `None`). `in_place` is mutually
+/// exclusive with `input`/`output`.
 ///
 /// If the source file has ark metadata, its file key and algorithm are reused
 /// and `key`/`encryption_algorithm` must be absent. Otherwise `key` (base64url,
 /// 32 bytes) is required; `encryption_algorithm` defaults to AES-256-GCM.
 ///
-/// Refuses to run when `user.ark_local.encrypted=true` on the source.
-pub fn encrypt_io(
+/// When writing to a file path, signed metadata is stored as `user.ark.*`
+/// xattrs plus local metadata as `user.ark_local.*` xattrs (including
+/// `encrypted=true`). Refuses to run when `user.ark_local.encrypted=true` on
+/// the source.
+pub fn encrypt(
     ctx: &IdentityContext,
     input: Option<&str>,
     output: Option<&str>,
     in_place: Option<&str>,
     key: Option<&str>,
     encryption_algorithm: Option<&str>,
-) -> std::io::Result<()> {
+) -> io::Result<()> {
     if in_place.is_some() && (input.is_some() || output.is_some()) {
         return Err(io_err("--in-place is mutually exclusive with -i/--input and -o/--output"));
     }
@@ -110,7 +92,7 @@ pub fn encrypt_io(
     }
 
     let mut ciphertext_bytes: Vec<u8> = Vec::new();
-    encrypt(ctx, &metadata, &mut plaintext_bytes.as_slice(), &mut ciphertext_bytes)?;
+    encrypt_stream(ctx, &metadata, &mut plaintext_bytes.as_slice(), &mut ciphertext_bytes)?;
 
     match destination {
         Some(d) => {
@@ -129,15 +111,41 @@ pub fn encrypt_io(
     Ok(())
 }
 
+/// Encrypt `plaintext` to `ciphertext` using the file key wrapped in
+/// `metadata` for the current account. The algorithm is taken from
+/// `metadata.encryption_algorithm`.
+pub fn encrypt_stream(
+    ctx: &IdentityContext,
+    metadata: &Metadata,
+    plaintext: &mut dyn Read,
+    ciphertext: &mut dyn Write,
+) -> io::Result<()> {
+    let file_key = extract_key_from_metadata(ctx, metadata)?
+        .ok_or_else(|| io_err(&format!("no key for {}", ctx.identity.address)))?;
+
+    let encryption_algorithm = metadata.encryption_algorithm.clone()
+        .ok_or_else(|| io_err("metadata missing encryption_algorithm"))?;
+
+    let mut plaintext_bytes = Vec::new();
+    plaintext.read_to_end(&mut plaintext_bytes)?;
+
+    let (_, ciphertext_bytes) = encrypt_bytes(&Key { algorithm: encryption_algorithm, value: file_key }, &plaintext_bytes)?;
+    ciphertext.write_all(&ciphertext_bytes)?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use std::env;
+    use std::env::set_current_dir;
+    use std::io::ErrorKind;
 
     use super::*;
     use crate::crypto::decrypt_bytes;
     use crate::context::create_client_context;
     use crate::util::encode_base64url;
-    use crate::util::test::{TEST_ADDRESS, create_test_account, in_test_dir, write_plain_test_file};
+    use crate::client::decrypt;
+    use crate::util::test::{TEST_ADDRESS, create_test_account, in_test_dir, write_encrypted_test_file, write_plain_test_file};
 
     fn aes_decrypt(key: &[u8], ciphertext: &[u8]) -> Vec<u8> {
         decrypt_bytes(&Key { algorithm: DEFAULT_ENCRYPTION_ALGORITHM.to_string(), value: key.to_vec() }, ciphertext).unwrap()
@@ -156,10 +164,10 @@ mod tests {
             let in_path = temp_dir.join("in.bin");
             fs::write(&in_path, b"hello world").unwrap();
             let out_path = temp_dir.join("out.bin");
-            env::set_current_dir(&acc).unwrap();
+            set_current_dir(&acc).unwrap();
             let ctx = create_client_context().unwrap();
             let k = encode_base64url([7u8; 32]);
-            encrypt_io(&ctx, Some(in_path.to_str().unwrap()), Some(out_path.to_str().unwrap()), None, Some(&k), None).unwrap();
+            encrypt(&ctx, Some(in_path.to_str().unwrap()), Some(out_path.to_str().unwrap()), None, Some(&k), None).unwrap();
             let ciphertext = fs::read(&out_path).unwrap();
             assert_ne!(ciphertext, b"hello world");
             let file_key = unwrap_first_member_key(&out_path, &secret_key.value);
@@ -173,10 +181,10 @@ mod tests {
             let (_identity, secret_key, acc) = create_test_account(temp_dir, TEST_ADDRESS);
             let p = temp_dir.join("file.bin");
             fs::write(&p, b"data").unwrap();
-            env::set_current_dir(&acc).unwrap();
+            set_current_dir(&acc).unwrap();
             let ctx = create_client_context().unwrap();
             let k = encode_base64url([3u8; 32]);
-            encrypt_io(&ctx, None, None, Some(p.to_str().unwrap()), Some(&k), None).unwrap();
+            encrypt(&ctx, None, None, Some(p.to_str().unwrap()), Some(&k), None).unwrap();
             let ciphertext = fs::read(&p).unwrap();
             assert_ne!(ciphertext, b"data");
             assert_eq!(
@@ -196,10 +204,10 @@ mod tests {
     fn encrypt_in_place_conflicts_with_input() {
         in_test_dir("ark_encrypt_test", |temp_dir| {
             let (_identity, _secret_key, acc) = create_test_account(temp_dir, TEST_ADDRESS);
-            env::set_current_dir(&acc).unwrap();
+            set_current_dir(&acc).unwrap();
             let ctx = create_client_context().unwrap();
             let x = temp_dir.join("x");
-            let err = encrypt_io(&ctx, Some("a"), None, Some(x.to_str().unwrap()), None, None).unwrap_err();
+            let err = encrypt(&ctx, Some("a"), None, Some(x.to_str().unwrap()), None, None).unwrap_err();
             assert!(err.to_string().contains("mutually exclusive"));
         });
     }
@@ -212,10 +220,10 @@ mod tests {
             let in_path = temp_dir.join("in.bin");
             fs::write(&in_path, b"secret").unwrap();
             let out_path = temp_dir.join("out.bin");
-            env::set_current_dir(&acc).unwrap();
+            set_current_dir(&acc).unwrap();
             let ctx = create_client_context().unwrap();
             let k = encode_base64url(raw_key);
-            encrypt_io(&ctx, Some(in_path.to_str().unwrap()), Some(out_path.to_str().unwrap()), None, Some(&k), None).unwrap();
+            encrypt(&ctx, Some(in_path.to_str().unwrap()), Some(out_path.to_str().unwrap()), None, Some(&k), None).unwrap();
             let ciphertext = fs::read(&out_path).unwrap();
             assert_eq!(aes_decrypt(&raw_key, &ciphertext), b"secret");
             let wrapped = unwrap_first_member_key(&out_path, &secret_key.value);
@@ -227,10 +235,10 @@ mod tests {
     fn encrypt_stdin_without_key_or_output_errors() {
         in_test_dir("ark_encrypt_test", |temp_dir| {
             let (_identity, _secret_key, acc) = create_test_account(temp_dir, TEST_ADDRESS);
-            env::set_current_dir(&acc).unwrap();
+            set_current_dir(&acc).unwrap();
             let ctx = create_client_context().unwrap();
             let _ = temp_dir;
-            let err = encrypt_io(&ctx, None, None, None, None, None).unwrap_err();
+            let err = encrypt(&ctx, None, None, None, None, None).unwrap_err();
             assert!(err.to_string().contains("no file key available"), "msg was {}", err);
         });
     }
@@ -242,9 +250,9 @@ mod tests {
             let p = temp_dir.join("in.bin");
             write_plain_test_file(&p, &identity, &secret_key, b"x");
             write_local_metadata_attributes(&p, &LocalMetadata { encrypted: Some(true), sync_body_hash: None, sync_modified: None }).unwrap();
-            env::set_current_dir(&acc).unwrap();
+            set_current_dir(&acc).unwrap();
             let ctx = create_client_context().unwrap();
-            let err = encrypt_io(&ctx, Some(p.to_str().unwrap()), None, None, None, None).unwrap_err();
+            let err = encrypt(&ctx, Some(p.to_str().unwrap()), None, None, None, None).unwrap_err();
             assert!(err.to_string().contains("already encrypted"), "msg was {}", err);
         });
     }
@@ -255,15 +263,15 @@ mod tests {
             let (identity, secret_key, acc) = create_test_account(temp_dir, TEST_ADDRESS);
 
             let ct_path = temp_dir.join("orig.bin");
-            crate::util::test::write_encrypted_test_file(&ct_path, &identity, &secret_key, b"hello");
-            env::set_current_dir(&acc).unwrap();
+            write_encrypted_test_file(&ct_path, &identity, &secret_key, b"hello");
+            set_current_dir(&acc).unwrap();
             let ctx = create_client_context().unwrap();
             let original_file_key = unwrap_first_member_key(&ct_path, &secret_key.value);
 
-            crate::client::decrypt_io(&ctx, None, None, Some(ct_path.to_str().unwrap()), None, None).unwrap();
+            decrypt(&ctx, None, None, Some(ct_path.to_str().unwrap()), None, None).unwrap();
             assert_eq!(fs::read(&ct_path).unwrap(), b"hello");
 
-            encrypt_io(&ctx, None, None, Some(ct_path.to_str().unwrap()), None, None).unwrap();
+            encrypt(&ctx, None, None, Some(ct_path.to_str().unwrap()), None, None).unwrap();
 
             let re_ct = fs::read(&ct_path).unwrap();
             let re_key = unwrap_first_member_key(&ct_path, &secret_key.value);
@@ -279,10 +287,10 @@ mod tests {
             let in_path = temp_dir.join("in.bin");
             fs::write(&in_path, b"plain").unwrap();
             let out_path = temp_dir.join("out.bin");
-            env::set_current_dir(&acc).unwrap();
+            set_current_dir(&acc).unwrap();
             let ctx = create_client_context().unwrap();
             let k = encode_base64url([9u8; 32]);
-            encrypt_io(&ctx, Some(in_path.to_str().unwrap()), Some(out_path.to_str().unwrap()), None, Some(&k), None).unwrap();
+            encrypt(&ctx, Some(in_path.to_str().unwrap()), Some(out_path.to_str().unwrap()), None, Some(&k), None).unwrap();
             let local = read_local_metadata_attributes(&out_path).unwrap();
             assert_eq!(local.sync_body_hash.as_ref().unwrap().value, sha256(b"plain"));
             assert_eq!(local.encrypted, Some(true));
@@ -293,11 +301,11 @@ mod tests {
     fn encrypt_missing_input_errors() {
         in_test_dir("ark_encrypt_test", |temp_dir| {
             let (_identity, _secret_key, acc) = create_test_account(temp_dir, TEST_ADDRESS);
-            env::set_current_dir(&acc).unwrap();
+            set_current_dir(&acc).unwrap();
             let ctx = create_client_context().unwrap();
             let missing = temp_dir.join("nope.bin");
-            let err = encrypt_io(&ctx, Some(missing.to_str().unwrap()), None, None, None, None).unwrap_err();
-            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            let err = encrypt(&ctx, Some(missing.to_str().unwrap()), None, None, None, None).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
             assert!(format!("{}", err).contains("input does not exist"));
         });
     }
@@ -309,10 +317,10 @@ mod tests {
             let in_path = temp_dir.join("in.bin");
             fs::write(&in_path, b"x").unwrap();
             let out_path = temp_dir.join("out.bin");
-            env::set_current_dir(&acc).unwrap();
+            set_current_dir(&acc).unwrap();
             let ctx = create_client_context().unwrap();
             let k = encode_base64url([1u8; 32]);
-            let err = encrypt_io(&ctx, Some(in_path.to_str().unwrap()), Some(out_path.to_str().unwrap()), None, Some(&k), Some("chacha20-poly1305")).unwrap_err();
+            let err = encrypt(&ctx, Some(in_path.to_str().unwrap()), Some(out_path.to_str().unwrap()), None, Some(&k), Some("chacha20-poly1305")).unwrap_err();
             assert!(err.to_string().contains("unsupported encryption algorithm"), "msg was {}", err);
         });
     }

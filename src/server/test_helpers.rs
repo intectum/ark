@@ -2,6 +2,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
+use std::str::from_utf8;
 use std::time::Duration;
 
 use crate::crypto::{DEFAULT_SIGNING_ALGORITHM, sign_bytes};
@@ -41,7 +42,7 @@ pub fn request(port: u16, method: &str, path: &str, body: &[u8], extra: &[(&str,
     let mut buf = Vec::new();
     s.read_to_end(&mut buf).unwrap();
     let split = buf.windows(4).position(|w| w == b"\r\n\r\n").expect("no header end");
-    let header_str = std::str::from_utf8(&buf[..split]).unwrap();
+    let header_str = from_utf8(&buf[..split]).unwrap();
     let body_bytes = buf[split + 4..].to_vec();
     let mut lines = header_str.split("\r\n");
     let status_line = lines.next().unwrap();

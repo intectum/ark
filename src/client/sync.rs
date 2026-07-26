@@ -1,18 +1,13 @@
 use std::collections::HashMap;
-use std::env::current_dir;
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::thread;
 
-use crate::client::get::{get, get_io};
-use crate::client::head::head;
-use crate::client::put::put_io;
-use crate::client::request::request;
+use super::{get, get_stream, head, put, request, watch_local, watch_remote};
 use crate::identity::parse_address;
 use crate::metadata::{has_metadata_attributes, read_local_metadata_attributes, read_metadata_attributes, read_metadata_headers, remove_local_metadata_attributes, write_local_metadata_attributes, write_metadata_attributes};
 use crate::types::{DirectoryEntry, DirectoryEntryKind, IdentityContext, Metadata, WatchAction};
-use crate::client::watch::{watch_local, watch_remote};
 use crate::util::{now_iso_fs, io_err, parse_request_entry, resolve_client_url, sha256};
 
 struct SyncEntry {
@@ -21,12 +16,6 @@ struct SyncEntry {
     modified_local_metadata: bool,
     modified_remote_body: bool,
     modified_remote_metadata: bool,
-}
-
-/// CLI-shaped [`sync`]. Reconciles the current working directory (which
-/// must live under an account root).
-pub fn sync_io(ctx: &IdentityContext, watch: bool, decrypt: bool) -> io::Result<()> {
-    sync(ctx, &current_dir()?, watch, decrypt)
 }
 
 /// Reconcile local and remote state under `path` in a single pass. `path`
@@ -38,8 +27,8 @@ pub fn sync_io(ctx: &IdentityContext, watch: bool, decrypt: bool) -> io::Result<
 /// metadata) when both sides diverged, leaving the local copy untouched. The
 /// sidecar is not sync-tracked itself.
 ///
-/// Only items with sync markers (tracked via [`track_io`](super::track_io) or
-/// previously synced) are considered. Symlinks, untracked local files, and
+/// Only items with sync markers (seeded via [`chmod`](super::chmod) or a
+/// previous [`put`](super::put)) are considered. Symlinks, untracked local files, and
 /// files encrypted at rest are left alone. Remote changes authored by the
 /// current account are ignored.
 ///
@@ -280,16 +269,16 @@ fn sync_entry(ctx: &IdentityContext, entry: &SyncEntry, decrypt: bool) -> io::Re
     if entry.modified_local_body && entry.modified_remote_body {
         eprintln!("pull: {}", entry.relative_path);
         let sidecar_path = sidecar_path_for(&local_path);
-        get_io(ctx, &target, sidecar_path.to_str(), decrypt)?;
+        get(ctx, &target, sidecar_path.to_str(), decrypt)?;
 
         remove_local_metadata_attributes(&sidecar_path)?;
         eprintln!("conflict: remote kept at {}", sidecar_path.display());
     } else if entry.modified_local_body {
         eprintln!("push: {}", entry.relative_path);
-        put_io(ctx, &target, local_path.to_str(), None)?;
+        put(ctx, &target, local_path.to_str(), None)?;
     } else if entry.modified_remote_body {
         eprintln!("pull: {}", entry.relative_path);
-        get_io(ctx, &target, local_path.to_str(), decrypt)?;
+        get(ctx, &target, local_path.to_str(), decrypt)?;
     } else if entry.modified_local_metadata && entry.modified_remote_metadata {
         eprintln!("pull: {}", entry.relative_path);
         let sidecar_path = sidecar_path_for(&local_path);
@@ -304,7 +293,7 @@ fn sync_entry(ctx: &IdentityContext, entry: &SyncEntry, decrypt: bool) -> io::Re
         eprintln!("conflict: remote kept at {}", sidecar_path.display());
     } else if entry.modified_local_metadata {
         eprintln!("push: {}", entry.relative_path);
-        put_io(ctx, &target, local_path.to_str(), None)?;
+        put(ctx, &target, local_path.to_str(), None)?;
     } else if entry.modified_remote_metadata {
         eprintln!("pull: {}", entry.relative_path);
         let (_, metadata) = head(ctx, &target)?;
@@ -367,7 +356,7 @@ fn fetch_log_map(ctx: &IdentityContext, path: &Path) -> io::Result<(HashMap<Stri
 
         let entry_path = format!("{}{}", requests_path, entry.name);
         let mut entry_body: Vec<u8> = Vec::new();
-        if get(ctx, &entry_path, &mut entry_body, false).is_err() {
+        if get_stream(ctx, &entry_path, &mut entry_body, false).is_err() {
             continue;
         }
 
@@ -413,7 +402,7 @@ fn under_prefix(rel: &str, prefix: &str) -> bool {
     rel == prefix || rel.starts_with(&format!("{}/", prefix))
 }
 
-fn sidecar_path_for(local_path: &Path) -> std::path::PathBuf {
+fn sidecar_path_for(local_path: &Path) -> PathBuf {
     let file_name = local_path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "conflict".to_string());
@@ -422,19 +411,19 @@ fn sidecar_path_for(local_path: &Path) -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::env::{current_dir, set_current_dir};
     use std::fs;
-
-    use std::env;
+    use std::os::unix::fs::symlink;
 
     use super::*;
-    use crate::client::{chmod_io, get::get_io, init_io, put::put_io, track_io};
+    use crate::client::{chmod, get::get, init, put::put};
     use crate::context::create_client_context;
     use crate::server::start_test_server;
     use crate::util::test::{in_test_dir, init_with_server, write_encrypted_test_file, write_plain_test_file};
 
     fn prime_plain(ctx: &IdentityContext, path: &Path, target: &str, body: &[u8]) {
         fs::write(path, body).unwrap();
-        put_io(ctx, target, path.to_str(), Some("none")).unwrap();
+        put(ctx, target, path.to_str(), Some("none")).unwrap();
     }
 
     fn init_two_accounts(temp_dir: &Path, port: u16) -> (IdentityContext, IdentityContext) {
@@ -443,12 +432,12 @@ mod tests {
         fs::create_dir_all(&alice_dir).unwrap();
         fs::create_dir_all(&bob_dir).unwrap();
 
-        env::set_current_dir(&alice_dir).unwrap();
-        init_io(&format!("alice@127.0.0.1:{}", port), None).unwrap();
+        set_current_dir(&alice_dir).unwrap();
+        init(&current_dir().unwrap(), &format!("alice@127.0.0.1:{}", port), None, false).unwrap();
         let alice_ctx = create_client_context().unwrap();
 
-        env::set_current_dir(&bob_dir).unwrap();
-        init_io(&format!("bob@127.0.0.1:{}", port), None).unwrap();
+        set_current_dir(&bob_dir).unwrap();
+        init(&current_dir().unwrap(), &format!("bob@127.0.0.1:{}", port), None, false).unwrap();
         let bob_ctx = create_client_context().unwrap();
 
         (alice_ctx, bob_ctx)
@@ -457,9 +446,8 @@ mod tests {
     fn seed_shared_dir_with_writer(alice_dir: &Path, alice_ctx: &IdentityContext, writer_addr: &str) {
         let shared = alice_dir.join("shared");
         fs::create_dir(&shared).unwrap();
-        track_io(alice_ctx, shared.to_str().unwrap(), None).unwrap();
-        chmod_io(alice_ctx, shared.to_str().unwrap(), &[], &[writer_addr.to_string()], &[], &[]).unwrap();
-        put_io(alice_ctx, "shared/", Some(shared.to_str().unwrap()), None).unwrap();
+        chmod(alice_ctx, shared.to_str().unwrap(), &[], &[writer_addr.to_string()], &[], &[], true, None).unwrap();
+        put(alice_ctx, "shared/", Some(shared.to_str().unwrap()), None).unwrap();
     }
 
     #[test]
@@ -471,7 +459,7 @@ mod tests {
 
             fs::write(temp_dir.join("bare.txt"), b"hi").unwrap();
 
-            sync_io(&ctx, false, false).unwrap();
+            sync(&ctx, &current_dir().unwrap(), false, false).unwrap();
 
             assert!(!temp_dir.join("ark/gyan/bare.txt").exists(), "untracked file should not upload");
         });
@@ -489,7 +477,7 @@ mod tests {
             prime_plain(&ctx, &local, "a/b/c.txt", b"deep v1");
 
             fs::write(&local, b"deep v2").unwrap();
-            sync_io(&ctx, false, false).unwrap();
+            sync(&ctx, &current_dir().unwrap(), false, false).unwrap();
 
             let server_body = fs::read(temp_dir.join("ark/gyan/a/b/c.txt")).unwrap();
             assert_eq!(server_body, b"deep v2");
@@ -509,7 +497,7 @@ mod tests {
             let server_path = temp_dir.join("ark/gyan/f.txt");
             let before = fs::read(&server_path).unwrap();
 
-            sync_io(&ctx, false, false).unwrap();
+            sync(&ctx, &current_dir().unwrap(), false, false).unwrap();
 
             let after = fs::read(&server_path).unwrap();
             assert_eq!(before, after, "server file should be unchanged when content matches cached hash");
@@ -530,7 +518,7 @@ mod tests {
             let before = fs::read(&server_path).unwrap();
 
             fs::write(&local, b"same").unwrap();
-            sync_io(&ctx, false, false).unwrap();
+            sync(&ctx, &current_dir().unwrap(), false, false).unwrap();
 
             let after = fs::read(&server_path).unwrap();
             assert_eq!(before, after, "identical content should skip upload even after rewrite");
@@ -549,9 +537,9 @@ mod tests {
             let before = fs::read(&server_path).unwrap();
 
             let local = temp_dir.join("pulled.txt");
-            get_io(&ctx, "pulled.txt", Some(local.to_str().unwrap()), false).unwrap();
+            get(&ctx, "pulled.txt", Some(local.to_str().unwrap()), false).unwrap();
 
-            sync_io(&ctx, false, false).unwrap();
+            sync(&ctx, &current_dir().unwrap(), false, false).unwrap();
 
             let after = fs::read(&server_path).unwrap();
             assert_eq!(before, after, "sync after get must not re-upload identical body");
@@ -569,7 +557,7 @@ mod tests {
             prime_plain(&ctx, &local, "f.txt", b"v1");
 
             fs::write(&local, b"v2").unwrap();
-            sync_io(&ctx, false, false).unwrap();
+            sync(&ctx, &current_dir().unwrap(), false, false).unwrap();
 
             let server_body = fs::read(temp_dir.join("ark/gyan/f.txt")).unwrap();
             assert_eq!(server_body, b"v2");
@@ -587,10 +575,10 @@ mod tests {
             prime_plain(&ctx, &target, "target.txt", b"v1");
 
             let link = temp_dir.join("link.txt");
-            std::os::unix::fs::symlink(&target, &link).unwrap();
+            symlink(&target, &link).unwrap();
 
             fs::write(&target, b"v2").unwrap();
-            sync_io(&ctx, false, false).unwrap();
+            sync(&ctx, &current_dir().unwrap(), false, false).unwrap();
 
             assert_eq!(fs::read(temp_dir.join("ark/gyan/target.txt")).unwrap(), b"v2");
             assert!(!temp_dir.join("ark/gyan/link.txt").exists(), "symlink must not be uploaded");
@@ -608,7 +596,7 @@ mod tests {
             prime_plain(&ctx, &local, "f.txt", b"v1");
 
             fs::write(&local, b"v2").unwrap();
-            sync_io(&ctx, false, false).unwrap();
+            sync(&ctx, &current_dir().unwrap(), false, false).unwrap();
 
             assert_eq!(
                 read_local_metadata_attributes(&local).unwrap().sync_body_hash.as_ref().unwrap().value,
@@ -618,7 +606,7 @@ mod tests {
 
             let server_path = temp_dir.join("ark/gyan/f.txt");
             let before = fs::read(&server_path).unwrap();
-            sync_io(&ctx, false, false).unwrap();
+            sync(&ctx, &current_dir().unwrap(), false, false).unwrap();
             assert_eq!(fs::read(&server_path).unwrap(), before, "second sync must no-op");
         });
     }
@@ -634,12 +622,12 @@ mod tests {
             write_encrypted_test_file(&server_path, &ctx.identity, ctx.identity_key.as_ref().unwrap(), b"plaintext");
 
             let local = temp_dir.join("secret");
-            get_io(&ctx, "secret", Some(local.to_str().unwrap()), false).unwrap();
+            get(&ctx, "secret", Some(local.to_str().unwrap()), false).unwrap();
             assert_eq!(xattr::get(&local, "user.ark_local.encrypted").unwrap().as_deref(), Some(b"true".as_slice()));
             assert!(read_local_metadata_attributes(&local).unwrap().sync_body_hash.is_none(), "encrypted-at-rest file should not carry sync_body_hash");
 
             let before = fs::read(&server_path).unwrap();
-            sync_io(&ctx, false, false).unwrap();
+            sync(&ctx, &current_dir().unwrap(), false, false).unwrap();
             let after = fs::read(&server_path).unwrap();
             assert_eq!(before, after, "encrypted-at-rest file should be skipped by sync");
         });
@@ -654,18 +642,18 @@ mod tests {
             let alice_dir = temp_dir.join("alice_client");
             let bob_dir = temp_dir.join("bob_client");
 
-            env::set_current_dir(&alice_dir).unwrap();
+            set_current_dir(&alice_dir).unwrap();
             seed_shared_dir_with_writer(&alice_dir, &alice_ctx, &bob_ctx.identity.address);
 
-            env::set_current_dir(&bob_dir).unwrap();
+            set_current_dir(&bob_dir).unwrap();
             let payload = bob_dir.join("payload.bin");
             fs::write(&payload, b"hello alice").unwrap();
             let target = format!("alice@127.0.0.1:{}/shared/foo.txt", port);
-            put_io(&bob_ctx, &target, Some(payload.to_str().unwrap()), Some("none")).unwrap();
+            put(&bob_ctx, &target, Some(payload.to_str().unwrap()), Some("none")).unwrap();
 
-            env::set_current_dir(&alice_dir).unwrap();
+            set_current_dir(&alice_dir).unwrap();
             let alice_ctx = create_client_context().unwrap();
-            sync_io(&alice_ctx, false, false).unwrap();
+            sync(&alice_ctx, &current_dir().unwrap(), false, false).unwrap();
 
             let pulled = alice_dir.join("shared/foo.txt");
             assert!(pulled.exists(), "sync should pull remote file");
@@ -681,35 +669,34 @@ mod tests {
             let alice_dir = temp_dir.join("alice_client");
             let bob_dir = temp_dir.join("bob_client");
 
-            env::set_current_dir(&alice_dir).unwrap();
+            set_current_dir(&alice_dir).unwrap();
             let shared = alice_dir.join("shared");
             fs::create_dir(&shared).unwrap();
-            track_io(&alice_ctx, shared.to_str().unwrap(), None).unwrap();
-            chmod_io(&alice_ctx, shared.to_str().unwrap(), &[bob_ctx.identity.address.clone()], &[], &[], &[]).unwrap();
-            put_io(&alice_ctx, "shared/", Some(shared.to_str().unwrap()), None).unwrap();
+            chmod(&alice_ctx, shared.to_str().unwrap(), &[bob_ctx.identity.address.clone()], &[], &[], &[], true, None).unwrap();
+            put(&alice_ctx, "shared/", Some(shared.to_str().unwrap()), None).unwrap();
 
-            env::set_current_dir(&bob_dir).unwrap();
+            set_current_dir(&bob_dir).unwrap();
             let bob_local = bob_dir.join("payload.bin");
             fs::write(&bob_local, b"v1").unwrap();
             let target = format!("alice@127.0.0.1:{}/shared/foo.txt", port);
-            put_io(&bob_ctx, &target, Some(bob_local.to_str().unwrap()), Some("none")).unwrap();
+            put(&bob_ctx, &target, Some(bob_local.to_str().unwrap()), Some("none")).unwrap();
 
-            env::set_current_dir(&alice_dir).unwrap();
+            set_current_dir(&alice_dir).unwrap();
             let alice_ctx = create_client_context().unwrap();
-            sync_io(&alice_ctx, false, false).unwrap();
+            sync(&alice_ctx, &current_dir().unwrap(), false, false).unwrap();
 
             let pulled = alice_dir.join("shared/foo.txt");
             assert_eq!(fs::read(&pulled).unwrap(), b"v1");
             let members_before = read_metadata_attributes(&pulled).unwrap().members.len();
             let modified_before = read_metadata_attributes(&pulled).unwrap().modified;
 
-            env::set_current_dir(&bob_dir).unwrap();
-            chmod_io(&bob_ctx, bob_local.to_str().unwrap(), &[], &[], &["public".to_string()], &[]).unwrap();
-            put_io(&bob_ctx, &target, Some(bob_local.to_str().unwrap()), Some("none")).unwrap();
+            set_current_dir(&bob_dir).unwrap();
+            chmod(&bob_ctx, bob_local.to_str().unwrap(), &[], &[], &["public".to_string()], &[], true, None).unwrap();
+            put(&bob_ctx, &target, Some(bob_local.to_str().unwrap()), Some("none")).unwrap();
 
-            env::set_current_dir(&alice_dir).unwrap();
+            set_current_dir(&alice_dir).unwrap();
             let alice_ctx = create_client_context().unwrap();
-            sync_io(&alice_ctx, false, false).unwrap();
+            sync(&alice_ctx, &current_dir().unwrap(), false, false).unwrap();
 
             assert_eq!(fs::read(&pulled).unwrap(), b"v1", "body should be unchanged");
             let m = read_metadata_attributes(&pulled).unwrap();
@@ -727,18 +714,18 @@ mod tests {
             let alice_dir = temp_dir.join("alice_client");
             let bob_dir = temp_dir.join("bob_client");
 
-            env::set_current_dir(&alice_dir).unwrap();
+            set_current_dir(&alice_dir).unwrap();
             seed_shared_dir_with_writer(&alice_dir, &alice_ctx, &bob_ctx.identity.address);
 
-            env::set_current_dir(&bob_dir).unwrap();
+            set_current_dir(&bob_dir).unwrap();
             let local_dir = bob_dir.join("sub");
             fs::create_dir_all(&local_dir).unwrap();
             let target = format!("alice@127.0.0.1:{}/shared/sub", port);
-            put_io(&bob_ctx, &target, Some(local_dir.to_str().unwrap()), None).unwrap();
+            put(&bob_ctx, &target, Some(local_dir.to_str().unwrap()), None).unwrap();
 
-            env::set_current_dir(&alice_dir).unwrap();
+            set_current_dir(&alice_dir).unwrap();
             let alice_ctx = create_client_context().unwrap();
-            sync_io(&alice_ctx, false, false).unwrap();
+            sync(&alice_ctx, &current_dir().unwrap(), false, false).unwrap();
 
             let pulled_dir = alice_dir.join("shared/sub");
             assert!(pulled_dir.is_dir(), "sync should create dir locally");
@@ -754,15 +741,15 @@ mod tests {
             let port = start_test_server(temp_dir.to_path_buf());
             let alice_dir = temp_dir.join("alice_client");
             fs::create_dir_all(&alice_dir).unwrap();
-            env::set_current_dir(&alice_dir).unwrap();
-            init_io(&format!("alice@127.0.0.1:{}", port), None).unwrap();
+            set_current_dir(&alice_dir).unwrap();
+            init(&current_dir().unwrap(), &format!("alice@127.0.0.1:{}", port), None, false).unwrap();
             let alice_ctx = create_client_context().unwrap();
 
             let local = alice_dir.join("notes.txt");
             fs::write(&local, b"body").unwrap();
-            put_io(&alice_ctx, "notes.txt", Some(local.to_str().unwrap()), Some("none")).unwrap();
+            put(&alice_ctx, "notes.txt", Some(local.to_str().unwrap()), Some("none")).unwrap();
 
-            sync_io(&alice_ctx, false, false).unwrap();
+            sync(&alice_ctx, &current_dir().unwrap(), false, false).unwrap();
 
             let last_sync_request = alice_dir.join(".ark/last_sync_request");
             assert!(last_sync_request.exists(), "last_sync_request should be recorded after sync");
@@ -780,22 +767,22 @@ mod tests {
             let alice_dir = temp_dir.join("alice_client");
             let bob_dir = temp_dir.join("bob_client");
 
-            env::set_current_dir(&alice_dir).unwrap();
+            set_current_dir(&alice_dir).unwrap();
             seed_shared_dir_with_writer(&alice_dir, &alice_ctx, &bob_ctx.identity.address);
 
-            env::set_current_dir(&bob_dir).unwrap();
+            set_current_dir(&bob_dir).unwrap();
             let payload = bob_dir.join("payload.bin");
             fs::write(&payload, b"first").unwrap();
             let target = format!("alice@127.0.0.1:{}/shared/foo.txt", port);
-            put_io(&bob_ctx, &target, Some(payload.to_str().unwrap()), Some("none")).unwrap();
+            put(&bob_ctx, &target, Some(payload.to_str().unwrap()), Some("none")).unwrap();
 
-            env::set_current_dir(&alice_dir).unwrap();
+            set_current_dir(&alice_dir).unwrap();
             let alice_ctx = create_client_context().unwrap();
-            sync_io(&alice_ctx, false, false).unwrap();
+            sync(&alice_ctx, &current_dir().unwrap(), false, false).unwrap();
             assert_eq!(fs::read(alice_dir.join("shared/foo.txt")).unwrap(), b"first");
 
             fs::remove_file(alice_dir.join("shared/foo.txt")).unwrap();
-            sync_io(&alice_ctx, false, false).unwrap();
+            sync(&alice_ctx, &current_dir().unwrap(), false, false).unwrap();
             assert!(!alice_dir.join("shared/foo.txt").exists(), "already-processed log entry must not re-pull");
         });
     }
@@ -806,16 +793,16 @@ mod tests {
             let port = start_test_server(temp_dir.to_path_buf());
             let alice_dir = temp_dir.join("alice_client");
             fs::create_dir_all(&alice_dir).unwrap();
-            env::set_current_dir(&alice_dir).unwrap();
-            init_io(&format!("alice@127.0.0.1:{}", port), None).unwrap();
+            set_current_dir(&alice_dir).unwrap();
+            init(&current_dir().unwrap(), &format!("alice@127.0.0.1:{}", port), None, false).unwrap();
             let alice_ctx = create_client_context().unwrap();
 
             let local = alice_dir.join("notes.txt");
             fs::write(&local, b"self body").unwrap();
-            put_io(&alice_ctx, "notes.txt", Some(local.to_str().unwrap()), Some("none")).unwrap();
+            put(&alice_ctx, "notes.txt", Some(local.to_str().unwrap()), Some("none")).unwrap();
             fs::remove_file(&local).unwrap();
 
-            sync_io(&alice_ctx, false, false).unwrap();
+            sync(&alice_ctx, &current_dir().unwrap(), false, false).unwrap();
 
             assert!(!local.exists(), "own PUTs must not be pulled back");
         });
@@ -830,31 +817,31 @@ mod tests {
             let alice_dir = temp_dir.join("alice_client");
             let bob_dir = temp_dir.join("bob_client");
 
-            env::set_current_dir(&alice_dir).unwrap();
+            set_current_dir(&alice_dir).unwrap();
             seed_shared_dir_with_writer(&alice_dir, &alice_ctx, &bob_ctx.identity.address);
 
             let local = alice_dir.join("shared/foo.txt");
             fs::create_dir_all(local.parent().unwrap()).unwrap();
             fs::write(&local, b"alice-v1").unwrap();
-            put_io(&alice_ctx, "/shared/foo.txt", Some(local.to_str().unwrap()), Some("none")).unwrap();
-            chmod_io(&alice_ctx, local.to_str().unwrap(), &[], &[bob_ctx.identity.address.clone()], &[], &[]).unwrap();
-            put_io(&alice_ctx, "/shared/foo.txt", Some(local.to_str().unwrap()), Some("none")).unwrap();
+            put(&alice_ctx, "/shared/foo.txt", Some(local.to_str().unwrap()), Some("none")).unwrap();
+            chmod(&alice_ctx, local.to_str().unwrap(), &[], &[bob_ctx.identity.address.clone()], &[], &[], true, None).unwrap();
+            put(&alice_ctx, "/shared/foo.txt", Some(local.to_str().unwrap()), Some("none")).unwrap();
 
             let alice_ctx = create_client_context().unwrap();
-            sync_io(&alice_ctx, false, false).unwrap();
+            sync(&alice_ctx, &current_dir().unwrap(), false, false).unwrap();
 
-            env::set_current_dir(&bob_dir).unwrap();
+            set_current_dir(&bob_dir).unwrap();
             let bob_payload = bob_dir.join("payload.bin");
             let target = format!("alice@127.0.0.1:{}/shared/foo.txt", port);
-            get_io(&bob_ctx, &target, Some(bob_payload.to_str().unwrap()), false).unwrap();
+            get(&bob_ctx, &target, Some(bob_payload.to_str().unwrap()), false).unwrap();
             fs::write(&bob_payload, b"bob-v2").unwrap();
-            put_io(&bob_ctx, &target, Some(bob_payload.to_str().unwrap()), Some("none")).unwrap();
+            put(&bob_ctx, &target, Some(bob_payload.to_str().unwrap()), Some("none")).unwrap();
 
-            env::set_current_dir(&alice_dir).unwrap();
+            set_current_dir(&alice_dir).unwrap();
             fs::write(&local, b"alice-v2-unpushed").unwrap();
 
             let alice_ctx = create_client_context().unwrap();
-            sync_io(&alice_ctx, false, false).unwrap();
+            sync(&alice_ctx, &current_dir().unwrap(), false, false).unwrap();
 
             assert_eq!(fs::read(&local).unwrap(), b"alice-v2-unpushed", "local edit preserved at original path");
 
@@ -881,7 +868,7 @@ mod tests {
             prime_plain(&ctx, &local, "f.txt", b"v1");
 
             fs::write(&local, b"v2").unwrap();
-            sync_io(&ctx, false, false).unwrap();
+            sync(&ctx, &current_dir().unwrap(), false, false).unwrap();
 
             assert_eq!(fs::read(temp_dir.join("ark/gyan/f.txt")).unwrap(), b"v2");
             let entries: Vec<_> = fs::read_dir(temp_dir).unwrap()
@@ -906,9 +893,9 @@ mod tests {
             let body_before = fs::read(&server_path).unwrap();
             let modified_before = read_metadata_attributes(&server_path).unwrap().modified;
 
-            chmod_io(&ctx, local.to_str().unwrap(), &[], &[], &["public".to_string()], &[]).unwrap();
+            chmod(&ctx, local.to_str().unwrap(), &[], &[], &["public".to_string()], &[], true, None).unwrap();
 
-            sync_io(&ctx, false, false).unwrap();
+            sync(&ctx, &current_dir().unwrap(), false, false).unwrap();
 
             let body_after = fs::read(&server_path).unwrap();
             assert_eq!(body_after, body_before, "body should be unchanged");
@@ -932,22 +919,22 @@ mod tests {
             let alice_dir = temp_dir.join("alice_client");
             let bob_dir = temp_dir.join("bob_client");
 
-            env::set_current_dir(&alice_dir).unwrap();
+            set_current_dir(&alice_dir).unwrap();
             seed_shared_dir_with_writer(&alice_dir, &alice_ctx, &bob_ctx.identity.address);
 
             fs::create_dir_all(alice_dir.join("shared")).unwrap();
             let local = alice_dir.join("shared/foo.txt");
             fs::write(&local, b"untracked local").unwrap();
 
-            env::set_current_dir(&bob_dir).unwrap();
+            set_current_dir(&bob_dir).unwrap();
             let payload = bob_dir.join("payload.bin");
             fs::write(&payload, b"bob body").unwrap();
             let target = format!("alice@127.0.0.1:{}/shared/foo.txt", port);
-            put_io(&bob_ctx, &target, Some(payload.to_str().unwrap()), Some("none")).unwrap();
+            put(&bob_ctx, &target, Some(payload.to_str().unwrap()), Some("none")).unwrap();
 
-            env::set_current_dir(&alice_dir).unwrap();
+            set_current_dir(&alice_dir).unwrap();
             let alice_ctx = create_client_context().unwrap();
-            sync_io(&alice_ctx, false, false).unwrap();
+            sync(&alice_ctx, &current_dir().unwrap(), false, false).unwrap();
 
             assert_eq!(fs::read(&local).unwrap(), b"untracked local", "untracked local must not be clobbered");
         });
@@ -961,35 +948,34 @@ mod tests {
             let alice_dir = temp_dir.join("alice_client");
             let bob_dir = temp_dir.join("bob_client");
 
-            env::set_current_dir(&alice_dir).unwrap();
+            set_current_dir(&alice_dir).unwrap();
             let shared = alice_dir.join("shared");
             fs::create_dir(&shared).unwrap();
-            track_io(&alice_ctx, shared.to_str().unwrap(), None).unwrap();
-            chmod_io(&alice_ctx, shared.to_str().unwrap(), &[bob_ctx.identity.address.clone()], &[], &[], &[]).unwrap();
-            put_io(&alice_ctx, "shared/", Some(shared.to_str().unwrap()), None).unwrap();
+            chmod(&alice_ctx, shared.to_str().unwrap(), &[bob_ctx.identity.address.clone()], &[], &[], &[], true, None).unwrap();
+            put(&alice_ctx, "shared/", Some(shared.to_str().unwrap()), None).unwrap();
 
             let alice_local = alice_dir.join("shared/foo.txt");
             fs::write(&alice_local, b"v1").unwrap();
-            put_io(&alice_ctx, "/shared/foo.txt", Some(alice_local.to_str().unwrap()), Some("none")).unwrap();
-            chmod_io(&alice_ctx, alice_local.to_str().unwrap(), &[bob_ctx.identity.address.clone()], &[], &[], &[]).unwrap();
-            put_io(&alice_ctx, "/shared/foo.txt", Some(alice_local.to_str().unwrap()), Some("none")).unwrap();
+            put(&alice_ctx, "/shared/foo.txt", Some(alice_local.to_str().unwrap()), Some("none")).unwrap();
+            chmod(&alice_ctx, alice_local.to_str().unwrap(), &[bob_ctx.identity.address.clone()], &[], &[], &[], true, None).unwrap();
+            put(&alice_ctx, "/shared/foo.txt", Some(alice_local.to_str().unwrap()), Some("none")).unwrap();
 
             let alice_ctx = create_client_context().unwrap();
-            sync_io(&alice_ctx, false, false).unwrap();
+            sync(&alice_ctx, &current_dir().unwrap(), false, false).unwrap();
 
-            env::set_current_dir(&bob_dir).unwrap();
+            set_current_dir(&bob_dir).unwrap();
             let bob_payload = bob_dir.join("payload.bin");
             let target = format!("alice@127.0.0.1:{}/shared/foo.txt", port);
-            get_io(&bob_ctx, &target, Some(bob_payload.to_str().unwrap()), false).unwrap();
+            get(&bob_ctx, &target, Some(bob_payload.to_str().unwrap()), false).unwrap();
 
-            chmod_io(&alice_ctx, alice_local.to_str().unwrap(), &[], &[], &["public".to_string()], &[]).unwrap();
+            chmod(&alice_ctx, alice_local.to_str().unwrap(), &[], &[], &["public".to_string()], &[], true, None).unwrap();
 
-            chmod_io(&bob_ctx, bob_payload.to_str().unwrap(), &[], &["carol@host".to_string()], &[], &[]).unwrap();
-            put_io(&bob_ctx, &target, Some(bob_payload.to_str().unwrap()), Some("none")).unwrap();
+            chmod(&bob_ctx, bob_payload.to_str().unwrap(), &[], &["carol@host".to_string()], &[], &[], true, None).unwrap();
+            put(&bob_ctx, &target, Some(bob_payload.to_str().unwrap()), Some("none")).unwrap();
 
-            env::set_current_dir(&alice_dir).unwrap();
+            set_current_dir(&alice_dir).unwrap();
             let alice_ctx = create_client_context().unwrap();
-            sync_io(&alice_ctx, false, false).unwrap();
+            sync(&alice_ctx, &current_dir().unwrap(), false, false).unwrap();
 
             assert_eq!(fs::read(&alice_local).unwrap(), b"v1", "original body untouched");
             let local_meta = read_metadata_attributes(&alice_local).unwrap();
@@ -1016,38 +1002,36 @@ mod tests {
             let alice_dir = temp_dir.join("alice_client");
             let bob_dir = temp_dir.join("bob_client");
 
-            env::set_current_dir(&alice_dir).unwrap();
+            set_current_dir(&alice_dir).unwrap();
             let shared = alice_dir.join("shared");
             fs::create_dir(&shared).unwrap();
-            track_io(&alice_ctx, shared.to_str().unwrap(), None).unwrap();
-            chmod_io(&alice_ctx, shared.to_str().unwrap(), &[bob_ctx.identity.address.clone()], &[], &[], &[]).unwrap();
-            put_io(&alice_ctx, "shared/", Some(shared.to_str().unwrap()), None).unwrap();
+            chmod(&alice_ctx, shared.to_str().unwrap(), &[bob_ctx.identity.address.clone()], &[], &[], &[], true, None).unwrap();
+            put(&alice_ctx, "shared/", Some(shared.to_str().unwrap()), None).unwrap();
 
             let alice_sub = alice_dir.join("shared/sub");
             fs::create_dir(&alice_sub).unwrap();
-            track_io(&alice_ctx, alice_sub.to_str().unwrap(), None).unwrap();
-            chmod_io(&alice_ctx, alice_sub.to_str().unwrap(), &[bob_ctx.identity.address.clone()], &[], &[], &[]).unwrap();
-            put_io(&alice_ctx, "/shared/sub", Some(alice_sub.to_str().unwrap()), None).unwrap();
+            chmod(&alice_ctx, alice_sub.to_str().unwrap(), &[bob_ctx.identity.address.clone()], &[], &[], &[], true, None).unwrap();
+            put(&alice_ctx, "/shared/sub", Some(alice_sub.to_str().unwrap()), None).unwrap();
 
             let alice_ctx = create_client_context().unwrap();
-            sync_io(&alice_ctx, false, false).unwrap();
+            sync(&alice_ctx, &current_dir().unwrap(), false, false).unwrap();
 
-            env::set_current_dir(&bob_dir).unwrap();
+            set_current_dir(&bob_dir).unwrap();
             let bob_sub = bob_dir.join("sub");
             fs::create_dir(&bob_sub).unwrap();
             let target = format!("alice@127.0.0.1:{}/shared/sub", port);
             head(&bob_ctx, &target).unwrap();
             let (_, remote_meta) = head(&bob_ctx, &target).unwrap();
-            crate::metadata::write_metadata_attributes(&bob_sub, &remote_meta).unwrap();
+            write_metadata_attributes(&bob_sub, &remote_meta).unwrap();
 
-            chmod_io(&alice_ctx, alice_sub.to_str().unwrap(), &[], &[], &["public".to_string()], &[]).unwrap();
+            chmod(&alice_ctx, alice_sub.to_str().unwrap(), &[], &[], &["public".to_string()], &[], true, None).unwrap();
 
-            chmod_io(&bob_ctx, bob_sub.to_str().unwrap(), &[], &["carol@host".to_string()], &[], &[]).unwrap();
-            put_io(&bob_ctx, &target, Some(bob_sub.to_str().unwrap()), None).unwrap();
+            chmod(&bob_ctx, bob_sub.to_str().unwrap(), &[], &["carol@host".to_string()], &[], &[], true, None).unwrap();
+            put(&bob_ctx, &target, Some(bob_sub.to_str().unwrap()), None).unwrap();
 
-            env::set_current_dir(&alice_dir).unwrap();
+            set_current_dir(&alice_dir).unwrap();
             let alice_ctx = create_client_context().unwrap();
-            sync_io(&alice_ctx, false, false).unwrap();
+            sync(&alice_ctx, &current_dir().unwrap(), false, false).unwrap();
 
             let sidecar = fs::read_dir(alice_dir.join("shared")).unwrap()
                 .filter_map(|e| e.ok())

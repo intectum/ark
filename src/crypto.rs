@@ -1,4 +1,5 @@
 use std::io;
+use std::str::from_utf8;
 
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use aes_gcm::aead::Aead;
@@ -104,7 +105,7 @@ pub fn to_public_key(secret_key: &Key) -> io::Result<Key> {
             }
 
             let (salt, password) = secret_key.value.split_at(PASSWORD_SALT_LEN);
-            let password_str = std::str::from_utf8(password)
+            let password_str = from_utf8(password)
                 .map_err(|_| io_err("password not valid utf-8"))?;
             let (verifier, secret_key_ed25519) = expand_argon2id_ed25519(password_str, salt)?;
 
@@ -245,7 +246,7 @@ pub fn encrypt_bytes(public_key: &Key, plaintext: &[u8]) -> io::Result<(String, 
     }
 }
 
-pub fn decrypt_bytes(secret_key: &Key, ciphertext: &[u8]) -> std::io::Result<Vec<u8>> {
+pub fn decrypt_bytes(secret_key: &Key, ciphertext: &[u8]) -> io::Result<Vec<u8>> {
     match secret_key.algorithm.as_str() {
         DEFAULT_ENCRYPTION_ALGORITHM => {
             if ciphertext.len() < 12 {
@@ -336,7 +337,7 @@ fn derive_secret_ed25519_from_argon2id_ed25519(secret_key: &Key) -> io::Result<K
     }
 
     let (salt, password) = secret_key.value.split_at(PASSWORD_SALT_LEN);
-    let password_str = std::str::from_utf8(password)
+    let password_str = from_utf8(password)
         .map_err(|_| io_err("password not valid utf-8"))?;
     let (_, secret_key_ed25519) = expand_argon2id_ed25519(password_str, salt)?;
 

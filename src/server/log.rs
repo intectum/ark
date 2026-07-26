@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::identity::read_identity;
 use crate::metadata::{create_metadata, read_metadata_attributes, sign_metadata, write_metadata_attributes};
@@ -130,7 +130,7 @@ fn find_double_crlf(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
-fn allocate_entry_path(dir: &Path) -> io::Result<std::path::PathBuf> {
+fn allocate_entry_path(dir: &Path) -> io::Result<PathBuf> {
     let timestamp = now_iso_fs();
     for seq in 0..1000 {
         let name = format!("{}_{:03}.http", timestamp, seq);
@@ -145,7 +145,9 @@ fn allocate_entry_path(dir: &Path) -> io::Result<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+    use std::thread::sleep;
+    use std::time::{Duration, Instant};
 
     use super::super::start_test_server;
     use super::super::test_helpers::{signed_request, signed_put_with_default_metadata};
@@ -178,7 +180,7 @@ mod tests {
         write_metadata_attributes(&requests_dir, &metadata).unwrap();
     }
 
-    fn list_log_entries(temp_dir: &Path, account_name: &str) -> Vec<std::path::PathBuf> {
+    fn list_log_entries(temp_dir: &Path, account_name: &str) -> Vec<PathBuf> {
         let requests_dir = temp_dir.join("ark").join(account_name).join(".ark").join("requests");
         if !requests_dir.is_dir() {
             return Vec::new();
@@ -293,10 +295,10 @@ mod tests {
             let code = signed_put_metadata_with_headers(port, &alice_identity, &alice_key, "/ark/alice/shared/todo.txt", b"body", &m, &[("X-Ark-Relay", "full")]);
             assert_eq!(code, 201);
 
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while std::time::Instant::now() < deadline {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
                 if !list_log_entries(temp_dir, "bob").is_empty() { break; }
-                std::thread::sleep(std::time::Duration::from_millis(20));
+                sleep(Duration::from_millis(20));
             }
 
             let alice_entries = list_log_entries(temp_dir, "alice");

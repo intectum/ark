@@ -3,13 +3,51 @@ use std::io;
 use std::io::Write;
 use std::path::Path;
 
-use super::decrypt::decrypt as decrypt_body;
-use crate::client::request;
+use super::{decrypt_stream, request};
 use crate::crypto::DEFAULT_HASH_ALGORITHM;
 use crate::types::{Hash, IdentityContext, LocalMetadata, Metadata};
 use crate::identity::resolve_identity;
 use crate::metadata::{read_metadata_headers, verify_metadata, write_local_metadata_attributes, write_metadata_attributes};
 use crate::util::{io_err, resolve_client_url, sha256};
+
+/// Fetch a file body and metadata from the server and write the body to a
+/// file or stdout.
+///
+/// `path` accepts relative, absolute account, or address form. See the
+/// [module documentation](../index.html) for path resolution details. Verifies
+/// the metadata signature against the modifier's identity. When `decrypt` is
+/// true, unwraps the file key using `ctx.identity_key` and decrypts the body
+/// before writing.
+///
+/// When `output` is `Some`, writes the body to that file path and stores
+/// signed metadata as `user.ark.*` xattrs plus local metadata as
+/// `user.ark_local.*` xattrs. When `output` is `None`, writes the body to
+/// stdout.
+pub fn get(ctx: &IdentityContext, path: &str, output: Option<&str>, decrypt: bool) -> io::Result<()> {
+    match output {
+        Some(o) => {
+            let mut buf: Vec<u8> = Vec::new();
+            let (metadata, local_metadata) = get_stream(ctx, path, &mut buf, decrypt)?;
+
+            let output_path = Path::new(o);
+            if let Some(parent) = output_path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    fs::create_dir_all(parent)?;
+                }
+            }
+            fs::write(output_path, &buf)?;
+
+            write_metadata_attributes(output_path, &metadata)?;
+            write_local_metadata_attributes(output_path, &local_metadata)?;
+        }
+        None => {
+            let mut stdout = io::stdout().lock();
+            get_stream(ctx, path, &mut stdout, decrypt)?;
+        }
+    }
+
+    Ok(())
+}
 
 /// Fetch a file body and metadata from the server and write the body to
 /// `output`.
@@ -21,7 +59,7 @@ use crate::util::{io_err, resolve_client_url, sha256};
 /// The returned [`LocalMetadata`] reflects whether the written body is
 /// ciphertext (`encrypted=Some(true)`) or plaintext, and includes a
 /// `sync_body_hash` when a plaintext body is written.
-pub fn get(
+pub fn get_stream(
     ctx: &IdentityContext,
     path: &str,
     output: &mut dyn Write,
@@ -42,7 +80,7 @@ pub fn get(
 
     let final_body = if decrypt && metadata.encryption_algorithm.is_some() {
         let mut buf = Vec::new();
-        decrypt_body(ctx, &metadata, &mut body.as_slice(), &mut buf)?;
+        decrypt_stream(ctx, &metadata, &mut body.as_slice(), &mut buf)?;
         buf
     } else {
         body
@@ -63,36 +101,6 @@ pub fn get(
     Ok((metadata, local_metadata))
 }
 
-/// CLI-shaped [`get`]. When `output` is `Some`, writes the body to that file
-/// path and stores signed metadata as `user.ark.*` xattrs plus local metadata
-/// as `user.ark_local.*` xattrs. When `output` is `None`, writes the body to
-/// stdout.
-pub fn get_io(ctx: &IdentityContext, path: &str, output: Option<&str>, decrypt: bool) -> io::Result<()> {
-    match output {
-        Some(o) => {
-            let mut buf: Vec<u8> = Vec::new();
-            let (metadata, local_metadata) = get(ctx, path, &mut buf, decrypt)?;
-
-            let output_path = Path::new(o);
-            if let Some(parent) = output_path.parent() {
-                if !parent.as_os_str().is_empty() {
-                    fs::create_dir_all(parent)?;
-                }
-            }
-            fs::write(output_path, &buf)?;
-
-            write_metadata_attributes(output_path, &metadata)?;
-            write_local_metadata_attributes(output_path, &local_metadata)?;
-        }
-        None => {
-            let mut stdout = io::stdout().lock();
-            get(ctx, path, &mut stdout, decrypt)?;
-        }
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::env;
@@ -107,7 +115,7 @@ mod tests {
     use crate::util::test::{in_test_dir, init_with_server, write_encrypted_test_file, write_plain_test_file};
 
     #[test]
-    fn get_file_via_get_io_writes_to_output() {
+    fn get_file_via_get_writes_to_output() {
         in_test_dir("ark_get_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
@@ -115,7 +123,7 @@ mod tests {
             write_plain_test_file(&temp_dir.join("ark/gyan/hello.txt"), &ctx.identity, ctx.identity_key.as_ref().unwrap(), b"hi from server");
 
             let out = temp_dir.join("out.bin");
-            get_io(&ctx, "hello.txt", Some(out.to_str().unwrap()), false).unwrap();
+            get(&ctx, "hello.txt", Some(out.to_str().unwrap()), false).unwrap();
 
             assert_eq!(fs::read(&out).unwrap(), b"hi from server");
         });
@@ -136,7 +144,7 @@ mod tests {
             write_metadata_attributes(&server_dir, &m).unwrap();
 
             let mut buf = Vec::new();
-            let (metadata, _) = get(&ctx, "shared", &mut buf, false).unwrap();
+            let (metadata, _) = get_stream(&ctx, "shared", &mut buf, false).unwrap();
             assert!(metadata.body_hash.is_none(), "dir metadata should have no body_hash");
             assert!(!buf.is_empty(), "dir listing body should be returned");
         });
@@ -156,7 +164,7 @@ mod tests {
             fs::create_dir_all(&client_notes).unwrap();
             let out = temp_dir.join("out.bin");
             env::set_current_dir(&client_notes).unwrap();
-            get_io(&ctx, "todo.txt", Some(out.to_str().unwrap()), false).unwrap();
+            get(&ctx, "todo.txt", Some(out.to_str().unwrap()), false).unwrap();
             assert_eq!(fs::read(&out).unwrap(), b"buy milk");
         });
     }
@@ -172,7 +180,7 @@ mod tests {
             write_plain_test_file(&subdir.join("file.txt"), &ctx.identity, ctx.identity_key.as_ref().unwrap(), b"absolute");
 
             let out = temp_dir.join("out.bin");
-            get_io(&ctx, "/sub/file.txt", Some(out.to_str().unwrap()), false).unwrap();
+            get(&ctx, "/sub/file.txt", Some(out.to_str().unwrap()), false).unwrap();
             assert_eq!(fs::read(&out).unwrap(), b"absolute");
         });
     }
@@ -187,7 +195,7 @@ mod tests {
 
             let out = temp_dir.join("out.bin");
             let arg = format!("gyan@127.0.0.1:{}/explicit.txt", port);
-            get_io(&ctx, &arg, Some(out.to_str().unwrap()), false).unwrap();
+            get(&ctx, &arg, Some(out.to_str().unwrap()), false).unwrap();
             assert_eq!(fs::read(&out).unwrap(), b"via address");
         });
     }
@@ -205,7 +213,7 @@ mod tests {
                 .members[0].key.as_ref().unwrap().value.clone();
 
             let out = temp_dir.join("out.bin");
-            get_io(&ctx, "secret", Some(out.to_str().unwrap()), false).unwrap();
+            get(&ctx, "secret", Some(out.to_str().unwrap()), false).unwrap();
 
             assert_eq!(fs::read(&out).unwrap(), expected_ciphertext);
             let m = read_metadata_attributes(&out).unwrap();
@@ -235,7 +243,7 @@ mod tests {
             write_metadata_attributes(&server_file, &m).unwrap();
 
             let out = temp_dir.join("out.bin");
-            get_io(&ctx, "secret", Some(out.to_str().unwrap()), true).unwrap();
+            get(&ctx, "secret", Some(out.to_str().unwrap()), true).unwrap();
 
             assert_eq!(fs::read(&out).unwrap(), b"clear text");
             assert_eq!(
@@ -259,20 +267,20 @@ mod tests {
             write_identity(&identities_dir.join("other@example.com.json"), &other_identity).unwrap();
 
             let out = temp_dir.join("out.bin");
-            let err = get_io(&ctx, "secret", Some(out.to_str().unwrap()), true).unwrap_err();
+            let err = get(&ctx, "secret", Some(out.to_str().unwrap()), true).unwrap_err();
             assert!(err.to_string().contains("no member entry"), "msg was {}", err);
         });
     }
 
     #[test]
-    fn get_io_to_stdout_succeeds() {
+    fn get_to_stdout_succeeds() {
         in_test_dir("ark_get_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &address);
             write_plain_test_file(&temp_dir.join("ark/gyan/stdout.txt"), &ctx.identity, ctx.identity_key.as_ref().unwrap(), b"to stdout");
 
-            get_io(&ctx, "stdout.txt", None, false).unwrap();
+            get(&ctx, "stdout.txt", None, false).unwrap();
         });
     }
 

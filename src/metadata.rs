@@ -270,7 +270,7 @@ pub fn apply_key_to_metadata(
     ctx: &IdentityContext,
     metadata: &mut Metadata,
     secret_key: &Key,
-) -> std::io::Result<()> {
+) -> io::Result<()> {
     for member in metadata.members.iter_mut() {
         if member.address == "*" {
             member.key = None;
@@ -288,11 +288,13 @@ pub fn apply_key_to_metadata(
     Ok(())
 }
 
-pub fn extract_key_from_metadata(ctx: &IdentityContext, metadata: &Metadata) -> io::Result<Vec<u8>> {
+pub fn extract_key_from_metadata(ctx: &IdentityContext, metadata: &Metadata) -> io::Result<Option<Vec<u8>>> {
     let member = get_member(&metadata.members, &ctx.identity.address)
         .ok_or_else(|| io_err(&format!("no member entry for {}", ctx.identity.address)))?;
-    let encrypted_file_key = member.key.as_ref()
-        .ok_or_else(|| io_err(&format!("no key for {}", ctx.identity.address)))?;
+    let encrypted_file_key = match member.key.as_ref() {
+        Some(key) => key,
+        None => return Ok(None),
+    };
     let identity_key = ctx.identity_key.as_ref().expect("context missing identity_key");
     // TODO: review this. seems strange...
     let algorithm = if identity_key.algorithm == DEFAULT_PASSWORD_ALGORITHM {
@@ -306,7 +308,7 @@ pub fn extract_key_from_metadata(ctx: &IdentityContext, metadata: &Metadata) -> 
             value: identity_key.value.clone(),
         },
         &encrypted_file_key.value,
-    )
+    ).map(Some)
 }
 
 pub fn sign_metadata(secret_key: &Key, metadata: &mut Metadata, body: Option<&[u8]>) -> io::Result<()> {
@@ -483,7 +485,7 @@ mod tests {
     use std::fs;
 
     use super::*;
-    use crate::crypto::DEFAULT_ENCRYPTION_ALGORITHM;
+    use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, DEFAULT_HASH_ALGORITHM};
     use crate::identity::create_identity;
     use crate::util::test::{TEST_ADDRESS, create_plain_test_metadata, in_test_dir};
 
@@ -556,12 +558,12 @@ mod tests {
         in_test_dir("ark_metadata_test", |temp_dir| {
             let p = temp_dir.join("file");
             fs::write(&p, b"x").unwrap();
-            let local = LocalMetadata { encrypted: Some(true), sync_body_hash: Some(Hash { algorithm: crate::crypto::DEFAULT_HASH_ALGORITHM.to_string(), value: vec![0xAB, 0xCD] }), sync_modified: Some("2026-01-01T00:00:00Z".to_string()) };
+            let local = LocalMetadata { encrypted: Some(true), sync_body_hash: Some(Hash { algorithm: DEFAULT_HASH_ALGORITHM.to_string(), value: vec![0xAB, 0xCD] }), sync_modified: Some("2026-01-01T00:00:00Z".to_string()) };
             write_local_metadata_attributes(&p, &local).unwrap();
             let back = read_local_metadata_attributes(&p).unwrap();
             assert_eq!(back.encrypted, Some(true));
             let back_hash = back.sync_body_hash.as_ref().unwrap();
-            assert_eq!(back_hash.algorithm, crate::crypto::DEFAULT_HASH_ALGORITHM);
+            assert_eq!(back_hash.algorithm, DEFAULT_HASH_ALGORITHM);
             assert_eq!(back_hash.value, vec![0xAB, 0xCD]);
             assert_eq!(back.sync_modified.as_deref(), Some("2026-01-01T00:00:00Z"));
         });
@@ -572,7 +574,7 @@ mod tests {
         in_test_dir("ark_metadata_test", |temp_dir| {
             let p = temp_dir.join("file");
             fs::write(&p, b"x").unwrap();
-            let full = LocalMetadata { encrypted: Some(true), sync_body_hash: Some(Hash { algorithm: crate::crypto::DEFAULT_HASH_ALGORITHM.to_string(), value: vec![1, 2, 3] }), sync_modified: Some("2026-01-01T00:00:00Z".to_string()) };
+            let full = LocalMetadata { encrypted: Some(true), sync_body_hash: Some(Hash { algorithm: DEFAULT_HASH_ALGORITHM.to_string(), value: vec![1, 2, 3] }), sync_modified: Some("2026-01-01T00:00:00Z".to_string()) };
             write_local_metadata_attributes(&p, &full).unwrap();
             let cleared = LocalMetadata::default();
             write_local_metadata_attributes(&p, &cleared).unwrap();

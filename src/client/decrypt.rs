@@ -8,40 +8,21 @@ use crate::metadata::{apply_key_to_metadata, create_metadata, extract_key_from_m
 use crate::types::{Hash, IdentityContext, Key, LocalMetadata, Metadata};
 use crate::util::{decode_base64url, io_err, io_invalid_input, sha256};
 
-/// Decrypt `ciphertext` to `plaintext` using the file key wrapped in
-/// `metadata` for the current account. The metadata's `encryption_algorithm`
-/// selects the AEAD.
-pub fn decrypt(
-    ctx: &IdentityContext,
-    metadata: &Metadata,
-    ciphertext: &mut dyn Read,
-    plaintext: &mut dyn Write,
-) -> io::Result<()> {
-    let file_key = extract_key_from_metadata(ctx, metadata)?;
-
-    let encryption_algorithm = metadata.encryption_algorithm.clone()
-        .ok_or_else(|| io_err("metadata missing encryption_algorithm"))?;
-
-    let mut ciphertext_bytes = Vec::new();
-    ciphertext.read_to_end(&mut ciphertext_bytes)?;
-
-    let plaintext_bytes = decrypt_bytes(&Key { algorithm: encryption_algorithm, value: file_key }, &ciphertext_bytes)
-        .map_err(|e| io_err(&format!("{} — input may already be plaintext or the key may be wrong", e)))?;
-    plaintext.write_all(&plaintext_bytes)?;
-
-    Ok(())
-}
-
-/// CLI-shaped [`decrypt`]. Rewrites `in_place` or reads `input` → writes
-/// `output` (each side defaults to stdio when the corresponding option is
-/// `None`). `in_place` is mutually exclusive with `input`/`output`.
+/// Decrypt a file with an ark file key.
+///
+/// Rewrites `in_place` or reads `input` → writes `output` (each side defaults
+/// to stdio when the corresponding option is `None`). `in_place` is mutually
+/// exclusive with `input`/`output`.
 ///
 /// If the source file has ark metadata, its file key and algorithm are reused
 /// and `key`/`encryption_algorithm` must be absent. Otherwise `key` (base64url,
 /// 32 bytes) is required; `encryption_algorithm` defaults to AES-256-GCM.
 ///
-/// Refuses to run when `user.ark_local.encrypted=false` on the source.
-pub fn decrypt_io(
+/// When writing to a file path, signed metadata is stored as `user.ark.*`
+/// xattrs plus local metadata as `user.ark_local.*` xattrs (including
+/// `encrypted=false`). Refuses to run when `user.ark_local.encrypted=false`
+/// on the source.
+pub fn decrypt(
     ctx: &IdentityContext,
     input: Option<&str>,
     output: Option<&str>,
@@ -111,7 +92,7 @@ pub fn decrypt_io(
     }
 
     let mut plaintext_bytes: Vec<u8> = Vec::new();
-    decrypt(ctx, &metadata, &mut ciphertext_bytes.as_slice(), &mut plaintext_bytes)?;
+    decrypt_stream(ctx, &metadata, &mut ciphertext_bytes.as_slice(), &mut plaintext_bytes)?;
 
     match destination {
         Some(d) => {
@@ -130,14 +111,40 @@ pub fn decrypt_io(
     Ok(())
 }
 
+/// Decrypt `ciphertext` to `plaintext` using the file key wrapped in
+/// `metadata` for the current account. The algorithm is taken from
+/// `metadata.encryption_algorithm`.
+pub fn decrypt_stream(
+    ctx: &IdentityContext,
+    metadata: &Metadata,
+    ciphertext: &mut dyn Read,
+    plaintext: &mut dyn Write,
+) -> io::Result<()> {
+    let file_key = extract_key_from_metadata(ctx, metadata)?
+        .ok_or_else(|| io_err(&format!("no key for {}", ctx.identity.address)))?;
+
+    let encryption_algorithm = metadata.encryption_algorithm.clone()
+        .ok_or_else(|| io_err("metadata missing encryption_algorithm"))?;
+
+    let mut ciphertext_bytes = Vec::new();
+    ciphertext.read_to_end(&mut ciphertext_bytes)?;
+
+    let plaintext_bytes = decrypt_bytes(&Key { algorithm: encryption_algorithm, value: file_key }, &ciphertext_bytes)
+        .map_err(|e| io_err(&format!("{} — input may already be plaintext or the key may be wrong", e)))?;
+    plaintext.write_all(&plaintext_bytes)?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use std::env;
+    use std::env::set_current_dir;
+    use std::io::ErrorKind;
 
     use super::*;
     use crate::crypto::{decrypt_bytes, encrypt_bytes};
     use crate::context::create_client_context;
-    use crate::metadata::{create_metadata, sign_metadata, write_metadata_attributes};
+    use crate::metadata::{create_metadata, read_metadata_attributes, sign_metadata, write_metadata_attributes};
     use crate::util::encode_base64url;
     use crate::util::test::{TEST_ADDRESS, create_test_account, in_test_dir, write_encrypted_test_file};
 
@@ -152,9 +159,9 @@ mod tests {
             let in_path = temp_dir.join("in.bin");
             write_encrypted_test_file(&in_path, &identity, &secret_key, b"hello world");
             let out_path = temp_dir.join("out.bin");
-            env::set_current_dir(&acc).unwrap();
+            set_current_dir(&acc).unwrap();
             let ctx = create_client_context().unwrap();
-            decrypt_io(&ctx, Some(in_path.to_str().unwrap()), Some(out_path.to_str().unwrap()), None, None, None).unwrap();
+            decrypt(&ctx, Some(in_path.to_str().unwrap()), Some(out_path.to_str().unwrap()), None, None, None).unwrap();
             assert_eq!(fs::read(&out_path).unwrap(), b"hello world");
         });
     }
@@ -165,9 +172,9 @@ mod tests {
             let (identity, secret_key, acc) = create_test_account(temp_dir, TEST_ADDRESS);
             let p = temp_dir.join("file.bin");
             write_encrypted_test_file(&p, &identity, &secret_key, b"data");
-            env::set_current_dir(&acc).unwrap();
+            set_current_dir(&acc).unwrap();
             let ctx = create_client_context().unwrap();
-            decrypt_io(&ctx, None, None, Some(p.to_str().unwrap()), None, None).unwrap();
+            decrypt(&ctx, None, None, Some(p.to_str().unwrap()), None, None).unwrap();
             assert_eq!(fs::read(&p).unwrap(), b"data");
             assert_eq!(
                 xattr::get(&p, "user.ark_local.encrypted").unwrap().as_deref(),
@@ -185,10 +192,10 @@ mod tests {
     fn decrypt_in_place_conflicts_with_input() {
         in_test_dir("ark_decrypt_test", |temp_dir| {
             let (_identity, _secret_key, acc) = create_test_account(temp_dir, TEST_ADDRESS);
-            env::set_current_dir(&acc).unwrap();
+            set_current_dir(&acc).unwrap();
             let ctx = create_client_context().unwrap();
             let x = temp_dir.join("x");
-            let err = decrypt_io(&ctx, Some("a"), None, Some(x.to_str().unwrap()), None, None).unwrap_err();
+            let err = decrypt(&ctx, Some("a"), None, Some(x.to_str().unwrap()), None, None).unwrap_err();
             assert!(err.to_string().contains("mutually exclusive"));
         });
     }
@@ -199,10 +206,10 @@ mod tests {
             let (identity, secret_key, acc) = create_test_account(temp_dir, TEST_ADDRESS);
             let p = temp_dir.join("in.bin");
             write_encrypted_test_file(&p, &identity, &secret_key, b"x");
-            env::set_current_dir(&acc).unwrap();
+            set_current_dir(&acc).unwrap();
             let ctx = create_client_context().unwrap();
             let k = encode_base64url([13u8; 32]);
-            let err = decrypt_io(&ctx, Some(p.to_str().unwrap()), None, None, Some(&k), None).unwrap_err();
+            let err = decrypt(&ctx, Some(p.to_str().unwrap()), None, None, Some(&k), None).unwrap_err();
             assert!(err.to_string().contains("cannot override existing metadata"), "msg was {}", err);
         });
     }
@@ -214,9 +221,9 @@ mod tests {
             let p = temp_dir.join("in.bin");
             let ct = aes_encrypt(&[1u8; 32], b"x");
             fs::write(&p, &ct).unwrap();
-            env::set_current_dir(&acc).unwrap();
+            set_current_dir(&acc).unwrap();
             let ctx = create_client_context().unwrap();
-            let err = decrypt_io(&ctx, Some(p.to_str().unwrap()), None, None, None, None).unwrap_err();
+            let err = decrypt(&ctx, Some(p.to_str().unwrap()), None, None, None, None).unwrap_err();
             assert!(err.to_string().contains("no file key"));
         });
     }
@@ -231,13 +238,13 @@ mod tests {
             fs::write(&p, &ct).unwrap();
             let out = temp_dir.join("out.bin");
 
-            env::set_current_dir(&acc).unwrap();
+            set_current_dir(&acc).unwrap();
             let ctx = create_client_context().unwrap();
             let k = encode_base64url(file_key);
-            decrypt_io(&ctx, Some(p.to_str().unwrap()), Some(out.to_str().unwrap()), None, Some(&k), None).unwrap();
+            decrypt(&ctx, Some(p.to_str().unwrap()), Some(out.to_str().unwrap()), None, Some(&k), None).unwrap();
 
             assert_eq!(fs::read(&out).unwrap(), b"secret");
-            let m = crate::metadata::read_metadata_attributes(&out).unwrap();
+            let m = read_metadata_attributes(&out).unwrap();
             let wrapped = m.members[0].key.as_ref().expect("key populated");
             assert_eq!(wrapped.algorithm, "hpke-x25519-hkdf-sha256-aes256gcm");
             let recovered = decrypt_bytes(&Key { algorithm: wrapped.algorithm.to_string(), value: secret_key.value.to_vec() }, &wrapped.value).unwrap();
@@ -252,9 +259,9 @@ mod tests {
             let p = temp_dir.join("in.bin");
             write_encrypted_test_file(&p, &identity, &secret_key, b"x");
             xattr::set(&p, "user.ark_local.encrypted", b"false").unwrap();
-            env::set_current_dir(&acc).unwrap();
+            set_current_dir(&acc).unwrap();
             let ctx = create_client_context().unwrap();
-            let err = decrypt_io(&ctx, Some(p.to_str().unwrap()), None, None, None, None).unwrap_err();
+            let err = decrypt(&ctx, Some(p.to_str().unwrap()), None, None, None, None).unwrap_err();
             assert!(err.to_string().contains("already plaintext"), "msg was {}", err);
         });
     }
@@ -266,9 +273,9 @@ mod tests {
             let p = temp_dir.join("in.bin");
             write_encrypted_test_file(&p, &identity, &secret_key, b"hi");
             let out = temp_dir.join("out.bin");
-            env::set_current_dir(&acc).unwrap();
+            set_current_dir(&acc).unwrap();
             let ctx = create_client_context().unwrap();
-            decrypt_io(&ctx, Some(p.to_str().unwrap()), Some(out.to_str().unwrap()), None, None, None).unwrap();
+            decrypt(&ctx, Some(p.to_str().unwrap()), Some(out.to_str().unwrap()), None, None, None).unwrap();
             assert_eq!(fs::read(&out).unwrap(), b"hi");
         });
     }
@@ -286,9 +293,9 @@ mod tests {
             sign_metadata(&secret_key, &mut m, Some(&body)).unwrap();
             write_metadata_attributes(&p, &m).unwrap();
             write_local_metadata_attributes(&p, &LocalMetadata { encrypted: Some(true), sync_body_hash: None, sync_modified: None }).unwrap();
-            env::set_current_dir(&acc).unwrap();
+            set_current_dir(&acc).unwrap();
             let ctx = create_client_context().unwrap();
-            let err = decrypt_io(&ctx, Some(p.to_str().unwrap()), None, None, None, None).unwrap_err();
+            let err = decrypt(&ctx, Some(p.to_str().unwrap()), None, None, None, None).unwrap_err();
             let msg = err.to_string();
             assert!(msg.contains("may already be plaintext"), "msg was {}", msg);
             assert!(msg.contains("key may be wrong"), "msg was {}", msg);
@@ -301,9 +308,9 @@ mod tests {
             let (identity, secret_key, acc) = create_test_account(temp_dir, TEST_ADDRESS);
             let p = temp_dir.join("in.bin");
             write_encrypted_test_file(&p, &identity, &secret_key, b"plain");
-            env::set_current_dir(&acc).unwrap();
+            set_current_dir(&acc).unwrap();
             let ctx = create_client_context().unwrap();
-            decrypt_io(&ctx, Some(p.to_str().unwrap()), None, None, None, None).unwrap();
+            decrypt(&ctx, Some(p.to_str().unwrap()), None, None, None, None).unwrap();
         });
     }
 
@@ -311,11 +318,11 @@ mod tests {
     fn decrypt_missing_input_errors() {
         in_test_dir("ark_decrypt_test", |temp_dir| {
             let (_identity, _secret_key, acc) = create_test_account(temp_dir, TEST_ADDRESS);
-            env::set_current_dir(&acc).unwrap();
+            set_current_dir(&acc).unwrap();
             let ctx = create_client_context().unwrap();
             let missing = temp_dir.join("nope.bin");
-            let err = decrypt_io(&ctx, Some(missing.to_str().unwrap()), None, None, None, None).unwrap_err();
-            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            let err = decrypt(&ctx, Some(missing.to_str().unwrap()), None, None, None, None).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
             assert!(format!("{}", err).contains("input does not exist"));
         });
     }
@@ -324,11 +331,11 @@ mod tests {
     fn decrypt_missing_in_place_errors() {
         in_test_dir("ark_decrypt_test", |temp_dir| {
             let (_identity, _secret_key, acc) = create_test_account(temp_dir, TEST_ADDRESS);
-            env::set_current_dir(&acc).unwrap();
+            set_current_dir(&acc).unwrap();
             let ctx = create_client_context().unwrap();
             let missing = temp_dir.join("nope.bin");
-            let err = decrypt_io(&ctx, None, None, Some(missing.to_str().unwrap()), None, None).unwrap_err();
-            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+            let err = decrypt(&ctx, None, None, Some(missing.to_str().unwrap()), None, None).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
             assert!(format!("{}", err).contains("input does not exist"));
         });
     }
@@ -341,10 +348,10 @@ mod tests {
             let p = temp_dir.join("raw.bin");
             let ct = aes_encrypt(&key, b"x");
             fs::write(&p, &ct).unwrap();
-            env::set_current_dir(&acc).unwrap();
+            set_current_dir(&acc).unwrap();
             let ctx = create_client_context().unwrap();
             let k = encode_base64url(key);
-            let err = decrypt_io(&ctx, Some(p.to_str().unwrap()), None, None, Some(&k), Some("chacha20-poly1305")).unwrap_err();
+            let err = decrypt(&ctx, Some(p.to_str().unwrap()), None, None, Some(&k), Some("chacha20-poly1305")).unwrap_err();
             assert!(err.to_string().contains("unsupported encryption algorithm"), "msg was {}", err);
         });
     }

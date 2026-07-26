@@ -69,6 +69,7 @@ fn tls_config() -> Arc<ClientConfig> {
 mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::str::from_utf8;
     use std::thread;
 
     use super::*;
@@ -99,7 +100,7 @@ mod tests {
             if header_end.is_none() {
                 if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
                     header_end = Some(p + 4);
-                    let h = std::str::from_utf8(&buf[..p]).unwrap();
+                    let h = from_utf8(&buf[..p]).unwrap();
                     for line in h.lines() {
                         if let Some((k, v)) = line.split_once(':') {
                             if k.trim().eq_ignore_ascii_case("content-length") {
@@ -120,7 +121,7 @@ mod tests {
 
     fn parse_header<'a>(req: &'a [u8], key: &str) -> Option<&'a str> {
         let split = req.windows(4).position(|w| w == b"\r\n\r\n")?;
-        let h = std::str::from_utf8(&req[..split]).ok()?;
+        let h = from_utf8(&req[..split]).ok()?;
         for line in h.lines() {
             if let Some((k, v)) = line.split_once(':') {
                 if k.trim().eq_ignore_ascii_case(key) {

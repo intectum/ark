@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::io;
+use std::str::from_utf8;
 use std::sync::Arc;
 
 use url::Url;
@@ -89,7 +90,7 @@ pub fn relay(
         if verbose {
             match result {
                 Ok((response_code, _, response_body)) if !(200..300).contains(&response_code) => {
-                    let response_string = std::str::from_utf8(&response_body).unwrap_or("<non-utf8 body>");
+                    let response_string = from_utf8(&response_body).unwrap_or("<non-utf8 body>");
                     eprintln!("ERROR(relay) {}", response_string);
                 }
                 Err(e) => eprintln!("ERROR(relay) {}", e),
@@ -114,6 +115,8 @@ fn build_member_path(member_name: &str, rel: &[&str]) -> String {
 mod tests {
     use std::fs;
     use std::path::Path;
+    use std::thread::sleep;
+    use std::time::{Duration, Instant};
 
     use super::super::start_test_server;
     use super::super::test_helpers::{seed_shared_dir, signed_put_dir_metadata_with_headers, signed_put_metadata_with_headers};
@@ -132,18 +135,18 @@ mod tests {
     }
 
     fn wait_for<F: Fn() -> bool>(check: F) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
             if check() {
                 return;
             }
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            sleep(Duration::from_millis(20));
         }
         panic!("wait_for timed out");
     }
 
     fn wait_for_not<F: Fn() -> bool>(check: F) {
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        sleep(Duration::from_millis(300));
         assert!(!check(), "condition should not become true");
     }
 

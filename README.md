@@ -79,13 +79,11 @@ mkdir -p apps/notes && cd apps/notes
 
 # Upload and download an encrypted file
 echo 'hello' > note.txt
-ark track note.txt              # register the file with ark
 ark put -i note.txt note.txt    # encrypt + upload
 ark get note.txt -o out.txt -d  # download + decrypt
 
 # Share with another user
-ark chmod -r bob@localhost:8080 note.txt
-ark put -i note.txt note.txt    # re-upload; server relays a copy to bob
+ark chmod -r bob@localhost:8080 note.txt    # updates local metadata + uploads
 
 # On bob's side — review and accept the share
 ark proposals list              # shows pending share proposals
@@ -105,14 +103,13 @@ Every command takes `-h` for details. Paths accept three forms:
 | Command | What it does |
 |---|---|
 | `ark server [PORT]` | Run a server. Serves the current directory. |
-| `ark init <ADDR>` | Create or download an account identity. `--password` gates remote key recovery. |
+| `ark init <ADDR>` | Create or download an account identity. `--password` gates remote key recovery. `--local-only` skips the server. |
 | `ark get <PATH>` | Download a file. `--decrypt` unwraps it, `-o FILE` writes to disk. |
 | `ark put <PATH>` | Upload a file. `-i FILE` for input, `--encryption-algorithm none` for plaintext. Trailing `/` creates a directory. |
 | `ark head <PATH>` | Fetch response headers only. |
 | `ark delete <PATH>` | Delete a file or directory (recursive). |
-| `ark chmod <FILE>` | Change members: `-o` owner, `-w` writer, `-r` reader, `-d` drop. Use `public` for the `*` wildcard. Follow with `put` to sync. |
+| `ark chmod <FILE>` | Change members: `-o` owner, `-w` writer, `-r` reader, `-d` drop. Use `public` for the `*` wildcard. Seeds metadata if absent and uploads by default; `--local-only` skips the upload. |
 | `ark sync` | Push local changes to the server. `-w` also watches and pulls. |
-| `ark track <PATH>` | Mark an existing local file as an ark file. |
 | `ark proposals list` | Show pending share proposals — unauthorized PUTs from other accounts, recorded in `.ark/requests/`. |
 | `ark proposals accept <ID>` | Fetch, verify, and PUT the shared file/dir. `-f` bypasses metadata-change checks. |
 | `ark proposals reject <ID>` | Delete the log entry. |
@@ -134,10 +131,10 @@ start_server(8080, "localhost:8080");                           // blocks
 // Terminal 2 — create an account on that server
 // cwd = ./alice
 use ark::context::create_client_context;
-use ark::client::{init_io, track_io, put_io, get, get_io, chmod_io, sync_io,
-    list_proposals_io, accept_proposal, reject_proposal, watch_local, watch_remote};
+use ark::client::{init, put, get, get_stream, chmod, sync, list_proposals,
+    accept_proposal, reject_proposal, watch_local, watch_remote};
 
-init_io("alice@localhost:8080", None)?;
+init(&std::env::current_dir()?, "alice@localhost:8080", None, /*local_only=*/ false)?;
 
 // Convention: apps namespace their files under apps/<app>/. Work from there.
 std::fs::create_dir_all("apps/notes")?;
@@ -147,21 +144,19 @@ let ctx = create_client_context()?;                             // walks up from
 
 // Upload and download an encrypted file
 std::fs::write("note.txt", b"hello")?;
-track_io(&ctx, "note.txt", None)?;                              // register the file with ark
-put_io(&ctx, "note.txt", Some("note.txt"), None)?;              // encrypt + upload
-get_io(&ctx, "note.txt", Some("out.txt"), /*decrypt=*/ true)?;  // download + decrypt
+put(&ctx, "note.txt", Some("note.txt"), None)?;                 // encrypt + upload
+get(&ctx, "note.txt", Some("out.txt"), /*decrypt=*/ true)?;     // download + decrypt
 
-// Share with another user
-chmod_io(&ctx, "note.txt", &[], &[], &["bob@localhost:8080".into()], &[])?;
-put_io(&ctx, "note.txt", Some("note.txt"), None)?;              // re-upload; server relays a copy to bob
+// Share with another user (seeds metadata if absent, then uploads)
+chmod(&ctx, "note.txt", &[], &[], &["bob@localhost:8080".into()], &[], /*local_only=*/ false, None)?;
 
 // On bob's side — review and accept the share
-list_proposals_io(&ctx)?;                                       // shows pending share proposals
+let proposals = list_proposals(&ctx)?;                          // pending share proposals
 accept_proposal(&ctx, "1", /*force=*/ false)?;                  // pulls the file, materializes it on bob's server
 reject_proposal(&ctx, "1")?;                                    // discard instead
 
 // Sync the cwd
-sync_io(&ctx, /*watch=*/ true, /*decrypt=*/ true)?;             // pull + push + watch (bidirectional), blocks
+sync(&ctx, &std::env::current_dir()?, /*watch=*/ true, /*decrypt=*/ true)?; // pull + push + watch (bidirectional), blocks
 
 // Watch for local changes
 let cwd = std::env::current_dir()?;
@@ -179,13 +174,10 @@ watch_remote(&ctx, &url, |event| {
 
 // Streaming form when you don't want to touch the filesystem
 let mut buf = Vec::new();
-let (metadata, _) = get(&ctx, "note.txt", &mut buf, true)?;
+let (metadata, _) = get_stream(&ctx, "note.txt", &mut buf, true)?;
 ```
 
-Every CLI command has a corresponding library function. Two shapes:
-
-- **Plain** — `get`, `put`, `head`, `delete`, `encrypt`, `decrypt`, `init`, `list_proposals`, `accept_proposal`, `reject_proposal`. Take/return values, read/write streams.
-- **`_io`** — `get_io`, `put_io`, `head_io`, `encrypt_io`, `decrypt_io`, `chmod_io`, `sync_io`, `track_io`, `init_io`, `list_proposals_io`. CLI shape: optional file paths, stdio fallbacks.
+Every CLI command has a corresponding library function. Most take file paths and use stdin/stdout when absent, writing metadata to `user.ark.*` xattrs as a side effect. For `encrypt`, `decrypt`, `get`, and `put`, a `_stream` variant (`encrypt_stream`, `decrypt_stream`, `get_stream`, `put_stream`) exposes the same operation over `Read`/`Write` streams and returns values instead of touching the filesystem.
 
 ---
 

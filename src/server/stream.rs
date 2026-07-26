@@ -1,4 +1,5 @@
-use std::io::Write;
+use std::fs;
+use std::io::{self, Write};
 use std::path::Path;
 use std::time::Duration;
 
@@ -9,7 +10,7 @@ use crate::util::{io_err, now};
 
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
-pub fn serve_stream(fs_path: &Path, stream: &mut dyn Write) -> std::io::Result<()> {
+pub fn serve_stream(fs_path: &Path, stream: &mut dyn Write) -> io::Result<()> {
     write_stream_start(stream)?;
 
     watch_local(fs_path, |event| {
@@ -22,10 +23,10 @@ pub fn serve_stream(fs_path: &Path, stream: &mut dyn Write) -> std::io::Result<(
     }, Some(KEEPALIVE_INTERVAL))
 }
 
-fn write_event(stream: &mut dyn Write, root: &Path, path: &Path, name: &str, kind: Option<&DirectoryEntryKind>) -> std::io::Result<()> {
+fn write_event(stream: &mut dyn Write, root: &Path, path: &Path, name: &str, kind: Option<&DirectoryEntryKind>) -> io::Result<()> {
     let kind = match kind {
         Some(k) => k.clone(),
-        None => std::fs::metadata(path)
+        None => fs::metadata(path)
             .map(|m| if m.is_dir() { DirectoryEntryKind::Dir } else { DirectoryEntryKind::File })
             .unwrap_or(DirectoryEntryKind::File),
     };

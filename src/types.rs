@@ -70,7 +70,7 @@ pub struct LocalMetadata {
     /// Hash of the last-synced plaintext body. Absent = do not sync.
     pub sync_body_hash: Option<Hash>,
     /// `Metadata.modified` at the last successful sync. Baseline for detecting
-    /// local metadata drift (e.g. `chmod_io` since last sync).
+    /// local metadata drift (e.g. `chmod` since last sync).
     pub sync_modified: Option<String>,
 }
 

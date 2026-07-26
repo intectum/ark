@@ -1,5 +1,4 @@
 use std::io;
-use std::io::Write;
 
 use crate::client::request;
 use crate::types::{IdentityContext, Metadata};
@@ -26,18 +25,6 @@ pub fn head(ctx: &IdentityContext, path: &str) -> io::Result<(Vec<(String, Strin
     verify_metadata_signature(&modifier_identity.public_key, &metadata)?;
 
     Ok((headers, metadata))
-}
-
-/// [`head`] wrapper that prints every response header to stdout, one per line.
-pub fn head_io(ctx: &IdentityContext, path: &str) -> io::Result<()> {
-    let (headers, _) = head(ctx, path)?;
-
-    let mut stdout = io::stdout().lock();
-    for (name, value) in &headers {
-        writeln!(stdout, "{}: {}", name, value)?;
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -93,25 +80,16 @@ mod tests {
     }
 
     #[test]
-    fn head_io_succeeds_against_real_server() {
-        in_test_dir("ark_head_test", |temp_dir| {
-            let port = start_test_server(temp_dir.to_path_buf());
-            let address = format!("gyan@127.0.0.1:{}", port);
-            let ctx = init_with_server(temp_dir, &address);
-            write_plain_test_file(&temp_dir.join("ark/gyan/x"), &ctx.identity, ctx.identity_key.as_ref().unwrap(), b"abc");
-
-            head_io(&ctx, "x").unwrap();
-        });
-    }
-
-    #[test]
-    fn head_io_missing_file_errors() {
+    fn head_missing_file_errors() {
         in_test_dir("ark_head_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &address);
 
-            let err = head_io(&ctx, "nope").unwrap_err();
+            let err = match head(&ctx, "nope") {
+                Ok(_) => panic!("expected error"),
+                Err(e) => e,
+            };
             assert!(err.to_string().contains("HTTP 404"), "msg was {}", err);
         });
     }

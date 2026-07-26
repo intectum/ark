@@ -9,8 +9,7 @@
 //!
 //! # Entrypoints
 //!
-//! - [`client`] — `get`, `put`, `head`, `delete`, `chmod_io`, `encrypt`,
-//!   `decrypt`, `track_io`, `sync_io`, `init`, `init_io`, low-level `request`.
+//! - [`client`] — file, membership, and sync operations.
 //! - [`server`] — [`server::start_server`] runs a listener on the current
 //!   working directory.
 //! - [`context`] — build the [`types::IdentityContext`] passed to every client
@@ -18,12 +17,13 @@
 //!
 //! # Function shapes
 //!
-//! Most client operations come in two forms. Plain (`get`, `put`, `head`,
-//! `encrypt`, `decrypt`) operate on [`std::io::Read`]/[`std::io::Write`]
-//! streams and return values. The `_io` variants (`get_io`, `put_io`,
-//! `head_io`, `encrypt_io`, `decrypt_io`, `chmod_io`, `sync_io`, `track_io`)
-//! wrap the CLI shape: optional file paths, stdio fallbacks, xattr side
-//! effects, printed output.
+//! Most [`client`] operations take file paths and use stdin/stdout when a path
+//! is absent, writing metadata to `user.ark.*` xattrs as a side effect.
+//!
+//! For `encrypt`, `decrypt`, `get`, and `put`, a `_stream` variant
+//! (`encrypt_stream`, `decrypt_stream`, `get_stream`, `put_stream`) exposes the
+//! same operation over [`std::io::Read`]/[`std::io::Write`] streams and returns
+//! values instead of touching the filesystem.
 
 pub mod client;
 pub mod context;

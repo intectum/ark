@@ -193,6 +193,7 @@ pub mod test {
     use std::env;
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::process;
     use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -211,7 +212,7 @@ pub mod test {
         let prev = env::current_dir().unwrap_or_else(|_| env::temp_dir());
 
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let dir = env::temp_dir().join(format!("{}_{}_{}", prefix, std::process::id(), nanos));
+        let dir = env::temp_dir().join(format!("{}_{}_{}", prefix, process::id(), nanos));
         fs::create_dir_all(&dir).unwrap();
 
         struct Cleanup(PathBuf, PathBuf);

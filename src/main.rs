@@ -1,10 +1,15 @@
 use std::env;
+use std::env::current_dir;
+use std::io::{self, Write};
+use std::process::exit;
 
 use clap::{Parser, Subcommand};
 
-use ark::client::{accept_proposal, chmod_io, decrypt_io, delete, encrypt_io, get_io, head_io, init_io, list_proposals_io, put_io, reject_proposal, sync_io, track_io};
+use ark::client::{accept_proposal, chmod, decrypt, delete, encrypt, get, head, init, list_proposals, put, reject_proposal, sync};
 use ark::context::create_client_context;
+use ark::identity::parse_address;
 use ark::server::start_server;
+use ark::types::IdentityContext;
 
 #[derive(Parser)]
 #[command(
@@ -62,23 +67,34 @@ enum Cmd {
     /// With --password, on first init encrypts and uploads identity.key
     /// gated by a password identity; on subsequent inits from another machine,
     /// recovers identity.key using the password.
+    ///
+    /// With --local-only, skips the network entirely: generates a keypair and
+    /// writes it locally without contacting the server.
     Init {
         /// Address in the form <name>@<host>[:<port>].
         address: String,
         /// Password to gate remote access to the identity key.
         #[arg(short, long)]
         password: Option<String>,
+        /// Skip network calls; only write local identity files.
+        #[arg(long)]
+        local_only: bool,
     },
     /// Print response headers (HEAD request).
     Head {
         /// Ark URL or path.
         path: String,
     },
-    /// Change members and permissions on a local file. Use `put` to sync.
+    /// Change members and permissions on a local file, uploading the result.
+    ///
+    /// If the file has no ark metadata yet, seeds fresh metadata with the
+    /// current account as sole owner before applying member changes.
+    /// `--encryption-algorithm` is only honored when seeding.
     ///
     /// For encrypted files, adding a member grants them access immediately.
     /// Removing a member does NOT rotate the file key — the next `put` will.
-    /// Follow `chmod` with `ark put -i <FILE> <PATH>` to upload the change.
+    /// By default the change is uploaded; pass `--local-only` to skip the
+    /// upload (a later `put` or `sync` will propagate).
     Chmod {
         /// Grant `owner` (repeatable). Use "public" for wildcard `*`.
         #[arg(short = 'o', long = "owner", value_name = "ADDR")]
@@ -92,7 +108,14 @@ enum Cmd {
         /// Drop a member (repeatable).
         #[arg(short = 'd', long = "drop", value_name = "ADDR")]
         drop: Vec<String>,
-        /// Local file path.
+        /// Encryption algorithm when seeding fresh metadata; use "none" for
+        /// plaintext. Files only. Default: aes-256-gcm.
+        #[arg(short, long, value_name = "NAME")]
+        encryption_algorithm: Option<String>,
+        /// Only update local xattrs; skip the upload.
+        #[arg(long)]
+        local_only: bool,
+        /// Local file or directory path.
         file: String,
     },
     /// Delete a file or directory.
@@ -141,16 +164,6 @@ enum Cmd {
         /// Decrypt pulled files using their metadata key.
         #[arg(short, long)]
         decrypt: bool,
-    },
-    /// Seed ark metadata on a local file or directory so `sync` picks it up.
-    ///
-    /// Errors if the path is already tracked.
-    Track {
-        /// Encryption algorithm; use "none" for plaintext. Files only.
-        #[arg(short, long, value_name = "NAME")]
-        encryption_algorithm: Option<String>,
-        /// Local file or directory path.
-        path: String,
     },
     /// Decrypt an encrypted file.
     ///
@@ -211,7 +224,7 @@ enum Cmd {
 fn main() {
     let _ = dotenvy::dotenv();
     let cli = Cli::parse();
-    let result: std::io::Result<()> = match cli.cmd {
+    let result: io::Result<()> = match cli.cmd {
         Cmd::Server { port, host } => {
             let resolved_host = host
                 .or_else(|| env::var("HOST").ok())
@@ -219,28 +232,64 @@ fn main() {
             start_server(port, &resolved_host);
             Ok(())
         },
-        Cmd::Init { address, password } => init_io(&address, password.as_deref()),
-        Cmd::Chmod { owner, writer, reader, drop, file } => create_client_context().and_then(|c| chmod_io(&c, &file, &owner, &writer, &reader, &drop)),
-        Cmd::Head { path } => create_client_context().and_then(|c| head_io(&c, &path)),
+        Cmd::Init { address, password, local_only } => current_dir().and_then(|c| init(&c, &address, password.as_deref(), local_only)),
+        Cmd::Chmod { owner, writer, reader, drop, encryption_algorithm, local_only, file } => create_client_context().and_then(|c| chmod(&c, &file, &owner, &writer, &reader, &drop, local_only, encryption_algorithm.as_deref())),
+        Cmd::Head { path } => create_client_context().and_then(|c| head_cli(&c, &path)),
         Cmd::Delete { path } => create_client_context().and_then(|c| delete(&c, &path)),
-        Cmd::Get { output, decrypt, path } => create_client_context().and_then(|c| get_io(&c, &path, output.as_deref(), decrypt)),
+        Cmd::Get { output, decrypt, path } => create_client_context().and_then(|c| get(&c, &path, output.as_deref(), decrypt)),
         Cmd::Proposals { cmd } => create_client_context().and_then(|c| match cmd {
-            ProposalsCmd::List => list_proposals_io(&c),
+            ProposalsCmd::List => list_proposals_cli(&c),
             ProposalsCmd::Accept { id, force } => accept_proposal(&c, &id, force),
             ProposalsCmd::Reject { id } => reject_proposal(&c, &id),
         }),
-        Cmd::Put { input, encryption_algorithm, path } => create_client_context().and_then(|c| put_io(&c, &path, input.as_deref(), encryption_algorithm.as_deref())),
-        Cmd::Sync { watch, decrypt } => create_client_context().and_then(|c| sync_io(&c, watch, decrypt)),
-        Cmd::Track { encryption_algorithm, path } => create_client_context().and_then(|c| track_io(&c, &path, encryption_algorithm.as_deref())),
+        Cmd::Put { input, encryption_algorithm, path } => create_client_context().and_then(|c| put(&c, &path, input.as_deref(), encryption_algorithm.as_deref())),
+        Cmd::Sync { watch, decrypt } => create_client_context().and_then(|c| current_dir().and_then(|d| sync(&c, &d, watch, decrypt))),
         Cmd::Decrypt { input, output, in_place, key, encryption_algorithm } => {
-            create_client_context().and_then(|c| decrypt_io(&c, input.as_deref(), output.as_deref(), in_place.as_deref(), key.as_deref(), encryption_algorithm.as_deref()))
+            create_client_context().and_then(|c| decrypt(&c, input.as_deref(), output.as_deref(), in_place.as_deref(), key.as_deref(), encryption_algorithm.as_deref()))
         }
         Cmd::Encrypt { input, output, in_place, key, encryption_algorithm } => {
-            create_client_context().and_then(|c| encrypt_io(&c, input.as_deref(), output.as_deref(), in_place.as_deref(), key.as_deref(), encryption_algorithm.as_deref()))
+            create_client_context().and_then(|c| encrypt(&c, input.as_deref(), output.as_deref(), in_place.as_deref(), key.as_deref(), encryption_algorithm.as_deref()))
         }
     };
     if let Err(e) = result {
         eprintln!("error: {}", e);
-        std::process::exit(1);
+        exit(1);
     }
+}
+
+fn head_cli(ctx: &IdentityContext, path: &str) -> io::Result<()> {
+    let (headers, _) = head(ctx, path)?;
+
+    let mut stdout = io::stdout().lock();
+    for (name, value) in &headers {
+        writeln!(stdout, "{}: {}", name, value)?;
+    }
+
+    Ok(())
+}
+
+fn list_proposals_cli(ctx: &IdentityContext) -> io::Result<()> {
+    let proposals = list_proposals(ctx)?;
+    if proposals.is_empty() {
+        println!("No pending proposals.");
+        return Ok(());
+    }
+
+    let (account_name, _, _) = parse_address(&ctx.identity.address)?;
+    let account_prefix = format!("/ark/{}", account_name);
+
+    for (index, proposal) in proposals.iter().enumerate() {
+        let kind = proposal.metadata.body_hash.as_ref().map(|_| "file").unwrap_or("dir");
+        let display_target = match proposal.target.strip_prefix(&account_prefix) {
+            Some("") => "/",
+            Some(rest) => rest,
+            None => &proposal.target,
+        };
+        println!("{:>3}  {}  {}  {}  ({})", index + 1, proposal.metadata.modified_by, kind, display_target, proposal.id);
+        for member in &proposal.metadata.members {
+            println!("       {} = {}", member.address, member.permission.as_str());
+        }
+    }
+
+    Ok(())
 }

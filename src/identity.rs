@@ -189,6 +189,8 @@ fn is_valid_account_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::env::set_current_dir;
+
     use super::*;
     use crate::client::init_local;
     use crate::context::create_client_context;
@@ -372,7 +374,7 @@ mod tests {
             let (_, _, bob_dir) = create_test_account(temp_dir, &peer_address);
             let expected = read_identity(&bob_dir.join(".ark/identity.json")).unwrap();
 
-            std::env::set_current_dir(&account_dir).unwrap();
+            set_current_dir(&account_dir).unwrap();
             let ctx = create_client_context().unwrap();
             let fetched = resolve_identity(&ctx, &peer_address).unwrap();
 
@@ -411,7 +413,7 @@ mod tests {
             write_metadata_attributes(&bob_identity_path, &meta).unwrap();
             let expected = read_identity(&bob_identity_path).unwrap();
 
-            std::env::set_current_dir(&alice_dir).unwrap();
+            set_current_dir(&alice_dir).unwrap();
             let ctx = create_client_context().unwrap();
             let fetched = resolve_identity(&ctx, &bob_address).unwrap();
 

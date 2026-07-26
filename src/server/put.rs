@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::Path;
 
 use crate::http::write_text;
@@ -12,7 +12,7 @@ pub fn serve_put_init(
     metadata: &Metadata,
     body: &[u8],
     target_path: &Path,
-) -> std::io::Result<()> {
+) -> io::Result<()> {
     let body_identity: Identity = match serde_json::from_slice(body) {
         Ok(i) => i,
         Err(e) => return write_text(stream, 400, format!("identity json: {}", e).as_bytes()),
@@ -25,7 +25,7 @@ pub fn serve_put_init(
     serve_put(target_path, stream, body, metadata, &body_identity, None, Permission::Owner)
 }
 
-pub fn serve_put(fs_path: &Path, stream: &mut dyn Write, body: &[u8], metadata: &Metadata, modifier_identity: &Identity, existing_metadata: Option<&Metadata>, permission: Permission) -> std::io::Result<()> {
+pub fn serve_put(fs_path: &Path, stream: &mut dyn Write, body: &[u8], metadata: &Metadata, modifier_identity: &Identity, existing_metadata: Option<&Metadata>, permission: Permission) -> io::Result<()> {
     let is_dir = metadata.body_hash.is_none();
 
     if is_dir {
@@ -79,6 +79,7 @@ mod tests {
     use crate::util::now;
     use crate::util::test::{TEST_ADDRESS, create_encrypted_test_metadata, create_plain_test_metadata, create_test_account, in_test_dir, write_plain_test_file};
     use std::fs;
+    use std::os::unix::fs::symlink;
 
     #[test]
     fn put_new_file_returns_201() {
@@ -126,7 +127,7 @@ mod tests {
             let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
             let target = account_dir.join("real.txt");
             write_plain_test_file(&target, &identity, &secret_key, b"original");
-            std::os::unix::fs::symlink(&target, account_dir.join("link")).unwrap();
+            symlink(&target, account_dir.join("link")).unwrap();
             let port = start_test_server(temp_dir.to_path_buf());
             let (code, _, _) = signed_put_with_default_metadata(port, &identity, &secret_key, "/ark/test/link", b"clobber");
             assert_eq!(code, 403);
@@ -385,7 +386,7 @@ mod tests {
             assert_eq!(code, 201);
             let dir = temp_dir.join("ark/test/notes");
             assert!(dir.is_dir());
-            let back = crate::metadata::read_metadata_attributes(&dir).unwrap();
+            let back = read_metadata_attributes(&dir).unwrap();
             assert_eq!(back.id, meta.id);
         });
     }

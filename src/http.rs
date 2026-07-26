@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader, Read, Result, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 
 use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
 use url::Url;
@@ -8,7 +8,7 @@ use crate::util::io_err;
 
 const PATH_ENCODE_SET: &AsciiSet = &CONTROLS.add(b' ').add(b'"').add(b'#').add(b'<').add(b'>').add(b'?').add(b'`').add(b'{').add(b'}');
 
-pub fn read_request(stream: &mut dyn Read, skip_body: bool) -> Result<(String, String, Vec<(String, String)>, Vec<u8>)> {
+pub fn read_request(stream: &mut dyn Read, skip_body: bool) -> io::Result<(String, String, Vec<(String, String)>, Vec<u8>)> {
     let (first_line, headers, body) = read_message(stream, skip_body)?;
 
     let request_line_parts: Vec<&str> = first_line.trim_end().split_whitespace().collect();
@@ -26,7 +26,7 @@ pub fn read_request(stream: &mut dyn Read, skip_body: bool) -> Result<(String, S
     Ok((method, target, headers, body))
 }
 
-pub fn write_request(stream: &mut dyn Write, url: &Url, method: &str, headers: &[(&str, &str)], body: &[u8]) -> Result<()> {
+pub fn write_request(stream: &mut dyn Write, url: &Url, method: &str, headers: &[(&str, &str)], body: &[u8]) -> io::Result<()> {
     let host = url.host_str().ok_or_else(|| io_err("URL missing host"))?;
     let request_line = format!("{} {} HTTP/1.1\r\n", method, utf8_percent_encode(url.path(), PATH_ENCODE_SET));
 
@@ -41,7 +41,7 @@ pub fn write_request(stream: &mut dyn Write, url: &Url, method: &str, headers: &
     write_message(stream, &request_line, &final_headers, body)
 }
 
-pub fn read_response(stream: &mut dyn Read, skip_body: bool) -> Result<(u16, Vec<(String, String)>, Vec<u8>)> {
+pub fn read_response(stream: &mut dyn Read, skip_body: bool) -> io::Result<(u16, Vec<(String, String)>, Vec<u8>)> {
     let (first_line, headers, body) = read_message(stream, skip_body)?;
 
     let code: u16 = first_line
@@ -54,17 +54,17 @@ pub fn read_response(stream: &mut dyn Read, skip_body: bool) -> Result<(u16, Vec
     Ok((code, headers, body))
 }
 
-pub fn write_response(stream: &mut dyn Write, status_code: u16, headers: &[(&str, &str)], body: &[u8]) -> Result<()> {
+pub fn write_response(stream: &mut dyn Write, status_code: u16, headers: &[(&str, &str)], body: &[u8]) -> io::Result<()> {
     let status_line = format!("HTTP/1.1 {} {}\r\n", status_code, status_msg(status_code));
 
     write_message(stream, &status_line, headers, body)
 }
 
-pub fn write_text(stream: &mut dyn Write, status_code: u16, body: &[u8]) -> Result<()> {
+pub fn write_text(stream: &mut dyn Write, status_code: u16, body: &[u8]) -> io::Result<()> {
     write_response(stream, status_code, &[("Content-Type", "text/plain"), ("Connection", "close")], body)
 }
 
-pub fn write_stream_start(stream: &mut dyn Write) -> std::io::Result<()> {
+pub fn write_stream_start(stream: &mut dyn Write) -> io::Result<()> {
     stream.write_all(b"HTTP/1.1 200 OK\r\n")?;
     stream.write_all(b"Content-Type: text/event-stream\r\n")?;
     stream.write_all(b"Cache-Control: no-cache\r\n")?;
@@ -74,9 +74,9 @@ pub fn write_stream_start(stream: &mut dyn Write) -> std::io::Result<()> {
     stream.flush()
 }
 
-pub fn read_stream_events<F>(stream: &mut dyn Read, on_event: &mut F) -> std::io::Result<()>
+pub fn read_stream_events<F>(stream: &mut dyn Read, on_event: &mut F) -> io::Result<()>
 where
-    F: FnMut(&StreamEvent) -> std::io::Result<()>,
+    F: FnMut(&StreamEvent) -> io::Result<()>,
 {
     let mut reader = BufReader::new(stream);
 
@@ -133,17 +133,17 @@ where
     }
 }
 
-pub fn write_stream_event(stream: &mut dyn Write, id: &str, event: &str, data: &str) -> std::io::Result<()> {
+pub fn write_stream_event(stream: &mut dyn Write, id: &str, event: &str, data: &str) -> io::Result<()> {
     write!(stream, "id: {}\nevent: {}\ndata: {}\n\n", id, event, data)?;
     stream.flush()
 }
 
-pub fn write_stream_keepalive(stream: &mut dyn Write) -> std::io::Result<()> {
+pub fn write_stream_keepalive(stream: &mut dyn Write) -> io::Result<()> {
     stream.write_all(b": keepalive\n\n")?;
     stream.flush()
 }
 
-fn read_message(stream: &mut dyn Read, skip_body: bool) -> Result<(String, Vec<(String, String)>, Vec<u8>)> {
+fn read_message(stream: &mut dyn Read, skip_body: bool) -> io::Result<(String, Vec<(String, String)>, Vec<u8>)> {
     let mut reader = BufReader::new(stream);
 
     let mut first_line = String::new();
@@ -184,7 +184,7 @@ fn read_message(stream: &mut dyn Read, skip_body: bool) -> Result<(String, Vec<(
     Ok((first_line, headers, body))
 }
 
-pub fn write_message(stream: &mut dyn Write, first_line: &str, headers: &[(&str, &str)], body: &[u8]) -> Result<()> {
+pub fn write_message(stream: &mut dyn Write, first_line: &str, headers: &[(&str, &str)], body: &[u8]) -> io::Result<()> {
     stream.write_all(first_line.as_bytes())?;
 
     let mut final_headers = headers.to_vec();

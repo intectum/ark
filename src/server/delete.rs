@@ -1,10 +1,10 @@
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::Path;
 
 use crate::http::write_text;
 
-pub fn serve_delete(fs_path: &Path, stream: &mut dyn Write) -> std::io::Result<()> {
+pub fn serve_delete(fs_path: &Path, stream: &mut dyn Write) -> io::Result<()> {
     let fs_metadata = match fs::metadata(fs_path) {
         Ok(m) => m,
         Err(_) => return write_text(stream, 404, b"not found"),
@@ -29,6 +29,7 @@ mod tests {
     use crate::types::{Member, Permission};
     use crate::util::test::{TEST_ADDRESS, create_test_account, in_test_dir, write_plain_test_file};
     use std::fs;
+    use std::os::unix::fs::symlink;
 
     #[test]
     fn delete_file_removes_and_returns_204() {
@@ -75,7 +76,7 @@ mod tests {
             let target = account_dir.join("real.txt");
             write_plain_test_file(&target, &identity, &secret_key, b"keep");
             let link = account_dir.join("link");
-            std::os::unix::fs::symlink(&target, &link).unwrap();
+            symlink(&target, &link).unwrap();
             let port = start_test_server(temp_dir.to_path_buf());
             let (code, _, _) = signed_request(port, &identity, &secret_key, "DELETE", "/ark/test/link", &[]);
             assert_eq!(code, 403);

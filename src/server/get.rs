@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::Path;
 
 use crate::http::{write_response, write_text};
@@ -7,7 +7,7 @@ use crate::metadata::{read_metadata_attributes, write_metadata_headers};
 use crate::types::{DirectoryEntry, DirectoryEntryKind};
 use crate::util::io_err;
 
-pub fn serve_get(fs_path: &Path, stream: &mut dyn Write, send_body: bool) -> std::io::Result<()> {
+pub fn serve_get(fs_path: &Path, stream: &mut dyn Write, send_body: bool) -> io::Result<()> {
     let fs_metadata = match fs::metadata(fs_path) {
         Ok(m) => m,
         Err(_) => return write_text(stream, 404, b"not found"),
@@ -41,13 +41,13 @@ pub fn serve_get(fs_path: &Path, stream: &mut dyn Write, send_body: bool) -> std
     write_response(stream, 200, &headers, &[])?;
     if send_body {
         let mut file = fs::File::open(fs_path)?;
-        std::io::copy(&mut file, stream)?;
+        io::copy(&mut file, stream)?;
     }
 
     Ok(())
 }
 
-fn list_dir(path: &Path) -> std::io::Result<String> {
+fn list_dir(path: &Path) -> io::Result<String> {
     let mut entries: Vec<_> = fs::read_dir(path)?.filter_map(|e| e.ok()).collect();
     entries.sort_by_key(|e| e.file_name());
     let items: Vec<DirectoryEntry> = entries
@@ -62,7 +62,7 @@ fn list_dir(path: &Path) -> std::io::Result<String> {
                 name: e.file_name().to_string_lossy().into_owned(),
             })
         })
-        .collect::<std::io::Result<_>>()?;
+        .collect::<io::Result<_>>()?;
     serde_json::to_string(&items).map_err(|e| io_err(&e.to_string()))
 }
 
@@ -90,6 +90,7 @@ mod tests {
     use crate::types::{DirectoryEntry, DirectoryEntryKind, Member, Permission};
     use crate::util::test::{TEST_ADDRESS, create_test_account, in_test_dir, write_encrypted_test_file, write_plain_test_file};
     use std::fs;
+    use std::os::unix::fs::symlink;
 
     #[test]
     fn get_file_returns_content() {
@@ -153,7 +154,7 @@ mod tests {
             let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
             let target = account_dir.join("real.txt");
             fs::write(&target, b"hi").unwrap();
-            std::os::unix::fs::symlink(&target, account_dir.join("link")).unwrap();
+            symlink(&target, account_dir.join("link")).unwrap();
             let port = start_test_server(temp_dir.to_path_buf());
             let (code, body, _) = signed_request(port, &identity, &secret_key, "GET", "/ark/test/", &[]);
             assert_eq!(code, 200);
@@ -222,7 +223,7 @@ mod tests {
             let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
             let target = account_dir.join("real.txt");
             write_plain_test_file(&target, &identity, &secret_key, b"secret");
-            std::os::unix::fs::symlink(&target, account_dir.join("link")).unwrap();
+            symlink(&target, account_dir.join("link")).unwrap();
             let port = start_test_server(temp_dir.to_path_buf());
             let (code, _, _) = signed_request(port, &identity, &secret_key, "GET", "/ark/test/link", &[]);
             assert_eq!(code, 403);
@@ -236,7 +237,7 @@ mod tests {
             let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
             let target = account_dir.join("real.txt");
             write_plain_test_file(&target, &identity, &secret_key, b"secret");
-            std::os::unix::fs::symlink(&target, account_dir.join("link")).unwrap();
+            symlink(&target, account_dir.join("link")).unwrap();
             let port = start_test_server(temp_dir.to_path_buf());
             let (code, _, _) = signed_request(port, &identity, &secret_key, "HEAD", "/ark/test/link", &[]);
             assert_eq!(code, 403);

@@ -1,9 +1,6 @@
 use std::io;
 
-use crate::client::delete::delete;
-use crate::client::get::get;
-use crate::client::head::head;
-use crate::client::request::request;
+use super::{delete, get_stream, head, request};
 use crate::identity::parse_address;
 use crate::metadata::{get_member, read_metadata_headers, write_metadata_headers};
 use crate::types::{DirectoryEntry, IdentityContext, Metadata, Permission, Proposal};
@@ -34,7 +31,7 @@ pub fn list_proposals(ctx: &IdentityContext) -> io::Result<Vec<Proposal>> {
 
         let entry_path = format!("/.ark/requests/{}", entry.name);
         let mut entry_body: Vec<u8> = Vec::new();
-        if get(ctx, &entry_path, &mut entry_body, false).is_err() {
+        if get_stream(ctx, &entry_path, &mut entry_body, false).is_err() {
             continue;
         }
 
@@ -46,35 +43,6 @@ pub fn list_proposals(ctx: &IdentityContext) -> io::Result<Vec<Proposal>> {
     proposals.sort_by(|a, b| a.id.cmp(&b.id));
 
     Ok(proposals)
-}
-
-/// CLI wrapper for [`list_proposals`]. Prints each proposal with its index,
-/// modifier address, target kind (`file` or `dir`), target path, log entry id,
-/// and proposed member list.
-pub fn list_proposals_io(ctx: &IdentityContext) -> io::Result<()> {
-    let proposals = list_proposals(ctx)?;
-    if proposals.is_empty() {
-        println!("No pending proposals.");
-        return Ok(());
-    }
-
-    let (account_name, _, _) = parse_address(&ctx.identity.address)?;
-    let account_prefix = format!("/ark/{}", account_name);
-
-    for (index, proposal) in proposals.iter().enumerate() {
-        let kind = proposal.metadata.body_hash.as_ref().map(|_| "file").unwrap_or("dir");
-        let display_target = match proposal.target.strip_prefix(&account_prefix) {
-            Some("") => "/",
-            Some(rest) => rest,
-            None => &proposal.target,
-        };
-        println!("{:>3}  {}  {}  {}  ({})", index + 1, proposal.metadata.modified_by, kind, display_target, proposal.id);
-        for member in &proposal.metadata.members {
-            println!("       {} = {}", member.address, member.permission.as_str());
-        }
-    }
-
-    Ok(())
 }
 
 /// Accept a share proposal. `index_or_id`: 1-based index (from
@@ -92,7 +60,7 @@ pub fn accept_proposal(ctx: &IdentityContext, index_or_id: &str, force: bool) ->
     let id = resolve_id(ctx, index_or_id)?;
     let entry_path = format!("/.ark/requests/{}", id);
     let mut entry_body: Vec<u8> = Vec::new();
-    get(ctx, &entry_path, &mut entry_body, false)?;
+    get_stream(ctx, &entry_path, &mut entry_body, false)?;
     let proposal = parse_proposal(&id, &entry_body)
         .ok_or_else(|| io_invalid_input("entry is not a valid proposal"))?;
 
@@ -114,7 +82,7 @@ pub fn accept_proposal(ctx: &IdentityContext, index_or_id: &str, force: bool) ->
         (metadata, Vec::new())
     } else {
         let mut buf: Vec<u8> = Vec::new();
-        let (metadata, _) = get(ctx, &modifier_path, &mut buf, false)?;
+        let (metadata, _) = get_stream(ctx, &modifier_path, &mut buf, false)?;
         let expected_hash = metadata.body_hash.as_ref()
             .ok_or_else(|| io_err("file metadata missing body_hash"))?;
         if sha256(&buf) != expected_hash.value {
@@ -237,11 +205,14 @@ fn check_member_changes(proposal: &Metadata, current: &Metadata, self_address: &
 
 #[cfg(test)]
 mod tests {
-    use std::env;
-    use std::path::Path;
+    use std::env::{current_dir, set_current_dir};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::thread::sleep;
+    use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::client::{init_io, put_io};
+    use crate::client::{init, put};
     use crate::context::create_client_context;
     use crate::server::start_test_server;
     use crate::util::test::in_test_dir;
@@ -249,23 +220,23 @@ mod tests {
     fn setup(temp_dir: &Path, port: u16) -> (IdentityContext, IdentityContext) {
         let alice_dir = temp_dir.join("alice_client");
         let bob_dir = temp_dir.join("bob_client");
-        std::fs::create_dir_all(&alice_dir).unwrap();
-        std::fs::create_dir_all(&bob_dir).unwrap();
+        fs::create_dir_all(&alice_dir).unwrap();
+        fs::create_dir_all(&bob_dir).unwrap();
 
-        env::set_current_dir(&alice_dir).unwrap();
-        init_io(&format!("alice@127.0.0.1:{}", port), None).unwrap();
+        set_current_dir(&alice_dir).unwrap();
+        init(&current_dir().unwrap(), &format!("alice@127.0.0.1:{}", port), None, false).unwrap();
         let alice_ctx = create_client_context().unwrap();
 
-        env::set_current_dir(&bob_dir).unwrap();
-        init_io(&format!("bob@127.0.0.1:{}", port), None).unwrap();
+        set_current_dir(&bob_dir).unwrap();
+        init(&current_dir().unwrap(), &format!("bob@127.0.0.1:{}", port), None, false).unwrap();
         let bob_ctx = create_client_context().unwrap();
 
         (alice_ctx, bob_ctx)
     }
 
-    fn write_payload(dir: &Path, name: &str, body: &[u8]) -> std::path::PathBuf {
+    fn write_payload(dir: &Path, name: &str, body: &[u8]) -> PathBuf {
         let p = dir.join(name);
-        std::fs::write(&p, body).unwrap();
+        fs::write(&p, body).unwrap();
         p
     }
 
@@ -275,12 +246,12 @@ mod tests {
             let port = start_test_server(temp_dir.to_path_buf());
             let (_alice_ctx, bob_ctx) = setup(temp_dir, port);
 
-            env::set_current_dir(temp_dir.join("bob_client")).unwrap();
+            set_current_dir(temp_dir.join("bob_client")).unwrap();
             let payload = write_payload(&temp_dir.join("bob_client"), "payload.bin", b"hello");
             let target = format!("alice@127.0.0.1:{}/apps/notes/foo.md", port);
-            let _ = put_io(&bob_ctx, &target, Some(payload.to_str().unwrap()), Some("none"));
+            let _ = put(&bob_ctx, &target, Some(payload.to_str().unwrap()), Some("none"));
 
-            env::set_current_dir(temp_dir.join("alice_client")).unwrap();
+            set_current_dir(temp_dir.join("alice_client")).unwrap();
             let alice_ctx = create_client_context().unwrap();
             let proposals = list_proposals(&alice_ctx).unwrap();
 
@@ -296,12 +267,12 @@ mod tests {
             let port = start_test_server(temp_dir.to_path_buf());
             let (_alice_ctx, bob_ctx) = setup(temp_dir, port);
 
-            env::set_current_dir(temp_dir.join("bob_client")).unwrap();
+            set_current_dir(temp_dir.join("bob_client")).unwrap();
             let payload = write_payload(&temp_dir.join("bob_client"), "payload.bin", b"hello");
             let target = format!("alice@127.0.0.1:{}/apps/notes/foo.md", port);
-            let _ = put_io(&bob_ctx, &target, Some(payload.to_str().unwrap()), Some("none"));
+            let _ = put(&bob_ctx, &target, Some(payload.to_str().unwrap()), Some("none"));
 
-            env::set_current_dir(temp_dir.join("alice_client")).unwrap();
+            set_current_dir(temp_dir.join("alice_client")).unwrap();
             let alice_ctx = create_client_context().unwrap();
             let proposals = list_proposals(&alice_ctx).unwrap();
             assert_eq!(proposals.len(), 1);
@@ -314,28 +285,28 @@ mod tests {
 
     #[test]
     fn accept_proposal_creates_dir_and_pulls_file() {
-        use crate::client::chmod_io;
+        use crate::client::chmod;
 
         in_test_dir("ark_proposals_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let (_alice_ctx, bob_ctx) = setup(temp_dir, port);
 
-            env::set_current_dir(temp_dir.join("bob_client")).unwrap();
+            set_current_dir(temp_dir.join("bob_client")).unwrap();
             let payload = write_payload(&temp_dir.join("bob_client"), "payload.bin", b"hello alice");
-            put_io(&bob_ctx, "apps/notes/foo.md", Some(payload.to_str().unwrap()), Some("none")).unwrap();
+            put(&bob_ctx, "apps/notes/foo.md", Some(payload.to_str().unwrap()), Some("none")).unwrap();
 
             let alice_addr = format!("alice@127.0.0.1:{}", port);
-            chmod_io(&bob_ctx, payload.to_str().unwrap(), &[], &[], &[alice_addr.clone()], &[]).unwrap();
-            put_io(&bob_ctx, "apps/notes/foo.md", Some(payload.to_str().unwrap()), Some("none")).unwrap();
+            chmod(&bob_ctx, payload.to_str().unwrap(), &[], &[], &[alice_addr.clone()], &[], true, None).unwrap();
+            put(&bob_ctx, "apps/notes/foo.md", Some(payload.to_str().unwrap()), Some("none")).unwrap();
 
-            env::set_current_dir(temp_dir.join("alice_client")).unwrap();
+            set_current_dir(temp_dir.join("alice_client")).unwrap();
             let alice_ctx = create_client_context().unwrap();
 
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let deadline = Instant::now() + Duration::from_secs(5);
             let proposals = loop {
                 let p = list_proposals(&alice_ctx).unwrap();
-                if !p.is_empty() || std::time::Instant::now() >= deadline { break p; }
-                std::thread::sleep(std::time::Duration::from_millis(20));
+                if !p.is_empty() || Instant::now() >= deadline { break p; }
+                sleep(Duration::from_millis(20));
             };
             assert_eq!(proposals.len(), 1, "expected one proposal");
 
@@ -343,7 +314,7 @@ mod tests {
 
             let alice_file = temp_dir.join("ark/alice/apps/notes/foo.md");
             assert!(alice_file.exists(), "file should exist on alice's server");
-            assert_eq!(std::fs::read(&alice_file).unwrap(), b"hello alice");
+            assert_eq!(fs::read(&alice_file).unwrap(), b"hello alice");
 
             assert_eq!(list_proposals(&alice_ctx).unwrap().len(), 0, "log entry should be deleted");
         });

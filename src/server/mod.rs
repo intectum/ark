@@ -10,10 +10,12 @@ mod test_helpers;
 
 use std::env;
 use std::fs;
-use std::io::Write;
+use std::io::{self, ErrorKind, Write};
 use std::net::{TcpListener, TcpStream};
 #[cfg(test)]
 use std::path::PathBuf;
+#[cfg(test)]
+use std::str::from_utf8;
 use std::sync::Arc;
 use std::thread;
 
@@ -80,7 +82,7 @@ pub fn serve(listener: TcpListener, server_ctx: IdentityContext, verbose: bool) 
     }
 }
 
-fn handle(mut stream: TcpStream, server_ctx: &Arc<IdentityContext>, verbose: bool) -> std::io::Result<()> {
+fn handle(mut stream: TcpStream, server_ctx: &Arc<IdentityContext>, verbose: bool) -> io::Result<()> {
     let (method, target, headers, body) = read_request(&mut stream, false)?;
     if verbose {
         println!("{} {}", method, target);
@@ -97,7 +99,7 @@ pub fn handle_parsed(
     headers: &[(String, String)],
     body: &[u8],
     verbose: bool,
-) -> std::io::Result<()> {
+) -> io::Result<()> {
     let mut logger = LoggingStream::new(stream);
     let result = handle_parsed_inner(&mut logger, server_ctx, method, target, headers, body, verbose);
 
@@ -118,7 +120,7 @@ fn handle_parsed_inner(
     headers: &[(String, String)],
     body: &[u8],
     verbose: bool,
-) -> std::io::Result<()> {
+) -> io::Result<()> {
     let url = match resolve_server_url(target) {
         Ok(u) => u,
         Err(_) => return write_text(stream, 400, b"bad path"),
@@ -148,7 +150,7 @@ fn handle_parsed_inner(
 
     let target_ctx = match create_target_context(server_root, name) {
         Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound =>
+        Err(e) if e.kind() == ErrorKind::NotFound =>
             return write_text(stream, 403, b"forbidden"),
         Err(e) => return Err(e),
     };
@@ -279,7 +281,7 @@ mod tests {
             let (identity, secret_key, _) = create_test_account(temp_dir, TEST_ADDRESS);
             let port = start_test_server(temp_dir.to_path_buf());
             let (code, body, _) = signed_request(port, &identity, &secret_key, "POST", "/ark/test/x", b"hello");
-            println!("code: {}, body: {}", code, std::str::from_utf8(&body).unwrap());
+            println!("code: {}, body: {}", code, from_utf8(&body).unwrap());
             assert_eq!(code, 405);
         });
     }
