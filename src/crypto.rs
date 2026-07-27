@@ -146,7 +146,7 @@ pub fn sign_bytes(secret_key: &Key, bytes: &[u8]) -> io::Result<Signature> {
 
             Ok(Signature {
                 algorithm: DEFAULT_SIGNING_ALGORITHM.to_string(),
-                value: secret_key_obj.sign(&bytes).to_bytes().to_vec()
+                value: secret_key_obj.sign(bytes).to_bytes().to_vec()
             })
         },
         _ => Err(io_err("unsupported signing algorithm"))
@@ -168,10 +168,10 @@ pub fn verify_bytes(public_key: &Key, signature: &Signature, bytes: &[u8]) -> io
                 algorithm: DEFAULT_SIGNING_ALGORITHM.to_string(),
                 value: signature.value.clone()
             };
-            verify_bytes(&public_key, &ed25519_signature, bytes)
+            verify_bytes(public_key, &ed25519_signature, bytes)
         },
         DEFAULT_PASSWORD_ALGORITHM if signature.algorithm == DEFAULT_SIGNING_ALGORITHM => {
-            let public_key_ed25519 = derive_public_ed25519_from_argon2id_ed25519(&public_key)?;
+            let public_key_ed25519 = derive_public_ed25519_from_argon2id_ed25519(public_key)?;
             verify_bytes(&public_key_ed25519, signature, bytes)
         },
         DEFAULT_SIGNING_ALGORITHM if signature.algorithm == DEFAULT_SIGNING_ALGORITHM => {
@@ -219,7 +219,7 @@ pub fn encrypt_bytes(public_key: &Key, plaintext: &[u8]) -> io::Result<(String, 
             Ok((DEFAULT_ENCRYPTION_ALGORITHM.to_string(), out))
         },
         DEFAULT_PASSWORD_ALGORITHM => {
-            let public_key_ed25519 = derive_public_ed25519_from_argon2id_ed25519(&public_key)?;
+            let public_key_ed25519 = derive_public_ed25519_from_argon2id_ed25519(public_key)?;
             encrypt_bytes(&public_key_ed25519, plaintext)
         },
         DEFAULT_SIGNING_ALGORITHM => {

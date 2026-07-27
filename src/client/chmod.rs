@@ -4,170 +4,76 @@ use std::io;
 use std::path::Path;
 
 use super::put;
-use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, DEFAULT_HASH_ALGORITHM, encrypt_bytes};
 use crate::types::IdentityContext;
 use crate::identity::resolve_identity;
-use crate::metadata::{create_metadata, extract_key_from_metadata, get_member, has_metadata_attributes, read_metadata_attributes, sign_metadata, verify_metadata_signature, write_local_metadata_attributes, write_metadata_attributes};
-use crate::types::{Hash, Key, LocalMetadata, Member, Permission};
-use crate::util::{io_err, io_invalid_input, now_iso, sha256};
+use crate::metadata::{apply_permissions, extract_key_from_metadata, get_member, has_metadata_attributes, read_metadata_attributes, sign_metadata, verify_metadata_signature, write_metadata_attributes};
+use crate::types::{Permission, Permissions};
+use crate::util::{io_err, io_invalid_input, now_iso};
 
-const PUBLIC_CLI: &str = "public";
-const PUBLIC_WIRE: &str = "*";
-
-/// Change members and permissions on a local file or directory.
+/// Change members and permissions on a tracked local file or directory.
 ///
-/// Adds or promotes each address in `owners`/`writers`/`readers` to the
-/// matching permission; removes each address in `drops`. The literal
-/// `"public"` maps to the wildcard address `*` (rejected for encrypted files).
+/// Adds or promotes each address in `permissions.owners`/`writers`/`readers`;
+/// removes each address in `permissions.drops`. The literal `"public"` maps
+/// to the wildcard address `*` (rejected for encrypted files).
 ///
-/// If the target has no metadata yet, seeds fresh metadata with the current
-/// account as sole owner before applying the requested changes.
-/// `encryption_algorithm` is only consulted when seeding: `Some("none")` =
-/// plaintext, `None` = default (AES-256-GCM), any other value = named
-/// algorithm. Directories reject any `encryption_algorithm`. When metadata
-/// already exists, the caller must be an owner and `encryption_algorithm` must
-/// be `None`.
+/// Requires the target to already carry local ark metadata (via a previous
+/// [`put`](super::put) or [`get`](super::get)); use `put` for the initial
+/// upload with permissions. The caller must be an owner. For encrypted files,
+/// the existing file key is unwrapped and re-wrapped for any newly-added
+/// member (removing a member does not rotate the key — the next
+/// [`put`](super::put) will).
 ///
-/// With `local_only = false` (the default), the change is uploaded via
-/// [`put`](super::put) after xattrs are written. With `local_only = true`,
-/// only the local xattrs are updated; a later [`put`](super::put) or
+/// With `local_only = false` (the default), the change is pushed via a
+/// metadata-only [`put`](super::put). With `local_only = true`, only the
+/// local xattrs are updated; a later [`put`](super::put) or
 /// [`sync`](super::sync) will propagate the change.
 ///
 /// At least one owner must remain.
 pub fn chmod(
     ctx: &IdentityContext,
     path: &str,
-    owners: &[String],
-    writers: &[String],
-    readers: &[String],
-    drops: &[String],
+    permissions: &Permissions,
     local_only: bool,
-    encryption_algorithm: Option<&str>,
 ) -> io::Result<()> {
     let input_path = Path::new(path);
     if !fs::exists(input_path)? {
         return Err(io_invalid_input("input does not exist"));
     }
 
-    let creating = !has_metadata_attributes(input_path)?;
-    let is_dir = input_path.is_dir();
-
-    if !creating && encryption_algorithm.is_some() {
-        return Err(io_invalid_input("--encryption-algorithm only allowed when seeding metadata"));
-    }
-    if input_path.is_dir() && encryption_algorithm.is_some() {
-        return Err(io_invalid_input("--encryption-algorithm not supported for directories"));
+    if !has_metadata_attributes(input_path)? {
+        return Err(io_invalid_input("no ark metadata: use put instead"));
     }
 
-    let mut metadata = if creating {
-        let algorithm = if input_path.is_dir() {
-            None
-        } else {
-            match encryption_algorithm {
-                Some("none") => None,
-                Some(a) => Some(a),
-                None => Some(DEFAULT_ENCRYPTION_ALGORITHM),
-            }
-        };
-        create_metadata(&ctx.identity.address, algorithm)
-    } else {
-        let m = read_metadata_attributes(input_path)?;
-        let modifier_identity = resolve_identity(ctx, &m.modified_by)?;
-        verify_metadata_signature(&modifier_identity.public_key, &m)?;
+    let mut metadata = read_metadata_attributes(input_path)?;
+    let modifier_identity = resolve_identity(ctx, &metadata.modified_by)?;
+    verify_metadata_signature(&modifier_identity.public_key, &metadata)?;
 
-        match get_member(&m.members, &ctx.identity.address) {
-            Some(mem) if mem.permission == Permission::Owner => {}
-            _ => return Err(io_err("only an owner can change permissions")),
-        }
+    match get_member(&metadata.members, &ctx.identity.address) {
+        Some(mem) if mem.permission == Permission::Owner => {}
+        _ => return Err(io_err("only an owner can change permissions")),
+    }
 
-        m
-    };
-
-    let encrypted = metadata.encryption_algorithm.is_some();
-
-    let file_key = if !creating && encrypted {
+    let file_key = if metadata.encryption_algorithm.is_some() {
         extract_key_from_metadata(ctx, &metadata)?
     } else {
         None
     };
 
-    apply_changes(ctx, &mut metadata.members, owners, Permission::Owner, encrypted, file_key.as_deref())?;
-    apply_changes(ctx, &mut metadata.members, writers, Permission::Writer, encrypted, file_key.as_deref())?;
-    apply_changes(ctx, &mut metadata.members, readers, Permission::Reader, encrypted, file_key.as_deref())?;
-
-    for addr in drops {
-        let wire = cli_address_to_wire(addr);
-        metadata.members.retain(|m| m.address != wire);
-    }
-
-    if !metadata.members.iter().any(|m| m.permission == Permission::Owner) {
-        return Err(io_invalid_input("at least one owner must remain"));
-    }
+    apply_permissions(ctx, &mut metadata, permissions, file_key.as_deref())?;
 
     metadata.modified = now_iso();
     metadata.modified_by = ctx.identity.address.clone();
 
     let secret_key = ctx.identity_key.as_ref().expect("client context missing identity_key");
-    if creating && !is_dir {
-        let body = fs::read(input_path)?;
-        sign_metadata(secret_key, &mut metadata, Some(&body))?;
-        write_metadata_attributes(input_path, &metadata)?;
-        write_local_metadata_attributes(input_path, &LocalMetadata {
-            encrypted: Some(false),
-            sync_body_hash: Some(Hash { algorithm: DEFAULT_HASH_ALGORITHM.to_string(), value: sha256(&body) }),
-            sync_modified: Some(metadata.modified.clone()),
-        })?;
-    } else {
-        sign_metadata(secret_key, &mut metadata, None)?;
-        write_metadata_attributes(input_path, &metadata)?;
-    }
+    sign_metadata(secret_key, &mut metadata, None)?;
+    write_metadata_attributes(input_path, &metadata)?;
 
     if !local_only {
         let url_path = url_path_for(ctx, input_path)?;
-        put(ctx, &url_path, Some(path), None, !creating)?;
+        put(ctx, &url_path, Some(path), &Permissions::default(), None, true)?;
     }
 
     Ok(())
-}
-
-fn apply_changes(
-    ctx: &IdentityContext,
-    members: &mut Vec<Member>,
-    addresses: &[String],
-    permission: Permission,
-    encrypted: bool,
-    file_key: Option<&[u8]>,
-) -> io::Result<()> {
-    for addr in addresses {
-        let wire = cli_address_to_wire(addr);
-        if wire == PUBLIC_WIRE && encrypted {
-            return Err(io_invalid_input("cannot add public member to encrypted file"));
-        }
-
-        match members.iter_mut().find(|m| m.address == wire) {
-            Some(existing) => existing.permission = permission,
-            None => {
-                let key = match (file_key, wire.as_str()) {
-                    (Some(fk), w) if w != PUBLIC_WIRE => {
-                        let new_identity = resolve_identity(ctx, &wire)?;
-                        let (algorithm, value) = encrypt_bytes(&new_identity.public_key, fk)?;
-                        Some(Key { algorithm, value })
-                    }
-                    _ => None,
-                };
-                members.push(Member {
-                    address: wire,
-                    permission,
-                    key,
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
-fn cli_address_to_wire(addr: &str) -> String {
-    if addr == PUBLIC_CLI { PUBLIC_WIRE.to_string() } else { addr.to_string() }
 }
 
 fn url_path_for(ctx: &IdentityContext, input_path: &Path) -> io::Result<String> {
@@ -190,10 +96,10 @@ mod tests {
 
     use super::*;
     use crate::context::create_client_context;
-    use crate::crypto::decrypt_bytes;
+    use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, decrypt_bytes};
     use crate::identity::{create_identity, write_identity};
-    use crate::metadata::{create_metadata, read_local_metadata_attributes, sign_metadata, verify_metadata, write_metadata_attributes};
-    use crate::types::{Identity, Key};
+    use crate::metadata::{create_metadata, drop, reader, sign_metadata, writer, write_metadata_attributes};
+    use crate::types::{Identity, Key, Member};
     use crate::util::test::{create_test_account, in_test_dir, write_encrypted_test_file, write_plain_test_file, TEST_ADDRESS};
 
     fn setup(temp_dir: &Path) -> (Identity, Key, PathBuf) {
@@ -213,7 +119,7 @@ mod tests {
 
             set_current_dir(&account_dir).unwrap();
             let ctx = create_client_context().unwrap();
-            chmod(&ctx, path.to_str().unwrap(), &[], &[], &["john@example.com".to_string()], &[], true, None).unwrap();
+            chmod(&ctx, path.to_str().unwrap(), &reader("john@example.com"), true).unwrap();
 
             let m = read_metadata_attributes(&path).unwrap();
             let john = m.members.iter().find(|m| m.address == "john@example.com").unwrap();
@@ -231,7 +137,7 @@ mod tests {
 
             set_current_dir(&account_dir).unwrap();
             let ctx = create_client_context().unwrap();
-            chmod(&ctx, path.to_str().unwrap(), &[], &[], &["public".to_string()], &[], true, None).unwrap();
+            chmod(&ctx, path.to_str().unwrap(), &reader("public"), true).unwrap();
 
             let m = read_metadata_attributes(&path).unwrap();
             let pub_member = m.members.iter().find(|m| m.address == "*").unwrap();
@@ -249,7 +155,7 @@ mod tests {
 
             set_current_dir(&account_dir).unwrap();
             let ctx = create_client_context().unwrap();
-            let err = chmod(&ctx, path.to_str().unwrap(), &[], &[], &["public".to_string()], &[], true, None).unwrap_err();
+            let err = chmod(&ctx, path.to_str().unwrap(), &reader("public"), true).unwrap_err();
             assert!(err.to_string().contains("public member to encrypted"), "msg was {}", err);
         });
     }
@@ -274,7 +180,7 @@ mod tests {
 
             set_current_dir(&account_dir).unwrap();
             let ctx = create_client_context().unwrap();
-            chmod(&ctx, path.to_str().unwrap(), &[], &[], &["bob@example.com".to_string()], &[], true, None).unwrap();
+            chmod(&ctx, path.to_str().unwrap(), &reader("bob@example.com"), true).unwrap();
 
             let m = read_metadata_attributes(&path).unwrap();
             let bob = m.members.iter().find(|m| m.address == "bob@example.com").unwrap();
@@ -305,7 +211,7 @@ mod tests {
 
             set_current_dir(&account_dir).unwrap();
             let ctx = create_client_context().unwrap();
-            chmod(&ctx, path.to_str().unwrap(), &[], &[], &["bob@example.com".to_string()], &[], true, None).unwrap();
+            chmod(&ctx, path.to_str().unwrap(), &reader("bob@example.com"), true).unwrap();
 
             let m2 = read_metadata_attributes(&path).unwrap();
             let bob = m2.members.iter().find(|m| m.address == "bob@example.com").unwrap();
@@ -335,7 +241,7 @@ mod tests {
 
             set_current_dir(&account_dir).unwrap();
             let ctx = create_client_context().unwrap();
-            chmod(&ctx, path.to_str().unwrap(), &[], &["sam@example.com".to_string()], &[], &[], true, None).unwrap();
+            chmod(&ctx, path.to_str().unwrap(), &writer("sam@example.com"), true).unwrap();
 
             let m2 = read_metadata_attributes(&path).unwrap();
             let sam = m2.members.iter().find(|m| m.address == "sam@example.com").unwrap();
@@ -362,7 +268,7 @@ mod tests {
 
             set_current_dir(&account_dir).unwrap();
             let ctx = create_client_context().unwrap();
-            chmod(&ctx, path.to_str().unwrap(), &[], &[], &[], &["sam@example.com".to_string()], true, None).unwrap();
+            chmod(&ctx, path.to_str().unwrap(), &drop("sam@example.com"), true).unwrap();
 
             let m2 = read_metadata_attributes(&path).unwrap();
             assert!(!m2.members.iter().any(|m| m.address == "sam@example.com"));
@@ -378,7 +284,7 @@ mod tests {
 
             set_current_dir(&account_dir).unwrap();
             let ctx = create_client_context().unwrap();
-            let err = chmod(&ctx, path.to_str().unwrap(), &[], &[], &[], &[TEST_ADDRESS.to_string()], true, None).unwrap_err();
+            let err = chmod(&ctx, path.to_str().unwrap(), &drop(TEST_ADDRESS), true).unwrap_err();
             assert!(err.to_string().contains("at least one owner"), "msg was {}", err);
         });
     }
@@ -403,7 +309,7 @@ mod tests {
 
             set_current_dir(&account_dir).unwrap();
             let ctx = create_client_context().unwrap();
-            let err = chmod(&ctx, path.to_str().unwrap(), &[], &[], &["john@example.com".to_string()], &[], true, None).unwrap_err();
+            let err = chmod(&ctx, path.to_str().unwrap(), &reader("john@example.com"), true).unwrap_err();
             assert!(err.to_string().contains("only an owner"), "msg was {}", err);
         });
     }
@@ -415,9 +321,24 @@ mod tests {
             set_current_dir(&account_dir).unwrap();
             let ctx = create_client_context().unwrap();
             let missing = account_dir.join("nope.txt");
-            let err = chmod(&ctx, missing.to_str().unwrap(), &[], &[], &["john@example.com".to_string()], &[], true, None).unwrap_err();
+            let err = chmod(&ctx, missing.to_str().unwrap(), &reader("john@example.com"), true).unwrap_err();
             assert_eq!(err.kind(), ErrorKind::InvalidInput);
             assert!(format!("{}", err).contains("input does not exist"));
+        });
+    }
+
+    #[test]
+    fn chmod_untracked_file_errors() {
+        in_test_dir("ark_chmod_test", |temp_dir| {
+            let (_identity, _secret_key, account_dir) = setup(temp_dir);
+            let path = account_dir.join("fresh.txt");
+            fs::write(&path, b"hello").unwrap();
+
+            set_current_dir(&account_dir).unwrap();
+            let ctx = create_client_context().unwrap();
+            let err = chmod(&ctx, path.to_str().unwrap(), &Permissions::default(), true).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert!(err.to_string().contains("no ark metadata"), "msg was {}", err);
         });
     }
 
@@ -430,96 +351,11 @@ mod tests {
 
             set_current_dir(&account_dir).unwrap();
             let ctx = create_client_context().unwrap();
-            chmod(&ctx, path.to_str().unwrap(), &[], &[], &["john@example.com".to_string()], &[], true, None).unwrap();
+            chmod(&ctx, path.to_str().unwrap(), &reader("john@example.com"), true).unwrap();
 
             let m = read_metadata_attributes(&path).unwrap();
             let body = fs::read(&path).unwrap();
-            verify_metadata(&identity.public_key, &m, Some(&body)).unwrap();
-        });
-    }
-
-    #[test]
-    fn seeds_metadata_on_untracked_file() {
-        in_test_dir("ark_chmod_test", |temp_dir| {
-            let (_, _, account_dir) = setup(temp_dir);
-            let path = account_dir.join("fresh.txt");
-            fs::write(&path, b"hello").unwrap();
-
-            set_current_dir(&account_dir).unwrap();
-            let ctx = create_client_context().unwrap();
-            chmod(&ctx, path.to_str().unwrap(), &[], &[], &[], &[], true, None).unwrap();
-
-            let m = read_metadata_attributes(&path).unwrap();
-            assert_eq!(m.encryption_algorithm.as_deref(), Some(DEFAULT_ENCRYPTION_ALGORITHM));
-            assert_eq!(m.members.len(), 1);
-            assert_eq!(m.members[0].address, TEST_ADDRESS);
-            assert_eq!(m.members[0].permission, Permission::Owner);
-            assert!(m.members[0].key.is_none(), "key deferred to first put");
-
-            let local = read_local_metadata_attributes(&path).unwrap();
-            assert_eq!(local.sync_body_hash.as_ref().unwrap().value, sha256(b"hello"));
-        });
-    }
-
-    #[test]
-    fn seeds_metadata_on_untracked_dir() {
-        in_test_dir("ark_chmod_test", |temp_dir| {
-            let (_, _, account_dir) = setup(temp_dir);
-            let dir = account_dir.join("shared");
-            fs::create_dir_all(&dir).unwrap();
-
-            set_current_dir(&account_dir).unwrap();
-            let ctx = create_client_context().unwrap();
-            chmod(&ctx, dir.to_str().unwrap(), &[], &[], &[], &[], true, None).unwrap();
-
-            let m = read_metadata_attributes(&dir).unwrap();
-            assert_eq!(m.encryption_algorithm, None);
-            assert!(m.body_hash.is_none());
-            assert_eq!(m.members[0].permission, Permission::Owner);
-        });
-    }
-
-    #[test]
-    fn seeds_plaintext_when_encryption_none() {
-        in_test_dir("ark_chmod_test", |temp_dir| {
-            let (_, _, account_dir) = setup(temp_dir);
-            let path = account_dir.join("plain.txt");
-            fs::write(&path, b"raw").unwrap();
-
-            set_current_dir(&account_dir).unwrap();
-            let ctx = create_client_context().unwrap();
-            chmod(&ctx, path.to_str().unwrap(), &[], &[], &[], &[], true, Some("none")).unwrap();
-
-            let m = read_metadata_attributes(&path).unwrap();
-            assert_eq!(m.encryption_algorithm, None);
-        });
-    }
-
-    #[test]
-    fn rejects_encryption_algorithm_when_already_tracked() {
-        in_test_dir("ark_chmod_test", |temp_dir| {
-            let (identity, secret_key, account_dir) = setup(temp_dir);
-            let path = account_dir.join("doc.txt");
-            write_plain_test_file(&path, &identity, &secret_key, b"body");
-
-            set_current_dir(&account_dir).unwrap();
-            let ctx = create_client_context().unwrap();
-            let err = chmod(&ctx, path.to_str().unwrap(), &[], &[], &[], &[], true, Some("none")).unwrap_err();
-            assert_eq!(err.kind(), ErrorKind::InvalidInput);
-        });
-    }
-
-    #[test]
-    fn rejects_encryption_algorithm_on_dir() {
-        in_test_dir("ark_chmod_test", |temp_dir| {
-            let (_, _, account_dir) = setup(temp_dir);
-            let dir = account_dir.join("shared");
-            fs::create_dir_all(&dir).unwrap();
-
-            set_current_dir(&account_dir).unwrap();
-            let ctx = create_client_context().unwrap();
-            let err = chmod(&ctx, dir.to_str().unwrap(), &[], &[], &[], &[], true, Some(DEFAULT_ENCRYPTION_ALGORITHM)).unwrap_err();
-            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            crate::metadata::verify_metadata(&identity.public_key, &m, Some(&body)).unwrap();
         });
     }
 }

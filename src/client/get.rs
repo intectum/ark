@@ -218,7 +218,7 @@ mod tests {
             assert_eq!(fs::read(&out).unwrap(), expected_ciphertext);
             let m = read_metadata_attributes(&out).unwrap();
             assert_eq!(m.encryption_algorithm.as_deref(), Some(DEFAULT_ENCRYPTION_ALGORITHM));
-            assert_eq!(m.members.iter().next().unwrap().key.as_ref().unwrap().value, expected_key_value);
+            assert_eq!(m.members.first().unwrap().key.as_ref().unwrap().value, expected_key_value);
         });
     }
 

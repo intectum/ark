@@ -130,10 +130,7 @@ fn to_watch_event_local(event_kind: &EventKind, path: &Path) -> Option<WatchEven
 }
 
 fn to_watch_event_remote(event: &StreamEvent) -> Option<WatchEvent> {
-    let action = match WatchAction::parse(&event.event) {
-        Some(a) => a,
-        None => return None,
-    };
+    let action = WatchAction::parse(&event.event)?;
 
     let entry: DirectoryEntry = match serde_json::from_str(&event.data) {
         Ok(e) => e,

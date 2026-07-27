@@ -105,7 +105,7 @@ pub fn validate_identity(identity: &Identity) -> io::Result<()> {
     time::OffsetDateTime::parse(&identity.modified, &time::format_description::well_known::Rfc3339)
         .map_err(|e| io_invalid_input(&format!("modified is not a valid RFC 3339 timestamp: {}", e)))?;
 
-    verify_identity(&identity)
+    verify_identity(identity)
         .map_err(|_| io_invalid_input("signature verification failed"))?;
 
     Ok(())

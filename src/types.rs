@@ -138,6 +138,20 @@ impl Permission {
     }
 }
 
+/// Member/permission changes applied to a file or directory. Addresses may
+/// include the literal `"public"` for the wildcard `*`.
+#[derive(Default)]
+pub struct Permissions {
+    /// Grant `owner` to each address.
+    pub owners: Vec<String>,
+    /// Grant `writer` to each address.
+    pub writers: Vec<String>,
+    /// Grant `reader` to each address.
+    pub readers: Vec<String>,
+    /// Drop each address from the member list.
+    pub drops: Vec<String>,
+}
+
 pub struct Proposal {
     pub id: String,
     pub target: String,

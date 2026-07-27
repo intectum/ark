@@ -11,7 +11,7 @@ const PATH_ENCODE_SET: &AsciiSet = &CONTROLS.add(b' ').add(b'"').add(b'#').add(b
 pub fn read_request(stream: &mut dyn Read, skip_body: bool) -> io::Result<(String, String, Vec<(String, String)>, Vec<u8>)> {
     let (first_line, headers, body) = read_message(stream, skip_body)?;
 
-    let request_line_parts: Vec<&str> = first_line.trim_end().split_whitespace().collect();
+    let request_line_parts: Vec<&str> = first_line.split_whitespace().collect();
     if request_line_parts.len() != 3 {
         return Err(io_err("bad request line"));
     }

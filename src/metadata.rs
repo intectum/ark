@@ -6,8 +6,11 @@ use uuid::Uuid;
 use crate::crypto::{DEFAULT_HASH_ALGORITHM, DEFAULT_PASSWORD_ALGORITHM, decrypt_bytes, encrypt_bytes, sign_json, verify_json};
 use crate::types::IdentityContext;
 use crate::identity::resolve_identity;
-use crate::types::{Hash, Key, LocalMetadata, Member, Metadata, Permission, Signature};
-use crate::util::{decode_base64url, encode_base64url, io_err, now_iso, sha256};
+use crate::types::{Hash, Key, LocalMetadata, Member, Metadata, Permission, Permissions, Signature};
+use crate::util::{decode_base64url, encode_base64url, io_err, io_invalid_input, now_iso, sha256};
+
+const PUBLIC_CLI: &str = "public";
+const PUBLIC_WIRE: &str = "*";
 
 const ATTRIBUTE_PREFIX: &str = "user.ark.";
 const LOCAL_ATTRIBUTE_PREFIX: &str = "user.ark_local.";
@@ -69,7 +72,7 @@ pub fn create_metadata(owner_address: &str, encryption_algorithm: Option<&str>) 
 }
 
 pub fn has_metadata_attributes(path: &Path) -> io::Result<bool> {
-    Ok(xattr::get(path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_ID))?.is_some())
+    Ok(xattr::get(path, format!("{}{}", ATTRIBUTE_PREFIX, FIELD_ID))?.is_some())
 }
 
 pub fn read_metadata_attributes(path: &Path) -> io::Result<Metadata> {
@@ -101,26 +104,26 @@ pub fn read_metadata_attributes(path: &Path) -> io::Result<Metadata> {
 pub fn write_metadata_attributes(path: &Path, metadata: &Metadata) -> io::Result<()> {
     remove_metadata_attributes(path)?;
 
-    xattr::set(path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_ID), metadata.id.as_bytes())?;
-    xattr::set(path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_CREATED), metadata.created.as_bytes())?;
-    xattr::set(path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_MODIFIED), metadata.modified.as_bytes())?;
-    xattr::set(path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_MODIFIED_BY), metadata.modified_by.as_bytes())?;
+    xattr::set(path, format!("{}{}", ATTRIBUTE_PREFIX, FIELD_ID), metadata.id.as_bytes())?;
+    xattr::set(path, format!("{}{}", ATTRIBUTE_PREFIX, FIELD_CREATED), metadata.created.as_bytes())?;
+    xattr::set(path, format!("{}{}", ATTRIBUTE_PREFIX, FIELD_MODIFIED), metadata.modified.as_bytes())?;
+    xattr::set(path, format!("{}{}", ATTRIBUTE_PREFIX, FIELD_MODIFIED_BY), metadata.modified_by.as_bytes())?;
     if let Some(alg) = &metadata.encryption_algorithm {
-        xattr::set(path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_ENCRYPTION_ALGORITHM), alg.as_bytes())?;
+        xattr::set(path, format!("{}{}", ATTRIBUTE_PREFIX, FIELD_ENCRYPTION_ALGORITHM), alg.as_bytes())?;
     }
     if let Some(body_hash) = &metadata.body_hash {
-        xattr::set(path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_BODY_HASH_ALGORITHM), body_hash.algorithm.as_bytes())?;
-        xattr::set(path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_BODY_HASH_VALUE), encode_base64url(&body_hash.value).as_bytes())?;
+        xattr::set(path, format!("{}{}", ATTRIBUTE_PREFIX, FIELD_BODY_HASH_ALGORITHM), body_hash.algorithm.as_bytes())?;
+        xattr::set(path, format!("{}{}", ATTRIBUTE_PREFIX, FIELD_BODY_HASH_VALUE), encode_base64url(&body_hash.value).as_bytes())?;
     }
-    xattr::set(path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_SIGNATURE_ALGORITHM), metadata.signature.algorithm.as_bytes())?;
-    xattr::set(path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_SIGNATURE_VALUE), encode_base64url(&metadata.signature.value).as_bytes())?;
+    xattr::set(path, format!("{}{}", ATTRIBUTE_PREFIX, FIELD_SIGNATURE_ALGORITHM), metadata.signature.algorithm.as_bytes())?;
+    xattr::set(path, format!("{}{}", ATTRIBUTE_PREFIX, FIELD_SIGNATURE_VALUE), encode_base64url(&metadata.signature.value).as_bytes())?;
 
     for (index, member) in metadata.members.iter().enumerate() {
-        xattr::set(path, &format!("{}member_{}_address", ATTRIBUTE_PREFIX, index), member.address.as_bytes())?;
-        xattr::set(path, &format!("{}member_{}_permission", ATTRIBUTE_PREFIX, index), member.permission.as_str().as_bytes())?;
+        xattr::set(path, format!("{}member_{}_address", ATTRIBUTE_PREFIX, index), member.address.as_bytes())?;
+        xattr::set(path, format!("{}member_{}_permission", ATTRIBUTE_PREFIX, index), member.permission.as_str().as_bytes())?;
         if let Some(key) = &member.key {
-            xattr::set(path, &format!("{}member_{}_key_algorithm", ATTRIBUTE_PREFIX, index), key.algorithm.as_bytes())?;
-            xattr::set(path, &format!("{}member_{}_key_value", ATTRIBUTE_PREFIX, index), encode_base64url(&key.value).as_bytes())?;
+            xattr::set(path, format!("{}member_{}_key_algorithm", ATTRIBUTE_PREFIX, index), key.algorithm.as_bytes())?;
+            xattr::set(path, format!("{}member_{}_key_value", ATTRIBUTE_PREFIX, index), encode_base64url(&key.value).as_bytes())?;
         }
     }
 
@@ -190,14 +193,14 @@ pub fn write_local_metadata_attributes(path: &Path, local: &LocalMetadata) -> io
     remove_local_metadata_attributes(path)?;
 
     if let Some(encrypted) = local.encrypted {
-        xattr::set(path, &format!("{}{}", LOCAL_ATTRIBUTE_PREFIX, LOCAL_FIELD_ENCRYPTED), if encrypted { b"true" } else { b"false" })?;
+        xattr::set(path, format!("{}{}", LOCAL_ATTRIBUTE_PREFIX, LOCAL_FIELD_ENCRYPTED), if encrypted { b"true" } else { b"false" })?;
     }
     if let Some(sync_body_hash) = &local.sync_body_hash {
-        xattr::set(path, &format!("{}{}", LOCAL_ATTRIBUTE_PREFIX, LOCAL_FIELD_SYNC_BODY_HASH_ALGORITHM), sync_body_hash.algorithm.as_bytes())?;
-        xattr::set(path, &format!("{}{}", LOCAL_ATTRIBUTE_PREFIX, LOCAL_FIELD_SYNC_BODY_HASH_VALUE), encode_base64url(&sync_body_hash.value).as_bytes())?;
+        xattr::set(path, format!("{}{}", LOCAL_ATTRIBUTE_PREFIX, LOCAL_FIELD_SYNC_BODY_HASH_ALGORITHM), sync_body_hash.algorithm.as_bytes())?;
+        xattr::set(path, format!("{}{}", LOCAL_ATTRIBUTE_PREFIX, LOCAL_FIELD_SYNC_BODY_HASH_VALUE), encode_base64url(&sync_body_hash.value).as_bytes())?;
     }
     if let Some(sync_modified) = &local.sync_modified {
-        xattr::set(path, &format!("{}{}", LOCAL_ATTRIBUTE_PREFIX, LOCAL_FIELD_SYNC_MODIFIED), sync_modified.as_bytes())?;
+        xattr::set(path, format!("{}{}", LOCAL_ATTRIBUTE_PREFIX, LOCAL_FIELD_SYNC_MODIFIED), sync_modified.as_bytes())?;
     }
 
     Ok(())
@@ -261,6 +264,46 @@ pub fn write_metadata_headers(metadata: &Metadata) -> Vec<(String, String)> {
 pub fn validate_metadata(metadata: &Metadata) -> io::Result<()> {
     if !metadata.members.iter().any(|m| m.permission == Permission::Owner) {
         return Err(io_err("metadata must contain at least one owner"));
+    }
+
+    Ok(())
+}
+
+pub fn owner(address: impl Into<String>) -> Permissions {
+    Permissions { owners: vec![address.into()], ..Default::default() }
+}
+
+pub fn writer(address: impl Into<String>) -> Permissions {
+    Permissions { writers: vec![address.into()], ..Default::default() }
+}
+
+pub fn reader(address: impl Into<String>) -> Permissions {
+    Permissions { readers: vec![address.into()], ..Default::default() }
+}
+
+pub fn drop(address: impl Into<String>) -> Permissions {
+    Permissions { drops: vec![address.into()], ..Default::default() }
+}
+
+pub fn apply_permissions(
+    ctx: &IdentityContext,
+    metadata: &mut Metadata,
+    permissions: &Permissions,
+    file_key: Option<&[u8]>,
+) -> io::Result<()> {
+    let encrypted = metadata.encryption_algorithm.is_some();
+
+    apply_permission(ctx, &mut metadata.members, &permissions.owners, Permission::Owner, encrypted, file_key)?;
+    apply_permission(ctx, &mut metadata.members, &permissions.writers, Permission::Writer, encrypted, file_key)?;
+    apply_permission(ctx, &mut metadata.members, &permissions.readers, Permission::Reader, encrypted, file_key)?;
+
+    for addr in &permissions.drops {
+        let wire = cli_address_to_wire(addr);
+        metadata.members.retain(|m| m.address != wire);
+    }
+
+    if !metadata.members.iter().any(|m| m.permission == Permission::Owner) {
+        return Err(io_invalid_input("at least one owner must remain"));
     }
 
     Ok(())
@@ -353,6 +396,46 @@ fn metadata_for_signing(metadata: &Metadata) -> Metadata {
     clone.signature.algorithm = String::new();
     clone.signature.value = Vec::new();
     clone
+}
+
+fn apply_permission(
+    ctx: &IdentityContext,
+    members: &mut Vec<Member>,
+    addresses: &[String],
+    permission: Permission,
+    encrypted: bool,
+    file_key: Option<&[u8]>,
+) -> io::Result<()> {
+    for addr in addresses {
+        let wire = cli_address_to_wire(addr);
+        if wire == PUBLIC_WIRE && encrypted {
+            return Err(io_invalid_input("cannot add public member to encrypted file"));
+        }
+
+        match members.iter_mut().find(|m| m.address == wire) {
+            Some(existing) => existing.permission = permission,
+            None => {
+                let key = match (file_key, wire.as_str()) {
+                    (Some(fk), w) if w != PUBLIC_WIRE => {
+                        let new_identity = resolve_identity(ctx, &wire)?;
+                        let (algorithm, value) = encrypt_bytes(&new_identity.public_key, fk)?;
+                        Some(Key { algorithm, value })
+                    }
+                    _ => None,
+                };
+                members.push(Member {
+                    address: wire,
+                    permission,
+                    key,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cli_address_to_wire(addr: &str) -> String {
+    if addr == PUBLIC_CLI { PUBLIC_WIRE.to_string() } else { addr.to_string() }
 }
 
 #[derive(Default)]

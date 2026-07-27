@@ -216,7 +216,9 @@ mod tests {
     use super::*;
     use crate::client::{init, put};
     use crate::context::create_client_context;
+    use crate::metadata::reader;
     use crate::server::start_test_server;
+    use crate::types::Permissions;
     use crate::util::test::in_test_dir;
 
     fn setup(temp_dir: &Path, port: u16) -> (IdentityContext, IdentityContext) {
@@ -251,7 +253,7 @@ mod tests {
             set_current_dir(temp_dir.join("bob_client")).unwrap();
             let payload = write_payload(&temp_dir.join("bob_client"), "payload.bin", b"hello");
             let target = format!("alice@127.0.0.1:{}/apps/notes/foo.md", port);
-            let _ = put(&bob_ctx, &target, Some(payload.to_str().unwrap()), Some("none"), false);
+            let _ = put(&bob_ctx, &target, Some(payload.to_str().unwrap()), &Permissions::default(), Some("none"), false);
 
             set_current_dir(temp_dir.join("alice_client")).unwrap();
             let alice_ctx = create_client_context().unwrap();
@@ -272,7 +274,7 @@ mod tests {
             set_current_dir(temp_dir.join("bob_client")).unwrap();
             let payload = write_payload(&temp_dir.join("bob_client"), "payload.bin", b"hello");
             let target = format!("alice@127.0.0.1:{}/apps/notes/foo.md", port);
-            let _ = put(&bob_ctx, &target, Some(payload.to_str().unwrap()), Some("none"), false);
+            let _ = put(&bob_ctx, &target, Some(payload.to_str().unwrap()), &Permissions::default(), Some("none"), false);
 
             set_current_dir(temp_dir.join("alice_client")).unwrap();
             let alice_ctx = create_client_context().unwrap();
@@ -295,11 +297,11 @@ mod tests {
 
             set_current_dir(temp_dir.join("bob_client")).unwrap();
             let payload = write_payload(&temp_dir.join("bob_client"), "payload.bin", b"hello alice");
-            put(&bob_ctx, "apps/notes/foo.md", Some(payload.to_str().unwrap()), Some("none"), false).unwrap();
+            put(&bob_ctx, "apps/notes/foo.md", Some(payload.to_str().unwrap()), &Permissions::default(), Some("none"), false).unwrap();
 
             let alice_addr = format!("alice@127.0.0.1:{}", port);
-            chmod(&bob_ctx, payload.to_str().unwrap(), &[], &[], &[alice_addr.clone()], &[], true, None).unwrap();
-            put(&bob_ctx, "apps/notes/foo.md", Some(payload.to_str().unwrap()), Some("none"), false).unwrap();
+            chmod(&bob_ctx, payload.to_str().unwrap(), &reader(alice_addr.clone()), true).unwrap();
+            put(&bob_ctx, "apps/notes/foo.md", Some(payload.to_str().unwrap()), &Permissions::default(), Some("none"), false).unwrap();
 
             set_current_dir(temp_dir.join("alice_client")).unwrap();
             let alice_ctx = create_client_context().unwrap();

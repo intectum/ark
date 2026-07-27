@@ -3,12 +3,12 @@ use std::io;
 use std::path::Path;
 use std::str::from_utf8;
 
-use super::{chmod, decrypt_stream, put, request};
+use super::{decrypt_stream, put, request};
 use crate::context::create_client_context;
 use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, DEFAULT_PASSWORD_ALGORITHM, create_secret_key_from_password, restore_secret_key_from_password, to_public_key};
 use crate::identity::{create_identity, parse_address, sign_identity, validate_identity, write_identity, write_identity_key};
-use crate::metadata::{create_metadata, read_metadata_headers, sign_metadata, write_metadata_attributes};
-use crate::types::{Identity, IdentityContext, Key, Member, Permission, Signature};
+use crate::metadata::{create_metadata, read_metadata_headers, sign_metadata, writer, write_metadata_attributes};
+use crate::types::{Identity, IdentityContext, Key, Member, Permission, Permissions, Signature};
 use crate::util::{decode_base64url, io_err, io_invalid_input, now_iso, resolve_client_url_raw};
 
 /// Initialize the ark account at `address` under `root`.
@@ -79,7 +79,7 @@ pub fn init(root: &Path, address: &str, password: Option<&str>, local_only: bool
             write_metadata_attributes(&identity_path, &metadata)?;
 
             let ctx = create_client_context()?;
-            put(&ctx, "/.ark/identity.json", identity_path.to_str(), None, false)?;
+            put(&ctx, "/.ark/identity.json", identity_path.to_str(), &Permissions::default(), None, false)?;
 
             let (_, host, _) = parse_address(&ctx.identity.address)?;
             let ark_address = format!("ark@{}", host);
@@ -87,7 +87,7 @@ pub fn init(root: &Path, address: &str, password: Option<&str>, local_only: bool
             let requests_dir = ctx.root.join(".ark").join("requests");
             fs::create_dir_all(&requests_dir)?;
 
-            chmod(&ctx, requests_dir.to_str().unwrap(), &[], &[ark_address], &[], &[], false, None)?;
+            put(&ctx, "/.ark/requests/", requests_dir.to_str(), &writer(ark_address), None, false)?;
 
             if let Some(pw) = password {
                 push_secret_key_with_password(&ctx, pw)?;
@@ -193,7 +193,7 @@ fn push_secret_key_with_password(
     sign_metadata(secret_key, &mut password_metadata, Some(&password_body))?;
     write_metadata_attributes(&password_path, &password_metadata)?;
 
-    put(ctx, "/.ark/passwords/primary.json", password_path.to_str(), None, false)?;
+    put(ctx, "/.ark/passwords/primary.json", password_path.to_str(), &Permissions::default(), None, false)?;
 
     let identity_key_path = dot_ark_dir.join("identity.key");
     let mut key_metadata = create_metadata(&ctx.identity.address, Some(DEFAULT_ENCRYPTION_ALGORITHM));
@@ -204,7 +204,7 @@ fn push_secret_key_with_password(
     });
     write_metadata_attributes(&identity_key_path, &key_metadata)?;
 
-    put(ctx, "/.ark/identity.key", identity_key_path.to_str(), None, false)?;
+    put(ctx, "/.ark/identity.key", identity_key_path.to_str(), &Permissions::default(), None, false)?;
 
     Ok(())
 }

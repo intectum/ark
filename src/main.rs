@@ -6,6 +6,7 @@ use std::process::exit;
 use clap::{Parser, Subcommand};
 
 use ark::client::{accept_proposal, chmod, decrypt, delete, encrypt, get, head, init, list_proposals, put, reject_proposal, sync};
+use ark::types::Permissions;
 use ark::context::create_client_context;
 use ark::identity::parse_address;
 use ark::server::start_server;
@@ -108,10 +109,6 @@ enum Cmd {
         /// Drop a member (repeatable).
         #[arg(short = 'd', long = "drop", value_name = "ADDR")]
         drop: Vec<String>,
-        /// Encryption algorithm when seeding fresh metadata; use "none" for
-        /// plaintext. Files only. Default: aes-256-gcm.
-        #[arg(short, long, value_name = "NAME")]
-        encryption_algorithm: Option<String>,
         /// Only update local xattrs; skip the upload.
         #[arg(long)]
         local_only: bool,
@@ -143,6 +140,18 @@ enum Cmd {
         /// Read body from FILE instead of stdin.
         #[arg(short, long, value_name = "FILE")]
         input: Option<String>,
+        /// Grant `owner` (repeatable). Use "public" for wildcard `*`.
+        #[arg(short = 'o', long = "owner", value_name = "ADDR")]
+        owner: Vec<String>,
+        /// Grant `writer` (repeatable). Use "public" for wildcard `*`.
+        #[arg(short = 'w', long = "writer", value_name = "ADDR")]
+        writer: Vec<String>,
+        /// Grant `reader` (repeatable). Use "public" for wildcard `*`.
+        #[arg(short = 'r', long = "reader", value_name = "ADDR")]
+        reader: Vec<String>,
+        /// Drop a member (repeatable).
+        #[arg(short = 'd', long = "drop", value_name = "ADDR")]
+        drop: Vec<String>,
         /// Encryption algorithm; use "none" for plaintext. Default: reuse
         /// existing metadata's algorithm, else aes-256-gcm.
         #[arg(short, long, value_name = "NAME")]
@@ -237,7 +246,7 @@ fn main() {
             Ok(())
         },
         Cmd::Init { address, password, local_only } => current_dir().and_then(|c| init(&c, &address, password.as_deref(), local_only)),
-        Cmd::Chmod { owner, writer, reader, drop, encryption_algorithm, local_only, file } => create_client_context().and_then(|c| chmod(&c, &file, &owner, &writer, &reader, &drop, local_only, encryption_algorithm.as_deref())),
+        Cmd::Chmod { owner, writer, reader, drop, local_only, file } => create_client_context().and_then(|c| chmod(&c, &file, &Permissions { owners: owner, writers: writer, readers: reader, drops: drop }, local_only)),
         Cmd::Head { path } => create_client_context().and_then(|c| head_cli(&c, &path)),
         Cmd::Delete { path } => create_client_context().and_then(|c| delete(&c, &path)),
         Cmd::Get { output, decrypt, path } => create_client_context().and_then(|c| get(&c, &path, output.as_deref(), decrypt)),
@@ -246,7 +255,7 @@ fn main() {
             ProposalsCmd::Accept { id, force } => accept_proposal(&c, &id, force),
             ProposalsCmd::Reject { id } => reject_proposal(&c, &id),
         }),
-        Cmd::Put { input, encryption_algorithm, metadata, path } => create_client_context().and_then(|c| put(&c, &path, input.as_deref(), encryption_algorithm.as_deref(), metadata)),
+        Cmd::Put { input, owner, writer, reader, drop, encryption_algorithm, metadata, path } => create_client_context().and_then(|c| put(&c, &path, input.as_deref(), &Permissions { owners: owner, writers: writer, readers: reader, drops: drop }, encryption_algorithm.as_deref(), metadata)),
         Cmd::Sync { watch, decrypt } => create_client_context().and_then(|c| current_dir().and_then(|d| sync(&c, &d, watch, decrypt))),
         Cmd::Decrypt { input, output, in_place, key, encryption_algorithm } => {
             create_client_context().and_then(|c| decrypt(&c, input.as_deref(), output.as_deref(), in_place.as_deref(), key.as_deref(), encryption_algorithm.as_deref()))

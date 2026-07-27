@@ -181,7 +181,7 @@ pub fn now_iso_fs() -> String {
 }
 
 pub fn io_err(s: &str) -> Error {
-    Error::new(ErrorKind::Other, s.to_string())
+    Error::other(s.to_string())
 }
 
 pub fn io_invalid_input(msg: &str) -> Error {
