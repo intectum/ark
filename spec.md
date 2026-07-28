@@ -143,6 +143,8 @@ Creates or updates a file or directory. **Dir vs file is determined by whether t
 
 **Optional query param: `metadata`.** Metadata-only PUT. The request body is ignored and the file body on disk is left unchanged; only the `X-Ark-Meta-*` xattrs are rewritten. The new metadata's `body_hash` MUST equal the existing file's `body_hash`; otherwise `400`. The target file MUST already exist; otherwise `409`. Query params combine (e.g. `?relay=full&metadata`) — relay carries the flag forward.
 
+**Parent directories.** Missing intermediate directories on the path are created automatically. They are created without metadata, so they inherit member checks from the nearest metadata-bearing ancestor (§7.3).
+
 **Response codes.** `201 Created` (new path), `204 No Content` (existing path updated), `400` (missing/bad metadata, body-vs-dir mismatch, or metadata-only body_hash mismatch), `401` (bad signature), `403` (not authorized, or member change without owner), `409` (id mismatch on overwrite, older `modified` than existing, or metadata-only PUT on nonexistent file).
 
 **Bootstrap: `PUT /ark/<account>/.ark/identity.json`.** If no identity exists at that path, the request is unauthenticated and the body is the new account's `Identity` JSON. The request metadata must still be signed by the new account's key. This is how an account is created.

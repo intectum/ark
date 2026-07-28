@@ -7,8 +7,9 @@ use std::time::Duration;
 
 use crate::crypto::{DEFAULT_SIGNING_ALGORITHM, sign_bytes};
 use crate::metadata::{sign_metadata, write_metadata_attributes, write_metadata_headers};
+use crate::timestamp;
 use crate::types::{Identity, Key, Member, Metadata};
-use crate::util::{encode_base64url, now, request_to_bytes};
+use crate::util::{encode_base64url, request_to_bytes};
 use crate::util::test::create_plain_test_metadata;
 
 pub fn test_host(port: u16) -> String {
@@ -62,9 +63,9 @@ pub fn signed_request(port: u16, requestor: &Identity, secret_key: &Key, method:
 
 pub fn signed_request_with_headers(port: u16, requestor: &Identity, secret_key: &Key, method: &str, target: &str, body: &[u8], extra: &[(&str, &str)]) -> (u16, Vec<u8>, Vec<(String, String)>) {
     let sign_path = target.split_once('?').map(|(p, _)| p).unwrap_or(target);
-    let timestamp = now();
-    let sig_b64 = sign(&secret_key.value, port, method, sign_path, timestamp, body);
-    let auth = build_auth(&requestor.address, timestamp, &sig_b64);
+    let ts = timestamp::now_ms();
+    let sig_b64 = sign(&secret_key.value, port, method, sign_path, ts, body);
+    let auth = build_auth(&requestor.address, ts, &sig_b64);
     let mut headers: Vec<(&str, &str)> = vec![("Authorization", &auth)];
     headers.extend_from_slice(extra);
     request(port, method, target, body, &headers)

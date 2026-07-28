@@ -93,7 +93,7 @@ pub fn get_stream(
         } else {
             None
         },
-        sync_modified: Some(metadata.modified.clone()),
+        sync_modified: Some(metadata.modified),
     };
 
     output.write_all(&final_body)?;

@@ -6,8 +6,9 @@ use uuid::Uuid;
 use crate::crypto::{DEFAULT_HASH_ALGORITHM, DEFAULT_PASSWORD_ALGORITHM, decrypt_bytes, encrypt_bytes, sign_json, verify_json};
 use crate::types::IdentityContext;
 use crate::identity::resolve_identity;
+use crate::timestamp;
 use crate::types::{Hash, Key, LocalMetadata, Member, Metadata, Permission, Permissions, Signature};
-use crate::util::{decode_base64url, encode_base64url, io_err, io_invalid_input, now_iso, sha256};
+use crate::util::{decode_base64url, encode_base64url, io_err, io_invalid_input, sha256};
 
 const PUBLIC_CLI: &str = "public";
 const PUBLIC_WIRE: &str = "*";
@@ -50,12 +51,12 @@ pub fn members_changed(old: &[Member], new: &[Member]) -> bool {
 }
 
 pub fn create_metadata(owner_address: &str, encryption_algorithm: Option<&str>) -> Metadata {
-    let now = now_iso();
+    let now = timestamp::now();
 
     Metadata {
         id: Uuid::new_v4().to_string(),
-        created: now.clone(),
-        modified: now.clone(),
+        created: now,
+        modified: now,
         modified_by: owner_address.to_string(),
         encryption_algorithm: encryption_algorithm.map(|s| s.to_string()),
         members: vec![Member {
@@ -105,8 +106,8 @@ pub fn write_metadata_attributes(path: &Path, metadata: &Metadata) -> io::Result
     remove_metadata_attributes(path)?;
 
     xattr::set(path, format!("{}{}", ATTRIBUTE_PREFIX, FIELD_ID), metadata.id.as_bytes())?;
-    xattr::set(path, format!("{}{}", ATTRIBUTE_PREFIX, FIELD_CREATED), metadata.created.as_bytes())?;
-    xattr::set(path, format!("{}{}", ATTRIBUTE_PREFIX, FIELD_MODIFIED), metadata.modified.as_bytes())?;
+    xattr::set(path, format!("{}{}", ATTRIBUTE_PREFIX, FIELD_CREATED), timestamp::format(metadata.created).as_bytes())?;
+    xattr::set(path, format!("{}{}", ATTRIBUTE_PREFIX, FIELD_MODIFIED), timestamp::format(metadata.modified).as_bytes())?;
     xattr::set(path, format!("{}{}", ATTRIBUTE_PREFIX, FIELD_MODIFIED_BY), metadata.modified_by.as_bytes())?;
     if let Some(alg) = &metadata.encryption_algorithm {
         xattr::set(path, format!("{}{}", ATTRIBUTE_PREFIX, FIELD_ENCRYPTION_ALGORITHM), alg.as_bytes())?;
@@ -175,7 +176,7 @@ pub fn read_local_metadata_attributes(path: &Path) -> io::Result<LocalMetadata> 
                     .map_err(|_| io_err("sync_body_hash_value is not base64url encoded"))?);
             }
             LOCAL_FIELD_SYNC_MODIFIED => {
-                local.sync_modified = Some(value);
+                local.sync_modified = Some(timestamp::parse(&value)?);
             }
             _ => {}
         }
@@ -200,7 +201,7 @@ pub fn write_local_metadata_attributes(path: &Path, local: &LocalMetadata) -> io
         xattr::set(path, format!("{}{}", LOCAL_ATTRIBUTE_PREFIX, LOCAL_FIELD_SYNC_BODY_HASH_VALUE), encode_base64url(&sync_body_hash.value).as_bytes())?;
     }
     if let Some(sync_modified) = &local.sync_modified {
-        xattr::set(path, format!("{}{}", LOCAL_ATTRIBUTE_PREFIX, LOCAL_FIELD_SYNC_MODIFIED), sync_modified.as_bytes())?;
+        xattr::set(path, format!("{}{}", LOCAL_ATTRIBUTE_PREFIX, LOCAL_FIELD_SYNC_MODIFIED), timestamp::format(*sync_modified).as_bytes())?;
     }
 
     Ok(())
@@ -236,8 +237,8 @@ pub fn write_metadata_headers(metadata: &Metadata) -> Vec<(String, String)> {
     let mut out = Vec::new();
 
     out.push((format!("{}Id", HEADER_PREFIX), metadata.id.clone()));
-    out.push((format!("{}Created", HEADER_PREFIX), metadata.created.clone()));
-    out.push((format!("{}Modified", HEADER_PREFIX), metadata.modified.clone()));
+    out.push((format!("{}Created", HEADER_PREFIX), timestamp::format(metadata.created)));
+    out.push((format!("{}Modified", HEADER_PREFIX), timestamp::format(metadata.modified)));
     out.push((format!("{}Modified-By", HEADER_PREFIX), metadata.modified_by.clone()));
     if let Some(alg) = &metadata.encryption_algorithm {
         out.push((format!("{}Encryption-Algorithm", HEADER_PREFIX), alg.clone()));
@@ -463,8 +464,8 @@ struct PartialMember {
 fn metadata_from_partial(partial: PartialMetadata) -> io::Result<Metadata> {
     Ok(Metadata {
         id: partial.id.unwrap(),
-        created: partial.created.unwrap(),
-        modified: partial.modified.unwrap(),
+        created: timestamp::parse(&partial.created.unwrap())?,
+        modified: timestamp::parse(&partial.modified.unwrap())?,
         modified_by: partial.modified_by.unwrap(),
         encryption_algorithm: partial.encryption_algorithm,
         members: partial.members.into_iter().map(|member| Member {
@@ -643,14 +644,15 @@ mod tests {
         in_test_dir("ark_metadata_test", |temp_dir| {
             let p = temp_dir.join("file");
             fs::write(&p, b"x").unwrap();
-            let local = LocalMetadata { encrypted: Some(true), sync_body_hash: Some(Hash { algorithm: DEFAULT_HASH_ALGORITHM.to_string(), value: vec![0xAB, 0xCD] }), sync_modified: Some("2026-01-01T00:00:00Z".to_string()) };
+            let sync_modified = timestamp::parse("2026-01-01T00:00:00Z").unwrap();
+            let local = LocalMetadata { encrypted: Some(true), sync_body_hash: Some(Hash { algorithm: DEFAULT_HASH_ALGORITHM.to_string(), value: vec![0xAB, 0xCD] }), sync_modified: Some(sync_modified) };
             write_local_metadata_attributes(&p, &local).unwrap();
             let back = read_local_metadata_attributes(&p).unwrap();
             assert_eq!(back.encrypted, Some(true));
             let back_hash = back.sync_body_hash.as_ref().unwrap();
             assert_eq!(back_hash.algorithm, DEFAULT_HASH_ALGORITHM);
             assert_eq!(back_hash.value, vec![0xAB, 0xCD]);
-            assert_eq!(back.sync_modified.as_deref(), Some("2026-01-01T00:00:00Z"));
+            assert_eq!(back.sync_modified, Some(sync_modified));
         });
     }
 
@@ -659,7 +661,7 @@ mod tests {
         in_test_dir("ark_metadata_test", |temp_dir| {
             let p = temp_dir.join("file");
             fs::write(&p, b"x").unwrap();
-            let full = LocalMetadata { encrypted: Some(true), sync_body_hash: Some(Hash { algorithm: DEFAULT_HASH_ALGORITHM.to_string(), value: vec![1, 2, 3] }), sync_modified: Some("2026-01-01T00:00:00Z".to_string()) };
+            let full = LocalMetadata { encrypted: Some(true), sync_body_hash: Some(Hash { algorithm: DEFAULT_HASH_ALGORITHM.to_string(), value: vec![1, 2, 3] }), sync_modified: Some(timestamp::parse("2026-01-01T00:00:00Z").unwrap()) };
             write_local_metadata_attributes(&p, &full).unwrap();
             let cleared = LocalMetadata::default();
             write_local_metadata_attributes(&p, &cleared).unwrap();

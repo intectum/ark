@@ -8,8 +8,9 @@ use crate::context::create_client_context;
 use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, DEFAULT_PASSWORD_ALGORITHM, create_secret_key_from_password, restore_secret_key_from_password, to_public_key};
 use crate::identity::{create_identity, parse_address, sign_identity, validate_identity, write_identity, write_identity_key};
 use crate::metadata::{create_metadata, read_metadata_headers, sign_metadata, writer, write_metadata_attributes};
+use crate::timestamp;
 use crate::types::{Identity, IdentityContext, Key, Member, Permission, Permissions, Signature};
-use crate::util::{decode_base64url, io_err, io_invalid_input, now_iso, resolve_client_url_raw};
+use crate::util::{decode_base64url, io_err, io_invalid_input, resolve_client_url_raw};
 
 /// Initialize the ark account at `address` under `root`.
 ///
@@ -170,7 +171,7 @@ fn push_secret_key_with_password(
     let mut password_identity = Identity {
         public_key: to_public_key(&password_secret_key)?,
         address: format!("{}/.ark/passwords/primary.json", ctx.identity.address),
-        modified: now_iso(),
+        modified: timestamp::now(),
         signature: Signature {
             algorithm: String::new(),
             value: Vec::new()

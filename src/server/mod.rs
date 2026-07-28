@@ -281,7 +281,7 @@ mod tests {
     use super::*;
     use crate::crypto::{DEFAULT_SIGNING_ALGORITHM, create_secret_key};
     use crate::identity::create_identity;
-    use crate::util::now;
+    use crate::timestamp::now_ms;
     use crate::util::test::{TEST_ADDRESS, create_test_account, in_test_dir, write_plain_test_file};
 
     #[test]
@@ -350,7 +350,7 @@ mod tests {
             let key = [17u8; 32];
             create_test_account(temp_dir, TEST_ADDRESS);
             let port = start_test_server(temp_dir.to_path_buf());
-            let sig = sign(&key, port, "GET", "/ark/test/x", now(), &[]);
+            let sig = sign(&key, port, "GET", "/ark/test/x", now_ms(), &[]);
             let auth = format!("ArkIdentity address=\"test@example.com\", signature=\"{}\"", sig);
             let (code, _, _) = request(port, "GET", "/ark/test/x", &[], &[("Authorization", &auth)]);
             assert_eq!(code, 401);
@@ -363,7 +363,7 @@ mod tests {
             let key = [18u8; 32];
             create_test_account(temp_dir, TEST_ADDRESS);
             let port = start_test_server(temp_dir.to_path_buf());
-            let old = now() - (MAX_CLOCK_SKEW_MS + 60_000);
+            let old = now_ms() - (MAX_CLOCK_SKEW_MS + 60_000);
             let sig = sign(&key, port, "GET", "/ark/test/x", old, &[]);
             let auth = build_auth("test@example.com", old, &sig);
             let (code, _, _) = request(port, "GET", "/ark/test/x", &[], &[("Authorization", &auth)]);
@@ -377,7 +377,7 @@ mod tests {
             let key = [19u8; 32];
             create_test_account(temp_dir, TEST_ADDRESS);
             let port = start_test_server(temp_dir.to_path_buf());
-            let ts = now();
+            let ts = now_ms();
             let sig = sign(&key, port, "GET", "/ark/test/somethingelse", ts, &[]);
             let auth = build_auth("test@example.com", ts, &sig);
             let (code, _, _) = request(port, "GET", "/ark/test/realtarget", &[], &[("Authorization", &auth)]);

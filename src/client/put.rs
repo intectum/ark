@@ -6,9 +6,10 @@ use std::path::PathBuf;
 use super::encrypt_stream;
 use crate::client::request;
 use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, DEFAULT_HASH_ALGORITHM, create_secret_key};
-use crate::types::{Hash, IdentityContext, LocalMetadata, Metadata, Permissions};
 use crate::metadata::{apply_key_to_metadata, apply_permissions, create_metadata, extract_key_from_metadata, get_member, has_metadata_attributes, read_local_metadata_attributes, read_metadata_attributes, sign_metadata, write_local_metadata_attributes, write_metadata_attributes, write_metadata_headers};
-use crate::util::{io_err, io_invalid_input, now_iso, resolve_client_url, sha256};
+use crate::timestamp;
+use crate::types::{Hash, IdentityContext, LocalMetadata, Metadata, Permissions};
+use crate::util::{io_err, io_invalid_input, resolve_client_url, sha256};
 
 /// Upload a file body (or create a directory) at `path`.
 ///
@@ -39,6 +40,10 @@ use crate::util::{io_err, io_invalid_input, now_iso, resolve_client_url, sha256}
 /// and the request is marked with the `metadata` query parameter. The
 /// existing metadata's `body_hash` is preserved. Requires the file to exist
 /// on the server. Rejects any `encryption_algorithm`.
+///
+/// Missing intermediate parent directories on `path` are created on the
+/// server automatically. They are created without metadata and inherit
+/// member checks from the nearest metadata-bearing ancestor.
 pub fn put(ctx: &IdentityContext, path: &str, input: Option<&str>, permissions: &Permissions, encryption_algorithm: Option<&str>, metadata_only: bool) -> io::Result<()> {
     let input_path: Option<PathBuf> = input.map(PathBuf::from);
     if let Some(i) = input_path.as_deref() {
@@ -194,13 +199,13 @@ pub fn put_stream(
         }
     };
 
-    metadata.modified = now_iso();
+    metadata.modified = timestamp::now();
     metadata.modified_by = ctx.identity.address.clone();
 
     let sign_body = if is_dir || metadata_only { None } else { Some(final_body.as_slice()) };
     sign_metadata(ctx.identity_key.as_ref().expect("client context missing identity_key"), &mut metadata, sign_body)?;
 
-    local_metadata.sync_modified = Some(metadata.modified.clone());
+    local_metadata.sync_modified = Some(metadata.modified);
 
     let metadata_headers = write_metadata_headers(&metadata);
     let headers: Vec<(&str, &str)> = metadata_headers.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();

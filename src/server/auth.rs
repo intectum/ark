@@ -5,8 +5,9 @@ use url::Url;
 use crate::crypto::verify_bytes;
 use crate::identity::{parse_address, resolve_identity};
 use crate::metadata::get_member;
+use crate::timestamp;
 use crate::types::{Identity, IdentityContext, Member, Permission, Signature};
-use crate::util::{decode_base64url, io_err, now, parse_authorization_header, request_to_bytes};
+use crate::util::{decode_base64url, io_err, parse_authorization_header, request_to_bytes};
 
 use super::MAX_CLOCK_SKEW_MS;
 
@@ -40,12 +41,12 @@ pub fn authenticate(
 
     let signature = decode_base64url(&signature_b64).map_err(|_| io_err("auth signature not base64url encoded"))?;
 
-    let timestamp: u64 = timestamp_str.parse().map_err(|_| io_err("invalid timestamp in Authorization"))?;
-    if now().abs_diff(timestamp) > MAX_CLOCK_SKEW_MS {
+    let ts: u64 = timestamp_str.parse().map_err(|_| io_err("invalid timestamp in Authorization"))?;
+    if timestamp::now_ms().abs_diff(ts) > MAX_CLOCK_SKEW_MS {
         return Err(io_err("timestamp outside allowed window"));
     }
 
-    let bytes = request_to_bytes(method, &request_host, url.path(), timestamp, body);
+    let bytes = request_to_bytes(method, &request_host, url.path(), ts, body);
     verify_bytes(&requestor_identity.public_key, &Signature { algorithm: requestor_identity.public_key.algorithm.clone(), value: signature }, &bytes).map_err(|_| io_err("signature verification failed"))?;
 
     Ok(requestor_identity)

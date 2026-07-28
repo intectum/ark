@@ -1,9 +1,7 @@
 use std::env::current_dir;
-use std::fs;
 use std::io;
 use std::io::{Error, ErrorKind};
-use std::path::{Component, Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::{Component, Path};
 
 use base64::{DecodeError, Engine};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -13,19 +11,6 @@ use url::Url;
 use crate::crypto::sign_bytes;
 use crate::http::{read_request, read_response};
 use crate::types::{IdentityContext, RequestEntry};
-
-pub fn find_account_root() -> io::Result<PathBuf> {
-    let current = current_dir()?;
-
-    let mut root = current.as_path();
-    while !fs::exists(root.join(".ark"))? {
-        root = root
-            .parent()
-            .ok_or_else(|| Error::new(ErrorKind::NotFound, "no .ark dir found"))?;
-    }
-
-    Ok(root.to_path_buf())
-}
 
 pub fn resolve_client_url(ctx: &IdentityContext, path: &str) -> io::Result<Url> {
     resolve_client_url_raw(&ctx.root, path, &ctx.identity.address)
@@ -159,25 +144,6 @@ pub fn sha256(data: &[u8]) -> Vec<u8> {
     let mut hash = Sha256::new();
     hash.update(data);
     hash.finalize().to_vec()
-}
-
-pub fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
-}
-
-pub fn now_iso() -> String {
-    let millis = now();
-    let secs = (millis / 1000) as i64;
-    let sub_millis = (millis % 1000) as u16;
-    let dt = time::OffsetDateTime::from_unix_timestamp(secs).expect("valid unix timestamp");
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
-        dt.year(), dt.month() as u8, dt.day(), dt.hour(), dt.minute(), dt.second(), sub_millis
-    )
-}
-
-pub fn now_iso_fs() -> String {
-    now_iso().replace(':', "-")
 }
 
 pub fn io_err(s: &str) -> Error {

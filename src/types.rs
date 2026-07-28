@@ -2,6 +2,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use time::OffsetDateTime;
 
 /// Runtime context for an ark account.
 ///
@@ -79,20 +80,21 @@ pub struct Hash {
 /// Public identity of an ark account: address, public key, and a self-signature
 /// binding the two. Served as `.ark/identity.json` and used to verify request
 /// signatures and wrap file keys for members.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Identity {
     /// Public key used to verify request signatures and wrap file keys for
     /// this account.
     pub public_key: Key,
     /// Account address in `name@host[:port]` form.
     pub address: String,
-    /// ISO 8601 timestamp of the most recent identity change.
-    pub modified: String,
+    /// Timestamp of the most recent identity change.
+    #[serde(with = "crate::timestamp::serde")]
+    pub modified: OffsetDateTime,
     /// Signature over the other fields, produced by the account's private key.
     pub signature: Signature,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Key {
     pub algorithm: String,
     #[serde(with = "base64url")]
@@ -109,7 +111,7 @@ pub struct LocalMetadata {
     pub sync_body_hash: Option<Hash>,
     /// `Metadata.modified` at the last successful sync. Baseline for detecting
     /// local metadata drift (e.g. `chmod` since last sync).
-    pub sync_modified: Option<String>,
+    pub sync_modified: Option<OffsetDateTime>,
 }
 
 /// A member entry in a file or directory's metadata: address, permission,
@@ -128,8 +130,10 @@ pub struct Member {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Metadata {
     pub id: String,
-    pub created: String,
-    pub modified: String,
+    #[serde(with = "crate::timestamp::serde")]
+    pub created: OffsetDateTime,
+    #[serde(with = "crate::timestamp::serde")]
+    pub modified: OffsetDateTime,
     pub modified_by: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption_algorithm: Option<String>,
@@ -229,7 +233,7 @@ pub struct RequestEntry {
     pub status: u16,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Signature {
     pub algorithm: String,
     #[serde(with = "base64url")]

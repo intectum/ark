@@ -3,9 +3,10 @@ use std::time::Duration;
 
 use url::Url;
 
-use crate::types::IdentityContext;
 use crate::http::{connect, read_response, write_request};
-use crate::util::{create_authorization_header, io_err, now};
+use crate::timestamp;
+use crate::types::IdentityContext;
+use crate::util::{create_authorization_header, io_err};
 
 pub fn request(ctx: Option<&IdentityContext>, method: &str, url: &Url, headers: &[(&str, &str)], body: &[u8]) -> io::Result<(u16, Vec<(String, String)>, Vec<u8>)> {
     let mut final_headers = headers.to_vec();
@@ -17,7 +18,7 @@ pub fn request(ctx: Option<&IdentityContext>, method: &str, url: &Url, headers: 
     };
 
     let authorization = match ctx {
-        Some(c) => Some(create_authorization_header(c, method, &host_header, url.path(), now(), body)?),
+        Some(c) => Some(create_authorization_header(c, method, &host_header, url.path(), timestamp::now_ms(), body)?),
         None => None,
     };
 

@@ -9,8 +9,9 @@ use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use url::Url;
 
 use crate::http::{connect, read_stream_events, write_request};
+use crate::timestamp;
 use crate::types::{DirEntry, DirEntryKind, EntryAction, EntryEvent, IdentityContext, StreamEvent};
-use crate::util::{create_authorization_header, io_err, now};
+use crate::util::{create_authorization_header, io_err};
 
 const REMOTE_READ_TIMEOUT: Duration = Duration::from_secs(45);
 const REMOTE_RECONNECT_DELAY: Duration = Duration::from_secs(2);
@@ -74,7 +75,7 @@ where
             None => host.to_string(),
         };
 
-        let authorization = create_authorization_header(ctx, "GET", &host_header, url.path(), now(), &[])?;
+        let authorization = create_authorization_header(ctx, "GET", &host_header, url.path(), timestamp::now_ms(), &[])?;
 
         let headers: Vec<(&str, &str)> = vec![
             ("Authorization", authorization.as_str()),

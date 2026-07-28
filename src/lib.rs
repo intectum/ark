@@ -32,5 +32,6 @@ pub mod http;
 pub mod identity;
 pub mod metadata;
 pub mod server;
+pub mod timestamp;
 pub mod types;
 pub mod util;

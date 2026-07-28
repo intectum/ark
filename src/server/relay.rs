@@ -8,8 +8,9 @@ use url::Url;
 use crate::client::request;
 use crate::http::read_response;
 use crate::identity::parse_address;
+use crate::timestamp;
 use crate::types::{IdentityContext, Metadata, RelayMode};
-use crate::util::{create_authorization_header, io_err, is_loopback_host, now};
+use crate::util::{create_authorization_header, io_err, is_loopback_host};
 
 use super::handle_parsed;
 
@@ -64,7 +65,7 @@ pub fn relay(
             .collect();
 
         if same_host {
-            let authorization = create_authorization_header(server_ctx, method, &server_host, &member_target, now(), body)?;
+            let authorization = create_authorization_header(server_ctx, method, &server_host, &member_target, timestamp::now_ms(), body)?;
             final_headers.push(("Authorization".to_string(), authorization));
             final_headers.push(("Host".to_string(), server_host.clone()));
         }

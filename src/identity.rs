@@ -7,9 +7,9 @@ use url::Url;
 
 use crate::crypto::{DEFAULT_SIGNING_ALGORITHM, create_secret_key, sign_json, to_public_key, verify_json};
 use crate::client::request;
-use crate::types::IdentityContext;
-use crate::types::{Identity, Key, Signature};
-use crate::util::{decode_base64url, encode_base64url, io_err, io_invalid_input, now_iso, resolve_client_url};
+use crate::timestamp;
+use crate::types::{Identity, IdentityContext, Key, Signature};
+use crate::util::{decode_base64url, encode_base64url, io_err, io_invalid_input, resolve_client_url};
 
 pub fn create_identity(address: &str) -> io::Result<(Identity, Key)> {
     let mut secret_key = create_secret_key(DEFAULT_SIGNING_ALGORITHM)?;
@@ -20,7 +20,7 @@ pub fn create_identity(address: &str) -> io::Result<(Identity, Key)> {
     let mut identity = Identity {
         public_key: to_public_key(&secret_key)?,
         address: address.to_string(),
-        modified: now_iso(),
+        modified: timestamp::now(),
         signature: Signature {
             algorithm: String::new(),
             value: Vec::new()
@@ -101,9 +101,6 @@ pub fn validate_identity(identity: &Identity) -> io::Result<()> {
     if !is_valid_account_name(&name) {
         return Err(io_invalid_input("invalid account name (must be lowercase alphanumeric, dots, hyphens, underscores; 1-64 chars; not pure dots)"));
     }
-
-    time::OffsetDateTime::parse(&identity.modified, &time::format_description::well_known::Rfc3339)
-        .map_err(|e| io_invalid_input(&format!("modified is not a valid RFC 3339 timestamp: {}", e)))?;
 
     verify_identity(identity)
         .map_err(|_| io_invalid_input("signature verification failed"))?;
@@ -292,11 +289,16 @@ mod tests {
     }
 
     #[test]
-    fn validate_identity_rejects_bad_timestamp() {
-        let (mut identity, _) = create_identity("alice@example.com").unwrap();
-        identity.modified = "not-a-timestamp".to_string();
-        let err = validate_identity(&identity).unwrap_err();
-        assert!(err.to_string().contains("not a valid RFC 3339 timestamp"));
+    fn read_identity_rejects_bad_timestamp() {
+        in_test_dir("ark_identity_test", |temp_dir| {
+            let (identity, _) = create_identity("alice@example.com").unwrap();
+            let mut json = serde_json::to_value(&identity).unwrap();
+            json["modified"] = serde_json::Value::String("not-a-timestamp".to_string());
+            let path = temp_dir.join("identity.json");
+            fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+            let err = read_identity(&path).unwrap_err();
+            assert!(err.to_string().contains("invalid rfc3339 timestamp"), "msg was {}", err);
+        });
     }
 
     #[test]

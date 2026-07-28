@@ -7,8 +7,9 @@ use std::thread;
 use super::{get, get_stream, head, list, put, watch_local, watch_remote};
 use crate::identity::parse_address;
 use crate::metadata::{has_metadata_attributes, read_local_metadata_attributes, read_metadata_attributes, read_metadata_headers, remove_local_metadata_attributes, write_local_metadata_attributes, write_metadata_attributes};
+use crate::timestamp;
 use crate::types::{DirEntryKind, EntryAction, EntryEvent, IdentityContext, Metadata, Permissions};
-use crate::util::{now_iso_fs, io_err, parse_request_entry, resolve_client_url, sha256};
+use crate::util::{io_err, parse_request_entry, resolve_client_url, sha256};
 
 struct SyncEntry {
     relative_path: String,
@@ -357,7 +358,7 @@ where
         write_metadata_attributes(&local_path, &metadata)?;
 
         let mut local = read_local_metadata_attributes(&local_path).unwrap_or_default();
-        local.sync_modified = Some(metadata.modified.clone());
+        local.sync_modified = Some(metadata.modified);
         write_local_metadata_attributes(&local_path, &local)?;
         return Ok(emit(EntryAction::Metadata, false));
     }
@@ -450,7 +451,7 @@ fn sidecar_path_for(local_path: &Path) -> PathBuf {
     let file_name = local_path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "conflict".to_string());
-    local_path.with_file_name(format!("{}.conflict-{}", file_name, now_iso_fs()))
+    local_path.with_file_name(format!("{}.conflict-{}", file_name, timestamp::format_fs_safe(timestamp::now())))
 }
 
 #[cfg(test)]
@@ -948,7 +949,7 @@ mod tests {
             assert_ne!(server_meta.modified, modified_before, "modified stamp should advance");
 
             let local_after = read_local_metadata_attributes(&local).unwrap();
-            assert_eq!(local_after.sync_modified.as_deref(), Some(server_meta.modified.as_str()),
+            assert_eq!(local_after.sync_modified, Some(server_meta.modified),
                 "sync_modified should track pushed metadata stamp");
         });
     }

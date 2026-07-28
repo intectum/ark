@@ -7,8 +7,9 @@ use super::put;
 use crate::types::IdentityContext;
 use crate::identity::resolve_identity;
 use crate::metadata::{apply_permissions, extract_key_from_metadata, get_member, has_metadata_attributes, read_metadata_attributes, sign_metadata, verify_metadata_signature, write_metadata_attributes};
+use crate::timestamp;
 use crate::types::{Permission, Permissions};
-use crate::util::{io_err, io_invalid_input, now_iso};
+use crate::util::{io_err, io_invalid_input};
 
 /// Change members and permissions on a tracked local file or directory.
 ///
@@ -61,7 +62,7 @@ pub fn chmod(
 
     apply_permissions(ctx, &mut metadata, permissions, file_key.as_deref())?;
 
-    metadata.modified = now_iso();
+    metadata.modified = timestamp::now();
     metadata.modified_by = ctx.identity.address.clone();
 
     let secret_key = ctx.identity_key.as_ref().expect("client context missing identity_key");

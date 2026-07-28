@@ -86,15 +86,16 @@ pub fn serve_put(fs_path: &Path, stream: &mut dyn Write, body: &[u8], metadata: 
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
     use super::super::start_test_server;
     use super::super::test_helpers::*;
     use crate::crypto::DEFAULT_ENCRYPTION_ALGORITHM;
     use crate::metadata::{read_metadata_attributes, sign_metadata, write_metadata_headers};
+    use crate::timestamp::now_ms;
     use crate::types::{Member, Permission};
-    use crate::util::now;
     use crate::util::test::{TEST_ADDRESS, create_encrypted_test_metadata, create_plain_test_metadata, create_test_account, in_test_dir, write_plain_test_file};
-    use std::fs;
-    use std::os::unix::fs::symlink;
 
     #[test]
     fn put_new_file_returns_201() {
@@ -176,7 +177,7 @@ mod tests {
             let key = [22u8; 32];
             create_test_account(temp_dir, TEST_ADDRESS);
             let port = start_test_server(temp_dir.to_path_buf());
-            let ts = now();
+            let ts = now_ms();
             let signed_body = b"original";
             let sig = sign(&key, port, "PUT", "/ark/test/file", ts, signed_body);
             let auth = build_auth("test@example.com", ts, &sig);

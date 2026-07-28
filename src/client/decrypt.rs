@@ -102,7 +102,7 @@ pub fn decrypt(
             write_local_metadata_attributes(destination_path, &LocalMetadata {
                 encrypted: Some(false),
                 sync_body_hash: Some(Hash { algorithm: DEFAULT_HASH_ALGORITHM.to_string(), value: sha256(&plaintext_bytes) }),
-                sync_modified: Some(metadata.modified.clone()),
+                sync_modified: Some(metadata.modified),
             })?;
         }
         None => io::stdout().write_all(&plaintext_bytes)?,

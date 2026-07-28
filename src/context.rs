@@ -1,11 +1,12 @@
+use std::env::current_dir;
 use std::fs;
 use std::io;
+use std::io::{Error, ErrorKind};
 use std::path::Path;
 
 use crate::identity::{create_identity, read_identity, read_identity_key, write_identity, write_identity_key};
 use crate::metadata::{create_metadata, sign_metadata, write_metadata_attributes};
 use crate::types::{IdentityContext, Key, Member, Permission};
-use crate::util::find_account_root;
 
 /// Load the [`IdentityContext`] for the ark account containing the current
 /// working directory. `identity_key` is set.
@@ -13,9 +14,15 @@ use crate::util::find_account_root;
 /// Errors with `NotFound` if the current directory is not inside an ark
 /// account.
 pub fn create_client_context() -> io::Result<IdentityContext> {
-    let root = find_account_root()?;
+    let current = current_dir()?;
+    let mut root = current.as_path();
+    while !fs::exists(root.join(".ark"))? {
+        root = root
+            .parent()
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, "no .ark dir found"))?;
+    }
 
-    read_context(&root)
+    read_context(root)
 }
 
 pub fn create_server_context(server_root: &Path, host: &str) -> io::Result<IdentityContext> {
