@@ -7,7 +7,7 @@ use std::thread;
 use super::{get, get_stream, head, list, put, watch_local, watch_remote};
 use crate::identity::parse_address;
 use crate::metadata::{has_metadata_attributes, read_local_metadata_attributes, read_metadata_attributes, read_metadata_headers, remove_local_metadata_attributes, write_local_metadata_attributes, write_metadata_attributes};
-use crate::types::{DirEntryKind, IdentityContext, Metadata, Permissions, WatchAction};
+use crate::types::{DirEntryKind, EntryAction, EntryEvent, IdentityContext, Metadata, Permissions};
 use crate::util::{now_iso_fs, io_err, parse_request_entry, resolve_client_url, sha256};
 
 struct SyncEntry {
@@ -34,37 +34,56 @@ struct SyncEntry {
 ///
 /// With `watch=true`, blocks and continues syncing as local FS events and
 /// remote SSE events arrive under `path`, in addition to the initial pass.
-/// `decrypt` controls whether pulled files are decrypted on write.
-pub fn sync(ctx: &IdentityContext, path: &Path, watch: bool, decrypt: bool) -> io::Result<()> {
+/// `decrypt` controls whether pulled files are decrypted on write. `on_event`
+/// fires once per reconciled entry; `on_error` receives non-fatal per-entry
+/// failures and watch stream errors.
+pub fn sync<F, G>(
+    ctx: &IdentityContext,
+    path: &Path,
+    watch: bool,
+    decrypt: bool,
+    on_event: F,
+    on_error: G,
+) -> io::Result<()>
+where
+    F: Fn(EntryEvent) -> bool + Send + Sync,
+    G: Fn(io::Error) -> bool + Send + Sync,
+{
     if watch {
         thread::scope(|s| {
             s.spawn(|| {
-                if let Err(e) = pull_watch(ctx, path, decrypt) {
-                    eprintln!("pull watch: {}", e);
+                if let Err(e) = pull_watch(ctx, path, decrypt, &on_event, &on_error) {
+                    on_error(io_err(&format!("pull watch: {}", e)));
                 }
             });
             s.spawn(|| {
-                if let Err(e) = push_watch(ctx, path) {
-                    eprintln!("push watch: {}", e);
+                if let Err(e) = push_watch(ctx, path, &on_event, &on_error) {
+                    on_error(io_err(&format!("push watch: {}", e)));
                 }
             });
-            if let Err(e) = initial_sync(ctx, path, decrypt) {
-                eprintln!("initial sync: {}", e);
+            if let Err(e) = initial_sync(ctx, path, decrypt, &on_event, &on_error) {
+                on_error(io_err(&format!("initial sync: {}", e)));
             }
         });
     } else {
-        initial_sync(ctx, path, decrypt)?;
+        initial_sync(ctx, path, decrypt, &on_event, &on_error)?;
     }
 
     Ok(())
 }
 
-fn initial_sync(ctx: &IdentityContext, path: &Path, decrypt: bool) -> io::Result<()> {
-    let (entries, last_sync_request) = check(ctx, path)?;
+fn initial_sync<F, G>(ctx: &IdentityContext, path: &Path, decrypt: bool, on_event: &F, on_error: &G) -> io::Result<()>
+where
+    F: Fn(EntryEvent) -> bool,
+    G: Fn(io::Error) -> bool,
+{
+    let (entries, last_sync_request) = check(ctx, path, on_error)?;
 
     for entry in entries {
-        if let Err(e) = sync_entry(ctx, &entry, decrypt) {
-            eprintln!("sync failed for {}: {}", entry.relative_path, e);
+        match sync_entry(ctx, &entry, decrypt, on_event) {
+            Ok(true) => break,
+            Ok(false) => {}
+            Err(e) => { on_error(io_err(&format!("sync failed for {}: {}", entry.relative_path, e))); }
         }
     }
 
@@ -77,7 +96,11 @@ fn initial_sync(ctx: &IdentityContext, path: &Path, decrypt: bool) -> io::Result
     Ok(())
 }
 
-fn pull_watch(ctx: &IdentityContext, path: &Path, decrypt: bool) -> io::Result<()> {
+fn pull_watch<F, G>(ctx: &IdentityContext, path: &Path, decrypt: bool, on_event: &F, on_error: &G) -> io::Result<()>
+where
+    F: Fn(EntryEvent) -> bool,
+    G: Fn(io::Error) -> bool,
+{
     let rel_prefix = to_relative_path(ctx, path)?;
     let url = resolve_client_url(ctx, &format!("/{}", rel_prefix))?;
 
@@ -93,7 +116,7 @@ fn pull_watch(ctx: &IdentityContext, path: &Path, decrypt: bool) -> io::Result<(
         let is_dir = matches!(event.kind, Some(DirEntryKind::Dir));
 
         match event.action {
-            WatchAction::Created | WatchAction::Modified => {
+            EntryAction::Created | EntryAction::Modified => {
                 let entry = SyncEntry {
                     relative_path: relative_path.clone(),
                     modified_local_body: false,
@@ -101,28 +124,40 @@ fn pull_watch(ctx: &IdentityContext, path: &Path, decrypt: bool) -> io::Result<(
                     modified_remote_body: !is_dir,
                     modified_remote_metadata: true,
                 };
-                if let Err(e) = sync_entry(ctx, &entry, decrypt) {
-                    eprintln!("sync failed for {}: {}", relative_path, e);
+                match sync_entry(ctx, &entry, decrypt, on_event) {
+                    Ok(true) => return true,
+                    Ok(false) => {}
+                    Err(e) => { on_error(io_err(&format!("sync failed for {}: {}", relative_path, e))); }
                 }
             }
-            WatchAction::Deleted => {
+            EntryAction::Deleted => {
                 let local_path = ctx.root.join(&relative_path);
                 if local_path.exists() && !is_dir {
-                    if let Err(e) = fs::remove_file(&local_path) {
-                        eprintln!("pull delete {}: {}", relative_path, e);
+                    match fs::remove_file(&local_path) {
+                        Ok(()) => if on_event(EntryEvent {
+                            action: EntryAction::Deleted,
+                            kind: Some(DirEntryKind::File),
+                            path: PathBuf::from(&relative_path),
+                            conflict: false,
+                        }) { return true; },
+                        Err(e) => { on_error(io_err(&format!("pull delete {}: {}", relative_path, e))); }
                     }
                 }
             }
             _ => {}
         }
-        Ok(())
-    })
+        false
+    }, on_error)
 }
 
-fn push_watch(ctx: &IdentityContext, path: &Path) -> io::Result<()> {
+fn push_watch<F, G>(ctx: &IdentityContext, path: &Path, on_event: &F, on_error: &G) -> io::Result<()>
+where
+    F: Fn(EntryEvent) -> bool,
+    G: Fn(io::Error) -> bool,
+{
     watch_local(path, |event| {
         match event.action {
-            WatchAction::Created | WatchAction::Modified => {}
+            EntryAction::Created | EntryAction::Modified => {}
             _ => return false,
         }
 
@@ -130,24 +165,27 @@ fn push_watch(ctx: &IdentityContext, path: &Path) -> io::Result<()> {
         if !absolute.is_file() { return false; }
 
         match check_entry(ctx, &absolute) {
-            Ok(Some(entry)) => {
-                if let Err(e) = sync_entry(ctx, &entry, false) {
-                    eprintln!("push failed for {}: {}", absolute.display(), e);
-                }
-            }
+            Ok(Some(entry)) => match sync_entry(ctx, &entry, false, on_event) {
+                Ok(true) => return true,
+                Ok(false) => {}
+                Err(e) => { on_error(io_err(&format!("push failed for {}: {}", absolute.display(), e))); }
+            },
             Ok(None) => {}
-            Err(e) => eprintln!("check {}: {}", absolute.display(), e),
+            Err(e) => { on_error(io_err(&format!("check {}: {}", absolute.display(), e))); }
         }
 
         false
-    }, None)
+    }, on_error)
 }
 
-fn check(ctx: &IdentityContext, path: &Path) -> io::Result<(Vec<SyncEntry>, Option<String>)> {
-    let (log_map, last_sync_request) = fetch_log_map(ctx, path)?;
+fn check<G>(ctx: &IdentityContext, path: &Path, on_error: &G) -> io::Result<(Vec<SyncEntry>, Option<String>)>
+where
+    G: Fn(io::Error) -> bool,
+{
+    let (log_map, last_sync_request) = fetch_log_map(ctx, path, on_error)?;
 
     let mut entries: HashMap<String, SyncEntry> = HashMap::new();
-    check_dir(ctx, path, &mut entries)?;
+    check_dir(ctx, path, &mut entries, on_error)?;
 
     for (rel, log) in &log_map {
         if log.modified_by == ctx.identity.address { continue; }
@@ -157,7 +195,6 @@ fn check(ctx: &IdentityContext, path: &Path) -> io::Result<(Vec<SyncEntry>, Opti
         let has_local_metadata = local_path.exists() && has_metadata_attributes(&local_path)?;
 
         if !is_dir && local_path.exists() && !has_local_metadata {
-            eprintln!("skip pull for untracked local {}", local_path.display());
             continue;
         }
 
@@ -204,11 +241,15 @@ fn check(ctx: &IdentityContext, path: &Path) -> io::Result<(Vec<SyncEntry>, Opti
     Ok((list, last_sync_request))
 }
 
-fn check_dir(
+fn check_dir<G>(
     ctx: &IdentityContext,
     path: &Path,
     entries: &mut HashMap<String, SyncEntry>,
-) -> io::Result<()> {
+    on_error: &G,
+) -> io::Result<()>
+where
+    G: Fn(io::Error) -> bool,
+{
     for entry in fs::read_dir(path)? {
         let entry = entry?;
         if entry.file_type()?.is_symlink() { continue; }
@@ -216,13 +257,13 @@ fn check_dir(
         let path = entry.path();
 
         if path.is_dir() {
-            check_dir(ctx, &path, entries)?;
+            check_dir(ctx, &path, entries, on_error)?;
         }
         if path.is_dir() || path.is_file() {
             match check_entry(ctx, &path) {
                 Ok(Some(e)) => { entries.insert(e.relative_path.clone(), e); }
                 Ok(None) => {}
-                Err(e) => eprintln!("check {}: {}", path.display(), e),
+                Err(e) => { on_error(io_err(&format!("check {}: {}", path.display(), e))); }
             }
         }
     }
@@ -262,25 +303,35 @@ fn check_entry(
     }))
 }
 
-fn sync_entry(ctx: &IdentityContext, entry: &SyncEntry, decrypt: bool) -> io::Result<()> {
+fn sync_entry<F>(ctx: &IdentityContext, entry: &SyncEntry, decrypt: bool, on_event: &F) -> io::Result<bool>
+where
+    F: Fn(EntryEvent) -> bool,
+{
     let local_path = ctx.root.join(&entry.relative_path);
     let target = format!("/{}", entry.relative_path);
 
+    let emit = |action: EntryAction, conflict: bool| -> bool {
+        let kind = if local_path.is_dir() { DirEntryKind::Dir } else { DirEntryKind::File };
+        on_event(EntryEvent {
+            action,
+            kind: Some(kind),
+            path: PathBuf::from(&entry.relative_path),
+            conflict,
+        })
+    };
+
     if entry.modified_local_body && entry.modified_remote_body {
-        eprintln!("pull: {}", entry.relative_path);
         let sidecar_path = sidecar_path_for(&local_path);
         get(ctx, &target, sidecar_path.to_str(), decrypt)?;
-
         remove_local_metadata_attributes(&sidecar_path)?;
-        eprintln!("conflict: remote kept at {}", sidecar_path.display());
+        return Ok(emit(EntryAction::Modified, true));
     } else if entry.modified_local_body {
-        eprintln!("push: {}", entry.relative_path);
         put(ctx, &target, local_path.to_str(), &Permissions::default(), None, false)?;
+        return Ok(emit(EntryAction::Modified, false));
     } else if entry.modified_remote_body {
-        eprintln!("pull: {}", entry.relative_path);
         get(ctx, &target, local_path.to_str(), decrypt)?;
+        return Ok(emit(EntryAction::Modified, false));
     } else if entry.modified_local_metadata && entry.modified_remote_metadata {
-        eprintln!("pull: {}", entry.relative_path);
         let sidecar_path = sidecar_path_for(&local_path);
         let (_, remote_metadata) = head(ctx, &target)?;
 
@@ -290,12 +341,11 @@ fn sync_entry(ctx: &IdentityContext, entry: &SyncEntry, decrypt: bool) -> io::Re
             fs::copy(&local_path, &sidecar_path)?;
         }
         write_metadata_attributes(&sidecar_path, &remote_metadata)?;
-        eprintln!("conflict: remote kept at {}", sidecar_path.display());
+        return Ok(emit(EntryAction::Metadata, true));
     } else if entry.modified_local_metadata {
-        eprintln!("push: {}", entry.relative_path);
         put(ctx, &target, local_path.to_str(), &Permissions::default(), None, false)?;
+        return Ok(emit(EntryAction::Metadata, false));
     } else if entry.modified_remote_metadata {
-        eprintln!("pull: {}", entry.relative_path);
         let (_, metadata) = head(ctx, &target)?;
 
         if metadata.body_hash.is_none() {
@@ -309,12 +359,16 @@ fn sync_entry(ctx: &IdentityContext, entry: &SyncEntry, decrypt: bool) -> io::Re
         let mut local = read_local_metadata_attributes(&local_path).unwrap_or_default();
         local.sync_modified = Some(metadata.modified.clone());
         write_local_metadata_attributes(&local_path, &local)?;
+        return Ok(emit(EntryAction::Metadata, false));
     }
 
-    Ok(())
+    Ok(false)
 }
 
-fn fetch_log_map(ctx: &IdentityContext, path: &Path) -> io::Result<(HashMap<String, Metadata>, Option<String>)> {
+fn fetch_log_map<G>(ctx: &IdentityContext, path: &Path, on_error: &G) -> io::Result<(HashMap<String, Metadata>, Option<String>)>
+where
+    G: Fn(io::Error) -> bool,
+{
     let last_sync_request = match fs::read_to_string(path.join(".ark").join("last_sync_request")) {
         Ok(s) => Some(s.trim().to_string()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => None,
@@ -352,7 +406,7 @@ fn fetch_log_map(ctx: &IdentityContext, path: &Path) -> io::Result<(HashMap<Stri
         let (relative_path, metadata) = match parse_put(&entry_body, &account_prefix) {
             Ok(Some(v)) => v,
             Ok(None) => continue,
-            Err(e) => { eprintln!("bad log entry: {}", e); continue; }
+            Err(e) => { on_error(io_err(&format!("bad log entry: {}", e))); continue; }
         };
 
         if !under_prefix(&relative_path, &rel_prefix) { continue; }
@@ -449,7 +503,7 @@ mod tests {
 
             fs::write(temp_dir.join("bare.txt"), b"hi").unwrap();
 
-            sync(&ctx, &current_dir().unwrap(), false, false).unwrap();
+            sync(&ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
 
             assert!(!temp_dir.join("ark/gyan/bare.txt").exists(), "untracked file should not upload");
         });
@@ -467,7 +521,7 @@ mod tests {
             prime_plain(&ctx, &local, "a/b/c.txt", b"deep v1");
 
             fs::write(&local, b"deep v2").unwrap();
-            sync(&ctx, &current_dir().unwrap(), false, false).unwrap();
+            sync(&ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
 
             let server_body = fs::read(temp_dir.join("ark/gyan/a/b/c.txt")).unwrap();
             assert_eq!(server_body, b"deep v2");
@@ -487,7 +541,7 @@ mod tests {
             let server_path = temp_dir.join("ark/gyan/f.txt");
             let before = fs::read(&server_path).unwrap();
 
-            sync(&ctx, &current_dir().unwrap(), false, false).unwrap();
+            sync(&ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
 
             let after = fs::read(&server_path).unwrap();
             assert_eq!(before, after, "server file should be unchanged when content matches cached hash");
@@ -508,7 +562,7 @@ mod tests {
             let before = fs::read(&server_path).unwrap();
 
             fs::write(&local, b"same").unwrap();
-            sync(&ctx, &current_dir().unwrap(), false, false).unwrap();
+            sync(&ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
 
             let after = fs::read(&server_path).unwrap();
             assert_eq!(before, after, "identical content should skip upload even after rewrite");
@@ -529,7 +583,7 @@ mod tests {
             let local = temp_dir.join("pulled.txt");
             get(&ctx, "pulled.txt", Some(local.to_str().unwrap()), false).unwrap();
 
-            sync(&ctx, &current_dir().unwrap(), false, false).unwrap();
+            sync(&ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
 
             let after = fs::read(&server_path).unwrap();
             assert_eq!(before, after, "sync after get must not re-upload identical body");
@@ -547,7 +601,7 @@ mod tests {
             prime_plain(&ctx, &local, "f.txt", b"v1");
 
             fs::write(&local, b"v2").unwrap();
-            sync(&ctx, &current_dir().unwrap(), false, false).unwrap();
+            sync(&ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
 
             let server_body = fs::read(temp_dir.join("ark/gyan/f.txt")).unwrap();
             assert_eq!(server_body, b"v2");
@@ -568,7 +622,7 @@ mod tests {
             symlink(&target, &link).unwrap();
 
             fs::write(&target, b"v2").unwrap();
-            sync(&ctx, &current_dir().unwrap(), false, false).unwrap();
+            sync(&ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
 
             assert_eq!(fs::read(temp_dir.join("ark/gyan/target.txt")).unwrap(), b"v2");
             assert!(!temp_dir.join("ark/gyan/link.txt").exists(), "symlink must not be uploaded");
@@ -586,7 +640,7 @@ mod tests {
             prime_plain(&ctx, &local, "f.txt", b"v1");
 
             fs::write(&local, b"v2").unwrap();
-            sync(&ctx, &current_dir().unwrap(), false, false).unwrap();
+            sync(&ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
 
             assert_eq!(
                 read_local_metadata_attributes(&local).unwrap().sync_body_hash.as_ref().unwrap().value,
@@ -596,7 +650,7 @@ mod tests {
 
             let server_path = temp_dir.join("ark/gyan/f.txt");
             let before = fs::read(&server_path).unwrap();
-            sync(&ctx, &current_dir().unwrap(), false, false).unwrap();
+            sync(&ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
             assert_eq!(fs::read(&server_path).unwrap(), before, "second sync must no-op");
         });
     }
@@ -617,7 +671,7 @@ mod tests {
             assert!(read_local_metadata_attributes(&local).unwrap().sync_body_hash.is_none(), "encrypted-at-rest file should not carry sync_body_hash");
 
             let before = fs::read(&server_path).unwrap();
-            sync(&ctx, &current_dir().unwrap(), false, false).unwrap();
+            sync(&ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
             let after = fs::read(&server_path).unwrap();
             assert_eq!(before, after, "encrypted-at-rest file should be skipped by sync");
         });
@@ -643,7 +697,7 @@ mod tests {
 
             set_current_dir(&alice_dir).unwrap();
             let alice_ctx = create_client_context().unwrap();
-            sync(&alice_ctx, &current_dir().unwrap(), false, false).unwrap();
+            sync(&alice_ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
 
             let pulled = alice_dir.join("shared/foo.txt");
             assert!(pulled.exists(), "sync should pull remote file");
@@ -672,7 +726,7 @@ mod tests {
 
             set_current_dir(&alice_dir).unwrap();
             let alice_ctx = create_client_context().unwrap();
-            sync(&alice_ctx, &current_dir().unwrap(), false, false).unwrap();
+            sync(&alice_ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
 
             let pulled = alice_dir.join("shared/foo.txt");
             assert_eq!(fs::read(&pulled).unwrap(), b"v1");
@@ -685,7 +739,7 @@ mod tests {
 
             set_current_dir(&alice_dir).unwrap();
             let alice_ctx = create_client_context().unwrap();
-            sync(&alice_ctx, &current_dir().unwrap(), false, false).unwrap();
+            sync(&alice_ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
 
             assert_eq!(fs::read(&pulled).unwrap(), b"v1", "body should be unchanged");
             let m = read_metadata_attributes(&pulled).unwrap();
@@ -714,7 +768,7 @@ mod tests {
 
             set_current_dir(&alice_dir).unwrap();
             let alice_ctx = create_client_context().unwrap();
-            sync(&alice_ctx, &current_dir().unwrap(), false, false).unwrap();
+            sync(&alice_ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
 
             let pulled_dir = alice_dir.join("shared/sub");
             assert!(pulled_dir.is_dir(), "sync should create dir locally");
@@ -738,7 +792,7 @@ mod tests {
             fs::write(&local, b"body").unwrap();
             put(&alice_ctx, "notes.txt", Some(local.to_str().unwrap()), &Permissions::default(), Some("none"), false).unwrap();
 
-            sync(&alice_ctx, &current_dir().unwrap(), false, false).unwrap();
+            sync(&alice_ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
 
             let last_sync_request = alice_dir.join(".ark/last_sync_request");
             assert!(last_sync_request.exists(), "last_sync_request should be recorded after sync");
@@ -767,11 +821,11 @@ mod tests {
 
             set_current_dir(&alice_dir).unwrap();
             let alice_ctx = create_client_context().unwrap();
-            sync(&alice_ctx, &current_dir().unwrap(), false, false).unwrap();
+            sync(&alice_ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
             assert_eq!(fs::read(alice_dir.join("shared/foo.txt")).unwrap(), b"first");
 
             fs::remove_file(alice_dir.join("shared/foo.txt")).unwrap();
-            sync(&alice_ctx, &current_dir().unwrap(), false, false).unwrap();
+            sync(&alice_ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
             assert!(!alice_dir.join("shared/foo.txt").exists(), "already-processed log entry must not re-pull");
         });
     }
@@ -791,7 +845,7 @@ mod tests {
             put(&alice_ctx, "notes.txt", Some(local.to_str().unwrap()), &Permissions::default(), Some("none"), false).unwrap();
             fs::remove_file(&local).unwrap();
 
-            sync(&alice_ctx, &current_dir().unwrap(), false, false).unwrap();
+            sync(&alice_ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
 
             assert!(!local.exists(), "own PUTs must not be pulled back");
         });
@@ -817,7 +871,7 @@ mod tests {
             put(&alice_ctx, "/shared/foo.txt", Some(local.to_str().unwrap()), &Permissions::default(), Some("none"), false).unwrap();
 
             let alice_ctx = create_client_context().unwrap();
-            sync(&alice_ctx, &current_dir().unwrap(), false, false).unwrap();
+            sync(&alice_ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
 
             set_current_dir(&bob_dir).unwrap();
             let bob_payload = bob_dir.join("payload.bin");
@@ -830,7 +884,7 @@ mod tests {
             fs::write(&local, b"alice-v2-unpushed").unwrap();
 
             let alice_ctx = create_client_context().unwrap();
-            sync(&alice_ctx, &current_dir().unwrap(), false, false).unwrap();
+            sync(&alice_ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
 
             assert_eq!(fs::read(&local).unwrap(), b"alice-v2-unpushed", "local edit preserved at original path");
 
@@ -857,7 +911,7 @@ mod tests {
             prime_plain(&ctx, &local, "f.txt", b"v1");
 
             fs::write(&local, b"v2").unwrap();
-            sync(&ctx, &current_dir().unwrap(), false, false).unwrap();
+            sync(&ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
 
             assert_eq!(fs::read(temp_dir.join("ark/gyan/f.txt")).unwrap(), b"v2");
             let entries: Vec<_> = fs::read_dir(temp_dir).unwrap()
@@ -884,7 +938,7 @@ mod tests {
 
             chmod(&ctx, local.to_str().unwrap(), &reader("public"), true).unwrap();
 
-            sync(&ctx, &current_dir().unwrap(), false, false).unwrap();
+            sync(&ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
 
             let body_after = fs::read(&server_path).unwrap();
             assert_eq!(body_after, body_before, "body should be unchanged");
@@ -923,7 +977,7 @@ mod tests {
 
             set_current_dir(&alice_dir).unwrap();
             let alice_ctx = create_client_context().unwrap();
-            sync(&alice_ctx, &current_dir().unwrap(), false, false).unwrap();
+            sync(&alice_ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
 
             assert_eq!(fs::read(&local).unwrap(), b"untracked local", "untracked local must not be clobbered");
         });
@@ -947,7 +1001,7 @@ mod tests {
             put(&alice_ctx, "/shared/foo.txt", Some(alice_local.to_str().unwrap()), &owner(bob_ctx.identity.address.clone()), Some("none"), false).unwrap();
 
             let alice_ctx = create_client_context().unwrap();
-            sync(&alice_ctx, &current_dir().unwrap(), false, false).unwrap();
+            sync(&alice_ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
 
             set_current_dir(&bob_dir).unwrap();
             let bob_payload = bob_dir.join("payload.bin");
@@ -961,7 +1015,7 @@ mod tests {
 
             set_current_dir(&alice_dir).unwrap();
             let alice_ctx = create_client_context().unwrap();
-            sync(&alice_ctx, &current_dir().unwrap(), false, false).unwrap();
+            sync(&alice_ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
 
             assert_eq!(fs::read(&alice_local).unwrap(), b"v1", "original body untouched");
             let local_meta = read_metadata_attributes(&alice_local).unwrap();
@@ -998,7 +1052,7 @@ mod tests {
             put(&alice_ctx, "/shared/sub", Some(alice_sub.to_str().unwrap()), &owner(bob_ctx.identity.address.clone()), None, false).unwrap();
 
             let alice_ctx = create_client_context().unwrap();
-            sync(&alice_ctx, &current_dir().unwrap(), false, false).unwrap();
+            sync(&alice_ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
 
             set_current_dir(&bob_dir).unwrap();
             let bob_sub = bob_dir.join("sub");
@@ -1015,7 +1069,7 @@ mod tests {
 
             set_current_dir(&alice_dir).unwrap();
             let alice_ctx = create_client_context().unwrap();
-            sync(&alice_ctx, &current_dir().unwrap(), false, false).unwrap();
+            sync(&alice_ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
 
             let sidecar = fs::read_dir(alice_dir.join("shared")).unwrap()
                 .filter_map(|e| e.ok())
@@ -1027,6 +1081,61 @@ mod tests {
             let sidecar_meta = read_metadata_attributes(&sidecar_path).unwrap();
             assert!(sidecar_meta.members.iter().any(|m| m.address == "carol@host"), "sidecar carries remote members");
             assert!(sidecar_meta.body_hash.is_none(), "dir sidecar carries no body_hash");
+        });
+    }
+
+    #[test]
+    fn sync_emits_events_for_push_metadata_and_conflict() {
+        use std::sync::Mutex;
+
+        in_test_dir("ark_sync_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let (alice_ctx, bob_ctx) = init_two_accounts(temp_dir, port);
+            let alice_dir = temp_dir.join("alice_client");
+            let bob_dir = temp_dir.join("bob_client");
+
+            set_current_dir(&alice_dir).unwrap();
+            seed_shared_dir_with_writer(&alice_dir, &alice_ctx, &bob_ctx.identity.address);
+
+            let local = alice_dir.join("shared/foo.txt");
+            fs::create_dir_all(local.parent().unwrap()).unwrap();
+            fs::write(&local, b"v1").unwrap();
+            put(&alice_ctx, "/shared/foo.txt", Some(local.to_str().unwrap()), &Permissions::default(), Some("none"), false).unwrap();
+            chmod(&alice_ctx, local.to_str().unwrap(), &writer(bob_ctx.identity.address.clone()), true).unwrap();
+            put(&alice_ctx, "/shared/foo.txt", Some(local.to_str().unwrap()), &Permissions::default(), Some("none"), false).unwrap();
+
+            let events: Mutex<Vec<EntryEvent>> = Mutex::new(Vec::new());
+            let capture = |e| { events.lock().unwrap().push(e); false };
+
+            fs::write(&local, b"v2").unwrap();
+            sync(&alice_ctx, &current_dir().unwrap(), false, false, capture, |_| false).unwrap();
+            let modified: Vec<_> = events.lock().unwrap().drain(..).collect();
+            assert_eq!(modified.len(), 1, "one event for local body push");
+            assert!(matches!(modified[0].action, EntryAction::Modified));
+            assert!(!modified[0].conflict);
+
+            chmod(&alice_ctx, local.to_str().unwrap(), &reader("public"), true).unwrap();
+            sync(&alice_ctx, &current_dir().unwrap(), false, false, capture, |_| false).unwrap();
+            let metadata: Vec<_> = events.lock().unwrap().drain(..).collect();
+            assert_eq!(metadata.len(), 1, "one event for metadata-only push");
+            assert!(matches!(metadata[0].action, EntryAction::Metadata));
+            assert!(!metadata[0].conflict);
+
+            set_current_dir(&bob_dir).unwrap();
+            let bob_payload = bob_dir.join("payload.bin");
+            let target = format!("alice@127.0.0.1:{}/shared/foo.txt", port);
+            get(&bob_ctx, &target, Some(bob_payload.to_str().unwrap()), false).unwrap();
+            fs::write(&bob_payload, b"bob-v3").unwrap();
+            put(&bob_ctx, &target, Some(bob_payload.to_str().unwrap()), &Permissions::default(), Some("none"), false).unwrap();
+
+            set_current_dir(&alice_dir).unwrap();
+            fs::write(&local, b"alice-v3-unpushed").unwrap();
+            let alice_ctx = create_client_context().unwrap();
+            sync(&alice_ctx, &current_dir().unwrap(), false, false, capture, |_| false).unwrap();
+            let conflict: Vec<_> = events.lock().unwrap().drain(..).collect();
+            assert_eq!(conflict.len(), 1, "one event for body divergence");
+            assert!(matches!(conflict[0].action, EntryAction::Modified));
+            assert!(conflict[0].conflict, "conflict flag set on sidecar write");
         });
     }
 }

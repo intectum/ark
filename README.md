@@ -91,7 +91,7 @@ ark proposals accept 1          # pulls the file, materializes it on bob's serve
 ark proposals reject 1          # discard instead
 
 # Sync the cwd
-ark sync -w                     # pull + push + watch (bidirectional)
+ark sync -w                     # reconcile local and remote; watch continuously
 ```
 
 Every command takes `-h` for details. Paths accept three forms:
@@ -110,7 +110,8 @@ Every command takes `-h` for details. Paths accept three forms:
 | `ark list <PATH>` | List entries of a directory. |
 | `ark delete <PATH>` | Delete a file or directory (recursive). |
 | `ark chmod <FILE>` | Change members on a tracked file: `-o` owner, `-w` writer, `-r` reader, `-d` drop. Use `public` for the `*` wildcard. Uploads by default; `--local-only` skips the upload. Untracked files must be created with `ark put` first. |
-| `ark sync` | Push local changes to the server. `-w` also watches and pulls. |
+| `ark sync` | Reconcile local and remote state in one pass. `-w` watches continuously. Prints one line per reconciled entry. |
+| `ark watch local <PATH>` / `ark watch remote <PATH>` | Print events for local FS changes or the server's SSE stream at PATH. |
 | `ark proposals list` | Show pending share proposals — unauthorized PUTs from other accounts, recorded in `.ark/requests/`. |
 | `ark proposals accept <ID>` | Fetch, verify, and PUT the shared file/dir. `-f` bypasses metadata-change checks. |
 | `ark proposals reject <ID>` | Delete the log entry. |
@@ -157,21 +158,24 @@ accept_proposal(&ctx, "1", /*force=*/ false)?;                  // pulls the fil
 reject_proposal(&ctx, "1")?;                                    // discard instead
 
 // Sync the cwd
-sync(&ctx, &std::env::current_dir()?, /*watch=*/ true, /*decrypt=*/ true)?; // pull + push + watch (bidirectional), blocks
+sync(&ctx, &std::env::current_dir()?, /*watch=*/ true, /*decrypt=*/ true,
+    |event| { println!("{} {}", event.action.as_str(), event.path.display()); false },
+    |error| { eprintln!("sync: {}", error); false }
+)?;                                                             // reconcile local and remote; watch continuously
 
 // Watch for local changes
 let cwd = std::env::current_dir()?;
-watch_local(&cwd, |event| {
-    println!("{:?} {}", event.action.as_str(), event.path.display());
-    false  // return true to stop
-}, None)?;
+watch_local(&cwd,
+    |event| { println!("{} {}", event.action.as_str(), event.path.display()); false },
+    |error| { eprintln!("watch: {}", error); false }
+)?;
 
 // Watch for remote changes
 let url = ark::util::resolve_client_url(&ctx, ".")?;
-watch_remote(&ctx, &url, |event| {
-    println!("remote: {}", event.path.display());
-    Ok(())
-})?;
+watch_remote(&ctx, &url,
+    |event| { println!("{} {}", event.action.as_str(), event.path.display()); false },
+    |error| { eprintln!("watch: {}", error); false }
+)?;
 
 // Streaming form when you don't want to touch the filesystem
 let mut buf = Vec::new();
@@ -192,7 +196,7 @@ Every CLI command has a corresponding library function. Most take file paths and
 | Directories | First-class. Recursive delete. Permissions inherit. |
 | Public files | Supported for plaintext only (any browser can fetch). |
 | Federation | On write, the server relays to co-members' servers. |
-| Sync | One-shot or watch mode (push + pull). |
+| Sync | One-shot or watch mode; reconciles divergence with a conflict sidecar. |
 | Transport | Server binds plain HTTP. Client URLs default to `https://` (put a reverse proxy in front for TLS); prefix an address with `http://` to override for dev. |
 | Authentication | `ArkIdentity` signed requests. No tokens, no sessions. |
 

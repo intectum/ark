@@ -80,7 +80,7 @@ pub fn write_stream_start(stream: &mut dyn Write) -> io::Result<()> {
 
 pub fn read_stream_events<F>(stream: &mut dyn Read, on_event: &mut F) -> io::Result<()>
 where
-    F: FnMut(&StreamEvent) -> io::Result<()>,
+    F: FnMut(&StreamEvent) -> bool,
 {
     let mut reader = BufReader::new(stream);
 
@@ -111,8 +111,8 @@ where
         let line = line.trim_end_matches(&['\r', '\n'][..]);
 
         if line.is_empty() {
-            if !event.data.is_empty() {
-                on_event(&event)?;
+            if !event.data.is_empty() && on_event(&event) {
+                return Ok(());
             }
             event = StreamEvent::default();
             continue;

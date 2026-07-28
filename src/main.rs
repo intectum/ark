@@ -1,16 +1,18 @@
 use std::env;
 use std::env::current_dir;
 use std::io::{self, Write};
+use std::path::Path;
 use std::process::exit;
 
 use clap::{Parser, Subcommand};
 
-use ark::client::{accept_proposal, chmod, decrypt, delete, encrypt, get, head, init, list, list_proposals, put, reject_proposal, sync};
-use ark::types::{DirEntryKind, Permissions};
+use ark::client::{accept_proposal, chmod, decrypt, delete, encrypt, get, head, init, list, list_proposals, put, reject_proposal, sync, watch_local, watch_remote};
+use ark::types::{DirEntryKind, EntryEvent, Permissions};
 use ark::context::create_client_context;
 use ark::identity::parse_address;
 use ark::server::start_server;
 use ark::types::IdentityContext;
+use ark::util::resolve_client_url;
 
 #[derive(Parser)]
 #[command(
@@ -22,6 +24,20 @@ use ark::types::IdentityContext;
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum WatchCmd {
+    /// Watch a local directory tree recursively.
+    Local {
+        /// Local directory path.
+        path: String,
+    },
+    /// Subscribe to remote server-sent events under a path.
+    Remote {
+        /// Ark URL or path.
+        path: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -183,6 +199,11 @@ enum Cmd {
         #[arg(short, long)]
         decrypt: bool,
     },
+    /// Watch for changes and print events as they arrive.
+    Watch {
+        #[command(subcommand)]
+        cmd: WatchCmd,
+    },
     /// Decrypt an encrypted file.
     ///
     /// If the source has ark metadata, its file key and algorithm are reused
@@ -262,7 +283,14 @@ fn main() {
             ProposalsCmd::Reject { id } => reject_proposal(&c, &id),
         }),
         Cmd::Put { input, owner, writer, reader, drop, encryption_algorithm, metadata, path } => create_client_context().and_then(|c| put(&c, &path, input.as_deref(), &Permissions { owners: owner, writers: writer, readers: reader, drops: drop }, encryption_algorithm.as_deref(), metadata)),
-        Cmd::Sync { watch, decrypt } => create_client_context().and_then(|c| current_dir().and_then(|d| sync(&c, &d, watch, decrypt))),
+        Cmd::Sync { watch, decrypt } => create_client_context().and_then(|c| current_dir().and_then(|d| sync(&c, &d, watch, decrypt, print_event, print_error))),
+        Cmd::Watch { cmd } => match cmd {
+            WatchCmd::Local { path } => watch_local(Path::new(&path), print_event, print_error),
+            WatchCmd::Remote { path } => create_client_context().and_then(|c| {
+                let url = resolve_client_url(&c, &path)?;
+                watch_remote(&c, &url, print_event, print_error)
+            }),
+        },
         Cmd::Decrypt { input, output, in_place, key, encryption_algorithm } => {
             create_client_context().and_then(|c| decrypt(&c, input.as_deref(), output.as_deref(), in_place.as_deref(), key.as_deref(), encryption_algorithm.as_deref()))
         }
@@ -325,4 +353,21 @@ fn list_proposals_cli(ctx: &IdentityContext) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+fn print_event(event: EntryEvent) -> bool {
+    let kind = match event.kind {
+        Some(DirEntryKind::Dir) => "dir",
+        Some(DirEntryKind::File) => "file",
+        Some(DirEntryKind::Symlink) => "symlink",
+        None => "?",
+    };
+    let suffix = if event.conflict { " (conflict)" } else { "" };
+    eprintln!("{} {} {}{}", kind, event.action.as_str(), event.path.display(), suffix);
+    false
+}
+
+fn print_error(e: io::Error) -> bool {
+    eprintln!("error: {}", e);
+    false
 }

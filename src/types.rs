@@ -31,6 +31,43 @@ pub enum DirEntryKind {
     Symlink,
 }
 
+#[derive(Clone)]
+pub enum EntryAction {
+    Created,
+    Deleted,
+    Metadata,
+    Modified,
+}
+
+impl EntryAction {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EntryAction::Created => "created",
+            EntryAction::Deleted => "deleted",
+            EntryAction::Metadata => "metadata",
+            EntryAction::Modified => "modified",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "created" => Some(EntryAction::Created),
+            "deleted" => Some(EntryAction::Deleted),
+            "metadata" => Some(EntryAction::Metadata),
+            "modified" => Some(EntryAction::Modified),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct EntryEvent {
+    pub action: EntryAction,
+    pub kind: Option<DirEntryKind>,
+    pub path: PathBuf,
+    pub conflict: bool,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Hash {
     pub algorithm: String,
@@ -201,42 +238,6 @@ pub struct StreamEvent {
     pub id: String,
     pub event: String,
     pub data: String,
-}
-
-#[derive(Clone)]
-pub enum WatchAction {
-    Created,
-    Deleted,
-    Keepalive,
-    Modified,
-}
-
-impl WatchAction {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            WatchAction::Created => "created",
-            WatchAction::Deleted => "deleted",
-            WatchAction::Keepalive => "keepalive",
-            WatchAction::Modified => "modified",
-        }
-    }
-
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "created" => Some(WatchAction::Created),
-            "deleted" => Some(WatchAction::Deleted),
-            "keepalive" => Some(WatchAction::Keepalive),
-            "modified" => Some(WatchAction::Modified),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct WatchEvent {
-    pub action: WatchAction,
-    pub kind: Option<DirEntryKind>,
-    pub path: PathBuf,
 }
 
 mod base64url {

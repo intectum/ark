@@ -1,26 +1,44 @@
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
+use std::sync::mpsc::{RecvTimeoutError, channel};
+use std::thread;
 use std::time::Duration;
 
 use crate::http::{write_stream_event, write_stream_keepalive, write_stream_start};
-use crate::types::{DirEntry, DirEntryKind, WatchAction};
+use crate::types::{DirEntry, DirEntryKind, EntryEvent};
 use crate::client::watch_local;
 use crate::util::{io_err, now};
 
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
-pub fn serve_stream(fs_path: &Path, stream: &mut dyn Write) -> io::Result<()> {
+pub fn serve_stream(fs_path: &Path, stream: &mut dyn Write, verbose: bool) -> io::Result<()> {
     write_stream_start(stream)?;
 
-    watch_local(fs_path, |event| {
-        let name = match event.action {
-            WatchAction::Keepalive => return write_stream_keepalive(stream).is_err(),
-            a => a.as_str(),
-        };
+    let (tx, rx) = channel::<EntryEvent>();
+    let watch_path = fs_path.to_path_buf();
+    thread::spawn(move || {
+        let _ = watch_local(&watch_path, |event| tx.send(event).is_err(), |e| {
+            if verbose { eprintln!("stream watch: {}", e); }
+            false
+        });
+    });
 
-        write_event(stream, fs_path, &event.path, name, event.kind.as_ref()).is_err()
-    }, Some(KEEPALIVE_INTERVAL))
+    loop {
+        match rx.recv_timeout(KEEPALIVE_INTERVAL) {
+            Ok(event) => {
+                if write_event(stream, fs_path, &event.path, event.action.as_str(), event.kind.as_ref()).is_err() {
+                    break;
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if write_stream_keepalive(stream).is_err() { break; }
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    Ok(())
 }
 
 fn write_event(stream: &mut dyn Write, root: &Path, path: &Path, name: &str, kind: Option<&DirEntryKind>) -> io::Result<()> {

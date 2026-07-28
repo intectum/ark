@@ -70,7 +70,7 @@ pub fn relay(
         }
 
         let result = if same_host {
-            println!("{}(relay) {}", method, member_target);
+            if verbose { println!("{}(relay) {}", method, member_target); }
 
             let mut buf: Vec<u8> = Vec::new();
             handle_parsed(&mut buf, server_ctx, method, &member_target, &final_headers, body, false)?;
@@ -79,7 +79,7 @@ pub fn relay(
             let bare_host = member_host.split(':').next().unwrap_or(&member_host);
             let scheme = if is_loopback_host(bare_host) { "http" } else { "https" };
             let url_string = format!("{}://{}{}", scheme, member_host, member_target);
-            println!("{}(relay) {}", method, url_string);
+            if verbose { println!("{}(relay) {}", method, url_string); }
 
             let url = Url::parse(&url_string).map_err(|e| io_err(&format!("invalid remote URL {}: {}", url_string, e)))?;
             let ref_headers: Vec<(&str, &str)> = final_headers.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();

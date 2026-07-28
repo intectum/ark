@@ -231,7 +231,7 @@ fn handle_parsed_inner(
             let wants_stream = fs_path.is_dir() && headers.iter().any(|(n, v)|
                 n.eq_ignore_ascii_case("accept") && v.contains("text/event-stream"));
             if wants_stream {
-                return serve_stream(&fs_path, stream);
+                return serve_stream(&fs_path, stream, verbose);
             }
             serve_get(&fs_path, stream, true)
         },

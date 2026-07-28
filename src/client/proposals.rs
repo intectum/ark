@@ -25,7 +25,7 @@ pub fn list_proposals(ctx: &IdentityContext) -> io::Result<Vec<Proposal>> {
             continue;
         }
 
-        if let Some(proposal) = parse_proposal(&entry.name, &entry_body) {
+        if let Some(proposal) = parse_proposal(&entry.name, &entry_body)? {
             proposals.push(proposal);
         }
     }
@@ -51,7 +51,7 @@ pub fn accept_proposal(ctx: &IdentityContext, index_or_id: &str, force: bool) ->
     let entry_path = format!("/.ark/requests/{}", id);
     let mut entry_body: Vec<u8> = Vec::new();
     get_stream(ctx, &entry_path, &mut entry_body, false)?;
-    let proposal = parse_proposal(&id, &entry_body)
+    let proposal = parse_proposal(&id, &entry_body)?
         .ok_or_else(|| io_invalid_input("entry is not a valid proposal"))?;
 
     let (account_name, _, _) = parse_address(&ctx.identity.address)?;
@@ -129,25 +129,21 @@ fn resolve_id(ctx: &IdentityContext, index_or_id: &str) -> io::Result<String> {
     }
 }
 
-fn parse_proposal(filename: &str, entry_bytes: &[u8]) -> Option<Proposal> {
-    let entry = parse_request_entry(entry_bytes)
-        .map_err(|e| eprintln!("bad log entry: {}", e))
-        .ok()?;
+fn parse_proposal(filename: &str, entry_bytes: &[u8]) -> io::Result<Option<Proposal>> {
+    let entry = parse_request_entry(entry_bytes)?;
 
-    if entry.method != "PUT" { return None; }
-    if entry.status != 403 { return None; }
+    if entry.method != "PUT" { return Ok(None); }
+    if entry.status != 403 { return Ok(None); }
 
-    let metadata = read_metadata_headers(&entry.request_headers)
-        .map_err(|e| eprintln!("bad log entry metadata: {}", e))
-        .ok()?;
+    let metadata = read_metadata_headers(&entry.request_headers)?;
 
     let target = entry.target.split_once('?').map(|(p, _)| p.to_string()).unwrap_or(entry.target);
 
-    Some(Proposal {
+    Ok(Some(Proposal {
         id: filename.to_string(),
         target,
         metadata,
-    })
+    }))
 }
 
 fn verify_metadata_changes(proposal: &Metadata, current: &Metadata, self_address: &str) -> io::Result<()> {
@@ -333,7 +329,7 @@ mod tests {
             "Content-Length: 0\r\n",
             "\r\n",
         );
-        let p = parse_proposal("entry.http", entry.as_bytes()).expect("proposal");
+        let p = parse_proposal("entry.http", entry.as_bytes()).unwrap().expect("proposal");
         assert_eq!(p.metadata.modified_by, "bob@h");
         assert_eq!(p.target, "/ark/alice/foo");
     }
@@ -346,7 +342,7 @@ mod tests {
             "HTTP/1.1 201 Created\r\n",
             "\r\n",
         );
-        assert!(parse_proposal("entry.http", entry.as_bytes()).is_none());
+        assert!(parse_proposal("entry.http", entry.as_bytes()).unwrap().is_none());
     }
 
     #[test]
@@ -357,6 +353,6 @@ mod tests {
             "HTTP/1.1 403 Forbidden\r\n",
             "\r\n",
         );
-        assert!(parse_proposal("entry.http", entry.as_bytes()).is_none());
+        assert!(parse_proposal("entry.http", entry.as_bytes()).unwrap().is_none());
     }
 }
