@@ -5,8 +5,8 @@ use std::process::exit;
 
 use clap::{Parser, Subcommand};
 
-use ark::client::{accept_proposal, chmod, decrypt, delete, encrypt, get, head, init, list_proposals, put, reject_proposal, sync};
-use ark::types::Permissions;
+use ark::client::{accept_proposal, chmod, decrypt, delete, encrypt, get, head, init, list, list_proposals, put, reject_proposal, sync};
+use ark::types::{DirEntryKind, Permissions};
 use ark::context::create_client_context;
 use ark::identity::parse_address;
 use ark::server::start_server;
@@ -131,6 +131,11 @@ enum Cmd {
         /// Ark URL or path.
         path: String,
     },
+    /// List entries of a directory.
+    List {
+        /// Ark URL or path.
+        path: String,
+    },
     /// Encrypt and upload a file.
     ///
     /// If INPUT is a directory, creates or updates a directory (empty body).
@@ -250,6 +255,7 @@ fn main() {
         Cmd::Head { path } => create_client_context().and_then(|c| head_cli(&c, &path)),
         Cmd::Delete { path } => create_client_context().and_then(|c| delete(&c, &path)),
         Cmd::Get { output, decrypt, path } => create_client_context().and_then(|c| get(&c, &path, output.as_deref(), decrypt)),
+        Cmd::List { path } => create_client_context().and_then(|c| list_cli(&c, &path)),
         Cmd::Proposals { cmd } => create_client_context().and_then(|c| match cmd {
             ProposalsCmd::List => list_proposals_cli(&c),
             ProposalsCmd::Accept { id, force } => accept_proposal(&c, &id, force),
@@ -278,6 +284,20 @@ fn head_cli(ctx: &IdentityContext, path: &str) -> io::Result<()> {
         writeln!(stdout, "{}: {}", name, value)?;
     }
 
+    Ok(())
+}
+
+fn list_cli(ctx: &IdentityContext, path: &str) -> io::Result<()> {
+    let entries = list(ctx, path)?;
+    let mut stdout = io::stdout().lock();
+    for entry in &entries {
+        let kind = match entry.kind {
+            DirEntryKind::Dir => "dir",
+            DirEntryKind::File => "file",
+            DirEntryKind::Symlink => "symlink",
+        };
+        writeln!(stdout, "{}  {}", kind, entry.name)?;
+    }
     Ok(())
 }
 

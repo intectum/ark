@@ -16,16 +16,16 @@ pub struct IdentityContext {
     pub identity_key: Option<Key>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-pub struct DirectoryEntry {
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DirEntry {
     #[serde(rename = "type")]
-    pub kind: DirectoryEntryKind,
+    pub kind: DirEntryKind,
     pub name: String,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum DirectoryEntryKind {
+pub enum DirEntryKind {
     Dir,
     File,
     Symlink,
@@ -235,7 +235,7 @@ impl WatchAction {
 #[derive(Clone)]
 pub struct WatchEvent {
     pub action: WatchAction,
-    pub kind: Option<DirectoryEntryKind>,
+    pub kind: Option<DirEntryKind>,
     pub path: PathBuf,
 }
 
@@ -261,8 +261,8 @@ mod tests {
 
     #[test]
     fn directory_entry_serializes_with_renamed_type_field() {
-        let e = DirectoryEntry {
-            kind: DirectoryEntryKind::File,
+        let e = DirEntry {
+            kind: DirEntryKind::File,
             name: "a.txt".to_string(),
         };
         let s = serde_json::to_string(&e).unwrap();
@@ -273,27 +273,27 @@ mod tests {
 
     #[test]
     fn directory_entry_kind_serializes_as_snake_case_strings() {
-        assert_eq!(serde_json::to_string(&DirectoryEntryKind::Dir).unwrap(), "\"dir\"");
-        assert_eq!(serde_json::to_string(&DirectoryEntryKind::File).unwrap(), "\"file\"");
-        assert_eq!(serde_json::to_string(&DirectoryEntryKind::Symlink).unwrap(), "\"symlink\"");
+        assert_eq!(serde_json::to_string(&DirEntryKind::Dir).unwrap(), "\"dir\"");
+        assert_eq!(serde_json::to_string(&DirEntryKind::File).unwrap(), "\"file\"");
+        assert_eq!(serde_json::to_string(&DirEntryKind::Symlink).unwrap(), "\"symlink\"");
     }
 
     #[test]
     fn directory_entry_round_trip() {
-        let original = DirectoryEntry {
-            kind: DirectoryEntryKind::Symlink,
+        let original = DirEntry {
+            kind: DirEntryKind::Symlink,
             name: "link".to_string(),
         };
         let s = serde_json::to_string(&original).unwrap();
-        let back: DirectoryEntry = serde_json::from_str(&s).unwrap();
-        assert!(matches!(back.kind, DirectoryEntryKind::Symlink));
+        let back: DirEntry = serde_json::from_str(&s).unwrap();
+        assert!(matches!(back.kind, DirEntryKind::Symlink));
         assert_eq!(back.name, "link");
     }
 
     #[test]
     fn directory_entry_rejects_unknown_kind() {
         let bad = r#"{"type":"bogus","name":"x"}"#;
-        let res: Result<DirectoryEntry, _> = serde_json::from_str(bad);
+        let res: Result<DirEntry, _> = serde_json::from_str(bad);
         assert!(res.is_err());
     }
 }

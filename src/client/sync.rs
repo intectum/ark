@@ -4,10 +4,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::thread;
 
-use super::{get, get_stream, head, put, request, watch_local, watch_remote};
+use super::{get, get_stream, head, list, put, watch_local, watch_remote};
 use crate::identity::parse_address;
 use crate::metadata::{has_metadata_attributes, read_local_metadata_attributes, read_metadata_attributes, read_metadata_headers, remove_local_metadata_attributes, write_local_metadata_attributes, write_metadata_attributes};
-use crate::types::{DirectoryEntry, DirectoryEntryKind, IdentityContext, Metadata, Permissions, WatchAction};
+use crate::types::{DirEntryKind, IdentityContext, Metadata, Permissions, WatchAction};
 use crate::util::{now_iso_fs, io_err, parse_request_entry, resolve_client_url, sha256};
 
 struct SyncEntry {
@@ -90,7 +90,7 @@ fn pull_watch(ctx: &IdentityContext, path: &Path, decrypt: bool) -> io::Result<(
         } else {
             format!("{}/{}", rel_prefix, subpath)
         };
-        let is_dir = matches!(event.kind, Some(DirectoryEntryKind::Dir));
+        let is_dir = matches!(event.kind, Some(DirEntryKind::Dir));
 
         match event.action {
             WatchAction::Created | WatchAction::Modified => {
@@ -323,20 +323,9 @@ fn fetch_log_map(ctx: &IdentityContext, path: &Path) -> io::Result<(HashMap<Stri
 
     let rel_prefix = to_relative_path(ctx, path)?;
 
-    let requests_path = "/.ark/requests/";
-    let requests_url = resolve_client_url(ctx, requests_path)?;
-    let (code, _, body) = request(Some(ctx), "GET", &requests_url, &[], &[])?;
-    if code == 404 {
-        return Ok((HashMap::new(), None));
-    }
-    if code != 200 {
-        return Err(io_err(&format!("HTTP {}: {}", code, String::from_utf8_lossy(&body))));
-    }
-
-    let mut entries: Vec<DirectoryEntry> = serde_json::from_slice(&body)
-        .map_err(|e| io_err(&format!("dir listing: {}", e)))?;
+    let mut entries = list(ctx, "/.ark/requests/")?;
     entries.retain(|entry|
-        matches!(entry.kind, DirectoryEntryKind::File) && entry.name.ends_with(".http"));
+        matches!(entry.kind, DirEntryKind::File) && entry.name.ends_with(".http"));
     entries.sort_by(|a, b| a.name.cmp(&b.name));
 
     let (account_name, _, _) = parse_address(&ctx.identity.address)?;
@@ -354,7 +343,7 @@ fn fetch_log_map(ctx: &IdentityContext, path: &Path) -> io::Result<(HashMap<Stri
 
         new_last_sync_request = Some(entry.name.clone());
 
-        let entry_path = format!("{}{}", requests_path, entry.name);
+        let entry_path = format!("/.ark/requests/{}", entry.name);
         let mut entry_body: Vec<u8> = Vec::new();
         if get_stream(ctx, &entry_path, &mut entry_body, false).is_err() {
             continue;

@@ -10,7 +10,7 @@ use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use url::Url;
 
 use crate::http::{read_stream_events, write_request};
-use crate::types::{DirectoryEntry, DirectoryEntryKind, IdentityContext, StreamEvent, WatchAction, WatchEvent};
+use crate::types::{DirEntry, DirEntryKind, IdentityContext, StreamEvent, WatchAction, WatchEvent};
 use crate::util::{create_authorization_header, io_err, now};
 
 const REMOTE_READ_TIMEOUT: Duration = Duration::from_secs(45);
@@ -116,13 +116,13 @@ where
 
 fn to_watch_event_local(event_kind: &EventKind, path: &Path) -> Option<WatchEvent> {
     let (action, kind) = match event_kind {
-        EventKind::Create(CreateKind::Folder) => (WatchAction::Created, Some(DirectoryEntryKind::Dir)),
-        EventKind::Create(CreateKind::File) => (WatchAction::Created, Some(DirectoryEntryKind::File)),
+        EventKind::Create(CreateKind::Folder) => (WatchAction::Created, Some(DirEntryKind::Dir)),
+        EventKind::Create(CreateKind::File) => (WatchAction::Created, Some(DirEntryKind::File)),
         EventKind::Create(_) => (WatchAction::Created, None),
         EventKind::Modify(ModifyKind::Data(_)) | EventKind::Modify(ModifyKind::Name(_)) => (WatchAction::Modified, None),
         EventKind::Modify(_) => return None,
-        EventKind::Remove(RemoveKind::Folder) => (WatchAction::Deleted, Some(DirectoryEntryKind::Dir)),
-        EventKind::Remove(_) => (WatchAction::Deleted, Some(DirectoryEntryKind::File)),
+        EventKind::Remove(RemoveKind::Folder) => (WatchAction::Deleted, Some(DirEntryKind::Dir)),
+        EventKind::Remove(_) => (WatchAction::Deleted, Some(DirEntryKind::File)),
         _ => return None,
     };
 
@@ -132,7 +132,7 @@ fn to_watch_event_local(event_kind: &EventKind, path: &Path) -> Option<WatchEven
 fn to_watch_event_remote(event: &StreamEvent) -> Option<WatchEvent> {
     let action = WatchAction::parse(&event.event)?;
 
-    let entry: DirectoryEntry = match serde_json::from_str(&event.data) {
+    let entry: DirEntry = match serde_json::from_str(&event.data) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("watch remote: bad SSE payload: {}", e);

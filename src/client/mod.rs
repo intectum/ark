@@ -5,6 +5,7 @@ mod encrypt;
 mod get;
 mod head;
 mod init;
+mod list;
 mod proposals;
 mod put;
 mod request;
@@ -20,6 +21,7 @@ pub use head::head;
 pub use init::init;
 #[cfg(test)]
 pub use init::init_local;
+pub use list::list;
 pub use proposals::{accept_proposal, list_proposals, reject_proposal};
 pub use put::{put, put_stream};
 pub use request::request;

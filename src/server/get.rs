@@ -4,7 +4,7 @@ use std::path::Path;
 
 use crate::http::{write_response, write_text};
 use crate::metadata::{read_metadata_attributes, write_metadata_headers};
-use crate::types::{DirectoryEntry, DirectoryEntryKind};
+use crate::types::{DirEntry, DirEntryKind};
 use crate::util::io_err;
 
 pub fn serve_get(fs_path: &Path, stream: &mut dyn Write, send_body: bool) -> io::Result<()> {
@@ -50,14 +50,14 @@ pub fn serve_get(fs_path: &Path, stream: &mut dyn Write, send_body: bool) -> io:
 fn list_dir(path: &Path) -> io::Result<String> {
     let mut entries: Vec<_> = fs::read_dir(path)?.filter_map(|e| e.ok()).collect();
     entries.sort_by_key(|e| e.file_name());
-    let items: Vec<DirectoryEntry> = entries
+    let items: Vec<DirEntry> = entries
         .into_iter()
         .map(|e| {
             let meta = e.metadata()?;
-            let kind = if meta.is_dir() { DirectoryEntryKind::Dir }
-                else if meta.is_symlink() { DirectoryEntryKind::Symlink }
-                else { DirectoryEntryKind::File };
-            Ok(DirectoryEntry {
+            let kind = if meta.is_dir() { DirEntryKind::Dir }
+                else if meta.is_symlink() { DirEntryKind::Symlink }
+                else { DirEntryKind::File };
+            Ok(DirEntry {
                 kind,
                 name: e.file_name().to_string_lossy().into_owned(),
             })
@@ -87,7 +87,7 @@ mod tests {
     use super::super::start_test_server;
     use super::super::test_helpers::*;
     use crate::crypto::DEFAULT_ENCRYPTION_ALGORITHM;
-    use crate::types::{DirectoryEntry, DirectoryEntryKind, Member, Permission};
+    use crate::types::{DirEntry, DirEntryKind, Member, Permission};
     use crate::util::test::{TEST_ADDRESS, create_test_account, in_test_dir, write_encrypted_test_file, write_plain_test_file};
     use std::fs;
     use std::os::unix::fs::symlink;
@@ -126,11 +126,11 @@ mod tests {
             assert_eq!(code, 200);
             assert_eq!(header(&headers, "content-type"), Some("application/json"));
 
-            let entries: Vec<DirectoryEntry> = serde_json::from_slice(&body).unwrap();
+            let entries: Vec<DirEntry> = serde_json::from_slice(&body).unwrap();
             let file = entries.iter().find(|e| e.name == "a.txt").unwrap();
-            assert!(matches!(file.kind, DirectoryEntryKind::File));
+            assert!(matches!(file.kind, DirEntryKind::File));
             let dir = entries.iter().find(|e| e.name == "sub").unwrap();
-            assert!(matches!(dir.kind, DirectoryEntryKind::Dir));
+            assert!(matches!(dir.kind, DirEntryKind::Dir));
         });
     }
 
@@ -142,7 +142,7 @@ mod tests {
             let port = start_test_server(temp_dir.to_path_buf());
             let (code, body, _) = signed_request(port, &identity, &secret_key, "GET", "/ark/test/empty/", &[]);
             assert_eq!(code, 200);
-            let entries: Vec<DirectoryEntry> = serde_json::from_slice(&body).unwrap();
+            let entries: Vec<DirEntry> = serde_json::from_slice(&body).unwrap();
             assert!(entries.is_empty());
         });
     }
@@ -158,9 +158,9 @@ mod tests {
             let port = start_test_server(temp_dir.to_path_buf());
             let (code, body, _) = signed_request(port, &identity, &secret_key, "GET", "/ark/test/", &[]);
             assert_eq!(code, 200);
-            let entries: Vec<DirectoryEntry> = serde_json::from_slice(&body).unwrap();
+            let entries: Vec<DirEntry> = serde_json::from_slice(&body).unwrap();
             let link = entries.iter().find(|e| e.name == "link").unwrap();
-            assert!(matches!(link.kind, DirectoryEntryKind::Symlink));
+            assert!(matches!(link.kind, DirEntryKind::Symlink));
         });
     }
 

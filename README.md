@@ -105,10 +105,11 @@ Every command takes `-h` for details. Paths accept three forms:
 | `ark server [PORT]` | Run a server. Serves the current directory. |
 | `ark init <ADDR>` | Create or download an account identity. `--password` gates remote key recovery. `--local-only` skips the server. |
 | `ark get <PATH>` | Download a file. `--decrypt` unwraps it, `-o FILE` writes to disk. |
-| `ark put <PATH>` | Upload a file. `-i FILE` for input, `--encryption-algorithm none` for plaintext. Trailing `/` creates a directory. |
+| `ark put <PATH>` | Upload a file, or create a directory when the input is a directory. `-i FILE` for input, `-o`/`-w`/`-r`/`-d` set members, `--encryption-algorithm none` for plaintext. |
 | `ark head <PATH>` | Fetch response headers only. |
+| `ark list <PATH>` | List entries of a directory. |
 | `ark delete <PATH>` | Delete a file or directory (recursive). |
-| `ark chmod <FILE>` | Change members: `-o` owner, `-w` writer, `-r` reader, `-d` drop. Use `public` for the `*` wildcard. Seeds metadata if absent and uploads by default; `--local-only` skips the upload. |
+| `ark chmod <FILE>` | Change members on a tracked file: `-o` owner, `-w` writer, `-r` reader, `-d` drop. Use `public` for the `*` wildcard. Uploads by default; `--local-only` skips the upload. Untracked files must be created with `ark put` first. |
 | `ark sync` | Push local changes to the server. `-w` also watches and pulls. |
 | `ark proposals list` | Show pending share proposals — unauthorized PUTs from other accounts, recorded in `.ark/requests/`. |
 | `ark proposals accept <ID>` | Fetch, verify, and PUT the shared file/dir. `-f` bypasses metadata-change checks. |

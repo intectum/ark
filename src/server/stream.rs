@@ -4,7 +4,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::http::{write_stream_event, write_stream_keepalive, write_stream_start};
-use crate::types::{DirectoryEntry, DirectoryEntryKind, WatchAction};
+use crate::types::{DirEntry, DirEntryKind, WatchAction};
 use crate::client::watch_local;
 use crate::util::{io_err, now};
 
@@ -23,15 +23,15 @@ pub fn serve_stream(fs_path: &Path, stream: &mut dyn Write) -> io::Result<()> {
     }, Some(KEEPALIVE_INTERVAL))
 }
 
-fn write_event(stream: &mut dyn Write, root: &Path, path: &Path, name: &str, kind: Option<&DirectoryEntryKind>) -> io::Result<()> {
+fn write_event(stream: &mut dyn Write, root: &Path, path: &Path, name: &str, kind: Option<&DirEntryKind>) -> io::Result<()> {
     let kind = match kind {
         Some(k) => k.clone(),
         None => fs::metadata(path)
-            .map(|m| if m.is_dir() { DirectoryEntryKind::Dir } else { DirectoryEntryKind::File })
-            .unwrap_or(DirectoryEntryKind::File),
+            .map(|m| if m.is_dir() { DirEntryKind::Dir } else { DirEntryKind::File })
+            .unwrap_or(DirEntryKind::File),
     };
 
-    let entry = DirectoryEntry {
+    let entry = DirEntry {
         kind,
         name: path.strip_prefix(root).unwrap_or(path).to_string_lossy().into_owned(),
     };

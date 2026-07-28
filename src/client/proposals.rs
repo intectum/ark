@@ -1,9 +1,9 @@
 use std::io;
 
-use super::{delete, get_stream, head, request};
+use super::{delete, get_stream, head, list, request};
 use crate::identity::parse_address;
 use crate::metadata::{get_member, read_metadata_headers, write_metadata_headers};
-use crate::types::{DirectoryEntry, IdentityContext, Metadata, Permission, Proposal};
+use crate::types::{IdentityContext, Metadata, Permission, Proposal};
 use crate::util::{io_err, io_invalid_input, parse_request_entry, resolve_client_url, sha256};
 
 /// List pending share proposals — requests where another account's PUT was
@@ -13,17 +13,7 @@ use crate::util::{io_err, io_invalid_input, parse_request_entry, resolve_client_
 /// Empty when the account has no request log (see [`crate::client::init`],
 /// which sets it up).
 pub fn list_proposals(ctx: &IdentityContext) -> io::Result<Vec<Proposal>> {
-    let requests_url = resolve_client_url(ctx, "/.ark/requests/")?;
-    let (code, _, body) = request(Some(ctx), "GET", &requests_url, &[], &[])?;
-    if code == 404 {
-        return Ok(Vec::new());
-    }
-    if code != 200 {
-        return Err(io_err(&format!("HTTP {}: {}", code, String::from_utf8_lossy(&body))));
-    }
-
-    let entries: Vec<DirectoryEntry> = serde_json::from_slice(&body)
-        .map_err(|e| io_err(&format!("dir listing: {}", e)))?;
+    let entries = list(ctx, "/.ark/requests/")?;
 
     let mut proposals = Vec::new();
     for entry in entries {
