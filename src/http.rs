@@ -1,12 +1,36 @@
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
+use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use url::Url;
 
-use crate::types::StreamEvent;
+use crate::types::{ReadWrite, StreamEvent};
 use crate::util::io_err;
 
 const PATH_ENCODE_SET: &AsciiSet = &CONTROLS.add(b' ').add(b'"').add(b'#').add(b'<').add(b'>').add(b'?').add(b'`').add(b'{').add(b'}');
+
+pub fn connect(url: &Url, read_timeout: Duration) -> io::Result<Box<dyn ReadWrite>> {
+    let host = url.host_str().ok_or_else(|| io_err("URL missing host"))?;
+    let https = url.scheme() == "https";
+    let default_port = if https { 443 } else { 80 };
+    let port = url.port().unwrap_or(default_port);
+    let stream = TcpStream::connect((host, port))?;
+    stream.set_read_timeout(Some(read_timeout))?;
+
+    if https {
+        let server_name = ServerName::try_from(host.to_string())
+            .map_err(|e| io_err(&format!("invalid TLS server name {}: {}", host, e)))?;
+        let connection = ClientConnection::new(tls_config(), server_name)
+            .map_err(|e| io_err(&format!("TLS setup failed: {}", e)))?;
+        Ok(Box::new(StreamOwned::new(connection, stream)))
+    } else {
+        Ok(Box::new(stream))
+    }
+}
 
 pub fn read_request(stream: &mut dyn Read, skip_body: bool) -> io::Result<(String, String, Vec<(String, String)>, Vec<u8>)> {
     let (first_line, headers, body) = read_message(stream, skip_body)?;
@@ -211,6 +235,20 @@ pub fn write_message(stream: &mut dyn Write, first_line: &str, headers: &[(&str,
     }
 
     Ok(())
+}
+
+fn tls_config() -> Arc<ClientConfig> {
+    static CONFIG: OnceLock<Arc<ClientConfig>> = OnceLock::new();
+    CONFIG.get_or_init(|| {
+        let mut roots = RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let config = ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .expect("rustls default protocol versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        Arc::new(config)
+    }).clone()
 }
 
 fn status_msg(status_code: u16) -> &'static str {

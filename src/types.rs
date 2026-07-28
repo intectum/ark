@@ -1,3 +1,4 @@
+use std::io::{Read, Write};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -194,6 +195,9 @@ pub struct Proposal {
     pub target: String,
     pub metadata: Metadata,
 }
+
+pub trait ReadWrite: Read + Write {}
+impl<T: Read + Write> ReadWrite for T {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RelayMode {

@@ -1,5 +1,4 @@
 use std::io;
-use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::channel;
 use std::thread;
@@ -9,7 +8,7 @@ use notify::event::{CreateKind, ModifyKind, RemoveKind};
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use url::Url;
 
-use crate::http::{read_stream_events, write_request};
+use crate::http::{connect, read_stream_events, write_request};
 use crate::types::{DirEntry, DirEntryKind, EntryAction, EntryEvent, IdentityContext, StreamEvent};
 use crate::util::{create_authorization_header, io_err, now};
 
@@ -70,8 +69,10 @@ where
 {
     loop {
         let host = url.host_str().ok_or_else(|| io_err("URL missing host"))?;
-        let port = url.port().unwrap_or(80);
-        let host_header = format!("{}:{}", host, port);
+        let host_header = match url.port() {
+            Some(p) => format!("{}:{}", host, p),
+            None => host.to_string(),
+        };
 
         let authorization = create_authorization_header(ctx, "GET", &host_header, url.path(), now(), &[])?;
 
@@ -80,10 +81,8 @@ where
             ("Accept", "text/event-stream"),
         ];
 
-        let mut stream = TcpStream::connect((host, port))?;
-        stream.set_read_timeout(Some(REMOTE_READ_TIMEOUT))?;
+        let mut stream = connect(url, REMOTE_READ_TIMEOUT)?;
         write_request(&mut stream, url, "GET", &headers, &[])?;
-
         let result = read_stream_events(&mut stream, &mut |stream_event: &StreamEvent| {
             match to_entry_event_remote(stream_event, &on_error) {
                 Some(entry_event) => on_event(entry_event),
