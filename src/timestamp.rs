@@ -49,6 +49,14 @@ pub fn parse(s: &str) -> io::Result<OffsetDateTime> {
         .map_err(|e| io_err(&format!("invalid rfc3339 timestamp: {}", e)))
 }
 
+/// Inverse of [`format_fs_safe`]: restore the `:` characters in the time
+/// portion and delegate to [`parse`].
+pub fn parse_fs_safe(s: &str) -> io::Result<OffsetDateTime> {
+    let (date, time) = s.split_once('T')
+        .ok_or_else(|| io_err(&format!("invalid rfc3339 timestamp: missing 'T' in {}", s)))?;
+    parse(&format!("{}T{}", date, time.replacen('-', ":", 2)))
+}
+
 fn truncate_to_millis(dt: OffsetDateTime) -> OffsetDateTime {
     let nanos = dt.nanosecond();
     let millis = nanos / 1_000_000;
@@ -109,5 +117,13 @@ mod tests {
     #[test]
     fn parse_rejects_garbage() {
         assert!(parse("not-a-timestamp").is_err());
+    }
+
+    #[test]
+    fn parse_fs_safe_round_trips_format_fs_safe() {
+        let dt = datetime!(2026-07-28 13:45:07.123 UTC);
+        let s = format_fs_safe(dt);
+        assert_eq!(s, "2026-07-28T13-45-07.123Z");
+        assert_eq!(parse_fs_safe(&s).unwrap(), dt);
     }
 }

@@ -12,6 +12,9 @@ path = "src/lib.rs"
 name = "ark"
 path = "src/main.rs"
 
+[features]
+test-utils = []
+
 [dependencies]
 aes-gcm = "0.10"
 argon2 = "0.5"

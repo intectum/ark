@@ -12,7 +12,7 @@ use std::env;
 use std::fs;
 use std::io::{self, ErrorKind, Write};
 use std::net::{TcpListener, TcpStream};
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 use std::path::PathBuf;
 #[cfg(test)]
 use std::str::from_utf8;
@@ -50,7 +50,7 @@ pub fn start_server(port: u16, host: &str) {
     serve(listener, server_ctx, true);
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 pub fn start_test_server(root: PathBuf) -> u16 {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
     let port = listener.local_addr().unwrap().port();
