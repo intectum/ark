@@ -255,7 +255,8 @@ mod tests {
     use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, decrypt_bytes, encrypt_bytes};
     use crate::context::create_client_context;
     use crate::identity::{create_identity, write_identity};
-    use crate::metadata::{drop, reader, verify_metadata, writer};
+    use crate::metadata::verify_metadata;
+    use crate::permissions::{drop, reader, writer};
     use crate::server::start_test_server;
     use crate::types::{IdentityContext, Identity, Key, Permission};
     use crate::util::test::{in_test_dir, init_with_server, write_plain_test_file};

@@ -31,6 +31,7 @@ pub mod crypto;
 pub mod http;
 pub mod identity;
 pub mod metadata;
+pub mod permissions;
 pub mod server;
 pub mod timestamp;
 pub mod types;

@@ -440,7 +440,7 @@ mod tests {
     use super::*;
     use crate::client::{get::get, init, put::{put, put_permissions}};
     use crate::context::create_client_context;
-    use crate::metadata::{owner, reader, writer};
+    use crate::permissions::{owner, reader, writer};
     use crate::server::start_test_server;
     use crate::types::Permissions;
     use crate::util::test::{in_test_dir, init_with_server, write_encrypted_test_file, write_plain_test_file};

@@ -6,12 +6,10 @@ use uuid::Uuid;
 use crate::crypto::{DEFAULT_HASH_ALGORITHM, DEFAULT_PASSWORD_ALGORITHM, decrypt_bytes, encrypt_bytes, sign_json, verify_json};
 use crate::types::IdentityContext;
 use crate::identity::resolve_identity;
+use crate::permissions::cli_address_to_wire;
 use crate::timestamp;
 use crate::types::{Hash, Key, LocalMetadata, Member, Metadata, Permission, Permissions, Signature};
 use crate::util::{decode_base64url, encode_base64url, io_err, io_invalid_input, sha256};
-
-const PUBLIC_CLI: &str = "public";
-const PUBLIC_WIRE: &str = "*";
 
 const ATTRIBUTE_PREFIX: &str = "user.ark.";
 const LOCAL_ATTRIBUTE_PREFIX: &str = "user.ark_local.";
@@ -270,22 +268,6 @@ pub fn validate_metadata(metadata: &Metadata) -> io::Result<()> {
     Ok(())
 }
 
-pub fn owner(address: impl Into<String>) -> Permissions {
-    Permissions { owners: vec![address.into()], ..Default::default() }
-}
-
-pub fn writer(address: impl Into<String>) -> Permissions {
-    Permissions { writers: vec![address.into()], ..Default::default() }
-}
-
-pub fn reader(address: impl Into<String>) -> Permissions {
-    Permissions { readers: vec![address.into()], ..Default::default() }
-}
-
-pub fn drop(address: impl Into<String>) -> Permissions {
-    Permissions { drops: vec![address.into()], ..Default::default() }
-}
-
 pub fn apply_permissions(
     ctx: &IdentityContext,
     metadata: &mut Metadata,
@@ -409,20 +391,20 @@ fn apply_permission(
 ) -> io::Result<()> {
     for addr in addresses {
         let wire = cli_address_to_wire(addr);
-        if wire == PUBLIC_WIRE && encrypted {
+        if wire == "*" && encrypted {
             return Err(io_invalid_input("cannot add public member to encrypted file"));
         }
 
         match members.iter_mut().find(|m| m.address == wire) {
             Some(existing) => existing.permission = permission,
             None => {
-                let key = match (file_key, wire.as_str()) {
-                    (Some(fk), w) if w != PUBLIC_WIRE => {
+                let key = match file_key {
+                    Some(fk) => {
                         let new_identity = resolve_identity(ctx, &wire)?;
                         let (algorithm, value) = encrypt_bytes(&new_identity.public_key, fk)?;
                         Some(Key { algorithm, value })
                     }
-                    _ => None,
+                    None => None,
                 };
                 members.push(Member {
                     address: wire,
@@ -433,10 +415,6 @@ fn apply_permission(
         }
     }
     Ok(())
-}
-
-fn cli_address_to_wire(addr: &str) -> String {
-    if addr == PUBLIC_CLI { PUBLIC_WIRE.to_string() } else { addr.to_string() }
 }
 
 #[derive(Default)]

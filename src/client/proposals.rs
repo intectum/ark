@@ -202,7 +202,7 @@ mod tests {
     use super::*;
     use crate::client::{init, put};
     use crate::context::create_client_context;
-    use crate::metadata::reader;
+    use crate::permissions::reader;
     use crate::server::start_test_server;
     use crate::types::Permissions;
     use crate::util::test::in_test_dir;
