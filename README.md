@@ -11,7 +11,7 @@ Ark gives your app four things from one primitive:
 
 Think Firebase or Supabase, but each user runs (or picks) their own server, and no host ever sees plaintext.
 
-See [`spec.md`](spec.md) for the wire protocol.
+See the [guide](guide.md) for app-building patterns, or the [spec](spec.md) for the wire protocol.
 
 ## Table of Contents
 
