@@ -9,41 +9,62 @@ use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, DEFAULT_HASH_ALGORITHM, create
 use crate::metadata::{apply_key_to_metadata, apply_permissions, create_metadata, extract_key_from_metadata, get_member, has_metadata_attributes, read_local_metadata_attributes, read_metadata_attributes, sign_metadata, write_local_metadata_attributes, write_metadata_attributes, write_metadata_headers};
 use crate::timestamp;
 use crate::types::{Hash, IdentityContext, LocalMetadata, Metadata, Permissions};
-use crate::util::{io_err, io_invalid_input, resolve_client_url, sha256};
+use crate::util::{io_err, io_invalid_input, resolve_client_url, resolve_local_path, sha256};
 
-/// Upload a file body (or create a directory) at `path`.
+/// Upload the body of a local file (or create a directory) at `path`.
 ///
-/// `path` accepts relative, absolute account, or address form. See the
-/// [module documentation](../index.html) for path resolution details. Reads
-/// the body from `input` (or stdin when `None`). If `input` is a directory,
-/// uploads an empty-body directory entry. `encryption_algorithm`: `None`
-/// reuses the input file's existing metadata algorithm (or defaults to
-/// AES-256-GCM); `Some("none")` uploads raw plaintext. Directories reject any
-/// `encryption_algorithm`.
-///
-/// `permissions` applies member/permission changes to the metadata before the
-/// upload — on the initial put this seeds who else can read/write; on
-/// subsequent puts it grants or drops members. The literal `"public"` maps to
-/// the wildcard address `*` (rejected for encrypted files). At least one
-/// owner must remain.
-///
-/// A fresh file key is generated on every encrypted put and wrapped for every
-/// member. If the input file is already encrypted at rest
-/// (`user.ark_local.encrypted=true`), its body is uploaded as-is without
-/// re-encryption. If the input file has ark metadata, it is reused for the
-/// upload; on success the updated signed metadata is written back as
-/// `user.ark.*` xattrs plus local metadata as `user.ark_local.*` xattrs.
-/// Writes are relayed to co-members.
-///
-/// With `metadata_only = true`, the body is not read or uploaded; only the
-/// metadata (including any member/permission changes) is sent to the server
-/// and the request is marked with the `metadata` query parameter. The
-/// existing metadata's `body_hash` is preserved. Requires the file to exist
-/// on the server. Rejects any `encryption_algorithm`.
+/// `path` accepts relative, absolute account (leading `/`), or address form
+/// (`<name>@<host>/...`). The local file is read from the account root at
+/// the path portion; for address form the address selects the upload
+/// destination while the local file is still read from the account root.
 ///
 /// Missing intermediate parent directories on `path` are created on the
-/// server automatically. They are created without metadata and inherit
-/// member checks from the nearest metadata-bearing ancestor.
+/// server automatically. Writes are relayed to co-members.
+pub fn put_content(ctx: &IdentityContext, path: &str) -> io::Result<()> {
+    let input = resolve_local_path(ctx, path)?;
+    put(ctx, path, input.to_str(), &Permissions::default(), None, false)
+}
+
+/// Change members and permissions on a file or directory at `path`.
+///
+/// `path` accepts relative, absolute account (leading `/`), or address form
+/// (`<name>@<host>/...`).
+///
+/// Adds or promotes each address in `permissions.owners`/`writers`/`readers`;
+/// removes each address in `permissions.drops`. The literal `"public"` maps
+/// to the wildcard address `*` (rejected for encrypted files). At least one
+/// owner must remain.
+///
+/// Requires the file to exist locally and on the server. The caller must be
+/// an owner. Writes are relayed to co-members.
+pub fn put_permissions(ctx: &IdentityContext, path: &str, permissions: &Permissions) -> io::Result<()> {
+    let input = resolve_local_path(ctx, path)?;
+    put(ctx, path, input.to_str(), permissions, None, true)
+}
+
+/// Upload a file body (or create a directory) at `path`, with optional
+/// permission changes and encryption control.
+///
+/// `path` accepts relative, absolute account (leading `/`), or address form
+/// (`<name>@<host>/...`). Reads the body from `input` (or stdin when `None`).
+/// If `input` is a directory, uploads an empty-body directory entry.
+///
+/// `permissions` applies member/permission changes to the metadata before
+/// the upload — on the initial upload this seeds who else can read/write;
+/// on subsequent uploads it grants or drops members. The literal `"public"`
+/// maps to the wildcard address `*` (rejected for encrypted files). At least
+/// one owner must remain.
+///
+/// `encryption_algorithm`: `None` reuses the local file's existing algorithm
+/// (or defaults to AES-256-GCM); `Some("none")` uploads raw plaintext.
+/// Directories reject any `encryption_algorithm`.
+///
+/// With `metadata_only = true`, the body is not uploaded; only the metadata
+/// (including any member/permission changes) is sent to the server. Requires
+/// the file to exist on the server. Rejects any `encryption_algorithm`.
+///
+/// Missing intermediate parent directories on `path` are created on the
+/// server automatically. Writes are relayed to co-members.
 pub fn put(ctx: &IdentityContext, path: &str, input: Option<&str>, permissions: &Permissions, encryption_algorithm: Option<&str>, metadata_only: bool) -> io::Result<()> {
     let input_path: Option<PathBuf> = input.map(PathBuf::from);
     if let Some(i) = input_path.as_deref() {
@@ -86,26 +107,32 @@ pub fn put(ctx: &IdentityContext, path: &str, input: Option<&str>, permissions: 
     Ok(())
 }
 
-/// Upload a body (or create a directory) at `path`, returning the signed
-/// [`Metadata`] and derived [`LocalMetadata`].
+/// Upload a body (or create a directory) at `path`, with optional permission
+/// changes and encryption control. Returns the signed metadata pair.
 ///
-/// - `body = None` produces a directory PUT (empty body).
-/// - `permissions` adds/promotes/drops members before the upload; `"public"`
-///   maps to wildcard `*` (rejected for encrypted files); at least one owner
-///   must remain.
-/// - `encryption_algorithm`: `None` reuses `existing_metadata`'s algorithm
-///   (or defaults to AES-256-GCM). `Some("none")` uploads raw plaintext.
-///   Directories reject any `encryption_algorithm`.
-/// - `existing_metadata` / `existing_local_metadata`: when present, update in
-///   place rather than minting a new [`Metadata`].
-/// - `metadata_only`: when true, `body` is ignored and the request is sent
-///   with the `metadata` query parameter. Requires `existing_metadata`, whose
-///   `body_hash` is preserved. Keys are not rotated and the body is not
-///   re-encrypted. Rejects any `encryption_algorithm`.
+/// `path` accepts relative, absolute account (leading `/`), or address form
+/// (`<name>@<host>/...`). Reads the body from `body` (or produces a directory
+/// PUT when `None`).
 ///
-/// A fresh file key is generated on every encrypted put and wrapped for every
-/// member. If `existing_local_metadata.encrypted == Some(true)`, the body is
-/// uploaded as-is without re-encryption. Writes are relayed to co-members.
+/// `permissions` applies member/permission changes to the metadata before
+/// the upload — on the initial upload this seeds who else can read/write;
+/// on subsequent uploads it grants or drops members. The literal `"public"`
+/// maps to the wildcard address `*` (rejected for encrypted files). At least
+/// one owner must remain.
+///
+/// `encryption_algorithm`: `None` reuses `existing_metadata`'s algorithm
+/// (or defaults to AES-256-GCM); `Some("none")` uploads raw plaintext.
+/// Directories reject any `encryption_algorithm`.
+///
+/// `existing_metadata` / `existing_local_metadata`: when present, update in
+/// place rather than minting fresh metadata.
+///
+/// With `metadata_only = true`, `body` is ignored; only metadata is sent to
+/// the server. Requires `existing_metadata`. Rejects any
+/// `encryption_algorithm`.
+///
+/// Missing intermediate parent directories on `path` are created on the
+/// server automatically. Writes are relayed to co-members.
 pub fn put_stream(
     ctx: &IdentityContext,
     path: &str,
@@ -227,9 +254,31 @@ mod tests {
     use super::*;
     use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, decrypt_bytes, encrypt_bytes};
     use crate::context::create_client_context;
+    use crate::identity::{create_identity, write_identity};
+    use crate::metadata::{drop, reader, verify_metadata, writer};
     use crate::server::start_test_server;
-    use crate::types::Key;
+    use crate::types::{IdentityContext, Identity, Key, Permission};
     use crate::util::test::{in_test_dir, init_with_server, write_plain_test_file};
+
+    fn cache_identity(ctx: &IdentityContext, identity: &Identity) {
+        let cache_dir = ctx.root.join(".ark").join("identities");
+        fs::create_dir_all(&cache_dir).unwrap();
+        write_identity(&cache_dir.join(format!("{}.json", identity.address)), identity).unwrap();
+    }
+
+    fn put_plain(ctx: &IdentityContext, dir: &Path, name: &str, body: &[u8]) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, body).unwrap();
+        put(ctx, name, Some(path.to_str().unwrap()), &Permissions::default(), Some("none"), false).unwrap();
+        path
+    }
+
+    fn put_encrypted(ctx: &IdentityContext, dir: &Path, name: &str, body: &[u8]) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, body).unwrap();
+        put(ctx, name, Some(path.to_str().unwrap()), &Permissions::default(), None, false).unwrap();
+        path
+    }
 
     fn aes_decrypt(key: &[u8], ciphertext: &[u8]) -> io::Result<Vec<u8>> {
         decrypt_bytes(&Key { algorithm: DEFAULT_ENCRYPTION_ALGORITHM.to_string(), value: key.to_vec() }, ciphertext)
@@ -569,6 +618,175 @@ mod tests {
             let err = create_client_context().err().expect("expected error");
             let msg = format!("{}", err);
             assert!(msg.contains("no .ark"), "msg was {}", msg);
+        });
+    }
+
+    #[test]
+    fn put_metadata_only_adds_reader() {
+        in_test_dir("ark_put_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let address = format!("gyan@127.0.0.1:{}", port);
+            let ctx = init_with_server(temp_dir, &address);
+            let path = put_plain(&ctx, temp_dir, "notes.txt", b"hello");
+
+            put(&ctx, "notes.txt", Some(path.to_str().unwrap()), &reader("john@example.com"), None, true).unwrap();
+
+            let m = read_metadata_attributes(&path).unwrap();
+            let john = m.members.iter().find(|m| m.address == "john@example.com").unwrap();
+            assert_eq!(john.permission, Permission::Reader);
+            assert!(m.members.iter().any(|m| m.address == address && m.permission == Permission::Owner));
+        });
+    }
+
+    #[test]
+    fn put_metadata_only_adds_public_reader_when_unencrypted() {
+        in_test_dir("ark_put_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let address = format!("gyan@127.0.0.1:{}", port);
+            let ctx = init_with_server(temp_dir, &address);
+            let path = put_plain(&ctx, temp_dir, "public.txt", b"open");
+
+            put(&ctx, "public.txt", Some(path.to_str().unwrap()), &reader("public"), None, true).unwrap();
+
+            let m = read_metadata_attributes(&path).unwrap();
+            let pub_member = m.members.iter().find(|m| m.address == "*").unwrap();
+            assert_eq!(pub_member.permission, Permission::Reader);
+            assert!(pub_member.key.is_none());
+        });
+    }
+
+    #[test]
+    fn put_metadata_only_rejects_public_on_encrypted_file() {
+        in_test_dir("ark_put_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let address = format!("gyan@127.0.0.1:{}", port);
+            let ctx = init_with_server(temp_dir, &address);
+            let path = put_encrypted(&ctx, temp_dir, "enc.bin", b"plaintext");
+
+            let err = put(&ctx, "enc.bin", Some(path.to_str().unwrap()), &reader("public"), None, true).unwrap_err();
+            assert!(err.to_string().contains("public member to encrypted"), "msg was {}", err);
+        });
+    }
+
+    #[test]
+    fn put_metadata_only_wraps_key_for_new_member_on_encrypted_file() {
+        in_test_dir("ark_put_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let address = format!("gyan@127.0.0.1:{}", port);
+            let ctx = init_with_server(temp_dir, &address);
+
+            let (bob_identity, bob_secret_key) = create_identity("bob@example.com").unwrap();
+            cache_identity(&ctx, &bob_identity);
+
+            let path = put_encrypted(&ctx, temp_dir, "enc.bin", b"plaintext");
+
+            let owner_wrapped = read_metadata_attributes(&path).unwrap().members[0].key.clone().unwrap();
+            let owner_secret = ctx.identity_key.clone().unwrap();
+            let file_key = decrypt_bytes(
+                &Key { algorithm: owner_wrapped.algorithm.clone(), value: owner_secret.value.clone() },
+                &owner_wrapped.value,
+            ).unwrap();
+
+            put(&ctx, "enc.bin", Some(path.to_str().unwrap()), &reader("bob@example.com"), None, true).unwrap();
+
+            let m = read_metadata_attributes(&path).unwrap();
+            let bob = m.members.iter().find(|m| m.address == "bob@example.com").unwrap();
+            assert_eq!(bob.permission, Permission::Reader);
+            let bob_wrapped = bob.key.as_ref().expect("bob's wrapped key");
+            let recovered = decrypt_bytes(
+                &Key { algorithm: bob_wrapped.algorithm.clone(), value: bob_secret_key.value.clone() },
+                &bob_wrapped.value,
+            ).unwrap();
+            assert_eq!(recovered, file_key, "bob unwraps to same file key");
+        });
+    }
+
+    #[test]
+    fn put_metadata_only_upgrades_existing_member_permission() {
+        in_test_dir("ark_put_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let address = format!("gyan@127.0.0.1:{}", port);
+            let ctx = init_with_server(temp_dir, &address);
+
+            let (sam_identity, _sam_secret_key) = create_identity("sam@example.com").unwrap();
+            cache_identity(&ctx, &sam_identity);
+
+            let path = temp_dir.join("doc.txt");
+            fs::write(&path, b"body").unwrap();
+            put(&ctx, "doc.txt", Some(path.to_str().unwrap()), &reader("sam@example.com"), Some("none"), false).unwrap();
+
+            put(&ctx, "doc.txt", Some(path.to_str().unwrap()), &writer("sam@example.com"), None, true).unwrap();
+
+            let m = read_metadata_attributes(&path).unwrap();
+            let sam = m.members.iter().find(|m| m.address == "sam@example.com").unwrap();
+            assert_eq!(sam.permission, Permission::Writer);
+        });
+    }
+
+    #[test]
+    fn put_metadata_only_drops_member() {
+        in_test_dir("ark_put_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let address = format!("gyan@127.0.0.1:{}", port);
+            let ctx = init_with_server(temp_dir, &address);
+
+            let (sam_identity, _sam_secret_key) = create_identity("sam@example.com").unwrap();
+            cache_identity(&ctx, &sam_identity);
+
+            let path = temp_dir.join("doc.txt");
+            fs::write(&path, b"body").unwrap();
+            put(&ctx, "doc.txt", Some(path.to_str().unwrap()), &reader("sam@example.com"), Some("none"), false).unwrap();
+
+            put(&ctx, "doc.txt", Some(path.to_str().unwrap()), &drop("sam@example.com"), None, true).unwrap();
+
+            let m = read_metadata_attributes(&path).unwrap();
+            assert!(!m.members.iter().any(|m| m.address == "sam@example.com"));
+        });
+    }
+
+    #[test]
+    fn put_metadata_only_rejects_dropping_last_owner() {
+        in_test_dir("ark_put_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let address = format!("gyan@127.0.0.1:{}", port);
+            let ctx = init_with_server(temp_dir, &address);
+            let path = put_plain(&ctx, temp_dir, "doc.txt", b"body");
+
+            let err = put(&ctx, "doc.txt", Some(path.to_str().unwrap()), &drop(&address), None, true).unwrap_err();
+            assert!(err.to_string().contains("at least one owner"), "msg was {}", err);
+        });
+    }
+
+    #[test]
+    fn put_permissions_ark_absolute_path_resolves_local_input() {
+        in_test_dir("ark_put_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let address = format!("gyan@127.0.0.1:{}", port);
+            let ctx = init_with_server(temp_dir, &address);
+            let path = temp_dir.join("notes.txt");
+            fs::write(&path, b"hello").unwrap();
+            put(&ctx, "notes.txt", Some(path.to_str().unwrap()), &Permissions::default(), Some("none"), false).unwrap();
+
+            put_permissions(&ctx, "/notes.txt", &reader("john@example.com")).unwrap();
+
+            let m = read_metadata_attributes(&path).unwrap();
+            assert!(m.members.iter().any(|m| m.address == "john@example.com"));
+        });
+    }
+
+    #[test]
+    fn put_metadata_only_preserves_body_hash_signature() {
+        in_test_dir("ark_put_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let address = format!("gyan@127.0.0.1:{}", port);
+            let ctx = init_with_server(temp_dir, &address);
+            let path = put_plain(&ctx, temp_dir, "doc.txt", b"body");
+
+            put(&ctx, "doc.txt", Some(path.to_str().unwrap()), &reader("john@example.com"), None, true).unwrap();
+
+            let m = read_metadata_attributes(&path).unwrap();
+            let body = fs::read(&path).unwrap();
+            verify_metadata(&ctx.identity.public_key, &m, Some(&body)).unwrap();
         });
     }
 }

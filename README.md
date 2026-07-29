@@ -83,7 +83,7 @@ ark put -i note.txt note.txt    # encrypt + upload
 ark get note.txt -o out.txt -d  # download + decrypt
 
 # Share with another user
-ark chmod -r bob@localhost:8080 note.txt    # updates local metadata + uploads
+ark put -r bob@localhost:8080 -m -i note.txt note.txt  # metadata-only put
 
 # On bob's side — review and accept the share
 ark proposals list              # shows pending share proposals
@@ -105,11 +105,10 @@ Every command takes `-h` for details. Paths accept three forms:
 | `ark server [PORT]` | Run a server. Serves the current directory. |
 | `ark init <ADDR>` | Create or download an account identity. `--password` gates remote key recovery. `--local-only` skips the server. |
 | `ark get <PATH>` | Download a file. `--decrypt` unwraps it, `-o FILE` writes to disk. |
-| `ark put <PATH>` | Upload a file, or create a directory when the input is a directory. `-i FILE` for input, `-o`/`-w`/`-r`/`-d` set members, `--encryption-algorithm none` for plaintext. |
+| `ark put <PATH>` | Upload a file, or create a directory when the input is a directory. `-i FILE` for input, `-o`/`-w`/`-r`/`-d` add or drop members (use `public` for the `*` wildcard), `--encryption-algorithm none` for plaintext, `-m` sends metadata only (server keeps the body). |
 | `ark head <PATH>` | Fetch response headers only. |
 | `ark list <PATH>` | List entries of a directory. |
 | `ark delete <PATH>` | Delete a file or directory (recursive). |
-| `ark chmod <FILE>` | Change members on a tracked file: `-o` owner, `-w` writer, `-r` reader, `-d` drop. Use `public` for the `*` wildcard. Uploads by default; `--local-only` skips the upload. Untracked files must be created with `ark put` first. |
 | `ark sync` | Reconcile local and remote state in one pass. `-w` watches continuously. Prints one line per reconciled entry. |
 | `ark watch local <PATH>` / `ark watch remote <PATH>` | Print events for local FS changes or the server's SSE stream at PATH. |
 | `ark proposals list` | Show pending share proposals — unauthorized PUTs from other accounts, recorded in `.ark/requests/`. |
@@ -126,15 +125,16 @@ Every command takes `-h` for details. Paths accept three forms:
 // cwd = ./server
 use ark::server::start_server;
 
-start_server(8080, "localhost:8080");                           // blocks
+start_server(8080, "localhost:8080");           // blocks
 ```
 
 ```rust
 // Terminal 2 — create an account on that server
 // cwd = ./alice
 use ark::context::create_client_context;
-use ark::client::{init, put, get, get_stream, chmod, sync, list_proposals,
+use ark::client::{init, put_content, put_permissions, get_content, get_stream, sync, list_proposals,
     accept_proposal, reject_proposal, watch_local, watch_remote};
+use ark::metadata::reader;
 
 init(&std::env::current_dir()?, "alice@localhost:8080", None, /*local_only=*/ false)?;
 
@@ -142,26 +142,26 @@ init(&std::env::current_dir()?, "alice@localhost:8080", None, /*local_only=*/ fa
 std::fs::create_dir_all("apps/notes")?;
 std::env::set_current_dir("apps/notes")?;
 
-let ctx = create_client_context()?;                             // walks up from cwd to find .ark/
+let ctx = create_client_context()?;             // walks up from cwd to find .ark/
 
 // Upload and download an encrypted file
 std::fs::write("note.txt", b"hello")?;
-put(&ctx, "note.txt", Some("note.txt"), None)?;                 // encrypt + upload
-get(&ctx, "note.txt", Some("out.txt"), /*decrypt=*/ true)?;     // download + decrypt
+put_content(&ctx, "note.txt")?;                 // encrypt + upload
+get_content(&ctx, "note.txt")?;                 // download + decrypt
 
-// Share with another user (seeds metadata if absent, then uploads)
-chmod(&ctx, "note.txt", &[], &[], &["bob@localhost:8080".into()], &[], /*local_only=*/ false, None)?;
+// Share with another user
+put_permissions(&ctx, "note.txt", &reader("bob@localhost:8080"))?;
 
 // On bob's side — review and accept the share
-let proposals = list_proposals(&ctx)?;                          // pending share proposals
-accept_proposal(&ctx, "1", /*force=*/ false)?;                  // pulls the file, materializes it on bob's server
-reject_proposal(&ctx, "1")?;                                    // discard instead
+let proposals = list_proposals(&ctx)?;          // pending share proposals
+accept_proposal(&ctx, "1", /*force=*/ false)?;  // pulls the file, materializes it on bob's server
+reject_proposal(&ctx, "1")?;                    // discard instead
 
 // Sync the cwd
 sync(&ctx, &std::env::current_dir()?, /*watch=*/ true, /*decrypt=*/ true,
     |event| { println!("{} {}", event.action.as_str(), event.path.display()); false },
     |error| { eprintln!("sync: {}", error); false }
-)?;                                                             // reconcile local and remote; watch continuously
+)?;                                             // reconcile local and remote; watch continuously
 
 // Watch for local changes
 let cwd = std::env::current_dir()?;
@@ -182,7 +182,11 @@ let mut buf = Vec::new();
 let (metadata, _) = get_stream(&ctx, "note.txt", &mut buf, true)?;
 ```
 
-Every CLI command has a corresponding library function. Most take file paths and use stdin/stdout when absent, writing metadata to `user.ark.*` xattrs as a side effect. For `encrypt`, `decrypt`, `get`, and `put`, a `_stream` variant (`encrypt_stream`, `decrypt_stream`, `get_stream`, `put_stream`) exposes the same operation over `Read`/`Write` streams and returns values instead of touching the filesystem.
+Every CLI command has a corresponding library function. Most take file paths and use stdin/stdout when absent. For `encrypt`, `decrypt`, `get`, and `put`, a `_stream` variant (`encrypt_stream`, `decrypt_stream`, `get_stream`, `put_stream`) exposes the same operation over `Read`/`Write` streams and returns values instead of touching the filesystem.
+
+`put` also has two focused wrappers: `put_content(ctx, path)` uploads the body at `path` with default permissions, and `put_permissions(ctx, path, &permissions)` sends a metadata-only PUT to add or drop members without re-uploading the body. Both delegate to `put`, which remains the full form (`input`, `permissions`, `encryption_algorithm`, `metadata_only`). Build a `Permissions` explicitly, or use the `ark::metadata::{owner, writer, reader, drop}` helpers for the common single-member cases.
+
+`get` has a matching wrapper: `get_content(ctx, path)` downloads the body at `path` and writes it under the account root, decrypting when encrypted. `get` remains the full form (`output`, `decrypt`).
 
 ---
 
@@ -192,7 +196,7 @@ Every CLI command has a corresponding library function. Most take file paths and
 |---|---|
 | Identities | Public/private key pairs. Publicly addressable, ED25519 by default. Optional password. |
 | Encryption | AES-256-GCM with HPKE key wrap per member by default. |
-| Sharing | `owner` / `writer` / `reader` per file. Add or drop members with `chmod`. |
+| Sharing | `owner` / `writer` / `reader` per file. Add or drop members with `put`. |
 | Directories | First-class. Recursive delete. Permissions inherit. |
 | Public files | Supported for plaintext only (any browser can fetch). |
 | Federation | On write, the server relays to co-members' servers. |
@@ -238,7 +242,7 @@ Not yet. Ark stores metadata in filesystem extended attributes; NTFS support isn
 
 **How does Ark compare to Solid / IPFS / Nostr?**
 
-- **Solid** — closest in spirit: user-owned personal data pods addressed by URL. Ark differs by encrypting end-to-end by default, pushing writes between servers automatically (federation), and shipping as a single Rust binary rather than a spec with many implementations.
+- **Solid** — closest in spirit: user-owned personal data pods addressed by URL. Ark differs by encrypting end-to-end by default and pushing writes between servers automatically (federation).
 - **IPFS** — content-addressed and public by default; great for immutable, shareable blobs. Ark is location-addressed (`user@host/path`), mutable, and private by default, with per-file ACLs.
 - **Nostr** — relay-based event stream for messaging. Ark is file-oriented with directories, permissions, and encrypted content; messaging is one thing you can build on top, not the primitive.
 

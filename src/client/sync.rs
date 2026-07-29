@@ -4,17 +4,16 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::thread;
 
-use super::{get, get_stream, head, list, put, watch_local, watch_remote};
+use super::{get, get_stream, head, list, put_content, watch_local, watch_remote};
 use crate::identity::parse_address;
 use crate::metadata::{has_metadata_attributes, read_local_metadata_attributes, read_metadata_attributes, read_metadata_headers, remove_local_metadata_attributes, write_local_metadata_attributes, write_metadata_attributes};
 use crate::timestamp;
-use crate::types::{DirEntryKind, EntryAction, EntryEvent, IdentityContext, Metadata, Permissions};
+use crate::types::{DirEntryKind, EntryAction, EntryEvent, IdentityContext, Metadata};
 use crate::util::{io_err, parse_request_entry, resolve_client_url, sha256};
 
 struct SyncEntry {
     relative_path: String,
     modified_local_body: bool,
-    modified_local_metadata: bool,
     modified_remote_body: bool,
     modified_remote_metadata: bool,
 }
@@ -23,13 +22,13 @@ struct SyncEntry {
 /// must be `ctx.root` or a descendant.
 ///
 /// Per tracked file/dir: push if only local changed; pull if only remote
-/// changed; pull metadata alone when only permissions/members diverged; write
-/// a `<name>.conflict-<iso>` sidecar carrying the remote copy (body plus
+/// changed; pull metadata alone when only remote permissions/members changed;
+/// write a `<name>.conflict-<iso>` sidecar carrying the remote copy (body plus
 /// metadata) when both sides diverged, leaving the local copy untouched. The
 /// sidecar is not sync-tracked itself.
 ///
-/// Only items with sync markers (seeded via [`chmod`](super::chmod) or a
-/// previous [`put`](super::put)) are considered. Symlinks, untracked local files, and
+/// Only items with sync markers (seeded via a previous [`put`](super::put))
+/// are considered. Symlinks, untracked local files, and
 /// files encrypted at rest are left alone. Remote changes authored by the
 /// current account are ignored.
 ///
@@ -121,7 +120,6 @@ where
                 let entry = SyncEntry {
                     relative_path: relative_path.clone(),
                     modified_local_body: false,
-                    modified_local_metadata: false,
                     modified_remote_body: !is_dir,
                     modified_remote_metadata: true,
                 };
@@ -230,14 +228,13 @@ where
             .or_insert(SyncEntry {
                 relative_path: rel.clone(),
                 modified_local_body: false,
-                modified_local_metadata: false,
                 modified_remote_body: body_changed,
                 modified_remote_metadata: metadata_changed,
             });
     }
 
     let list = entries.into_values()
-        .filter(|e| e.modified_local_body || e.modified_local_metadata || e.modified_remote_body || e.modified_remote_metadata)
+        .filter(|e| e.modified_local_body || e.modified_remote_body || e.modified_remote_metadata)
         .collect();
     Ok((list, last_sync_request))
 }
@@ -290,15 +287,9 @@ fn check_entry(
         _ => false,
     };
 
-    let modified_local_metadata = match (&local.sync_modified, has_metadata_attributes(path)?) {
-        (Some(baseline), true) => &read_metadata_attributes(path)?.modified != baseline,
-        _ => false,
-    };
-
     Ok(Some(SyncEntry {
         relative_path: to_relative_path(ctx, path)?,
         modified_local_body,
-        modified_local_metadata,
         modified_remote_body: false,
         modified_remote_metadata: false,
     }))
@@ -327,25 +318,11 @@ where
         remove_local_metadata_attributes(&sidecar_path)?;
         return Ok(emit(EntryAction::Modified, true));
     } else if entry.modified_local_body {
-        put(ctx, &target, local_path.to_str(), &Permissions::default(), None, false)?;
+        put_content(ctx, &target)?;
         return Ok(emit(EntryAction::Modified, false));
     } else if entry.modified_remote_body {
         get(ctx, &target, local_path.to_str(), decrypt)?;
         return Ok(emit(EntryAction::Modified, false));
-    } else if entry.modified_local_metadata && entry.modified_remote_metadata {
-        let sidecar_path = sidecar_path_for(&local_path);
-        let (_, remote_metadata) = head(ctx, &target)?;
-
-        if remote_metadata.body_hash.is_none() {
-            fs::create_dir_all(&sidecar_path)?;
-        } else {
-            fs::copy(&local_path, &sidecar_path)?;
-        }
-        write_metadata_attributes(&sidecar_path, &remote_metadata)?;
-        return Ok(emit(EntryAction::Metadata, true));
-    } else if entry.modified_local_metadata {
-        put(ctx, &target, local_path.to_str(), &Permissions::default(), None, false)?;
-        return Ok(emit(EntryAction::Metadata, false));
     } else if entry.modified_remote_metadata {
         let (_, metadata) = head(ctx, &target)?;
 
@@ -461,10 +438,11 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use super::*;
-    use crate::client::{chmod, get::get, init, put::put};
+    use crate::client::{get::get, init, put::{put, put_permissions}};
     use crate::context::create_client_context;
     use crate::metadata::{owner, reader, writer};
     use crate::server::start_test_server;
+    use crate::types::Permissions;
     use crate::util::test::{in_test_dir, init_with_server, write_encrypted_test_file, write_plain_test_file};
 
     fn prime_plain(ctx: &IdentityContext, path: &Path, target: &str, body: &[u8]) {
@@ -735,8 +713,7 @@ mod tests {
             let modified_before = read_metadata_attributes(&pulled).unwrap().modified;
 
             set_current_dir(&bob_dir).unwrap();
-            chmod(&bob_ctx, bob_local.to_str().unwrap(), &reader("public"), true).unwrap();
-            put(&bob_ctx, &target, Some(bob_local.to_str().unwrap()), &Permissions::default(), Some("none"), false).unwrap();
+            put(&bob_ctx, &target, Some(bob_local.to_str().unwrap()), &reader("public"), Some("none"), false).unwrap();
 
             set_current_dir(&alice_dir).unwrap();
             let alice_ctx = create_client_context().unwrap();
@@ -868,8 +845,7 @@ mod tests {
             fs::create_dir_all(local.parent().unwrap()).unwrap();
             fs::write(&local, b"alice-v1").unwrap();
             put(&alice_ctx, "/shared/foo.txt", Some(local.to_str().unwrap()), &Permissions::default(), Some("none"), false).unwrap();
-            chmod(&alice_ctx, local.to_str().unwrap(), &writer(bob_ctx.identity.address.clone()), true).unwrap();
-            put(&alice_ctx, "/shared/foo.txt", Some(local.to_str().unwrap()), &Permissions::default(), Some("none"), false).unwrap();
+            put_permissions(&alice_ctx, "/shared/foo.txt", &writer(bob_ctx.identity.address.clone())).unwrap();
 
             let alice_ctx = create_client_context().unwrap();
             sync(&alice_ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
@@ -924,37 +900,6 @@ mod tests {
     }
 
     #[test]
-    fn sync_pushes_local_metadata_only_after_chmod() {
-        in_test_dir("ark_sync_test", |temp_dir| {
-            let port = start_test_server(temp_dir.to_path_buf());
-            let address = format!("gyan@127.0.0.1:{}", port);
-            let ctx = init_with_server(temp_dir, &address);
-
-            let local = temp_dir.join("f.txt");
-            prime_plain(&ctx, &local, "f.txt", b"v1");
-
-            let server_path = temp_dir.join("ark/gyan/f.txt");
-            let body_before = fs::read(&server_path).unwrap();
-            let modified_before = read_metadata_attributes(&server_path).unwrap().modified;
-
-            chmod(&ctx, local.to_str().unwrap(), &reader("public"), true).unwrap();
-
-            sync(&ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
-
-            let body_after = fs::read(&server_path).unwrap();
-            assert_eq!(body_after, body_before, "body should be unchanged");
-
-            let server_meta = read_metadata_attributes(&server_path).unwrap();
-            assert!(server_meta.members.iter().any(|m| m.address == "*"), "public member should propagate");
-            assert_ne!(server_meta.modified, modified_before, "modified stamp should advance");
-
-            let local_after = read_local_metadata_attributes(&local).unwrap();
-            assert_eq!(local_after.sync_modified, Some(server_meta.modified),
-                "sync_modified should track pushed metadata stamp");
-        });
-    }
-
-    #[test]
     fn sync_leaves_untracked_local_alone_when_remote_puts_same_path() {
         in_test_dir("ark_sync_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
@@ -985,108 +930,7 @@ mod tests {
     }
 
     #[test]
-    fn sync_writes_metadata_sidecar_when_both_sides_bump_metadata() {
-        in_test_dir("ark_sync_test", |temp_dir| {
-            let port = start_test_server(temp_dir.to_path_buf());
-            let (alice_ctx, bob_ctx) = init_two_accounts(temp_dir, port);
-            let alice_dir = temp_dir.join("alice_client");
-            let bob_dir = temp_dir.join("bob_client");
-
-            set_current_dir(&alice_dir).unwrap();
-            let shared = alice_dir.join("shared");
-            fs::create_dir(&shared).unwrap();
-            put(&alice_ctx, "shared/", Some(shared.to_str().unwrap()), &owner(bob_ctx.identity.address.clone()), None, false).unwrap();
-
-            let alice_local = alice_dir.join("shared/foo.txt");
-            fs::write(&alice_local, b"v1").unwrap();
-            put(&alice_ctx, "/shared/foo.txt", Some(alice_local.to_str().unwrap()), &owner(bob_ctx.identity.address.clone()), Some("none"), false).unwrap();
-
-            let alice_ctx = create_client_context().unwrap();
-            sync(&alice_ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
-
-            set_current_dir(&bob_dir).unwrap();
-            let bob_payload = bob_dir.join("payload.bin");
-            let target = format!("alice@127.0.0.1:{}/shared/foo.txt", port);
-            get(&bob_ctx, &target, Some(bob_payload.to_str().unwrap()), false).unwrap();
-
-            chmod(&alice_ctx, alice_local.to_str().unwrap(), &reader("public"), true).unwrap();
-
-            chmod(&bob_ctx, bob_payload.to_str().unwrap(), &writer("carol@host"), true).unwrap();
-            put(&bob_ctx, &target, Some(bob_payload.to_str().unwrap()), &Permissions::default(), Some("none"), false).unwrap();
-
-            set_current_dir(&alice_dir).unwrap();
-            let alice_ctx = create_client_context().unwrap();
-            sync(&alice_ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
-
-            assert_eq!(fs::read(&alice_local).unwrap(), b"v1", "original body untouched");
-            let local_meta = read_metadata_attributes(&alice_local).unwrap();
-            assert!(local_meta.members.iter().any(|m| m.address == "*"), "local keeps its own chmod");
-
-            let sidecar = fs::read_dir(alice_dir.join("shared")).unwrap()
-                .filter_map(|e| e.ok())
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .find(|n| n.starts_with("foo.txt.conflict-"))
-                .expect("metadata sidecar present");
-            let sidecar_path = alice_dir.join("shared").join(&sidecar);
-            assert_eq!(fs::read(&sidecar_path).unwrap(), b"v1", "sidecar copies local body");
-            let sidecar_meta = read_metadata_attributes(&sidecar_path).unwrap();
-            assert!(sidecar_meta.members.iter().any(|m| m.address == "carol@host"), "sidecar carries remote members");
-            assert!(read_local_metadata_attributes(&sidecar_path).unwrap().sync_body_hash.is_none(), "sidecar must not be sync-tracked");
-        });
-    }
-
-    #[test]
-    fn sync_writes_dir_metadata_sidecar_when_both_sides_bump_metadata() {
-        in_test_dir("ark_sync_test", |temp_dir| {
-            let port = start_test_server(temp_dir.to_path_buf());
-            let (alice_ctx, bob_ctx) = init_two_accounts(temp_dir, port);
-            let alice_dir = temp_dir.join("alice_client");
-            let bob_dir = temp_dir.join("bob_client");
-
-            set_current_dir(&alice_dir).unwrap();
-            let shared = alice_dir.join("shared");
-            fs::create_dir(&shared).unwrap();
-            put(&alice_ctx, "shared/", Some(shared.to_str().unwrap()), &owner(bob_ctx.identity.address.clone()), None, false).unwrap();
-
-            let alice_sub = alice_dir.join("shared/sub");
-            fs::create_dir(&alice_sub).unwrap();
-            put(&alice_ctx, "/shared/sub", Some(alice_sub.to_str().unwrap()), &owner(bob_ctx.identity.address.clone()), None, false).unwrap();
-
-            let alice_ctx = create_client_context().unwrap();
-            sync(&alice_ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
-
-            set_current_dir(&bob_dir).unwrap();
-            let bob_sub = bob_dir.join("sub");
-            fs::create_dir(&bob_sub).unwrap();
-            let target = format!("alice@127.0.0.1:{}/shared/sub", port);
-            head(&bob_ctx, &target).unwrap();
-            let (_, remote_meta) = head(&bob_ctx, &target).unwrap();
-            write_metadata_attributes(&bob_sub, &remote_meta).unwrap();
-
-            chmod(&alice_ctx, alice_sub.to_str().unwrap(), &reader("public"), true).unwrap();
-
-            chmod(&bob_ctx, bob_sub.to_str().unwrap(), &writer("carol@host"), true).unwrap();
-            put(&bob_ctx, &target, Some(bob_sub.to_str().unwrap()), &Permissions::default(), None, false).unwrap();
-
-            set_current_dir(&alice_dir).unwrap();
-            let alice_ctx = create_client_context().unwrap();
-            sync(&alice_ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
-
-            let sidecar = fs::read_dir(alice_dir.join("shared")).unwrap()
-                .filter_map(|e| e.ok())
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .find(|n| n.starts_with("sub.conflict-"))
-                .expect("dir metadata sidecar present");
-            let sidecar_path = alice_dir.join("shared").join(&sidecar);
-            assert!(sidecar_path.is_dir(), "sidecar must be a dir");
-            let sidecar_meta = read_metadata_attributes(&sidecar_path).unwrap();
-            assert!(sidecar_meta.members.iter().any(|m| m.address == "carol@host"), "sidecar carries remote members");
-            assert!(sidecar_meta.body_hash.is_none(), "dir sidecar carries no body_hash");
-        });
-    }
-
-    #[test]
-    fn sync_emits_events_for_push_metadata_and_conflict() {
+    fn sync_emits_events_for_push_and_conflict() {
         use std::sync::Mutex;
 
         in_test_dir("ark_sync_test", |temp_dir| {
@@ -1102,8 +946,7 @@ mod tests {
             fs::create_dir_all(local.parent().unwrap()).unwrap();
             fs::write(&local, b"v1").unwrap();
             put(&alice_ctx, "/shared/foo.txt", Some(local.to_str().unwrap()), &Permissions::default(), Some("none"), false).unwrap();
-            chmod(&alice_ctx, local.to_str().unwrap(), &writer(bob_ctx.identity.address.clone()), true).unwrap();
-            put(&alice_ctx, "/shared/foo.txt", Some(local.to_str().unwrap()), &Permissions::default(), Some("none"), false).unwrap();
+            put_permissions(&alice_ctx, "/shared/foo.txt", &writer(bob_ctx.identity.address.clone())).unwrap();
 
             let events: Mutex<Vec<EntryEvent>> = Mutex::new(Vec::new());
             let capture = |e| { events.lock().unwrap().push(e); false };
@@ -1114,13 +957,6 @@ mod tests {
             assert_eq!(modified.len(), 1, "one event for local body push");
             assert!(matches!(modified[0].action, EntryAction::Modified));
             assert!(!modified[0].conflict);
-
-            chmod(&alice_ctx, local.to_str().unwrap(), &reader("public"), true).unwrap();
-            sync(&alice_ctx, &current_dir().unwrap(), false, false, capture, |_| false).unwrap();
-            let metadata: Vec<_> = events.lock().unwrap().drain(..).collect();
-            assert_eq!(metadata.len(), 1, "one event for metadata-only push");
-            assert!(matches!(metadata[0].action, EntryAction::Metadata));
-            assert!(!metadata[0].conflict);
 
             set_current_dir(&bob_dir).unwrap();
             let bob_payload = bob_dir.join("payload.bin");

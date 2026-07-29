@@ -6,7 +6,7 @@ use std::process::exit;
 
 use clap::{Parser, Subcommand};
 
-use ark::client::{accept_proposal, chmod, decrypt, delete, encrypt, get, head, init, list, list_proposals, put, reject_proposal, sync, watch_local, watch_remote};
+use ark::client::{accept_proposal, decrypt, delete, encrypt, get, head, init, list, list_proposals, put, reject_proposal, sync, watch_local, watch_remote};
 use ark::types::{DirEntryKind, EntryEvent, Permissions};
 use ark::context::create_client_context;
 use ark::identity::parse_address;
@@ -102,35 +102,6 @@ enum Cmd {
         /// Ark URL or path.
         path: String,
     },
-    /// Change members and permissions on a local file, uploading the result.
-    ///
-    /// If the file has no ark metadata yet, seeds fresh metadata with the
-    /// current account as sole owner before applying member changes.
-    /// `--encryption-algorithm` is only honored when seeding.
-    ///
-    /// For encrypted files, adding a member grants them access immediately.
-    /// Removing a member does NOT rotate the file key — the next `put` will.
-    /// By default the change is uploaded; pass `--local-only` to skip the
-    /// upload (a later `put` or `sync` will propagate).
-    Chmod {
-        /// Grant `owner` (repeatable). Use "public" for wildcard `*`.
-        #[arg(short = 'o', long = "owner", value_name = "ADDR")]
-        owner: Vec<String>,
-        /// Grant `writer` (repeatable). Use "public" for wildcard `*`.
-        #[arg(short = 'w', long = "writer", value_name = "ADDR")]
-        writer: Vec<String>,
-        /// Grant `reader` (repeatable). Use "public" for wildcard `*`.
-        #[arg(short = 'r', long = "reader", value_name = "ADDR")]
-        reader: Vec<String>,
-        /// Drop a member (repeatable).
-        #[arg(short = 'd', long = "drop", value_name = "ADDR")]
-        drop: Vec<String>,
-        /// Only update local xattrs; skip the upload.
-        #[arg(long)]
-        local_only: bool,
-        /// Local file or directory path.
-        file: String,
-    },
     /// Delete a file or directory.
     Delete {
         /// Ark URL or path.
@@ -180,7 +151,7 @@ enum Cmd {
         /// Send only metadata; server keeps the existing body. Requires the
         /// file to exist on the server.
         #[arg(short, long)]
-        metadata: bool,
+        metadata_only: bool,
         /// Ark URL or path.
         path: String,
     },
@@ -272,7 +243,6 @@ fn main() {
             Ok(())
         },
         Cmd::Init { address, password, local_only } => current_dir().and_then(|c| init(&c, &address, password.as_deref(), local_only)),
-        Cmd::Chmod { owner, writer, reader, drop, local_only, file } => create_client_context().and_then(|c| chmod(&c, &file, &Permissions { owners: owner, writers: writer, readers: reader, drops: drop }, local_only)),
         Cmd::Head { path } => create_client_context().and_then(|c| head_cli(&c, &path)),
         Cmd::Delete { path } => create_client_context().and_then(|c| delete(&c, &path)),
         Cmd::Get { output, decrypt, path } => create_client_context().and_then(|c| get(&c, &path, output.as_deref(), decrypt)),
@@ -282,7 +252,7 @@ fn main() {
             ProposalsCmd::Accept { id, force } => accept_proposal(&c, &id, force),
             ProposalsCmd::Reject { id } => reject_proposal(&c, &id),
         }),
-        Cmd::Put { input, owner, writer, reader, drop, encryption_algorithm, metadata, path } => create_client_context().and_then(|c| put(&c, &path, input.as_deref(), &Permissions { owners: owner, writers: writer, readers: reader, drops: drop }, encryption_algorithm.as_deref(), metadata)),
+        Cmd::Put { input, owner, writer, reader, drop, encryption_algorithm, metadata_only, path } => create_client_context().and_then(|c| put(&c, &path, input.as_deref(), &Permissions { owners: owner, writers: writer, readers: reader, drops: drop }, encryption_algorithm.as_deref(), metadata_only)),
         Cmd::Sync { watch, decrypt } => create_client_context().and_then(|c| current_dir().and_then(|d| sync(&c, &d, watch, decrypt, print_event, print_error))),
         Cmd::Watch { cmd } => match cmd {
             WatchCmd::Local { path } => watch_local(Path::new(&path), print_event, print_error),

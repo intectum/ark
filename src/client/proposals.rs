@@ -275,8 +275,6 @@ mod tests {
 
     #[test]
     fn accept_proposal_creates_dir_and_pulls_file() {
-        use crate::client::chmod;
-
         in_test_dir("ark_proposals_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let (_alice_ctx, bob_ctx) = setup(temp_dir, port);
@@ -286,8 +284,7 @@ mod tests {
             put(&bob_ctx, "apps/notes/foo.md", Some(payload.to_str().unwrap()), &Permissions::default(), Some("none"), false).unwrap();
 
             let alice_addr = format!("alice@127.0.0.1:{}", port);
-            chmod(&bob_ctx, payload.to_str().unwrap(), &reader(alice_addr.clone()), true).unwrap();
-            put(&bob_ctx, "apps/notes/foo.md", Some(payload.to_str().unwrap()), &Permissions::default(), Some("none"), false).unwrap();
+            put(&bob_ctx, "apps/notes/foo.md", Some(payload.to_str().unwrap()), &reader(alice_addr.clone()), Some("none"), false).unwrap();
 
             set_current_dir(temp_dir.join("alice_client")).unwrap();
             let alice_ctx = create_client_context().unwrap();

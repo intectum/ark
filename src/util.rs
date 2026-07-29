@@ -1,7 +1,7 @@
 use std::env::current_dir;
 use std::io;
 use std::io::{Error, ErrorKind};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use base64::{DecodeError, Engine};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -10,6 +10,7 @@ use url::Url;
 
 use crate::crypto::sign_bytes;
 use crate::http::{read_request, read_response};
+use crate::identity::parse_address;
 use crate::types::{IdentityContext, RequestEntry};
 
 pub fn resolve_client_url(ctx: &IdentityContext, path: &str) -> io::Result<Url> {
@@ -46,6 +47,19 @@ pub fn resolve_client_url_raw(root: &Path, path: &str, address: &str) -> io::Res
     reject_path_traversal(&url)?;
 
     Ok(url)
+}
+
+pub fn resolve_local_path(ctx: &IdentityContext, path: &str) -> io::Result<PathBuf> {
+    let rel = if path.contains('@') {
+        let (_, _, path_part) = parse_address(path)?;
+        path_part.trim_start_matches('/').to_string()
+    } else if path.starts_with('/') {
+        path.trim_start_matches('/').to_string()
+    } else {
+        return Ok(PathBuf::from(path));
+    };
+
+    Ok(ctx.root.join(rel))
 }
 
 pub fn resolve_server_url(path: &str) -> io::Result<Url> {

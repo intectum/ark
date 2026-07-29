@@ -8,21 +8,31 @@ use crate::crypto::DEFAULT_HASH_ALGORITHM;
 use crate::types::{Hash, IdentityContext, LocalMetadata, Metadata};
 use crate::identity::resolve_identity;
 use crate::metadata::{read_metadata_headers, verify_metadata, write_local_metadata_attributes, write_metadata_attributes};
-use crate::util::{io_err, resolve_client_url, sha256};
+use crate::util::{io_err, resolve_client_url, resolve_local_path, sha256};
 
-/// Fetch a file body and metadata from the server and write the body to a
-/// file or stdout.
+/// Download the body of a file at `path` (decrypting when encrypted).
 ///
-/// `path` accepts relative, absolute account, or address form. See the
-/// [module documentation](../index.html) for path resolution details. Verifies
-/// the metadata signature against the modifier's identity. When `decrypt` is
-/// true, unwraps the file key using `ctx.identity_key` and decrypts the body
-/// before writing.
+/// `path` accepts relative, absolute account (leading `/`), or address form
+/// (`<name>@<host>/...`). The local file is written to the account root at
+/// the path portion; for address form the address selects the download source
+/// while the local file is still written under the account root.
+pub fn get_content(ctx: &IdentityContext, path: &str) -> io::Result<()> {
+    let output = resolve_local_path(ctx, path)?;
+    get(ctx, path, output.to_str(), true)
+}
+
+/// Download a file body (and metadata) at `path`, writing the body to a file
+/// or stdout.
 ///
-/// When `output` is `Some`, writes the body to that file path and stores
-/// signed metadata as `user.ark.*` xattrs plus local metadata as
-/// `user.ark_local.*` xattrs. When `output` is `None`, writes the body to
-/// stdout.
+/// `path` accepts relative, absolute account (leading `/`), or address form
+/// (`<name>@<host>/...`). Writes the body to `output` (or stdout when `None`).
+///
+/// Verifies the metadata signature against the modifier's identity. When
+/// `decrypt` is true, unwraps the file key using `ctx.identity_key` and
+/// decrypts the body before writing.
+///
+/// When `output` is `Some`, stores signed metadata as `user.ark.*` xattrs
+/// plus local metadata as `user.ark_local.*` xattrs on the written file.
 pub fn get(ctx: &IdentityContext, path: &str, output: Option<&str>, decrypt: bool) -> io::Result<()> {
     match output {
         Some(o) => {
@@ -49,8 +59,11 @@ pub fn get(ctx: &IdentityContext, path: &str, output: Option<&str>, decrypt: boo
     Ok(())
 }
 
-/// Fetch a file body and metadata from the server and write the body to
-/// `output`.
+/// Download a file body (and metadata) at `path`, writing the body to
+/// `output`. Returns the signed metadata pair.
+///
+/// `path` accepts relative, absolute account (leading `/`), or address form
+/// (`<name>@<host>/...`). Writes the body to `output`.
 ///
 /// Verifies the metadata signature against the modifier's identity. When
 /// `decrypt` is true, unwraps the file key using `ctx.identity_key` and
