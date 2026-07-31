@@ -1,11 +1,11 @@
 use std::io;
 use std::str::from_utf8;
 
-use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
-use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+use aes_gcm::aead::Aead;
 use argon2::{Algorithm as Argon2Algorithm, Argon2, Params as Argon2Params, Version as Argon2Version};
 use curve25519_dalek::edwards::CompressedEdwardsY;
+use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use getrandom::getrandom;
 use hkdf::Hkdf;
 use hpke::{
@@ -268,6 +268,13 @@ pub fn decrypt_bytes(secret_key: &Key, ciphertext: &[u8]) -> io::Result<Vec<u8>>
             let secret_key_hpke = Key {
                 algorithm: "hpke-x25519-hkdf-sha256-aes256gcm".to_string(),
                 value: secret_key_ed25519.value,
+            };
+            decrypt_bytes(&secret_key_hpke, ciphertext)
+        },
+        DEFAULT_SIGNING_ALGORITHM => {
+            let secret_key_hpke = Key {
+                algorithm: "hpke-x25519-hkdf-sha256-aes256gcm".to_string(),
+                value: secret_key.value.clone(),
             };
             decrypt_bytes(&secret_key_hpke, ciphertext)
         },

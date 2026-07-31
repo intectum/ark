@@ -90,13 +90,14 @@ fn content_type(path: &Path) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::super::start_test_server;
-    use super::super::test_helpers::*;
-    use crate::crypto::DEFAULT_ENCRYPTION_ALGORITHM;
-    use crate::types::{DirEntry, DirEntryKind, Member, Permission};
-    use crate::util::test::{TEST_ADDRESS, create_test_account, in_test_dir, write_encrypted_test_file, write_plain_test_file};
     use std::fs;
     use std::os::unix::fs::symlink;
+
+    use crate::crypto::DEFAULT_ENCRYPTION_ALGORITHM;
+    use crate::testing::fs::{TEST_ADDRESS, create_test_account, in_test_dir, write_encrypted_test_file, write_plain_test_file};
+    use crate::testing::http::*;
+    use crate::testing::http::start_test_server;
+    use crate::types::{DirEntry, DirEntryKind, Member, Permission};
 
     #[test]
     fn get_file_returns_content() {
@@ -366,7 +367,7 @@ mod tests {
             ]);
 
             let port = start_test_server(temp_dir.to_path_buf());
-            let auth = build_auth("nobody@x", 0, "AAAA");
+            let auth = format_authorization_header("nobody@x", 0, "AAAA");
             let (code, body, _) = request(port, "GET", "/ark/owner/public.txt", &[], &[
                 ("Authorization", &auth),
             ]);

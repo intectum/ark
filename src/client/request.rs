@@ -41,12 +41,13 @@ mod tests {
     use std::thread;
 
     use super::*;
+
     use crate::client::init_local;
-    use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, verify_bytes};
     use crate::context::create_client_context;
+    use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, verify_bytes};
+    use crate::testing::fs::in_test_dir;
     use crate::types::Signature;
     use crate::util::{decode_base64url, parse_authorization_header, request_to_bytes};
-    use crate::util::test::in_test_dir;
 
     pub fn bind_local() -> (TcpListener, u16) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();

@@ -58,7 +58,6 @@ GET https://gateway.example.com/ark/x-a7f3k2m9p4q8r2/.ark/identity
     "value": "base64url-encoded"
   },
   "notify": true,
-  "modified": "2026-04-14T12:00:00Z",
   "signature": {
     "algorithm": "ed25519",
     "value": "base64url-encoded"
@@ -119,7 +118,6 @@ The `legacy_gateway` field in `ark.toml` (Appendix A) enables legacy email inter
     "value": "<base64url>"
   },
   "notify": true,
-  "modified": "2026-04-14T12:00:00Z",
   "signature": {
     "algorithm": "ed25519",
     "value": "<base64url>"

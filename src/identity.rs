@@ -5,13 +5,16 @@ use std::path::Path;
 use getrandom::getrandom;
 use url::Url;
 
-use crate::crypto::{DEFAULT_SIGNING_ALGORITHM, create_secret_key, sign_json, to_public_key, verify_json};
 use crate::client::request;
-use crate::timestamp;
+use crate::crypto::{DEFAULT_SIGNING_ALGORITHM, create_secret_key, sign_json, to_public_key, verify_json};
 use crate::types::{Identity, IdentityContext, Key, Signature};
 use crate::util::{decode_base64url, encode_base64url, io_err, io_invalid_input, resolve_client_url};
 
-pub fn create_identity(address: &str) -> io::Result<(Identity, Key)> {
+/// Create a fresh identity keypair for `address`.
+///
+/// When `members` is `Some`, the identity is a group and those addresses are
+/// included in the signed document.
+pub fn create_identity(address: &str, members: Option<Vec<String>>) -> io::Result<(Identity, Key)> {
     let mut secret_key = create_secret_key(DEFAULT_SIGNING_ALGORITHM)?;
 
     getrandom(&mut secret_key.value)
@@ -20,7 +23,7 @@ pub fn create_identity(address: &str) -> io::Result<(Identity, Key)> {
     let mut identity = Identity {
         public_key: to_public_key(&secret_key)?,
         address: address.to_string(),
-        modified: timestamp::now(),
+        members,
         signature: Signature {
             algorithm: String::new(),
             value: Vec::new()
@@ -47,7 +50,10 @@ pub fn resolve_identity(ctx: &IdentityContext, address: &str) -> io::Result<Iden
         return Ok(ctx.identity.clone());
     }
 
-    let (name, host, path) = parse_address(address)?;
+    let (name, host, mut path) = parse_address(address)?;
+    if path.is_empty() {
+        path = "/.ark/identity.json".to_string();
+    }
 
     let peer_path = ctx.root.parent().unwrap()
         .join(&name).join(path.trim_start_matches('/'));
@@ -115,6 +121,8 @@ pub fn verify_identity(identity: &Identity) -> io::Result<()> {
         .map_err(|_| io_err("identity signature verification failed"))
 }
 
+/// Split `<name>@<host>[:<port>][/<path>]` into name, host (with port when
+/// given) and path. The path is empty when the address omits one.
 pub fn parse_address(address: &str) -> io::Result<(String, String, String)> {
     let url = Url::parse(&format!("https://{}", address))
         .map_err(|_| io_invalid_input("invalid address"))?;
@@ -129,8 +137,8 @@ pub fn parse_address(address: &str) -> io::Result<(String, String, String)> {
         None => host_str.unwrap().to_string(),
     };
 
-    let path = if url.path().is_empty() || url.path() == "/" {
-        "/.ark/identity.json".to_string()
+    let path = if url.path() == "/" {
+        String::new()
     } else {
         url.path().to_string()
     };
@@ -189,25 +197,44 @@ mod tests {
     use std::env::set_current_dir;
 
     use super::*;
+
     use crate::client::init_local;
     use crate::context::create_client_context;
-    use crate::server::start_test_server;
-    use crate::util::test::{create_test_account, in_test_dir};
+    use crate::testing::fs::{create_test_account, in_test_dir};
+    use crate::testing::http::start_test_server;
 
 
     #[test]
     fn create_identity_has_valid_signature() {
-        let (identity, _) = create_identity("alice@example.com").unwrap();
+        let (identity, _) = create_identity("alice@example.com", None).unwrap();
         assert_eq!(identity.address, "alice@example.com");
         assert_eq!(identity.public_key.algorithm, DEFAULT_SIGNING_ALGORITHM);
         assert_eq!(identity.signature.algorithm, DEFAULT_SIGNING_ALGORITHM);
+        assert!(identity.members.is_none());
 
         assert!(verify_identity(&identity).is_ok());
     }
 
     #[test]
+    fn create_identity_with_members_is_group() {
+        let members = vec![
+            "alice@example.com".to_string(),
+            "bob@example.com".to_string(),
+        ];
+        let (identity, _) = create_identity(
+            "alice@example.com/.ark/groups/team.json",
+            Some(members.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(identity.members.as_ref().unwrap(), &members);
+        assert!(verify_identity(&identity).is_ok());
+        validate_identity(&identity).unwrap();
+    }
+
+    #[test]
     fn create_identity_signature_detects_tampering() {
-        let (identity, _) = create_identity("alice@example.com").unwrap();
+        let (identity, _) = create_identity("alice@example.com", None).unwrap();
         assert_eq!(identity.address, "alice@example.com");
         assert_eq!(identity.public_key.algorithm, DEFAULT_SIGNING_ALGORITHM);
         assert_eq!(identity.signature.algorithm, DEFAULT_SIGNING_ALGORITHM);
@@ -220,11 +247,10 @@ mod tests {
 
     #[test]
     fn identity_json_round_trip() {
-        let (identity, _) = create_identity("alice@example.com").unwrap();
+        let (identity, _) = create_identity("alice@example.com", None).unwrap();
         let s = serde_json::to_string(&identity).unwrap();
         let parsed: Identity = serde_json::from_str(&s).unwrap();
         assert_eq!(parsed.address, identity.address);
-        assert_eq!(parsed.modified, identity.modified);
         assert_eq!(parsed.public_key.algorithm, identity.public_key.algorithm);
         assert_eq!(parsed.public_key.value, identity.public_key.value);
         assert_eq!(parsed.signature.algorithm, identity.signature.algorithm);
@@ -234,12 +260,11 @@ mod tests {
     #[test]
     fn read_write_identity_round_trip() {
         in_test_dir("ark_identity_test", |temp_dir| {
-            let (identity, _) = create_identity("alice@example.com").unwrap();
+            let (identity, _) = create_identity("alice@example.com", None).unwrap();
             let path = temp_dir.join("identity.json");
             write_identity(&path, &identity).unwrap();
             let loaded = read_identity(&path).unwrap();
             assert_eq!(loaded.address, identity.address);
-            assert_eq!(loaded.modified, identity.modified);
             assert_eq!(loaded.public_key.algorithm, identity.public_key.algorithm);
             assert_eq!(loaded.public_key.value, identity.public_key.value);
             assert_eq!(loaded.signature.algorithm, identity.signature.algorithm);
@@ -275,35 +300,38 @@ mod tests {
     }
 
     #[test]
+    fn parse_address_path_is_empty_when_omitted() {
+        let (name, host, path) = parse_address("bob@example.com").unwrap();
+        assert_eq!(name, "bob");
+        assert_eq!(host, "example.com");
+        assert_eq!(path, "");
+    }
+
+    #[test]
+    fn parse_address_keeps_port_and_path() {
+        let (name, host, path) = parse_address("bob@example.com:9000/groups/team.json").unwrap();
+        assert_eq!(name, "bob");
+        assert_eq!(host, "example.com:9000");
+        assert_eq!(path, "/groups/team.json");
+    }
+
+    #[test]
     fn validate_identity_accepts_well_formed() {
-        let (identity, _) = create_identity("alice@example.com").unwrap();
+        let (identity, _) = create_identity("alice@example.com", None).unwrap();
         validate_identity(&identity).unwrap();
     }
 
     #[test]
     fn validate_identity_rejects_invalid_account_name() {
-        let (mut identity, _) = create_identity("alice@example.com").unwrap();
+        let (mut identity, _) = create_identity("alice@example.com", None).unwrap();
         identity.address = "BAD@example.com".to_string();
         let err = validate_identity(&identity).unwrap_err();
         assert!(err.to_string().contains("invalid account name"));
     }
 
     #[test]
-    fn read_identity_rejects_bad_timestamp() {
-        in_test_dir("ark_identity_test", |temp_dir| {
-            let (identity, _) = create_identity("alice@example.com").unwrap();
-            let mut json = serde_json::to_value(&identity).unwrap();
-            json["modified"] = serde_json::Value::String("not-a-timestamp".to_string());
-            let path = temp_dir.join("identity.json");
-            fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
-            let err = read_identity(&path).unwrap_err();
-            assert!(err.to_string().contains("invalid rfc3339 timestamp"), "msg was {}", err);
-        });
-    }
-
-    #[test]
     fn validate_identity_rejects_tampered_address() {
-        let (mut identity, _) = create_identity("alice@example.com").unwrap();
+        let (mut identity, _) = create_identity("alice@example.com", None).unwrap();
         identity.address = "bob@example.com".to_string();
         let err = validate_identity(&identity).unwrap_err();
         assert!(err.to_string().contains("signature verification failed"));
@@ -328,7 +356,7 @@ mod tests {
 
             let cache_dir = temp_dir.join(".ark/identities");
             fs::create_dir_all(&cache_dir).unwrap();
-            let (identity, _) = create_identity("bob@example.com").unwrap();
+            let (identity, _) = create_identity("bob@example.com", None).unwrap();
             write_identity(&cache_dir.join("bob@example.com.json"), &identity).unwrap();
 
             let loaded = resolve_identity(&ctx, "bob@example.com").unwrap();

@@ -4,10 +4,10 @@
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use time::OffsetDateTime;
 use time::format_description::FormatItem;
 use time::format_description::well_known::Rfc3339;
 use time::macros::format_description;
+use time::OffsetDateTime;
 
 use crate::util::io_err;
 
@@ -81,8 +81,9 @@ pub mod serde {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use time::macros::datetime;
+
+    use super::*;
 
     #[test]
     fn format_emits_millisecond_precision() {

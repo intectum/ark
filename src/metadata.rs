@@ -1,14 +1,16 @@
+use std::fs;
 use std::io;
 use std::path::Path;
 
 use uuid::Uuid;
 
-use crate::crypto::{DEFAULT_HASH_ALGORITHM, DEFAULT_PASSWORD_ALGORITHM, decrypt_bytes, encrypt_bytes, sign_json, verify_json};
-use crate::types::IdentityContext;
-use crate::identity::resolve_identity;
+use crate::client::decrypt_stream;
+use crate::crypto::{DEFAULT_HASH_ALGORITHM, decrypt_bytes, encrypt_bytes, sign_json, verify_json};
+use crate::identity::{parse_address, read_identity_key, resolve_identity};
 use crate::permissions::cli_address_to_wire;
 use crate::timestamp;
 use crate::types::{Hash, Key, LocalMetadata, Member, Metadata, Permission, Permissions, Signature};
+use crate::types::IdentityContext;
 use crate::util::{decode_base64url, encode_base64url, io_err, io_invalid_input, sha256};
 
 const ATTRIBUTE_PREFIX: &str = "user.ark.";
@@ -34,10 +36,6 @@ const LOCAL_FIELD_ENCRYPTED: &str = "encrypted";
 const LOCAL_FIELD_SYNC_BODY_HASH_ALGORITHM: &str = "sync_body_hash_algorithm";
 const LOCAL_FIELD_SYNC_BODY_HASH_VALUE: &str = "sync_body_hash_value";
 const LOCAL_FIELD_SYNC_MODIFIED: &str = "sync_modified";
-
-pub fn get_member<'a>(members: &'a [Member], address: &str) -> Option<&'a Member> {
-    members.iter().find(|m| m.address == address)
-}
 
 pub fn members_changed(old: &[Member], new: &[Member]) -> bool {
     if old.len() != new.len() { return true; }
@@ -314,27 +312,91 @@ pub fn apply_key_to_metadata(
     Ok(())
 }
 
-pub fn extract_key_from_metadata(ctx: &IdentityContext, metadata: &Metadata) -> io::Result<Option<Vec<u8>>> {
-    let member = get_member(&metadata.members, &ctx.identity.address)
-        .ok_or_else(|| io_err(&format!("no member entry for {}", ctx.identity.address)))?;
-    let encrypted_file_key = match member.key.as_ref() {
-        Some(key) => key,
-        None => return Ok(None),
-    };
-    let identity_key = ctx.identity_key.as_ref().expect("context missing identity_key");
-    // TODO: review this. seems strange...
-    let algorithm = if identity_key.algorithm == DEFAULT_PASSWORD_ALGORITHM {
-        identity_key.algorithm.clone()
-    } else {
-        encrypted_file_key.algorithm.clone()
-    };
-    decrypt_bytes(
-        &Key {
-            algorithm,
-            value: identity_key.value.clone(),
-        },
-        &encrypted_file_key.value,
-    ).map(Some)
+pub fn resolve_member_addresses(ctx: &IdentityContext, members: &[Member]) -> io::Result<Vec<String>> {
+    let mut member_addresses: Vec<String> = Vec::new();
+
+    for member in members {
+        let member_identity = resolve_identity(ctx, &member.address)?;
+
+        for member_address in member_identity.members.unwrap_or_else(|| vec![member.address.clone()]) {
+            if !member_addresses.contains(&member_address) {
+                member_addresses.push(member_address);
+            }
+        }
+    }
+
+    Ok(member_addresses)
+}
+
+/// Unwrap the file key wrapped in `members` for the current account, either
+/// from its own member entry or, failing that, from the entry of a group it
+/// belongs to. `Ok(None)` when the entry carries no key (the file is not
+/// encrypted).
+///
+/// Unwrapping via a group needs the group's private key beside its identity
+/// document in the local mirror. When that key is itself held encrypted, it is
+/// unwrapped from its own members first.
+pub fn resolve_key_from_members(ctx: &IdentityContext, members: &[Member]) -> io::Result<Option<Vec<u8>>> {
+    if let Some(member) = members.iter().find(|m| m.address == ctx.identity.address) {
+        let identity_key = ctx.identity_key.as_ref().expect("context missing identity_key");
+
+        let encrypted_file_key = match member.key.as_ref() {
+            Some(key) => key,
+            None => return Ok(None),
+        };
+
+        return decrypt_bytes(identity_key, &encrypted_file_key.value).map(Some);
+    }
+
+    for member in members {
+        let group_identity = resolve_identity(ctx, &member.address)?;
+        if !group_identity.members.as_ref().is_some_and(|m| m.contains(&ctx.identity.address)) {
+            continue;
+        }
+
+        let path = match parse_address(&member.address) {
+            // A group is a document under an account, so a bare account address
+            // never is one — skip it rather than resolving the identity.
+            Ok((_, _, path)) if !path.is_empty() => path,
+            _ => continue,
+        };
+
+        let key_path = ctx.root.join(format!("{}.key", path.trim_start_matches('/').trim_end_matches(".json")));
+        if !fs::exists(&key_path)? {
+            continue;
+        }
+
+        let group_key_value = if read_local_metadata_attributes(&key_path)?.encrypted == Some(true) {
+            let key_metadata = read_metadata_attributes(&key_path)?;
+
+            // Recurses, the key file is wrapped for its own members.
+            let mut plaintext = Vec::new();
+            if decrypt_stream(ctx, &key_metadata, &mut fs::File::open(&key_path)?, &mut plaintext).is_err() {
+                continue;
+            }
+
+            let encoded = String::from_utf8(plaintext)
+                .map_err(|_| io_err("group key is not utf8"))?;
+            decode_base64url(encoded)
+                .map_err(|_| io_err("group key is not base64url encoded"))?
+        } else {
+            read_identity_key(&key_path)?
+        };
+
+        let group_key = Key {
+            algorithm: group_identity.public_key.algorithm.clone(),
+            value: group_key_value,
+        };
+
+        let encrypted_file_key = match member.key.as_ref() {
+            Some(key) => key,
+            None => return Ok(None),
+        };
+
+        return decrypt_bytes(&group_key, &encrypted_file_key.value).map(Some);
+    }
+
+    Err(io_err(&format!("no member entry for {}", ctx.identity.address)))
 }
 
 pub fn sign_metadata(secret_key: &Key, metadata: &mut Metadata, body: Option<&[u8]>) -> io::Result<()> {
@@ -549,9 +611,107 @@ mod tests {
     use std::fs;
 
     use super::*;
+
     use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, DEFAULT_HASH_ALGORITHM};
     use crate::identity::create_identity;
-    use crate::util::test::{TEST_ADDRESS, create_plain_test_metadata, in_test_dir};
+    use crate::testing::fs::{TEST_ADDRESS, create_plain_test_metadata, in_test_dir};
+
+    #[test]
+    fn resolve_key_unwraps_via_group() {
+        use crate::client::init_local;
+        use crate::context::create_client_context;
+        use crate::crypto::create_secret_key;
+        use crate::identity::{write_identity, write_identity_key};
+
+        in_test_dir("ark_metadata_test", |temp_dir| {
+            init_local(temp_dir, "bob@example.com").unwrap();
+            let ctx = create_client_context().unwrap();
+
+            let group_address = "alice@example.com/team.json";
+            let (group_identity, group_key) = create_identity(group_address, Some(vec![ctx.identity.address.clone()])).unwrap();
+
+            let cache_dir = temp_dir.join(".ark").join("identities");
+            fs::create_dir_all(&cache_dir).unwrap();
+            write_identity(&cache_dir.join(group_address.replace('/', "_") + ".json"), &group_identity).unwrap();
+            write_identity_key(&temp_dir.join("team.key"), &group_key.value).unwrap();
+
+            let file_key = create_secret_key(DEFAULT_ENCRYPTION_ALGORITHM).unwrap();
+            let (wrap_algorithm, wrapped) = encrypt_bytes(&group_identity.public_key, &file_key.value).unwrap();
+            let mut metadata = create_metadata("alice@example.com", Some(DEFAULT_ENCRYPTION_ALGORITHM));
+            metadata.members[0].key = None;
+            metadata.members.push(Member {
+                address: group_address.to_string(),
+                permission: Permission::Reader,
+                key: Some(Key { algorithm: wrap_algorithm, value: wrapped }),
+            });
+
+            assert_eq!(resolve_key_from_members(&ctx, &metadata.members).unwrap(), Some(file_key.value));
+        });
+    }
+
+    #[test]
+    fn resolve_key_unwraps_via_group_with_encrypted_key_file() {
+        use crate::client::init_local;
+        use crate::context::create_client_context;
+        use crate::crypto::create_secret_key;
+        use crate::identity::write_identity;
+
+        in_test_dir("ark_metadata_test", |temp_dir| {
+            init_local(temp_dir, "bob@example.com").unwrap();
+            let ctx = create_client_context().unwrap();
+
+            let group_address = "alice@example.com/team.json";
+            let (group_identity, group_key) = create_identity(group_address, Some(vec![ctx.identity.address.clone()])).unwrap();
+
+            let cache_dir = temp_dir.join(".ark").join("identities");
+            fs::create_dir_all(&cache_dir).unwrap();
+            write_identity(&cache_dir.join(group_address.replace('/', "_") + ".json"), &group_identity).unwrap();
+
+            // The group key file as mirrored without decrypting: its body is
+            // the group key, encrypted with a file key wrapped for the account.
+            let key_file_key = create_secret_key(DEFAULT_ENCRYPTION_ALGORITHM).unwrap();
+            let (_, key_file_body) = encrypt_bytes(&key_file_key, encode_base64url(&group_key.value).as_bytes()).unwrap();
+            let key_path = temp_dir.join("team.key");
+            fs::write(&key_path, &key_file_body).unwrap();
+
+            let (key_wrap_algorithm, wrapped_key_file_key) = encrypt_bytes(&ctx.identity.public_key, &key_file_key.value).unwrap();
+            let mut key_file_metadata = create_metadata("alice@example.com", Some(DEFAULT_ENCRYPTION_ALGORITHM));
+            key_file_metadata.members.push(Member {
+                address: ctx.identity.address.clone(),
+                permission: Permission::Reader,
+                key: Some(Key { algorithm: key_wrap_algorithm, value: wrapped_key_file_key }),
+            });
+            write_metadata_attributes(&key_path, &key_file_metadata).unwrap();
+            write_local_metadata_attributes(&key_path, &LocalMetadata { encrypted: Some(true), ..LocalMetadata::default() }).unwrap();
+
+            let file_key = create_secret_key(DEFAULT_ENCRYPTION_ALGORITHM).unwrap();
+            let (wrap_algorithm, wrapped) = encrypt_bytes(&group_identity.public_key, &file_key.value).unwrap();
+            let mut metadata = create_metadata("alice@example.com", Some(DEFAULT_ENCRYPTION_ALGORITHM));
+            metadata.members[0].key = None;
+            metadata.members.push(Member {
+                address: group_address.to_string(),
+                permission: Permission::Reader,
+                key: Some(Key { algorithm: wrap_algorithm, value: wrapped }),
+            });
+
+            assert_eq!(resolve_key_from_members(&ctx, &metadata.members).unwrap(), Some(file_key.value));
+        });
+    }
+
+    #[test]
+    fn resolve_key_errors_without_own_or_group_entry() {
+        use crate::client::init_local;
+        use crate::context::create_client_context;
+
+        in_test_dir("ark_metadata_test", |temp_dir| {
+            init_local(temp_dir, "bob@example.com").unwrap();
+            let ctx = create_client_context().unwrap();
+
+            let metadata = create_metadata("alice@example.com", Some(DEFAULT_ENCRYPTION_ALGORITHM));
+            let err = resolve_key_from_members(&ctx, &metadata.members).unwrap_err();
+            assert!(err.to_string().contains("no member entry"), "msg was {}", err);
+        });
+    }
 
     #[test]
     fn get_metadata_key_case_insensitive() {
@@ -564,7 +724,7 @@ mod tests {
 
     #[test]
     fn write_headers_emits_all_fields() {
-        let (owner, owner_key) = create_identity(TEST_ADDRESS).unwrap();
+        let (owner, owner_key) = create_identity(TEST_ADDRESS, None).unwrap();
         let mut m = create_metadata(&owner.address, Some(DEFAULT_ENCRYPTION_ALGORITHM));
         sign_metadata(&owner_key, &mut m, Some(b"body")).unwrap();
         let headers = write_metadata_headers(&m);
@@ -582,7 +742,7 @@ mod tests {
 
     #[test]
     fn header_round_trip_preserves_all_fields() {
-        let (owner, owner_key) = create_identity(TEST_ADDRESS).unwrap();
+        let (owner, owner_key) = create_identity(TEST_ADDRESS, None).unwrap();
         let mut m = create_metadata(&owner.address, Some(DEFAULT_ENCRYPTION_ALGORITHM));
         m.members[0].key = Some(Key {
             algorithm: "hpke-x25519-hkdf-sha256-aes256gcm".to_string(),
@@ -608,7 +768,7 @@ mod tests {
         in_test_dir("ark_metadata_test", |temp_dir| {
             let p = temp_dir.join("file");
             fs::write(&p, b"x").unwrap();
-            let (owner, owner_key) = create_identity(TEST_ADDRESS).unwrap();
+            let (owner, owner_key) = create_identity(TEST_ADDRESS, None).unwrap();
             let m = create_plain_test_metadata(&owner, &owner_key, b"x");
             write_metadata_attributes(&p, &m).unwrap();
             let back = read_metadata_attributes(&p).unwrap();
@@ -651,19 +811,8 @@ mod tests {
     }
 
     #[test]
-    fn get_member_filters_by_address() {
-        let members = [
-            Member { address: "a@x".to_string(), permission: Permission::Owner, key: None },
-            Member { address: "b@y".to_string(), permission: Permission::Owner, key: None },
-        ];
-        let got = get_member(&members, "b@y").unwrap();
-        assert_eq!(got.address, "b@y");
-        assert!(get_member(&members, "nope@z").is_none());
-    }
-
-    #[test]
     fn sign_and_verify_metadata_round_trip() {
-        let (owner, owner_key) = create_identity(TEST_ADDRESS).unwrap();
+        let (owner, owner_key) = create_identity(TEST_ADDRESS, None).unwrap();
         let body = b"signed payload";
         let m = create_plain_test_metadata(&owner, &owner_key, body);
         verify_metadata(&owner.public_key, &m, Some(body)).unwrap();
@@ -671,7 +820,7 @@ mod tests {
 
     #[test]
     fn verify_metadata_detects_body_tampering() {
-        let (owner, owner_key) = create_identity(TEST_ADDRESS).unwrap();
+        let (owner, owner_key) = create_identity(TEST_ADDRESS, None).unwrap();
         let m = create_plain_test_metadata(&owner, &owner_key, b"original");
         let err = verify_metadata(&owner.public_key, &m, Some(b"tampered")).unwrap_err();
         assert!(err.to_string().contains("body hash mismatch"));
@@ -679,7 +828,7 @@ mod tests {
 
     #[test]
     fn verify_metadata_detects_metadata_tampering() {
-        let (owner, owner_key) = create_identity(TEST_ADDRESS).unwrap();
+        let (owner, owner_key) = create_identity(TEST_ADDRESS, None).unwrap();
         let body = b"body";
         let mut m = create_plain_test_metadata(&owner, &owner_key, body);
         m.modified_by = "attacker@evil".to_string();
@@ -749,7 +898,7 @@ mod tests {
         in_test_dir("ark_metadata_test", |temp_dir| {
             let p = temp_dir.join("file");
             fs::write(&p, b"x").unwrap();
-            let (owner, owner_key) = create_identity(TEST_ADDRESS).unwrap();
+            let (owner, owner_key) = create_identity(TEST_ADDRESS, None).unwrap();
             let mut two = create_plain_test_metadata(&owner, &owner_key, b"x");
             two.members.push(Member { address: "b@y".to_string(), permission: Permission::Owner, key: None });
             sign_metadata(&owner_key, &mut two, Some(b"x")).unwrap();

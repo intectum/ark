@@ -1,9 +1,9 @@
 use std::io;
 
 use crate::client::request;
-use crate::types::{IdentityContext, Metadata};
 use crate::identity::resolve_identity;
 use crate::metadata::{read_metadata_headers, verify_metadata_signature};
+use crate::types::{IdentityContext, Metadata};
 use crate::util::{io_err, resolve_client_url};
 
 /// Fetch response headers and signed metadata for `path` without downloading
@@ -30,12 +30,13 @@ pub fn head(ctx: &IdentityContext, path: &str) -> io::Result<(Vec<(String, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::crypto::DEFAULT_ENCRYPTION_ALGORITHM;
     use crate::identity::read_identity;
     use crate::metadata::read_metadata_attributes;
-    use crate::server::start_test_server;
+    use crate::testing::fs::{in_test_dir, init_with_server, write_encrypted_test_file, write_plain_test_file};
+    use crate::testing::http::start_test_server;
     use crate::util::{encode_base64url, resolve_client_url_raw};
-    use crate::util::test::{in_test_dir, init_with_server, write_encrypted_test_file, write_plain_test_file};
 
     #[test]
     fn head_returns_headers_without_body() {

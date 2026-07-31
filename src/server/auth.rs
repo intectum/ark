@@ -2,14 +2,13 @@ use std::io::Result;
 
 use url::Url;
 
+use super::MAX_CLOCK_SKEW_MS;
+
 use crate::crypto::verify_bytes;
 use crate::identity::{parse_address, resolve_identity};
-use crate::metadata::get_member;
 use crate::timestamp;
 use crate::types::{Identity, IdentityContext, Member, Permission, Signature};
 use crate::util::{decode_base64url, io_err, parse_authorization_header, request_to_bytes};
-
-use super::MAX_CLOCK_SKEW_MS;
 
 pub fn authenticate(
     server_ctx: &IdentityContext,
@@ -53,6 +52,7 @@ pub fn authenticate(
 }
 
 pub fn authorize(
+    server_ctx: &IdentityContext,
     target_ctx: &IdentityContext,
     requestor_identity: &Identity,
     modifier_identity: Option<&Identity>,
@@ -62,20 +62,74 @@ pub fn authorize(
         return Ok(Permission::Owner);
     }
 
-    let requestor_member = existing_members
-        .and_then(|members| get_member(members, &requestor_identity.address));
+    let members = match existing_members {
+        Some(m) => m,
+        None => return Err(io_err("forbidden")),
+    };
 
-    let modifier_member = modifier_identity
-        .and_then(|identity| existing_members.and_then(|members| get_member(members, &identity.address)));
+    let requestor_permission = resolve_member_permission(server_ctx, members, &requestor_identity.address)?;
+    let modifier_permission = match modifier_identity {
+        Some(m) => resolve_member_permission(server_ctx, members, &m.address)?,
+        None => None,
+    };
 
-    let public_member = existing_members
-        .and_then(|members| members.iter().find(|member| member.address == "*"));
+    let public_permission = members.iter()
+        .find(|member| member.address == "*")
+        .map(|member| member.permission);
 
-    [requestor_member, modifier_member, public_member]
+    [requestor_permission, modifier_permission, public_permission]
         .into_iter()
         .flatten()
-        .map(|member| member.permission)
         .max_by_key(|permission| permission.rank())
         .ok_or_else(|| io_err("forbidden"))
+}
+
+fn resolve_member_permission(
+    ctx: &IdentityContext,
+    members: &[Member],
+    address: &str,
+) -> Result<Option<Permission>> {
+    if let Some(member) = members.iter().find(|member| member.address == address) {
+        return Ok(Some(member.permission));
+    }
+
+    let mut best: Option<Permission> = None;
+    for member in members {
+        if member.address == "*" || member.address == address {
+            continue;
+        }
+
+        let member_identity = match resolve_identity(ctx, &member.address) {
+            Ok(i) => i,
+            Err(_) => continue,
+        };
+
+        let group_members = match member_identity.members.as_ref() {
+            Some(m) => m,
+            None => continue,
+        };
+
+        if !group_members.iter().any(|entry| entry == address) {
+            continue;
+        }
+
+        for entry in group_members {
+            let entry_identity = match resolve_identity(ctx, entry) {
+                Ok(i) => i,
+                Err(_) => continue,
+            };
+
+            if entry_identity.members.is_some() {
+                return Err(io_err("nested groups not supported"));
+            }
+        }
+
+        best = match best {
+            Some(current) if current.rank() >= member.permission.rank() => Some(current),
+            _ => Some(member.permission),
+        };
+    }
+
+    Ok(best)
 }
 

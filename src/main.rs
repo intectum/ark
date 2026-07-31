@@ -4,15 +4,13 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::process::exit;
 
-use clap::{Parser, Subcommand};
-
-use ark::client::{accept_proposal, decrypt, delete, encrypt, get, head, init, list, list_proposals, put, reject_proposal, sync, watch_local, watch_remote};
-use ark::types::{DirEntryKind, EntryEvent, Permissions};
+use ark::client::{accept_proposal, create_identity, decrypt, delete, encrypt, get, head, change_identity_members, init, list, list_proposals, put, reject_proposal, sync, watch_local, watch_remote};
 use ark::context::create_client_context;
 use ark::identity::parse_address;
 use ark::server::start_server;
-use ark::types::IdentityContext;
+use ark::types::{DirEntryKind, EntryEvent, IdentityContext, Permissions};
 use ark::util::resolve_client_url;
+use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(
@@ -37,6 +35,32 @@ enum WatchCmd {
     Remote {
         /// Ark URL or path.
         path: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum IdentityCmd {
+    /// Create an identity at PATH (plus a companion `.key`).
+    ///
+    /// Path must end with `.json`. With no members, creates a regular identity.
+    /// With `-m`, creates a group from the listed members.
+    Create {
+        /// Ark URL or path ending in `.json`.
+        path: String,
+        /// Member address (repeatable). When supplied, creates a group identity.
+        #[arg(short = 'm', long = "member", value_name = "ADDR")]
+        member: Vec<String>,
+    },
+    /// Add and/or drop members on an identity (promotes to a group if needed).
+    Members {
+        /// Ark URL or path ending in `.json`.
+        path: String,
+        /// Member address to add (repeatable).
+        #[arg(short = 'a', long = "add", value_name = "ADDR")]
+        add: Vec<String>,
+        /// Member address to drop (repeatable).
+        #[arg(short = 'd', long = "drop", value_name = "ADDR")]
+        drop: Vec<String>,
     },
 }
 
@@ -200,6 +224,15 @@ enum Cmd {
         #[arg(short, long, value_name = "NAME")]
         encryption_algorithm: Option<String>,
     },
+    /// Manage identities (keypair documents at a path).
+    ///
+    /// An identity is a `.json` file with a companion `.key`. When the identity
+    /// lists members it is a group: files or directories that name it as a
+    /// member grant access to any listed member.
+    Identity {
+        #[command(subcommand)]
+        cmd: IdentityCmd,
+    },
     /// Review and act on pending share proposals.
     ///
     /// A proposal is another account attempting to share a file with you at a
@@ -250,6 +283,10 @@ fn main() {
         Cmd::Delete { path } => create_client_context().and_then(|c| delete(&c, &path)),
         Cmd::Get { output, decrypt, path } => create_client_context().and_then(|c| get(&c, &path, output.as_deref(), decrypt)),
         Cmd::List { prefix, path } => create_client_context().and_then(|c| list_cli(&c, &path, prefix.as_deref())),
+        Cmd::Identity { cmd } => create_client_context().and_then(|c| match cmd {
+            IdentityCmd::Create { path, member } => create_identity(&c, &path, &member),
+            IdentityCmd::Members { path, add, drop } => change_identity_members(&c, &path, &add, &drop),
+        }),
         Cmd::Proposals { cmd } => create_client_context().and_then(|c| match cmd {
             ProposalsCmd::List => list_proposals_cli(&c),
             ProposalsCmd::Accept { id, force } => accept_proposal(&c, &id, force),

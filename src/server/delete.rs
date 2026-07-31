@@ -24,12 +24,13 @@ pub fn serve_delete(fs_path: &Path, stream: &mut dyn Write) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::start_test_server;
-    use super::super::test_helpers::*;
-    use crate::types::{Member, Permission};
-    use crate::util::test::{TEST_ADDRESS, create_test_account, in_test_dir, write_plain_test_file};
     use std::fs;
     use std::os::unix::fs::symlink;
+
+    use crate::testing::fs::{TEST_ADDRESS, create_test_account, in_test_dir, write_plain_test_file};
+    use crate::testing::http::*;
+    use crate::testing::http::start_test_server;
+    use crate::types::{Member, Permission};
 
     #[test]
     fn delete_file_removes_and_returns_204() {

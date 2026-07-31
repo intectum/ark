@@ -1,6 +1,7 @@
 use std::io;
 
 use super::request;
+
 use crate::types::{DirEntry, IdentityContext};
 use crate::util::{io_err, resolve_client_url};
 
@@ -38,9 +39,10 @@ mod tests {
     use std::fs;
 
     use super::*;
-    use crate::server::start_test_server;
+
+    use crate::testing::fs::{in_test_dir, init_with_server, write_plain_test_file};
+    use crate::testing::http::start_test_server;
     use crate::types::DirEntryKind;
-    use crate::util::test::{in_test_dir, init_with_server, write_plain_test_file};
 
     #[test]
     fn list_returns_dir_entries() {

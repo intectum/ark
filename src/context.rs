@@ -32,7 +32,7 @@ pub fn create_server_context(server_root: &Path, host: &str) -> io::Result<Ident
     let key_path = dot_ark_dir.join("identity.key");
 
     if !identity_path.exists() {
-        let (identity, secret_key) = create_identity(&format!("ark@{}", host))?;
+        let (identity, secret_key) = create_identity(&format!("ark@{}", host), None)?;
         fs::create_dir_all(&dot_ark_dir)?;
         write_identity(&identity_path, &identity)?;
         write_identity_key(&key_path, &secret_key.value)?;

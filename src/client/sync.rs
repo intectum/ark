@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 
 use super::{get, get_stream, head, list, put_content, watch_local, watch_remote};
+
 use crate::identity::parse_address;
 use crate::metadata::{has_metadata_attributes, read_local_metadata_attributes, read_metadata_attributes, read_metadata_headers, remove_local_metadata_attributes, write_local_metadata_attributes, write_metadata_attributes};
 use crate::timestamp;
@@ -79,12 +80,22 @@ where
 {
     let (entries, last_sync_request) = check(ctx, path, on_error)?;
 
+    let mut failed = false;
     for entry in entries {
         match sync_entry(ctx, &entry, decrypt, on_event) {
             Ok(true) => break,
             Ok(false) => {}
-            Err(e) => { on_error(io_err(&format!("sync failed for {}: {}", entry.relative_path, e))); }
+            Err(e) => {
+                failed = true;
+                on_error(io_err(&format!("sync failed for {}: {}", entry.relative_path, e)));
+            }
         }
+    }
+
+    // Hold the cutoff back so a failed entry is retried: entries already
+    // applied are filtered out by `check` on the next pass.
+    if failed {
+        return Ok(());
     }
 
     if let Some(l) = last_sync_request {
@@ -443,12 +454,13 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use super::*;
+
     use crate::client::{get::get, init, put::{put, put_permissions}};
     use crate::context::create_client_context;
     use crate::permissions::{owner, reader, writer};
-    use crate::server::start_test_server;
+    use crate::testing::fs::{in_test_dir, init_with_server, write_encrypted_test_file, write_plain_test_file};
+    use crate::testing::http::start_test_server;
     use crate::types::Permissions;
-    use crate::util::test::{in_test_dir, init_with_server, write_encrypted_test_file, write_plain_test_file};
 
     fn prime_plain(ctx: &IdentityContext, path: &Path, target: &str, body: &[u8]) {
         fs::write(path, body).unwrap();

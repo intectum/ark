@@ -22,8 +22,9 @@ mod tests {
     use std::fs;
 
     use super::*;
-    use crate::server::start_test_server;
-    use crate::util::test::{in_test_dir, init_with_server, write_plain_test_file};
+
+    use crate::testing::fs::{in_test_dir, init_with_server, write_plain_test_file};
+    use crate::testing::http::start_test_server;
 
     #[test]
     fn delete_removes_file() {

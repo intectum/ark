@@ -71,19 +71,15 @@ Only **directories without metadata** inherit — an auto-created intermediate d
 
 ```rust
 use ark::client::put;
-use ark::types::Permissions;
+use ark::permissions::writers;
 
 // Create the container. Members are writers on the dir — they can add items.
 let dir_rel = "apps/notes/team-brainstorm";
 let local_dir = ctx.root.join(dir_rel);
 std::fs::create_dir_all(&local_dir)?;
 
-let dir_perms = Permissions {
-    writers: vec!["bob@host".into(), "carol@host".into()],
-    ..Default::default()
-};
 put(&ctx, &format!("/{}", dir_rel), Some(local_dir.to_str().unwrap()),
-    &dir_perms, None, /*metadata_only=*/ false)?;
+    &writers(["bob@host", "carol@host"]), None, /*metadata_only=*/ false)?;
 ```
 
 Because path mirroring is guaranteed by the protocol, `apps/notes/team-brainstorm/` lives at that same relative path on every member's server. No rehoming, no per-server IDs — the path *is* the identifier.

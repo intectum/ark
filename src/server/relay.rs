@@ -5,14 +5,15 @@ use std::sync::Arc;
 
 use url::Url;
 
+use super::handle_parsed;
+
 use crate::client::request;
 use crate::http::read_response;
 use crate::identity::parse_address;
+use crate::metadata::resolve_member_addresses;
 use crate::timestamp;
 use crate::types::{IdentityContext, Metadata, RelayMode};
 use crate::util::{create_authorization_header, io_err, is_loopback_host};
-
-use super::handle_parsed;
 
 pub fn relay(
     server_ctx: &Arc<IdentityContext>,
@@ -38,8 +39,8 @@ pub fn relay(
 
     let mut remote_hosts: HashSet<String> = HashSet::new();
 
-    for member in &metadata.members {
-        let (member_name, member_host, _) = match parse_address(&member.address) {
+    for member_address in resolve_member_addresses(server_ctx, &metadata.members)? {
+        let (member_name, member_host, _) = match parse_address(&member_address) {
             Ok(v) => v,
             Err(_) => continue,
         };
@@ -132,11 +133,11 @@ mod tests {
     use std::thread::sleep;
     use std::time::{Duration, Instant};
 
-    use super::super::start_test_server;
-    use super::super::test_helpers::{seed_shared_dir, signed_put_dir_metadata_with_headers, signed_put_metadata_with_headers};
     use crate::metadata::{create_metadata, read_metadata_attributes, sign_metadata, write_metadata_attributes};
+    use crate::testing::fs::{create_plain_test_metadata, create_test_account, in_test_dir};
+    use crate::testing::http::{seed_shared_dir, signed_put_metadata_with_headers};
+    use crate::testing::http::start_test_server;
     use crate::types::{Key, Member, Permission};
-    use crate::util::test::{create_plain_test_metadata, create_test_account, in_test_dir};
 
     fn make_identity_public(root: &Path, name: &str, address: &str, key: &Key) {
         let path = root.join("ark").join(name).join(".ark").join("identity.json");
@@ -162,6 +163,36 @@ mod tests {
     fn wait_for_not<F: Fn() -> bool>(check: F) {
         sleep(Duration::from_millis(300));
         assert!(!check(), "condition should not become true");
+    }
+
+    #[test]
+    fn relay_expands_group_members() {
+        use crate::identity::{create_identity, write_identity};
+
+        in_test_dir("ark_server_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let (alice_id, alice_key, _) = create_test_account(temp_dir, &format!("alice@127.0.0.1:{}", port));
+            let (bob_id, bob_key, _) = create_test_account(temp_dir, &format!("bob@127.0.0.1:{}", port));
+
+            let group_address = format!("{}/team.json", alice_id.address);
+            let (group_identity, _) = create_identity(&group_address, Some(vec![bob_id.address.clone()])).unwrap();
+            write_identity(&temp_dir.join("ark/alice/team.json"), &group_identity).unwrap();
+
+            seed_shared_dir(temp_dir, &bob_id, &bob_key, "ark/bob/shared", vec![
+                Member { address: alice_id.address.clone(), permission: Permission::Writer, key: None },
+            ]);
+
+            let mut m = create_plain_test_metadata(&alice_id, &alice_key, b"todo body");
+            m.encryption_algorithm = None;
+            m.members[0].key = None;
+            m.members.push(Member { address: group_address.clone(), permission: Permission::Writer, key: None });
+            sign_metadata(&alice_key, &mut m, Some(b"todo body")).unwrap();
+
+            let code = signed_put_metadata_with_headers(port, &alice_id, &alice_key, "/ark/alice/shared/todo.txt?relay=full", b"todo body", &m, &[]);
+            assert_eq!(code, 201);
+
+            wait_for(|| temp_dir.join("ark/bob/shared/todo.txt").exists());
+        });
     }
 
     #[test]
@@ -235,7 +266,7 @@ mod tests {
             m.body_hash = None;
             sign_metadata(&alice_key, &mut m, None).unwrap();
 
-            let code = signed_put_dir_metadata_with_headers(port, &alice_id, &alice_key, "/ark/alice/shared/sub/?relay=full", &m, &[]);
+            let code = signed_put_metadata_with_headers(port, &alice_id, &alice_key, "/ark/alice/shared/sub/?relay=full", b"", &m, &[]);
             assert_eq!(code, 201);
 
             assert!(temp_dir.join("ark/alice/shared/sub").is_dir());

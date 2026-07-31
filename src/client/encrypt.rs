@@ -4,7 +4,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, DEFAULT_HASH_ALGORITHM, encrypt_bytes};
-use crate::metadata::{apply_key_to_metadata, create_metadata, extract_key_from_metadata, has_metadata_attributes, read_local_metadata_attributes, read_metadata_attributes, validate_metadata, write_local_metadata_attributes, write_metadata_attributes};
+use crate::metadata::{apply_key_to_metadata, create_metadata, has_metadata_attributes, read_local_metadata_attributes, read_metadata_attributes, resolve_key_from_members, validate_metadata, write_local_metadata_attributes, write_metadata_attributes};
 use crate::types::{Hash, IdentityContext, Key, LocalMetadata, Metadata};
 use crate::util::{decode_base64url, io_err, io_invalid_input, sha256};
 
@@ -120,7 +120,7 @@ pub fn encrypt_stream(
     plaintext: &mut dyn Read,
     ciphertext: &mut dyn Write,
 ) -> io::Result<()> {
-    let file_key = extract_key_from_metadata(ctx, metadata)?
+    let file_key = resolve_key_from_members(ctx, &metadata.members)?
         .ok_or_else(|| io_err(&format!("no key for {}", ctx.identity.address)))?;
 
     let encryption_algorithm = metadata.encryption_algorithm.clone()
@@ -141,11 +141,12 @@ mod tests {
     use std::io::ErrorKind;
 
     use super::*;
-    use crate::crypto::decrypt_bytes;
-    use crate::context::create_client_context;
-    use crate::util::encode_base64url;
+
     use crate::client::decrypt;
-    use crate::util::test::{TEST_ADDRESS, create_test_account, in_test_dir, write_encrypted_test_file, write_plain_test_file};
+    use crate::context::create_client_context;
+    use crate::crypto::decrypt_bytes;
+    use crate::testing::fs::{TEST_ADDRESS, create_test_account, in_test_dir, write_encrypted_test_file, write_plain_test_file};
+    use crate::util::encode_base64url;
 
     fn aes_decrypt(key: &[u8], ciphertext: &[u8]) -> Vec<u8> {
         decrypt_bytes(&Key { algorithm: DEFAULT_ENCRYPTION_ALGORITHM.to_string(), value: key.to_vec() }, ciphertext).unwrap()

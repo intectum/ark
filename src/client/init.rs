@@ -4,13 +4,13 @@ use std::path::Path;
 use std::str::from_utf8;
 
 use super::{decrypt_stream, put, request};
+
 use crate::context::create_client_context;
-use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, DEFAULT_PASSWORD_ALGORITHM, create_secret_key_from_password, restore_secret_key_from_password, to_public_key};
+use crate::crypto::{DEFAULT_PASSWORD_ALGORITHM, create_secret_key_from_password, restore_secret_key_from_password, to_public_key};
 use crate::identity::{create_identity, parse_address, sign_identity, validate_identity, write_identity, write_identity_key};
-use crate::metadata::{create_metadata, read_metadata_headers, sign_metadata, write_metadata_attributes};
-use crate::permissions::writer;
-use crate::timestamp;
-use crate::types::{Identity, IdentityContext, Key, Member, Permission, Permissions, Signature};
+use crate::metadata::{read_metadata_headers, write_metadata_attributes};
+use crate::permissions::{reader, writer};
+use crate::types::{Identity, IdentityContext, Key, Signature};
 use crate::util::{decode_base64url, io_err, io_invalid_input, resolve_client_url_raw};
 
 /// Initialize the ark account at `address` under `root`.
@@ -68,20 +68,10 @@ pub fn init(root: &Path, address: &str, password: Option<&str>, local_only: bool
             }
         }
         403 | 404 => {
-            let (identity, secret_key) = init_local(root, address)?;
-
-            let body = fs::read(&identity_path)?;
-            let mut metadata = create_metadata(&identity.address, None);
-            metadata.members.push(Member {
-                address: "*".to_string(),
-                permission: Permission::Reader,
-                key: None,
-            });
-            sign_metadata(&secret_key, &mut metadata, Some(&body))?;
-            write_metadata_attributes(&identity_path, &metadata)?;
+            let (_identity, _secret_key) = init_local(root, address)?;
 
             let ctx = create_client_context()?;
-            put(&ctx, "/.ark/identity.json", identity_path.to_str(), &Permissions::default(), None, false)?;
+            put(&ctx, "/.ark/identity.json", identity_path.to_str(), &reader("public"), Some("none"), false)?;
 
             let (_, host, _) = parse_address(&ctx.identity.address)?;
             let ark_address = format!("ark@{}", host);
@@ -105,7 +95,7 @@ pub fn init(root: &Path, address: &str, password: Option<&str>, local_only: bool
 /// network. Returns the new [`Identity`] and its secret [`Key`]. Test helper.
 pub fn init_local(root: &Path, address: &str) -> io::Result<(Identity, Key)> {
     let dot_ark_dir = root.join(".ark");
-    let (identity, secret_key) = create_identity(address)?;
+    let (identity, secret_key) = create_identity(address, None)?;
     validate_identity(&identity)?;
 
     fs::create_dir_all(&dot_ark_dir)?;
@@ -167,12 +157,11 @@ fn push_secret_key_with_password(
 ) -> io::Result<()> {
     let password_secret_key = create_secret_key_from_password(DEFAULT_PASSWORD_ALGORITHM, password)?;
     let dot_ark_dir = ctx.root.join(".ark");
-    let secret_key = ctx.identity_key.as_ref().expect("client context missing identity_key");
 
     let mut password_identity = Identity {
         public_key: to_public_key(&password_secret_key)?,
         address: format!("{}/.ark/passwords/primary.json", ctx.identity.address),
-        modified: timestamp::now(),
+        members: None,
         signature: Signature {
             algorithm: String::new(),
             value: Vec::new()
@@ -185,28 +174,10 @@ fn push_secret_key_with_password(
     let password_path = passwords_dir.join("primary.json");
     write_identity(&password_path, &password_identity)?;
 
-    let password_body = fs::read(&password_path)?;
-    let mut password_metadata = create_metadata(&ctx.identity.address, None);
-    password_metadata.members.push(Member {
-        address: "*".to_string(),
-        permission: Permission::Reader,
-        key: None,
-    });
-    sign_metadata(secret_key, &mut password_metadata, Some(&password_body))?;
-    write_metadata_attributes(&password_path, &password_metadata)?;
-
-    put(ctx, "/.ark/passwords/primary.json", password_path.to_str(), &Permissions::default(), None, false)?;
+    put(ctx, "/.ark/passwords/primary.json", password_path.to_str(), &reader("public"), Some("none"), false)?;
 
     let identity_key_path = dot_ark_dir.join("identity.key");
-    let mut key_metadata = create_metadata(&ctx.identity.address, Some(DEFAULT_ENCRYPTION_ALGORITHM));
-    key_metadata.members.push(Member {
-        address: password_identity.address.clone(),
-        permission: Permission::Reader,
-        key: None,
-    });
-    write_metadata_attributes(&identity_key_path, &key_metadata)?;
-
-    put(ctx, "/.ark/identity.key", identity_key_path.to_str(), &Permissions::default(), None, false)?;
+    put(ctx, "/.ark/identity.key", identity_key_path.to_str(), &reader(&password_identity.address), None, false)?;
 
     Ok(())
 }
@@ -219,12 +190,14 @@ mod tests {
     use ed25519_dalek::SigningKey;
 
     use super::*;
-    use crate::crypto::{DEFAULT_SIGNING_ALGORITHM, PASSWORD_SALT_LEN, PASSWORD_VERIFIER_LEN, decrypt_bytes};
+
+    use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, DEFAULT_SIGNING_ALGORITHM, PASSWORD_SALT_LEN, PASSWORD_VERIFIER_LEN, decrypt_bytes};
     use crate::identity::read_identity;
-    use crate::metadata::{read_metadata_attributes, write_metadata_attributes};
-    use crate::server::start_test_server;
+    use crate::metadata::{create_metadata, read_metadata_attributes, sign_metadata, write_metadata_attributes};
+    use crate::testing::fs::in_test_dir;
+    use crate::testing::http::start_test_server;
+    use crate::types::{Member, Permission};
     use crate::util::decode_base64url;
-    use crate::util::test::in_test_dir;
 
     #[test]
     fn init_writes_identity_file() {
@@ -243,9 +216,7 @@ mod tests {
             assert_eq!(pk_bytes, SigningKey::from_bytes(&seed).verifying_key().to_bytes());
 
             assert_eq!(v["address"].as_str(), Some("gyan@example.com:8080"));
-            let modified = v["modified"].as_str().unwrap();
-            time::OffsetDateTime::parse(modified, &time::format_description::well_known::Rfc3339)
-                .unwrap_or_else(|e| panic!("modified is not RFC 3339: {} ({})", modified, e));
+            assert!(v.get("modified").is_none());
             assert_eq!(v["signature"]["algorithm"].as_str(), Some(DEFAULT_SIGNING_ALGORITHM));
         });
     }
@@ -275,7 +246,7 @@ mod tests {
 
             let server_identity_path = server_account_dir.join(".ark").join("identity.json");
             let identity_bytes = fs::read(&server_identity_path).unwrap();
-            let mut meta = create_metadata(&address, None);
+            let mut meta = create_metadata(&server_identity.address, None);
             meta.members[0].key = None;
             meta.members.push(Member {
                 address: "*".to_string(),

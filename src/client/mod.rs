@@ -3,6 +3,7 @@ mod delete;
 mod encrypt;
 mod get;
 mod head;
+mod identity;
 mod init;
 mod list;
 mod proposals;
@@ -16,6 +17,7 @@ pub use delete::delete;
 pub use encrypt::{encrypt, encrypt_stream};
 pub use get::{get, get_content, get_stream};
 pub use head::head;
+pub use identity::{create_identity, change_identity_members};
 pub use init::init;
 #[cfg(test)]
 pub use init::init_local;

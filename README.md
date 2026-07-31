@@ -114,6 +114,8 @@ Every command takes `-h` for details. Paths accept three forms:
 | `ark proposals list` | Show pending share proposals — unauthorized PUTs from other accounts, recorded in `.ark/requests/`. |
 | `ark proposals accept <ID>` | Fetch, verify, and PUT the shared file/dir. `-f` bypasses metadata-change checks. |
 | `ark proposals reject <ID>` | Delete the log entry. |
+| `ark identity create <PATH>` | Create an identity at PATH (plus a companion `.key`). PATH must end with `.json`. With `-m ADDR`, creates a group from the listed members. |
+| `ark identity members <PATH>` | Add (`-a ADDR`) and/or drop (`-d ADDR`) members. Promotes to a group if needed; grants or revokes identity key access. |
 | `ark encrypt` / `ark decrypt` | Local file crypto. `--in-place` rewrites the file. |
 
 ---
@@ -184,7 +186,7 @@ let (metadata, _) = get_stream(&ctx, "note.txt", &mut buf, true)?;
 
 Every CLI command has a corresponding library function. Most take file paths and use stdin/stdout when absent. For `encrypt`, `decrypt`, `get`, and `put`, a `_stream` variant (`encrypt_stream`, `decrypt_stream`, `get_stream`, `put_stream`) exposes the same operation over `Read`/`Write` streams and returns values instead of touching the filesystem.
 
-`put` also has two focused wrappers: `put_content(ctx, path)` uploads the body at `path` with default permissions, and `put_permissions(ctx, path, &permissions)` sends a metadata-only PUT to add or drop members without re-uploading the body. Both delegate to `put`, which remains the full form (`input`, `permissions`, `encryption_algorithm`, `metadata_only`). Build a `Permissions` explicitly, or use the `ark::metadata::{owner, writer, reader, drop}` helpers for the common single-member cases.
+`put` also has two focused wrappers: `put_content(ctx, path)` uploads the body at `path` with default permissions, and `put_permissions(ctx, path, &permissions)` sends a metadata-only PUT to add or drop members without re-uploading the body. Both delegate to `put`, which remains the full form (`input`, `permissions`, `encryption_algorithm`, `metadata_only`). Build a `Permissions` explicitly, or use `ark::permissions::{owner, writer, reader, drop}` (and plural `owners`/`writers`/`readers`/`drops`) for the common cases.
 
 `get` has a matching wrapper: `get_content(ctx, path)` downloads the body at `path` and writes it under the account root, decrypting when encrypted. `get` remains the full form (`output`, `decrypt`).
 

@@ -4,8 +4,8 @@ use std::sync::mpsc::channel;
 use std::thread;
 use std::time::Duration;
 
-use notify::event::{CreateKind, ModifyKind, RemoveKind};
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::event::{CreateKind, ModifyKind, RemoveKind};
 use url::Url;
 
 use crate::http::{connect, read_stream_events, write_request};

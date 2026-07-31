@@ -1,8 +1,9 @@
 use std::io;
 
 use super::{delete, get_stream, head, list, request};
+
 use crate::identity::parse_address;
-use crate::metadata::{get_member, read_metadata_headers, write_metadata_headers};
+use crate::metadata::{read_metadata_headers, write_metadata_headers};
 use crate::types::{IdentityContext, Metadata, Permission, Proposal};
 use crate::util::{io_err, io_invalid_input, parse_request_entry, resolve_client_url, sha256};
 
@@ -164,22 +165,22 @@ fn verify_metadata_changes(proposal: &Metadata, current: &Metadata, self_address
 
 fn check_member_changes(proposal: &Metadata, current: &Metadata, self_address: &str) -> Option<&'static str> {
     if let (Some(proposed), Some(current_self)) = (
-        get_member(&proposal.members, self_address),
-        get_member(&current.members, self_address),
+        proposal.members.iter().find(|m| m.address == self_address),
+        current.members.iter().find(|m| m.address == self_address),
     ) {
         if current_self.permission.rank() < proposed.permission.rank() {
             return Some("your permission was downgraded since proposal");
         }
     }
 
-    let modifier_is_owner = get_member(&proposal.members, &current.modified_by)
+    let modifier_is_owner = proposal.members.iter().find(|m| m.address == current.modified_by)
         .map(|m| m.permission) == Some(Permission::Owner);
     if modifier_is_owner {
         return None;
     }
 
     for member in &current.members {
-        match get_member(&proposal.members, &member.address) {
+        match proposal.members.iter().find(|m| m.address == member.address) {
             None => return Some("member added since proposal"),
             Some(proposed) if member.permission.rank() > proposed.permission.rank() => {
                 return Some("member permission upgraded since proposal");
@@ -200,12 +201,13 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+
     use crate::client::{init, put};
     use crate::context::create_client_context;
     use crate::permissions::reader;
-    use crate::server::start_test_server;
+    use crate::testing::fs::in_test_dir;
+    use crate::testing::http::start_test_server;
     use crate::types::Permissions;
-    use crate::util::test::in_test_dir;
 
     fn setup(temp_dir: &Path, port: u16) -> (IdentityContext, IdentityContext) {
         let alice_dir = temp_dir.join("alice_client");

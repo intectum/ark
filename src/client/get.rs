@@ -4,10 +4,11 @@ use std::io::Write;
 use std::path::Path;
 
 use super::{decrypt_stream, request};
+
 use crate::crypto::DEFAULT_HASH_ALGORITHM;
-use crate::types::{Hash, IdentityContext, LocalMetadata, Metadata};
 use crate::identity::resolve_identity;
 use crate::metadata::{read_metadata_headers, verify_metadata, write_local_metadata_attributes, write_metadata_attributes};
+use crate::types::{Hash, IdentityContext, LocalMetadata, Metadata};
 use crate::util::{io_err, resolve_client_url, resolve_local_path, sha256};
 
 /// Download the body of a file at `path` (decrypting when encrypted).
@@ -119,13 +120,14 @@ mod tests {
     use std::env;
 
     use super::*;
-    use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, create_secret_key, encrypt_bytes};
+
     use crate::context::create_client_context;
+    use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, create_secret_key, encrypt_bytes};
     use crate::identity::{create_identity, write_identity};
     use crate::metadata::{create_metadata, read_metadata_attributes, sign_metadata, write_metadata_attributes};
-    use crate::server::start_test_server;
+    use crate::testing::fs::{in_test_dir, init_with_server, write_encrypted_test_file, write_plain_test_file};
+    use crate::testing::http::start_test_server;
     use crate::types::Key;
-    use crate::util::test::{in_test_dir, init_with_server, write_encrypted_test_file, write_plain_test_file};
 
     #[test]
     fn get_file_via_get_writes_to_output() {
@@ -272,7 +274,7 @@ mod tests {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &address);
-            let (other_identity, other_key) = create_identity("other@example.com").unwrap();
+            let (other_identity, other_key) = create_identity("other@example.com", None).unwrap();
             write_encrypted_test_file(&temp_dir.join("ark/gyan/secret"), &other_identity, &other_key, b"raw");
 
             let identities_dir = temp_dir.join(".ark").join("identities");

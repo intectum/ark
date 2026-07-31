@@ -5,8 +5,6 @@ mod get;
 mod log;
 mod put;
 mod relay;
-#[cfg(test)]
-mod test_helpers;
 
 use std::env;
 use std::fs;
@@ -19,20 +17,20 @@ use std::str::from_utf8;
 use std::sync::Arc;
 use std::thread;
 
+use self::auth::{authenticate, authorize};
+use self::delete::serve_delete;
+use self::get::serve_get;
+use self::log::{LoggingStream, try_log_request};
+use self::put::{serve_put, serve_put_init};
+use self::relay::relay;
+use self::stream::serve_stream;
+
 use crate::context::{create_server_context, create_target_context};
 use crate::http::{read_request, write_text};
 use crate::identity::resolve_identity;
 use crate::metadata::{read_metadata_attributes, read_metadata_headers};
 use crate::types::{IdentityContext, Permission, RelayMode};
 use crate::util::resolve_server_url;
-
-use self::auth::{authenticate, authorize};
-use self::delete::serve_delete;
-use self::stream::serve_stream;
-use self::get::serve_get;
-use self::log::{LoggingStream, try_log_request};
-use self::put::{serve_put, serve_put_init};
-use self::relay::relay;
 
 pub const MAX_CLOCK_SKEW_MS: u64 = 300_000;
 
@@ -218,7 +216,7 @@ fn handle_parsed_inner(
         None
     };
 
-    let permission = match authorize(&target_ctx, &requestor_identity, modifier_identity.as_ref(), effective_members.as_deref()) {
+    let permission = match authorize(server_ctx, &target_ctx, &requestor_identity, modifier_identity.as_ref(), effective_members.as_deref()) {
         Ok(p) => p,
         Err(e) => return write_text(stream, 403, e.to_string().as_bytes())
     };
@@ -281,12 +279,13 @@ fn handle_parsed_inner(
 
 #[cfg(test)]
 mod tests {
-    use super::test_helpers::*;
     use super::*;
+
     use crate::crypto::{DEFAULT_SIGNING_ALGORITHM, create_secret_key};
     use crate::identity::create_identity;
+    use crate::testing::fs::{TEST_ADDRESS, create_test_account, in_test_dir, write_plain_test_file};
+    use crate::testing::http::*;
     use crate::timestamp::now_ms;
-    use crate::util::test::{TEST_ADDRESS, create_test_account, in_test_dir, write_plain_test_file};
 
     #[test]
     fn unsupported_method_returns_405() {
@@ -354,7 +353,7 @@ mod tests {
             let key = [17u8; 32];
             create_test_account(temp_dir, TEST_ADDRESS);
             let port = start_test_server(temp_dir.to_path_buf());
-            let sig = sign(&key, port, "GET", "/ark/test/x", now_ms(), &[]);
+            let sig = sign_request(&key, port, "GET", "/ark/test/x", now_ms(), &[]);
             let auth = format!("ArkIdentity address=\"test@example.com\", signature=\"{}\"", sig);
             let (code, _, _) = request(port, "GET", "/ark/test/x", &[], &[("Authorization", &auth)]);
             assert_eq!(code, 401);
@@ -368,8 +367,8 @@ mod tests {
             create_test_account(temp_dir, TEST_ADDRESS);
             let port = start_test_server(temp_dir.to_path_buf());
             let old = now_ms() - (MAX_CLOCK_SKEW_MS + 60_000);
-            let sig = sign(&key, port, "GET", "/ark/test/x", old, &[]);
-            let auth = build_auth("test@example.com", old, &sig);
+            let sig = sign_request(&key, port, "GET", "/ark/test/x", old, &[]);
+            let auth = format_authorization_header("test@example.com", old, &sig);
             let (code, _, _) = request(port, "GET", "/ark/test/x", &[], &[("Authorization", &auth)]);
             assert_eq!(code, 401);
         });
@@ -382,8 +381,8 @@ mod tests {
             create_test_account(temp_dir, TEST_ADDRESS);
             let port = start_test_server(temp_dir.to_path_buf());
             let ts = now_ms();
-            let sig = sign(&key, port, "GET", "/ark/test/somethingelse", ts, &[]);
-            let auth = build_auth("test@example.com", ts, &sig);
+            let sig = sign_request(&key, port, "GET", "/ark/test/somethingelse", ts, &[]);
+            let auth = format_authorization_header("test@example.com", ts, &sig);
             let (code, _, _) = request(port, "GET", "/ark/test/realtarget", &[], &[("Authorization", &auth)]);
             assert_eq!(code, 401);
         });
@@ -403,7 +402,7 @@ mod tests {
     #[test]
     fn no_identity_file_403() {
         in_test_dir("ark_server_test", |temp_dir| {
-            let (attacker_identity, attacker_key) = create_identity("ghost@example.com").unwrap();
+            let (attacker_identity, attacker_key) = create_identity("ghost@example.com", None).unwrap();
             let port = start_test_server(temp_dir.to_path_buf());
             let (code, _, _) = signed_request(port, &attacker_identity, &attacker_key, "GET", "/ark/ghost/x", &[]);
             assert_eq!(code, 403);

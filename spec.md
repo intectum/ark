@@ -53,7 +53,9 @@ An Ark **server** is an authenticated file server rooted at `/ark/<account>/…`
 
 **Address.** `<account>@<host>[:<port>][/<path>]`. `host` is the server's hostname or IP; port defaults to 443. Path defaults to `/.ark/identity.json` (the primary identity). A path other than the default addresses a **sub-identity** — a distinct keypair whose identity file lives under the same account root (for example a password identity at `/.ark/passwords/primary.json`).
 
-**Identity.** A JSON document at some path under `/ark/<account>/.ark/` that pairs an address with a public key and a self-signature (Appendix A.1). The primary identity is at `identity.json`; alternative identities (password, passkey) live under `passwords/`, `passkeys/`. Servers do not validate identity content beyond the self-signature.
+**Identity.** A JSON document at some path under `/ark/<account>/.ark/` that pairs an address with a public key and a self-signature (Appendix A.1). The primary identity is at `identity.json`; alternative identities (password, passkey, group) live under `passwords/`, `passkeys/`, `groups/`. Servers do not validate identity content beyond the self-signature.
+
+**Group.** Any identity whose JSON document carries a `members` field. The field lists the addresses of the group's members. A group's own address may appear in a `Member` entry on a file or directory; authorization then treats any listed group member as if they held the group's permission. Convention is to keep groups under `/.ark/groups/`, but the authoritative rule is field presence, not path.
 
 **File.** Raw body bytes on disk, plus a signed metadata record (§7). The metadata carries the file's `id`, timestamps, author, member list, encryption algorithm, body hash, and signature. Bodies of encrypted files are `nonce ‖ ciphertext+tag`; bodies of unencrypted files are raw.
 
@@ -179,8 +181,8 @@ Everything under `/.ark/` is protocol-defined. Applications must not write arbit
 | `identities/<address>.json` | Cached peer `Identity` | **Client-local.** Not required or served by the server; documented so implementations agree on where clients keep their TOFU cache. |
 | `passwords/<name>.json` | `Identity` with `algorithm: argon2id-ed25519` | Publicly readable. GET/HEAD unauthenticated. See §11. |
 | `passkeys/<name>.json` | `Identity` with `algorithm: webauthn-prf-ed25519` | Publicly readable. **Status: not yet implemented.** |
-| `groups/<name>.json` | `Group` (A.8) | **Status: not yet implemented.** |
-| `groups/<name>.key` | Group private key file (Ark file, members-only) | **Status: not yet implemented.** |
+| `groups/<name>.json` | `Identity` with a `members` field | Publicly readable. Path is convention; any identity with `members` is a group (§2). |
+| `groups/<name>.key` | Group Ed25519 seed as an encrypted Ark file, members-only | Body is the base64url seed; wrapped per member like `identity.key` (§11.2). |
 | `invitations/<token>.json` | `Invitation` (A.9) | **Status: not yet implemented.** |
 | `invitations/<token>.html` | Human landing page | **Status: not yet implemented.** |
 | `requests/<ts>_<seq>.http` | Request log entry | See §10. Owner reads; `ark@<host>` writes. |
@@ -239,8 +241,11 @@ The server derives an **effective member list** for the target:
 2. Otherwise authenticate (§5), then compute the highest permission across:
    - a direct match on `requestor_identity.address`,
    - a match on the metadata's `modified_by` (for PUT — proving the request was signed on behalf of a member author),
+   - a group match — for any member entry whose identity carries a `members` list, treat the requestor (or `modified_by`) as matching if their address is in that list; the entry's permission is granted,
    - the `*` public member (read-only shortcut).
 3. If none match, `403`.
+
+**Group resolution.** When a member entry's identity is itself a group, the server resolves that identity and checks the requestor against its `members` list. Groups whose members list other groups are rejected — nested groups are **Status: not yet implemented** (§13).
 
 **Method vs permission.**
 
@@ -351,15 +356,11 @@ hpke-x25519-hkdf-sha256-aes256gcm
 
 ### 8.4 Removing a member
 
-The removed member already holds the previous file key. To prevent access to future edits:
+Every PUT of an encrypted file body already generates a fresh file key (§8), so a removed member loses access to future edits as a natural consequence of the next write — no extra step is required for regular member removals. The removed member retains any local copy they downloaded, but the server never re-issues them the current file key.
 
-1. Remove the member entry.
-2. Generate a new file key.
-3. Re-encrypt the body under the new file key.
-4. Re-wrap the new file key for every remaining member.
-5. PUT the file.
+Removing a **group** member is different: the group's public key does not change, so a fresh file key wrapped for the group's public key would still be unwrappable by the removed member (who kept the group's private key locally). Preventing that requires rotating the group's Ed25519 keypair, re-publishing `groups/<name>.json`, and re-publishing `groups/<name>.key` wrapped only for the remaining members. **Status: not yet implemented** (§13).
 
-Steps 2–4 are skipped for directories and unencrypted files (they carry no wrapped key).
+The server cannot verify that a client rotated the file key. On a member-list change it MAY require the incoming `body_hash` to differ from the previous — a minimum "you re-encrypted something" backstop — but a client that reuses the file key with a new nonce would pass that check. Rotation is a client responsibility.
 
 ### 8.5 Public `*` member
 
@@ -501,7 +502,8 @@ The following spec sections describe intended behavior that the reference implem
 
 - Password recovery UX and seed-phrase display (§11.1) — the low-level password identity flow (§11.2) is implemented.
 - Passkey identities (§4.8 `passkeys/`).
-- Groups (§4.8 `groups/`, Appendix A.8).
+- Nested groups — a group whose `members` list references another group (§2, §6, A.1).
+- Group member removal with forward secrecy — removing a member requires rotating the group keypair; the reference implementation does not yet perform this rotation (§8.4).
 - Invitations (§4.8 `invitations/`, Appendix A.9).
 - Blocklists (§4.8 `blocked/`).
 - Per-sender rate limits (§12.1).
@@ -523,7 +525,7 @@ Types below define the JSON shapes that ride in bodies and the field set that ri
 {
   "public_key": Key,
   "address": "alice@example.com",
-  "modified": "2026-07-24T10:00:00.000Z",
+  "members": ["bob@example.com", "carol@example.com"],
   "signature": Signature
 }
 ```
@@ -532,7 +534,7 @@ Types below define the JSON shapes that ride in bodies and the field set that ri
 |---|---|---|
 | `public_key` | ✓ | The identity's public key. Must be a signing algorithm (Appendix B). |
 | `address` | ✓ | Full address (may include a sub-identity path). |
-| `modified` | ✓ | RFC 3339 timestamp, millisecond precision, `Z`-terminated. |
+| `members` | optional | Addresses of the identity's members. When present, this identity is a group (§2, §6). Entries must be non-group identities — nested groups are **Status: not yet implemented**. |
 | `signature` | ✓ | Self-signature over the JCS-canonical serialization with `signature.algorithm` and `signature.value` cleared. |
 | `key_transition` | optional | See A.7. **Status: not yet implemented.** |
 
@@ -565,7 +567,7 @@ Field rules per §7. Signature computed over the JCS-canonical serialization wit
 
 | Field | Required | Notes |
 |---|---|---|
-| `address` | ✓ | Full address, a group local path (not yet implemented), or `*`. |
+| `address` | ✓ | Full address (may be a group's address), or `*`. |
 | `permission` | ✓ | `owner` / `writer` / `reader`. |
 | `key` | when encrypted | The file key wrapped for this member under the wrap algorithm (§8.2). Omitted for `*`, for group members without a group key, and for unencrypted files. |
 
@@ -607,19 +609,9 @@ Algorithm ids are registered in Appendix B.1.
 
 Cross-signatures prove both keys authorized the transition. Verification and lifetime rules TBD.
 
-### A.8 Group — **Status: not yet implemented**
+### A.8 Group
 
-```json
-{
-  "version": 1,
-  "members": [Member],
-  "key": Key,
-  "updated": "2026-07-24T10:00:00.000Z",
-  "signature": Signature
-}
-```
-
-Addressed by local path, e.g. `groups:team-alpha` (short form of `/.ark/groups/team-alpha.json`). Group `key` is present when the group encrypts files (its private key lives in the companion members-only `.key` file); absent when the group is only used for authorization.
+A group is an [`Identity`](#a1-identity) whose `members` field is set. The identity's `public_key` is the group's Ed25519 key used to wrap file keys when the group is a member of an encrypted file; the group's Ed25519 seed lives in the companion members-only `.key` file (§4.8), wrapped for each member like `identity.key` (§11.2). Groups have no dedicated JSON shape beyond that.
 
 ### A.9 Invitation — **Status: not yet implemented**
 

@@ -4,9 +4,10 @@ use std::io::Read;
 use std::path::PathBuf;
 
 use super::encrypt_stream;
+
 use crate::client::request;
 use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, DEFAULT_HASH_ALGORITHM, create_secret_key};
-use crate::metadata::{apply_key_to_metadata, apply_permissions, create_metadata, extract_key_from_metadata, get_member, has_metadata_attributes, read_local_metadata_attributes, read_metadata_attributes, sign_metadata, write_local_metadata_attributes, write_metadata_attributes, write_metadata_headers};
+use crate::metadata::{apply_key_to_metadata, apply_permissions, create_metadata, has_metadata_attributes, read_local_metadata_attributes, read_metadata_attributes, resolve_key_from_members, sign_metadata, write_local_metadata_attributes, write_metadata_attributes, write_metadata_headers};
 use crate::timestamp;
 use crate::types::{Hash, IdentityContext, LocalMetadata, Metadata, Permissions};
 use crate::util::{io_err, io_invalid_input, resolve_client_url, resolve_local_path, sha256};
@@ -171,7 +172,7 @@ pub fn put_stream(
         }
     };
 
-    if get_member(&metadata.members, &ctx.identity.address).is_none() {
+    if !metadata.members.iter().any(|m| m.address == ctx.identity.address) {
         return Err(io_err("no member entry for current account"));
     }
 
@@ -180,7 +181,7 @@ pub fn put_stream(
     }
 
     let existing_file_key = if metadata_only && metadata.encryption_algorithm.is_some() {
-        extract_key_from_metadata(ctx, &metadata)?
+        resolve_key_from_members(ctx, &metadata.members)?
     } else {
         None
     };
@@ -252,14 +253,15 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, decrypt_bytes, encrypt_bytes};
+
     use crate::context::create_client_context;
+    use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, decrypt_bytes, encrypt_bytes};
     use crate::identity::{create_identity, write_identity};
     use crate::metadata::verify_metadata;
     use crate::permissions::{drop, reader, writer};
-    use crate::server::start_test_server;
+    use crate::testing::fs::{in_test_dir, init_with_server, write_plain_test_file};
+    use crate::testing::http::start_test_server;
     use crate::types::{IdentityContext, Identity, Key, Permission};
-    use crate::util::test::{in_test_dir, init_with_server, write_plain_test_file};
 
     fn cache_identity(ctx: &IdentityContext, identity: &Identity) {
         let cache_dir = ctx.root.join(".ark").join("identities");
@@ -676,7 +678,7 @@ mod tests {
             let address = format!("gyan@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &address);
 
-            let (bob_identity, bob_secret_key) = create_identity("bob@example.com").unwrap();
+            let (bob_identity, bob_secret_key) = create_identity("bob@example.com", None).unwrap();
             cache_identity(&ctx, &bob_identity);
 
             let path = put_encrypted(&ctx, temp_dir, "enc.bin", b"plaintext");
@@ -709,7 +711,7 @@ mod tests {
             let address = format!("gyan@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &address);
 
-            let (sam_identity, _sam_secret_key) = create_identity("sam@example.com").unwrap();
+            let (sam_identity, _sam_secret_key) = create_identity("sam@example.com", None).unwrap();
             cache_identity(&ctx, &sam_identity);
 
             let path = temp_dir.join("doc.txt");
@@ -731,7 +733,7 @@ mod tests {
             let address = format!("gyan@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &address);
 
-            let (sam_identity, _sam_secret_key) = create_identity("sam@example.com").unwrap();
+            let (sam_identity, _sam_secret_key) = create_identity("sam@example.com", None).unwrap();
             cache_identity(&ctx, &sam_identity);
 
             let path = temp_dir.join("doc.txt");

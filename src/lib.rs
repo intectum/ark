@@ -33,6 +33,8 @@ pub mod identity;
 pub mod metadata;
 pub mod permissions;
 pub mod server;
+#[cfg(test)]
+pub mod testing;
 pub mod timestamp;
 pub mod types;
 pub mod util;

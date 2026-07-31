@@ -155,12 +155,12 @@ mod tests {
     use std::thread::sleep;
     use std::time::{Duration, Instant};
 
-    use super::super::start_test_server;
-    use super::super::test_helpers::{signed_request, signed_put_with_default_metadata};
     use crate::identity::read_identity;
     use crate::metadata::{create_metadata, read_metadata_attributes, sign_metadata, write_metadata_attributes};
+    use crate::testing::fs::{create_test_account, in_test_dir};
+    use crate::testing::http::{signed_request, signed_put_with_default_metadata};
+    use crate::testing::http::start_test_server;
     use crate::types::{Identity, Key, Member, Permission};
-    use crate::util::test::{create_test_account, in_test_dir};
 
     fn ark_identity(temp_dir: &Path) -> Identity {
         read_identity(&temp_dir.join("ark/ark/.ark/identity.json")).unwrap()
@@ -276,8 +276,8 @@ mod tests {
 
     #[test]
     fn logs_relayed_write_in_recipient_account() {
-        use super::super::test_helpers::{seed_shared_dir, signed_put_metadata_with_headers};
-        use crate::util::test::create_plain_test_metadata;
+        use crate::testing::fs::create_plain_test_metadata;
+        use crate::testing::http::{seed_shared_dir, signed_put_metadata_with_headers};
 
         in_test_dir("ark_log_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());

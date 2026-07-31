@@ -1,19 +1,47 @@
 use crate::types::{Member, Permission, Permissions};
 
 pub fn owner(address: impl Into<String>) -> Permissions {
-    Permissions { owners: vec![address.into()], ..Default::default() }
+    owners([address])
 }
 
 pub fn writer(address: impl Into<String>) -> Permissions {
-    Permissions { writers: vec![address.into()], ..Default::default() }
+    writers([address])
 }
 
 pub fn reader(address: impl Into<String>) -> Permissions {
-    Permissions { readers: vec![address.into()], ..Default::default() }
+    readers([address])
 }
 
 pub fn drop(address: impl Into<String>) -> Permissions {
-    Permissions { drops: vec![address.into()], ..Default::default() }
+    drops([address])
+}
+
+pub fn owners(addresses: impl IntoIterator<Item = impl Into<String>>) -> Permissions {
+    Permissions {
+        owners: addresses.into_iter().map(Into::into).collect(),
+        ..Default::default()
+    }
+}
+
+pub fn writers(addresses: impl IntoIterator<Item = impl Into<String>>) -> Permissions {
+    Permissions {
+        writers: addresses.into_iter().map(Into::into).collect(),
+        ..Default::default()
+    }
+}
+
+pub fn readers(addresses: impl IntoIterator<Item = impl Into<String>>) -> Permissions {
+    Permissions {
+        readers: addresses.into_iter().map(Into::into).collect(),
+        ..Default::default()
+    }
+}
+
+pub fn drops(addresses: impl IntoIterator<Item = impl Into<String>>) -> Permissions {
+    Permissions {
+        drops: addresses.into_iter().map(Into::into).collect(),
+        ..Default::default()
+    }
 }
 
 pub fn without(members: &[Member], address: &str) -> Vec<Member> {
@@ -22,12 +50,12 @@ pub fn without(members: &[Member], address: &str) -> Vec<Member> {
 }
 
 pub fn assign(members: &[Member], permission: Permission) -> Permissions {
-    let addresses: Vec<String> = members.iter().map(|member| member.address.clone()).collect();
+    let addresses = members.iter().map(|member| member.address.clone());
 
     match permission {
-        Permission::Owner => Permissions { owners: addresses, ..Default::default() },
-        Permission::Writer => Permissions { writers: addresses, ..Default::default() },
-        Permission::Reader => Permissions { readers: addresses, ..Default::default() },
+        Permission::Owner => owners(addresses),
+        Permission::Writer => writers(addresses),
+        Permission::Reader => readers(addresses),
     }
 }
 
@@ -102,5 +130,29 @@ mod tests {
         assert_eq!(perms.owners, vec!["a@x".to_string()]);
         assert_eq!(perms.readers, vec!["b@y".to_string(), "c@z".to_string()]);
         assert!(perms.writers.is_empty());
+    }
+
+    #[test]
+    fn plural_helpers_collect_addresses() {
+        let perms = readers(["a@x", "b@y"]);
+        assert_eq!(perms.readers, vec!["a@x".to_string(), "b@y".to_string()]);
+        assert!(perms.owners.is_empty());
+
+        let perms = writers(vec!["a@x".to_string(), "b@y".to_string()]);
+        assert_eq!(perms.writers, vec!["a@x".to_string(), "b@y".to_string()]);
+
+        let perms = owners(["a@x"]);
+        assert_eq!(perms.owners, vec!["a@x".to_string()]);
+
+        let perms = drops(["a@x", "b@y"]);
+        assert_eq!(perms.drops, vec!["a@x".to_string(), "b@y".to_string()]);
+    }
+
+    #[test]
+    fn singular_helpers_match_one_element_plurals() {
+        assert_eq!(reader("a@x").readers, readers(["a@x"]).readers);
+        assert_eq!(writer("a@x").writers, writers(["a@x"]).writers);
+        assert_eq!(owner("a@x").owners, owners(["a@x"]).owners);
+        assert_eq!(drop("a@x").drops, drops(["a@x"]).drops);
     }
 }

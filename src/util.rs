@@ -13,6 +13,31 @@ use crate::http::{read_request, read_response};
 use crate::identity::parse_address;
 use crate::types::{IdentityContext, RequestEntry};
 
+/// Expand a CLI/library path argument into a fully-qualified address string
+/// (`name@host[:port][/path]`).
+///
+/// Accepts the three forms used by put/get/list/identity:
+/// - relative: `team.json` (cwd relative to account root)
+/// - account-absolute: `/groups/team.json`
+/// - address form: `bob@host/team.json` (optional scheme)
+///
+/// Relative and account-absolute forms take name/host from `ctx.identity.address`.
+/// An omitted path stays omitted.
+pub fn resolve_address(ctx: &IdentityContext, path: &str) -> io::Result<String> {
+    let url = resolve_client_url(ctx, path)?;
+
+    let name = url.username();
+    let host = match url.port() {
+        Some(port) => format!("{}:{}", url.host_str().unwrap_or(""), port),
+        None => url.host_str().unwrap_or("").to_string(),
+    };
+    let account_path = url.path()
+        .strip_prefix(&format!("/ark/{}", name)).unwrap_or("")
+        .trim_end_matches('/');
+
+    Ok(format!("{}@{}{}", name, host, account_path))
+}
+
 pub fn resolve_client_url(ctx: &IdentityContext, path: &str) -> io::Result<Url> {
     resolve_client_url_raw(&ctx.root, path, &ctx.identity.address)
 }
@@ -118,12 +143,18 @@ pub fn create_authorization_header(ctx: &IdentityContext, method: &str, host: &s
     let identity_key = ctx.identity_key.as_ref().ok_or_else(|| io_err("context missing identity_key"))?;
     let request_bytes = request_to_bytes(method, host, path, timestamp, body);
     let signature = sign_bytes(identity_key, &request_bytes)?;
-    Ok(format!(
-        "ArkIdentity address=\"{}\", timestamp=\"{}\", signature=\"{}\"",
-        ctx.identity.address,
+    Ok(format_authorization_header(
+        &ctx.identity.address,
         timestamp,
-        encode_base64url(signature.value),
+        &encode_base64url(signature.value),
     ))
+}
+
+pub fn format_authorization_header(address: &str, timestamp: u64, signature_b64: &str) -> String {
+    format!(
+        "ArkIdentity address=\"{}\", timestamp=\"{}\", signature=\"{}\"",
+        address, timestamp, signature_b64,
+    )
 }
 
 pub fn parse_authorization_header(value: &str) -> Option<(String, String, String)> {
@@ -169,97 +200,36 @@ pub fn io_invalid_input(msg: &str) -> Error {
 }
 
 #[cfg(test)]
-pub mod test {
-    use std::env;
-    use std::fs;
-    use std::path::{Path, PathBuf};
-    use std::process;
-    use std::sync::Mutex;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    use crate::client::init_local;
-    use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, create_secret_key, encrypt_bytes};
-    use crate::context::create_client_context;
-    use crate::identity::{parse_address, write_identity};
-    use crate::metadata::{create_metadata, sign_metadata, write_metadata_attributes};
-    use crate::types::{IdentityContext, Identity, Key, Metadata};
-
-    static CWD_LOCK: Mutex<()> = Mutex::new(());
-    pub const TEST_ADDRESS: &str = "test@example.com";
-
-    pub fn in_test_dir<R>(prefix: &str, f: impl FnOnce(&Path) -> R) -> R {
-        let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = env::current_dir().unwrap_or_else(|_| env::temp_dir());
-
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let dir = env::temp_dir().join(format!("{}_{}_{}", prefix, process::id(), nanos));
-        fs::create_dir_all(&dir).unwrap();
-
-        struct Cleanup(PathBuf, PathBuf);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                let _ = env::set_current_dir(&self.0);
-                let _ = fs::remove_dir_all(&self.1);
-            }
-        }
-        let _cleanup = Cleanup(prev, dir.clone());
-
-        env::set_current_dir(&dir).unwrap();
-        f(&dir)
-    }
-
-    pub fn create_test_account(temp_dir: &Path, address: &str) -> (Identity, Key, PathBuf) {
-        let (name, _, _) = parse_address(address).unwrap();
-        let account_dir = temp_dir.join("ark").join(&name);
-        fs::create_dir_all(&account_dir).unwrap();
-        let (identity, secret_key) = init_local(&account_dir, address).unwrap();
-        (identity, secret_key, account_dir)
-    }
-
-    pub fn init_with_server(temp_dir: &Path, address: &str) -> IdentityContext {
-        let (identity, _) = init_local(temp_dir, address).unwrap();
-        let (name, _, _) = parse_address(address).unwrap();
-        let server_dot_ark = temp_dir.join("ark").join(&name).join(".ark");
-        fs::create_dir_all(&server_dot_ark).unwrap();
-        write_identity(&server_dot_ark.join("identity.json"), &identity).unwrap();
-        create_client_context().unwrap()
-    }
-
-    pub fn create_plain_test_metadata(owner: &Identity, owner_key: &Key, body: &[u8]) -> Metadata {
-        let mut metadata = create_metadata(&owner.address, None);
-        sign_metadata(owner_key, &mut metadata, Some(body)).unwrap();
-
-        metadata
-    }
-
-    pub fn write_plain_test_file(path: &Path, owner: &Identity, owner_key: &Key, body: &[u8]) {
-        let metadata = create_plain_test_metadata(owner, owner_key, body);
-        fs::write(path, body).unwrap();
-        write_metadata_attributes(path, &metadata).unwrap();
-    }
-
-    pub fn create_encrypted_test_metadata(owner: &Identity, owner_key: &Key, plaintext: &[u8]) -> (Metadata, Vec<u8>) {
-        let mut metadata = create_metadata(&owner.address, Some(DEFAULT_ENCRYPTION_ALGORITHM));
-        let file_key = create_secret_key(DEFAULT_ENCRYPTION_ALGORITHM).unwrap();
-        let (_, ciphertext) = encrypt_bytes(&file_key, plaintext).unwrap();
-        let (wrap_alg, wrapped) = encrypt_bytes(&owner.public_key, &file_key.value).unwrap();
-        metadata.members[0].key = Some(Key { algorithm: wrap_alg, value: wrapped });
-        sign_metadata(owner_key, &mut metadata, Some(&ciphertext)).unwrap();
-        (metadata, ciphertext)
-    }
-
-    pub fn write_encrypted_test_file(path: &Path, owner: &Identity, owner_key: &Key, plaintext: &[u8]) {
-        let (metadata, ciphertext) = create_encrypted_test_metadata(owner, owner_key, plaintext);
-        fs::write(path, ciphertext).unwrap();
-        write_metadata_attributes(path, &metadata).unwrap();
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use std::env;
 
     use super::*;
+
+    use crate::client::init_local;
+    use crate::context::create_client_context;
+    use crate::testing::fs::in_test_dir;
+
+    #[test]
+    fn resolve_local_path_address_without_path_is_account_root() {
+        in_test_dir("ark_util_test", |temp_dir| {
+            init_local(temp_dir, "alice@example.com").unwrap();
+            let ctx = create_client_context().unwrap();
+
+            let path = resolve_local_path(&ctx, "bob@example.com").unwrap();
+            assert_eq!(path, ctx.root);
+        });
+    }
+
+    #[test]
+    fn resolve_local_path_address_with_path_is_under_account_root() {
+        in_test_dir("ark_util_test", |temp_dir| {
+            init_local(temp_dir, "alice@example.com").unwrap();
+            let ctx = create_client_context().unwrap();
+
+            let path = resolve_local_path(&ctx, "bob@example.com/notes/todo.txt").unwrap();
+            assert_eq!(path, ctx.root.join("notes/todo.txt"));
+        });
+    }
 
     #[test]
     fn resolve_url_absolute() {

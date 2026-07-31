@@ -80,16 +80,21 @@ pub struct Hash {
 /// Public identity of an ark account: address, public key, and a self-signature
 /// binding the two. Served as `.ark/identity.json` and used to verify request
 /// signatures and wrap file keys for members.
+///
+/// An identity with `members` set is a **group**. Its public key wraps file
+/// keys for the group; anyone listed in `members` can act with the group's
+/// permissions on files where the group is a member.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Identity {
     /// Public key used to verify request signatures and wrap file keys for
     /// this account.
     pub public_key: Key,
-    /// Account address in `name@host[:port]` form.
+    /// Account address in `name@host[:port][/<path>]` form.
     pub address: String,
-    /// Timestamp of the most recent identity change.
-    #[serde(with = "crate::timestamp::serde")]
-    pub modified: OffsetDateTime,
+    /// Addresses of identities that are members of this group. When set, this
+    /// identity is a group; when absent, this is a regular account identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub members: Option<Vec<String>>,
     /// Signature over the other fields, produced by the account's private key.
     pub signature: Signature,
 }

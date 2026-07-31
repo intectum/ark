@@ -4,8 +4,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
-use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
+use rustls::pki_types::ServerName;
 use url::Url;
 
 use crate::types::{ReadWrite, StreamEvent};
