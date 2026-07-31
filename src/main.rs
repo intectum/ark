@@ -120,6 +120,9 @@ enum Cmd {
     },
     /// List entries of a directory.
     List {
+        /// Only return entries whose name starts with PREFIX (server-side filter).
+        #[arg(short, long, value_name = "PREFIX")]
+        prefix: Option<String>,
         /// Ark URL or path.
         path: String,
     },
@@ -246,7 +249,7 @@ fn main() {
         Cmd::Head { path } => create_client_context().and_then(|c| head_cli(&c, &path)),
         Cmd::Delete { path } => create_client_context().and_then(|c| delete(&c, &path)),
         Cmd::Get { output, decrypt, path } => create_client_context().and_then(|c| get(&c, &path, output.as_deref(), decrypt)),
-        Cmd::List { path } => create_client_context().and_then(|c| list_cli(&c, &path)),
+        Cmd::List { prefix, path } => create_client_context().and_then(|c| list_cli(&c, &path, prefix.as_deref())),
         Cmd::Proposals { cmd } => create_client_context().and_then(|c| match cmd {
             ProposalsCmd::List => list_proposals_cli(&c),
             ProposalsCmd::Accept { id, force } => accept_proposal(&c, &id, force),
@@ -285,8 +288,8 @@ fn head_cli(ctx: &IdentityContext, path: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn list_cli(ctx: &IdentityContext, path: &str) -> io::Result<()> {
-    let entries = list(ctx, path)?;
+fn list_cli(ctx: &IdentityContext, path: &str, prefix: Option<&str>) -> io::Result<()> {
+    let entries = list(ctx, path, prefix)?;
     let mut stdout = io::stdout().lock();
     for entry in &entries {
         let kind = match entry.kind {

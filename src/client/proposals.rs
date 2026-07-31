@@ -13,7 +13,7 @@ use crate::util::{io_err, io_invalid_input, parse_request_entry, resolve_client_
 /// Empty when the account has no request log (see [`crate::client::init`],
 /// which sets it up).
 pub fn list_proposals(ctx: &IdentityContext) -> io::Result<Vec<Proposal>> {
-    let entries = list(ctx, "/.ark/requests/")?;
+    let entries = list(ctx, "/.ark/requests/", Some("PUT_403_"))?;
 
     let mut proposals = Vec::new();
     for entry in entries {

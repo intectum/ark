@@ -11,8 +11,15 @@ use crate::util::{io_err, resolve_client_url};
 /// server returns the JSON listing produced for directory GETs; each entry
 /// carries its `name` and `kind` (dir / file / symlink). A missing directory
 /// (`404`) is treated as an empty listing.
-pub fn list(ctx: &IdentityContext, path: &str) -> io::Result<Vec<DirEntry>> {
-    let url = resolve_client_url(ctx, path)?;
+///
+/// When `prefix` is `Some`, only entries whose name starts with the given
+/// string are returned. Filtering happens server-side, so unmatched entries
+/// never cross the wire.
+pub fn list(ctx: &IdentityContext, path: &str, prefix: Option<&str>) -> io::Result<Vec<DirEntry>> {
+    let mut url = resolve_client_url(ctx, path)?;
+    if let Some(p) = prefix {
+        url.query_pairs_mut().append_pair("prefix", p);
+    }
 
     let (code, _, body) = request(Some(ctx), "GET", &url, &[], &[])?;
     if code == 404 {
@@ -47,11 +54,32 @@ mod tests {
             write_plain_test_file(&dir.join("a.txt"), &ctx.identity, ctx.identity_key.as_ref().unwrap(), b"a");
             write_plain_test_file(&dir.join("b.txt"), &ctx.identity, ctx.identity_key.as_ref().unwrap(), b"b");
 
-            let entries = list(&ctx, "notes").unwrap();
+            let entries = list(&ctx, "notes", None).unwrap();
             let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
             assert!(names.contains(&"a.txt"));
             assert!(names.contains(&"b.txt"));
             assert!(entries.iter().all(|e| matches!(e.kind, DirEntryKind::File)));
+        });
+    }
+
+    #[test]
+    fn list_prefix_filters_server_side() {
+        in_test_dir("ark_list_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let address = format!("gyan@127.0.0.1:{}", port);
+            let ctx = init_with_server(temp_dir, &address);
+
+            let dir = temp_dir.join("ark/gyan/mixed");
+            fs::create_dir_all(&dir).unwrap();
+            write_plain_test_file(&dir.join("PUT_403_a.http"), &ctx.identity, ctx.identity_key.as_ref().unwrap(), b"a");
+            write_plain_test_file(&dir.join("PUT_201_b.http"), &ctx.identity, ctx.identity_key.as_ref().unwrap(), b"b");
+            write_plain_test_file(&dir.join("PUT_403_c.http"), &ctx.identity, ctx.identity_key.as_ref().unwrap(), b"c");
+
+            let entries = list(&ctx, "mixed", Some("PUT_403_")).unwrap();
+            let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+            assert_eq!(names.len(), 2);
+            assert!(names.contains(&"PUT_403_a.http"));
+            assert!(names.contains(&"PUT_403_c.http"));
         });
     }
 
@@ -62,7 +90,7 @@ mod tests {
             let address = format!("gyan@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &address);
 
-            let entries = list(&ctx, "nope").unwrap();
+            let entries = list(&ctx, "nope", None).unwrap();
             assert!(entries.is_empty());
         });
     }

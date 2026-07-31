@@ -91,9 +91,14 @@ pub fn try_log_request(
         entry.extend_from_slice(b"\r\n");
     }
 
+    let status = captured_response.windows(2).position(|w| w == b"\r\n")
+        .and_then(|line_end| std::str::from_utf8(&captured_response[..line_end]).ok())
+        .and_then(|line| line.split_whitespace().nth(1)?.parse().ok())
+        .unwrap_or(0);
+
     let target_identity = read_identity(&target_root.join(".ark").join("identity.json"))?;
 
-    let entry_path = allocate_entry_path(&requests_dir)?;
+    let entry_path = allocate_entry_path(&requests_dir, method, status)?;
     fs::write(&entry_path, &entry)?;
 
     let mut metadata = create_metadata(&server_ctx.identity.address, None);
@@ -131,10 +136,10 @@ fn find_double_crlf(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
-fn allocate_entry_path(dir: &Path) -> io::Result<PathBuf> {
+fn allocate_entry_path(dir: &Path, method: &str, status: u16) -> io::Result<PathBuf> {
     let stamp = timestamp::format_fs_safe(timestamp::now());
     for seq in 0..1000 {
-        let name = format!("{}_{:03}.http", stamp, seq);
+        let name = format!("{}_{}_{}_{:03}.http", method, status, stamp, seq);
         let candidate = dir.join(&name);
         if !candidate.exists() {
             return Ok(candidate);

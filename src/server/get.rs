@@ -7,14 +7,14 @@ use crate::metadata::{read_metadata_attributes, write_metadata_headers};
 use crate::types::{DirEntry, DirEntryKind};
 use crate::util::io_err;
 
-pub fn serve_get(fs_path: &Path, stream: &mut dyn Write, send_body: bool) -> io::Result<()> {
+pub fn serve_get(fs_path: &Path, stream: &mut dyn Write, send_body: bool, prefix: Option<&str>) -> io::Result<()> {
     let fs_metadata = match fs::metadata(fs_path) {
         Ok(m) => m,
         Err(_) => return write_text(stream, 404, b"not found"),
     };
 
     if fs_metadata.is_dir() {
-        let body = list_dir(fs_path)?;
+        let body = list_dir(fs_path, prefix)?;
         let content_length = body.len().to_string();
         let metadata_headers = read_metadata_attributes(fs_path).ok()
             .map(|m| write_metadata_headers(&m))
@@ -47,8 +47,14 @@ pub fn serve_get(fs_path: &Path, stream: &mut dyn Write, send_body: bool) -> io:
     Ok(())
 }
 
-fn list_dir(path: &Path) -> io::Result<String> {
-    let mut entries: Vec<_> = fs::read_dir(path)?.filter_map(|e| e.ok()).collect();
+fn list_dir(path: &Path, prefix: Option<&str>) -> io::Result<String> {
+    let mut entries: Vec<_> = fs::read_dir(path)?
+        .filter_map(|e| e.ok())
+        .filter(|e| match prefix {
+            Some(p) => e.file_name().to_string_lossy().starts_with(p),
+            None => true,
+        })
+        .collect();
     entries.sort_by_key(|e| e.file_name());
     let items: Vec<DirEntry> = entries
         .into_iter()

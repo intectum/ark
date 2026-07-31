@@ -97,13 +97,13 @@ Ark preserves no server-side ordering across files. If your app needs chronologi
 ```rust
 use ark::timestamp::{format_fs_safe, now};
 
-let file_name = format!("msg-{}.md", format_fs_safe(now()));
-// e.g. "msg-2026-07-29T14-22-03.418Z.md"
+let file_name = format!("msg_{}.md", format_fs_safe(now()));
+// e.g. "msg_2026-07-29T14-22-03.418Z.md"
 ```
 
 `format_fs_safe` produces a filesystem-safe ISO-8601 stamp. Because ISO stamps sort lexically, `std::fs::read_dir` + `sort_by(name)` yields chronological order without any extra index.
 
-Prefix the file with a short type discriminator (`msg-`, `event-`, `photo-`) so multiple item kinds can share a directory without collision, and so `starts_with` gives you a cheap filter when listing.
+Prefix the file with a short type discriminator (`msg_`, `event_`, `photo_`) so multiple item kinds can share a directory without collision, and so `starts_with` gives you a cheap filter when listing. Use `_` as the field separator — timestamps already contain `-`, so hyphens make names harder to split and scan.
 
 ---
 

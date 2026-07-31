@@ -355,10 +355,10 @@ where
 
     let rel_prefix = to_relative_path(ctx, path)?;
 
-    let mut entries = list(ctx, "/.ark/requests/")?;
+    let mut entries = list(ctx, "/.ark/requests/", Some("PUT_2"))?;
     entries.retain(|entry|
         matches!(entry.kind, DirEntryKind::File) && entry.name.ends_with(".http"));
-    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    entries.sort_by(|a, b| stamp_key(&a.name).cmp(stamp_key(&b.name)));
 
     let (account_name, _, _) = parse_address(&ctx.identity.address)?;
     let account_prefix = format!("/ark/{}/", account_name);
@@ -368,7 +368,7 @@ where
 
     for entry in entries {
         if let Some(cutoff) = &last_sync_request {
-            if entry.name.as_str() <= cutoff.as_str() {
+            if stamp_key(&entry.name) <= stamp_key(cutoff) {
                 continue;
             }
         }
@@ -396,6 +396,11 @@ where
     }
 
     Ok((map, new_last_sync_request))
+}
+
+/// Strip the `METHOD_STATUS_` prefix so entries sort and compare by timestamp.
+fn stamp_key(name: &str) -> &str {
+    name.splitn(3, '_').nth(2).unwrap_or(name)
 }
 
 fn parse_put(entry_bytes: &[u8], account_prefix: &str) -> io::Result<Option<(String, Metadata)>> {

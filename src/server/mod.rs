@@ -187,8 +187,12 @@ fn handle_parsed_inner(
         .as_deref()
         .and_then(|members| members.iter().find(|member| member.address == "*"));
 
+    let prefix: Option<String> = url.query_pairs()
+        .find(|(k, _)| k == "prefix")
+        .map(|(_, v)| v.into_owned());
+
     if public_member.is_some() && (method == "GET" || method == "HEAD") {
-        return serve_get(&fs_path, stream, method == "GET");
+        return serve_get(&fs_path, stream, method == "GET", prefix.as_deref());
     }
 
     let requestor_identity = match authenticate(server_ctx, &url, method, headers, body) {
@@ -233,9 +237,9 @@ fn handle_parsed_inner(
             if wants_stream {
                 return serve_stream(&fs_path, stream, verbose);
             }
-            serve_get(&fs_path, stream, true)
+            serve_get(&fs_path, stream, true, prefix.as_deref())
         },
-        "HEAD" => serve_get(&fs_path, stream, false),
+        "HEAD" => serve_get(&fs_path, stream, false, prefix.as_deref()),
         "PUT" => {
             let metadata = metadata.as_ref().expect("metadata presence checked above");
             let modifier = modifier_identity.as_ref().expect("modifier presence checked above");
