@@ -46,6 +46,12 @@ pub fn create_server_context(server_root: &Path, host: &str) -> io::Result<Ident
         });
         sign_metadata(&secret_key, &mut metadata, Some(&body))?;
         write_metadata_attributes(&identity_path, &metadata)?;
+
+        return Ok(IdentityContext {
+            root,
+            identity,
+            identity_key: Some(secret_key),
+        });
     }
 
     read_context(&root)

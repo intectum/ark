@@ -284,7 +284,7 @@ fn main() {
         Cmd::Get { output, decrypt, path } => create_client_context().and_then(|c| get(&c, &path, output.as_deref(), decrypt)),
         Cmd::List { prefix, path } => create_client_context().and_then(|c| list_cli(&c, &path, prefix.as_deref())),
         Cmd::Identity { cmd } => create_client_context().and_then(|c| match cmd {
-            IdentityCmd::Create { path, member } => create_identity(&c, &path, &member),
+            IdentityCmd::Create { path, member } => create_identity(&c, &path, &member).map(|_| ()),
             IdentityCmd::Members { path, add, drop } => change_identity_members(&c, &path, &add, &drop),
         }),
         Cmd::Proposals { cmd } => create_client_context().and_then(|c| match cmd {

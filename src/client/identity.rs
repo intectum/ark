@@ -8,7 +8,7 @@ use crate::identity::{
     validate_identity, write_identity, write_identity_key,
 };
 use crate::permissions::{reader, readers};
-use crate::types::{IdentityContext, Key, Permissions};
+use crate::types::{Identity, IdentityContext, Key, Permissions};
 use crate::util::{io_invalid_input, resolve_address, resolve_local_path};
 
 /// Create an identity (keypair document) at `path`.
@@ -24,7 +24,9 @@ use crate::util::{io_invalid_input, resolve_address, resolve_local_path};
 /// identity document and each is granted `reader` on the encrypted private key.
 /// Members must be regular account addresses — nested groups are not supported.
 /// With no members, the identity has no `members` field.
-pub fn create_identity(ctx: &IdentityContext, path: &str, members: &[String]) -> io::Result<()> {
+///
+/// Returns the new [`Identity`] and its secret [`Key`].
+pub fn create_identity(ctx: &IdentityContext, path: &str, members: &[String]) -> io::Result<(Identity, Key)> {
     if !path.ends_with(".json") {
         return Err(io_invalid_input("path must end with .json"));
     }
@@ -72,7 +74,7 @@ pub fn create_identity(ctx: &IdentityContext, path: &str, members: &[String]) ->
     put(ctx, &address, local_path.to_str(), &reader("public"), Some("none"), false)?;
     put(ctx, &key_path_for(path), key_path.to_str(), &key_permissions, None, false)?;
 
-    Ok(())
+    Ok((identity, secret_key))
 }
 
 /// Add and/or drop members on an identity at `path`.
@@ -193,12 +195,10 @@ mod tests {
             let ctx = init_with_server(temp_dir, &alice_address);
             cache_identity(&ctx.root, &bob_identity);
 
-            create_identity(&ctx, "team.json", std::slice::from_ref(&bob_address)).unwrap();
+            let (identity, _) = create_identity(&ctx, "team.json", std::slice::from_ref(&bob_address)).unwrap();
 
             let expected_address = format!("{}/team.json", alice_address);
 
-            let local_identity_path = temp_dir.join("team.json");
-            let identity = read_identity(&local_identity_path).unwrap();
             assert_eq!(identity.address, expected_address);
             let members = identity.members.as_ref().expect("members set");
             assert_eq!(members, &vec![bob_address.clone()]);
@@ -238,11 +238,11 @@ mod tests {
             let address = format!("alice@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &address);
 
-            create_identity(&ctx, "team.json", &[]).unwrap();
+            let (identity, secret_key) = create_identity(&ctx, "team.json", &[]).unwrap();
 
-            let identity = read_identity(&temp_dir.join("team.json")).unwrap();
             assert!(identity.members.is_none());
             assert_eq!(identity.address, format!("{}/team.json", address));
+            assert!(!secret_key.value.is_empty());
 
             let key_path = temp_dir.join("team.key");
             assert!(key_path.exists());
@@ -258,9 +258,8 @@ mod tests {
             let address = format!("alice@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &address);
 
-            create_identity(&ctx, "contacts/team.json", &[]).unwrap();
+            let (identity, _) = create_identity(&ctx, "contacts/team.json", &[]).unwrap();
 
-            let identity = read_identity(&temp_dir.join("contacts/team.json")).unwrap();
             assert_eq!(identity.address, format!("{}/contacts/team.json", address));
             assert!(temp_dir.join("contacts/team.key").exists());
             assert!(temp_dir.join("ark/alice/contacts/team.json").exists());
@@ -286,9 +285,8 @@ mod tests {
             let address = format!("alice@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &address);
 
-            create_identity(&ctx, "/groups/team.json", &[]).unwrap();
+            let (identity, _) = create_identity(&ctx, "/groups/team.json", &[]).unwrap();
 
-            let identity = read_identity(&temp_dir.join("groups/team.json")).unwrap();
             assert_eq!(identity.address, format!("{}/groups/team.json", address));
             assert!(temp_dir.join("groups/team.key").exists());
             assert!(temp_dir.join("ark/alice/groups/team.json").exists());
@@ -305,9 +303,8 @@ mod tests {
             // Same-account address form; local files still land under the path portion
             // of the address.
             let path = format!("{}/team.json", alice_address);
-            create_identity(&ctx, &path, &[]).unwrap();
+            let (identity, _) = create_identity(&ctx, &path, &[]).unwrap();
 
-            let identity = read_identity(&temp_dir.join("team.json")).unwrap();
             assert_eq!(identity.address, format!("{}/team.json", alice_address));
             assert!(temp_dir.join("team.key").exists());
             assert!(temp_dir.join("ark/alice/team.json").exists());
@@ -475,12 +472,11 @@ mod tests {
             let address = format!("alice@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &address);
 
-            create_identity(&ctx, "team.json", &[]).unwrap();
+            let (identity, _) = create_identity(&ctx, "team.json", &[]).unwrap();
 
             set_current_dir(temp_dir).unwrap();
             let _ = create_client_context().unwrap();
 
-            let identity = read_identity(&temp_dir.join("team.json")).unwrap();
             validate_identity(&identity).unwrap();
         });
     }
@@ -678,8 +674,7 @@ mod tests {
             let ctx = init_with_server(temp_dir, &alice_address);
             cache_identity(&ctx.root, &bob_identity);
 
-            create_identity(&ctx, "team.json", &[]).unwrap();
-            let identity = read_identity(&temp_dir.join("team.json")).unwrap();
+            let (identity, _) = create_identity(&ctx, "team.json", &[]).unwrap();
             assert!(identity.members.is_none());
 
             let group_address = format!("{}/team.json", alice_address);
