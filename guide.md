@@ -183,7 +183,7 @@ let ctx = Arc::new(ctx);
 
 **One thread, not two — for file/dir events.** `sync(watch=true)` handles both push (local → remote) and pull (remote → local) internally. You don't need a separate watcher.
 
-**Proposals are the exception.** Share proposals — unauthorized PUTs recorded in the request log — are *not* on the watch stream today. See [§7](#7-accepting-share-proposals).
+**Proposals are the exception.** Share proposals — unauthorized PUTs recorded in the request log — are *not* on the sync stream; they have their own watcher. See [§7](#7-accepting-share-proposals).
 
 ---
 
@@ -229,7 +229,19 @@ Accept all proposal IDs in the group in one user action.
 
 ### Discovering new proposals
 
-Because proposals aren't on the sync watch stream, poll `list_proposals` on an interval (30s is usually fine for interactive apps) *and* re-poll immediately after any accept/reject so the UI reflects the new state without waiting for the tick. A small `mpsc::channel` trigger works well: the poller loops on `recv_timeout(interval)` and re-runs whenever a message arrives or the timer expires.
+`watch_proposals` streams proposals arriving at a path or below it. It blocks like `sync(watch=true)`, so run it on its own thread, and it only reports proposals logged after the call started — call `list_proposals` first for the pending ones.
+
+```rust
+use ark::client::watch_proposals;
+
+watch_proposals(&ctx, "/apps/notes", |p| {
+    // Same Proposal as list_proposals returns; accept/reject by p.id.
+    let _ = tx.send(p);
+    false // true stops the watcher
+}, |e| { eprintln!("proposals: {}", e); false })?;
+```
+
+It rides the same server-sent event stream as sync, so a dropped connection reconnects on its own, but proposals logged while disconnected are missed. Re-run `list_proposals` after any reconnect error — and after any accept/reject, so the UI reflects the new state.
 
 ---
 

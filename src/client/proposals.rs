@@ -1,12 +1,22 @@
+use std::collections::HashSet;
 use std::io;
+use std::thread::sleep;
+use std::time::Duration;
 
-use super::{delete, get_stream, head, list, request};
+use super::{delete, get_stream, head, list, request, watch_remote};
 
 use crate::http::check_response_code;
 use crate::identity::parse_address;
 use crate::metadata::{read_metadata_headers, write_metadata_headers};
-use crate::types::{IdentityContext, Metadata, Permission, Proposal};
+use crate::types::{EntryAction, IdentityContext, Metadata, Permission, Proposal};
 use crate::util::{parse_request_entry, resolve_client_url, sha256};
+
+// A log entry's body lands before its metadata does, so a fetch triggered by
+// the create event can arrive too early to verify.
+// TODO: drop the retry once log entries are written temp+rename, the create
+// event then fires on a complete entry
+const ENTRY_FETCH_ATTEMPTS: usize = 5;
+const ENTRY_FETCH_DELAY: Duration = Duration::from_millis(100);
 
 /// List pending share proposals — requests where another account's PUT was
 /// rejected with `403` at a path the current account owns. Returned in
@@ -35,6 +45,55 @@ pub fn list_proposals(ctx: &IdentityContext) -> io::Result<Vec<Proposal>> {
     proposals.sort_by(|a, b| a.id.cmp(&b.id));
 
     Ok(proposals)
+}
+
+/// Watch for share proposals arriving at `path` or below it and invoke
+/// `on_proposal` for each. Blocks; auto-reconnects like
+/// [`crate::client::watch_remote`]. Either callback returning `true` stops the
+/// watcher; `on_error` receives stream and fetch errors.
+///
+/// `path` accepts relative, absolute account (leading `/`), or address form
+/// (`<name>@<host>/...`); use `/` for every path in the account.
+///
+/// Only proposals logged after the call started are reported, so callers
+/// wanting the pending ones too should call [`list_proposals`] first.
+pub fn watch_proposals<F, G>(ctx: &IdentityContext, path: &str, mut on_proposal: F, on_error: G) -> io::Result<()>
+where
+    F: FnMut(Proposal) -> bool,
+    G: Fn(io::Error) -> bool,
+{
+    let target_prefix = resolve_client_url(ctx, path)?.path().trim_end_matches('/').to_string();
+    let requests_url = resolve_client_url(ctx, "/.ark/requests/")?;
+
+    let mut reported: HashSet<String> = HashSet::new();
+
+    watch_remote(ctx, &requests_url, |event| {
+        match event.action {
+            EntryAction::Created | EntryAction::Modified => {}
+            _ => return false,
+        }
+
+        let id = event.path.to_string_lossy().into_owned();
+        if !id.starts_with("PUT_403_") || !id.ends_with(".http") { return false; }
+        if reported.contains(&id) { return false; }
+
+        let proposal = match fetch_proposal(ctx, &id) {
+            Ok(Some(p)) => p,
+            Ok(None) => return false,
+            Err(e) => {
+                on_error(io::Error::other(format!("proposal {}: {}", id, e)));
+                return false;
+            }
+        };
+
+        reported.insert(id);
+
+        let under_target = proposal.target == target_prefix
+            || proposal.target.starts_with(&format!("{}/", target_prefix));
+        if !under_target { return false; }
+
+        on_proposal(proposal)
+    }, &on_error)
 }
 
 /// Accept a share proposal. `index_or_id`: 1-based index (from
@@ -129,6 +188,23 @@ fn resolve_id(ctx: &IdentityContext, index_or_id: &str) -> io::Result<String> {
     }
 }
 
+fn fetch_proposal(ctx: &IdentityContext, id: &str) -> io::Result<Option<Proposal>> {
+    let entry_path = format!("/.ark/requests/{}", id);
+
+    let mut last_error = None;
+    for attempt in 0..ENTRY_FETCH_ATTEMPTS {
+        if attempt > 0 { sleep(ENTRY_FETCH_DELAY); }
+
+        let mut entry_body: Vec<u8> = Vec::new();
+        match get_stream(ctx, &entry_path, &mut entry_body, false) {
+            Ok(_) => return parse_proposal(id, &entry_body),
+            Err(e) => last_error = Some(e),
+        }
+    }
+
+    Err(last_error.expect("at least one attempt"))
+}
+
 fn parse_proposal(filename: &str, entry_bytes: &[u8]) -> io::Result<Option<Proposal>> {
     let entry = parse_request_entry(entry_bytes)?;
 
@@ -196,7 +272,8 @@ mod tests {
     use std::env::{current_dir, set_current_dir};
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::thread::sleep;
+    use std::sync::mpsc::channel;
+    use std::thread::{sleep, spawn};
     use std::time::{Duration, Instant};
 
     use super::*;
@@ -305,6 +382,36 @@ mod tests {
             assert_eq!(fs::read(&alice_file).unwrap(), b"hello alice");
 
             assert_eq!(list_proposals(&alice_ctx).unwrap().len(), 0, "log entry should be deleted");
+        });
+    }
+
+    #[test]
+    fn watch_proposals_reports_new_403_puts_under_path() {
+        in_test_dir("ark_proposals_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let (alice_ctx, bob_ctx) = setup(temp_dir, port);
+
+            let (tx, rx) = channel();
+            // Detached: on failure `watch_proposals` never returns, so joining
+            // it would hang the test rather than fail it.
+            spawn(move || {
+                let _ = watch_proposals(&alice_ctx, "/apps/notes", |proposal| {
+                    let _ = tx.send(proposal);
+                    true
+                }, |_| false);
+            });
+            sleep(Duration::from_millis(500));
+
+            set_current_dir(temp_dir.join("bob_client")).unwrap();
+            let payload = write_payload(&temp_dir.join("bob_client"), "payload.bin", b"hello");
+            let outside_target = format!("alice@127.0.0.1:{}/docs/other.md", port);
+            let _ = put(&bob_ctx, &outside_target, Some(payload.to_str().unwrap()), &Permissions::default(), Some("none"), false);
+            let target = format!("alice@127.0.0.1:{}/apps/notes/foo.md", port);
+            let _ = put(&bob_ctx, &target, Some(payload.to_str().unwrap()), &Permissions::default(), Some("none"), false);
+
+            let proposal = rx.recv_timeout(Duration::from_secs(10)).expect("expected a proposal");
+            assert_eq!(proposal.target, "/ark/alice/apps/notes/foo.md");
+            assert_eq!(proposal.metadata.modified_by, bob_ctx.identity.address);
         });
     }
 
