@@ -6,7 +6,6 @@ use crate::identity::read_identity;
 use crate::metadata::{create_metadata, read_metadata_attributes, sign_metadata, write_metadata_attributes};
 use crate::timestamp;
 use crate::types::{IdentityContext, Member, Permission};
-use crate::util::io_err;
 
 const LOG_CAPTURE_LIMIT: usize = 16 * 1024;
 
@@ -60,7 +59,7 @@ pub fn try_log_request(
     };
 
     let server_root = server_ctx.root.parent().and_then(|p| p.parent())
-        .ok_or_else(|| io_err("server root not resolvable"))?;
+        .ok_or_else(|| io::Error::other("server root not resolvable"))?;
     let target_root = server_root.join("ark").join(name);
     let requests_dir = target_root.join(".ark").join("requests");
 
@@ -115,7 +114,7 @@ pub fn try_log_request(
         },
     ];
     let secret_key = server_ctx.identity_key.as_ref()
-        .ok_or_else(|| io_err("server context missing identity_key"))?;
+        .ok_or_else(|| io::Error::other("server context missing identity_key"))?;
     sign_metadata(secret_key, &mut metadata, Some(&entry))?;
     write_metadata_attributes(&entry_path, &metadata)?;
 
@@ -145,7 +144,7 @@ fn allocate_entry_path(dir: &Path, method: &str, status: u16) -> io::Result<Path
             return Ok(candidate);
         }
     }
-    Err(io_err("could not allocate unique log filename"))
+    Err(io::Error::other("could not allocate unique log filename"))
 }
 
 #[cfg(test)]

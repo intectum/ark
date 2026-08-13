@@ -9,7 +9,6 @@ use crate::client::watch_local;
 use crate::http::{write_stream_event, write_stream_keepalive, write_stream_start};
 use crate::timestamp;
 use crate::types::{DirEntry, DirEntryKind, EntryEvent};
-use crate::util::io_err;
 
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
@@ -55,6 +54,6 @@ fn write_event(stream: &mut dyn Write, root: &Path, path: &Path, name: &str, kin
         name: path.strip_prefix(root).unwrap_or(path).to_string_lossy().into_owned(),
     };
 
-    let json = serde_json::to_string(&entry).map_err(|e| io_err(&e.to_string()))?;
+    let json = serde_json::to_string(&entry).map_err(|e| io::Error::other(e.to_string()))?;
     write_stream_event(stream, &timestamp::now_ms().to_string(), name, &json)
 }

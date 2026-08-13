@@ -7,8 +7,9 @@ use url::Url;
 
 use crate::client::request;
 use crate::crypto::{DEFAULT_SIGNING_ALGORITHM, create_secret_key, sign_json, to_public_key, verify_json};
+use crate::http::check_response_code;
 use crate::types::{Identity, IdentityContext, Key, Signature};
-use crate::util::{decode_base64url, encode_base64url, io_err, io_invalid_input, resolve_client_url};
+use crate::util::{decode_base64url, encode_base64url, resolve_client_url};
 
 /// Create a fresh identity keypair for `address`.
 ///
@@ -18,7 +19,7 @@ pub fn create_identity(address: &str, members: Option<Vec<String>>) -> io::Resul
     let mut secret_key = create_secret_key(DEFAULT_SIGNING_ALGORITHM)?;
 
     getrandom(&mut secret_key.value)
-        .map_err(|e| io_err(&e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
 
     let mut identity = Identity {
         public_key: to_public_key(&secret_key)?,
@@ -39,7 +40,7 @@ pub fn create_identity(address: &str, members: Option<Vec<String>>) -> io::Resul
 pub fn read_identity(path: &Path) -> io::Result<Identity> {
     let content = fs::read_to_string(path)?;
     let identity: Identity = serde_json::from_str(&content)
-        .map_err(|e| io_err(&format!("identity.json parse: {}", e)))?;
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("identity.json parse: {}", e)))?;
     validate_identity(&identity)?;
 
     Ok(identity)
@@ -74,12 +75,10 @@ pub fn resolve_identity(ctx: &IdentityContext, address: &str) -> io::Result<Iden
 
     let url = resolve_client_url(ctx, &format!("{}@{}{}", name, host, path))?;
     let (code, _, body) = request(Some(ctx), "GET", &url, &[], &[])?;
-    if code != 200 {
-        return Err(io_err(&format!("HTTP {}: {}", code, String::from_utf8_lossy(&body))));
-    }
+    check_response_code(code, &body)?;
 
     let identity: Identity = serde_json::from_slice(&body)
-        .map_err(|e| io_err(&format!("identity.json parse: {}", e)))?;
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("identity.json parse: {}", e)))?;
     validate_identity(&identity)?;
 
     fs::create_dir_all(&cache_dir)?;
@@ -90,7 +89,7 @@ pub fn resolve_identity(ctx: &IdentityContext, address: &str) -> io::Result<Iden
 
 pub fn write_identity(path: &Path, identity: &Identity) -> io::Result<()> {
     let pretty = serde_json::to_string_pretty(identity)
-        .map_err(|e| io_err(&e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
     fs::write(path, pretty)
 }
 
@@ -105,11 +104,11 @@ pub fn validate_identity(identity: &Identity) -> io::Result<()> {
     let (name, _, _) = parse_address(&identity.address)?;
 
     if !is_valid_account_name(&name) {
-        return Err(io_invalid_input("invalid account name (must be lowercase alphanumeric, dots, hyphens, underscores; 1-64 chars; not pure dots)"));
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid account name (must be lowercase alphanumeric, dots, hyphens, underscores; 1-64 chars; not pure dots)"));
     }
 
     verify_identity(identity)
-        .map_err(|_| io_invalid_input("signature verification failed"))?;
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "signature verification failed"))?;
 
     Ok(())
 }
@@ -118,19 +117,19 @@ pub fn verify_identity(identity: &Identity) -> io::Result<()> {
     let json = serde_json::to_value(identity_for_signing(identity)).expect("serialize identity");
 
     verify_json(&identity.public_key, &identity.signature, &json)
-        .map_err(|_| io_err("identity signature verification failed"))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "identity signature verification failed"))
 }
 
 /// Split `<name>@<host>[:<port>][/<path>]` into name, host (with port when
 /// given) and path. The path is empty when the address omits one.
 pub fn parse_address(address: &str) -> io::Result<(String, String, String)> {
     let url = Url::parse(&format!("https://{}", address))
-        .map_err(|_| io_invalid_input("invalid address"))?;
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid address"))?;
 
     let name = url.username();
     let host_str = url.host_str();
     if name.is_empty() || host_str.is_none() {
-        return Err(io_invalid_input("address must be <name>@<host>[/<path>]"));
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "address must be <name>@<host>[/<path>]"));
     }
     let host = match url.port() {
         Some(port) => format!("{}:{}", host_str.unwrap(), port),
@@ -156,7 +155,7 @@ fn identity_for_signing(identity: &Identity) -> Identity {
 pub fn read_identity_key(path: &Path) -> io::Result<Vec<u8>> {
     let content = fs::read_to_string(path)?;
     let key = decode_base64url(content)
-        .map_err(|_| io_invalid_input("public key is not base64url encoded"))?;
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "public key is not base64url encoded"))?;
 
     Ok(key)
 }

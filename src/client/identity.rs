@@ -9,7 +9,7 @@ use crate::identity::{
 };
 use crate::permissions::{reader, readers};
 use crate::types::{Identity, IdentityContext, Key, Permissions};
-use crate::util::{io_invalid_input, resolve_address, resolve_local_path};
+use crate::util::{resolve_address, resolve_local_path};
 
 /// Create an identity (keypair document) at `path`.
 ///
@@ -28,7 +28,7 @@ use crate::util::{io_invalid_input, resolve_address, resolve_local_path};
 /// Returns the new [`Identity`] and its secret [`Key`].
 pub fn create_identity(ctx: &IdentityContext, path: &str, members: &[String]) -> io::Result<(Identity, Key)> {
     if !path.ends_with(".json") {
-        return Err(io_invalid_input("path must end with .json"));
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "path must end with .json"));
     }
 
     let local_path = resolve_local_path(ctx, path)?;
@@ -97,11 +97,11 @@ pub fn change_identity_members(
     drop: &[String],
 ) -> io::Result<()> {
     if !path.ends_with(".json") {
-        return Err(io_invalid_input("path must end with .json"));
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "path must end with .json"));
     }
 
     if add.is_empty() && drop.is_empty() {
-        return Err(io_invalid_input("at least one add or drop address is required"));
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "at least one add or drop address is required"));
     }
 
     let local_path = resolve_local_path(ctx, path)?;

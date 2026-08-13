@@ -11,7 +11,7 @@ use crate::permissions::cli_address_to_wire;
 use crate::timestamp;
 use crate::types::{Hash, Key, LocalMetadata, Member, Metadata, Permission, Permissions, Signature};
 use crate::types::IdentityContext;
-use crate::util::{decode_base64url, encode_base64url, io_err, io_invalid_input, sha256};
+use crate::util::{decode_base64url, encode_base64url, sha256};
 
 const ATTRIBUTE_PREFIX: &str = "user.ark.";
 const LOCAL_ATTRIBUTE_PREFIX: &str = "user.ark_local.";
@@ -83,7 +83,7 @@ pub fn read_metadata_attributes(path: &Path) -> io::Result<Metadata> {
 
         let value = match xattr::get(path, &name)? {
             Some(v) => String::from_utf8(v)
-                .map_err(|_| io_err(&format!("xattr {} not utf8", name)))?,
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, format!("xattr {} not utf8", name)))?,
             None => continue,
         };
 
@@ -152,7 +152,7 @@ pub fn read_local_metadata_attributes(path: &Path) -> io::Result<LocalMetadata> 
 
         let value = match xattr::get(path, &name)? {
             Some(v) => String::from_utf8(v)
-                .map_err(|_| io_err(&format!("xattr {} not utf8", name)))?,
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, format!("xattr {} not utf8", name)))?,
             None => continue,
         };
 
@@ -161,7 +161,7 @@ pub fn read_local_metadata_attributes(path: &Path) -> io::Result<LocalMetadata> 
                 local.encrypted = match value.trim() {
                     "true" => Some(true),
                     "false" => Some(false),
-                    other => return Err(io_err(&format!("encrypted local attribute invalid: {}", other))),
+                    other => return Err(io::Error::new(io::ErrorKind::InvalidData, format!("encrypted local attribute invalid: {}", other))),
                 };
             }
             LOCAL_FIELD_SYNC_BODY_HASH_ALGORITHM => {
@@ -169,7 +169,7 @@ pub fn read_local_metadata_attributes(path: &Path) -> io::Result<LocalMetadata> 
             }
             LOCAL_FIELD_SYNC_BODY_HASH_VALUE => {
                 sync_body_hash_value = Some(decode_base64url(value)
-                    .map_err(|_| io_err("sync_body_hash_value is not base64url encoded"))?);
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "sync_body_hash_value is not base64url encoded"))?);
             }
             LOCAL_FIELD_SYNC_MODIFIED => {
                 local.sync_modified = Some(timestamp::parse(&value)?);
@@ -212,6 +212,10 @@ pub fn remove_local_metadata_attributes(path: &Path) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+pub fn has_metadata_headers(headers: &[(String, String)]) -> bool {
+    headers.iter().any(|(name, _)| get_metadata_key(name).as_deref() == Some(FIELD_ID))
 }
 
 pub fn read_metadata_headers(headers: &[(String, String)]) -> io::Result<Metadata> {
@@ -260,7 +264,7 @@ pub fn write_metadata_headers(metadata: &Metadata) -> Vec<(String, String)> {
 
 pub fn validate_metadata(metadata: &Metadata) -> io::Result<()> {
     if !metadata.members.iter().any(|m| m.permission == Permission::Owner) {
-        return Err(io_err("metadata must contain at least one owner"));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "metadata must contain at least one owner"));
     }
 
     Ok(())
@@ -284,7 +288,7 @@ pub fn apply_permissions(
     }
 
     if !metadata.members.iter().any(|m| m.permission == Permission::Owner) {
-        return Err(io_invalid_input("at least one owner must remain"));
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "at least one owner must remain"));
     }
 
     Ok(())
@@ -376,9 +380,9 @@ pub fn resolve_key_from_members(ctx: &IdentityContext, members: &[Member]) -> io
             }
 
             let encoded = String::from_utf8(plaintext)
-                .map_err(|_| io_err("group key is not utf8"))?;
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "group key is not utf8"))?;
             decode_base64url(encoded)
-                .map_err(|_| io_err("group key is not base64url encoded"))?
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "group key is not base64url encoded"))?
         } else {
             read_identity_key(&key_path)?
         };
@@ -396,7 +400,7 @@ pub fn resolve_key_from_members(ctx: &IdentityContext, members: &[Member]) -> io
         return decrypt_bytes(&group_key, &encrypted_file_key.value).map(Some);
     }
 
-    Err(io_err(&format!("no member entry for {}", ctx.identity.address)))
+    Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("no member entry for {}", ctx.identity.address)))
 }
 
 pub fn sign_metadata(secret_key: &Key, metadata: &mut Metadata, body: Option<&[u8]>) -> io::Result<()> {
@@ -416,7 +420,7 @@ pub fn sign_metadata(secret_key: &Key, metadata: &mut Metadata, body: Option<&[u
 pub fn verify_metadata_signature(public_key: &Key, metadata: &Metadata) -> io::Result<()> {
     let json = serde_json::to_value(metadata_for_signing(metadata)).expect("serialize metadata");
     verify_json(public_key, &metadata.signature, &json)
-        .map_err(|_| io_err("metadata signature verification failed"))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "metadata signature verification failed"))
 }
 
 pub fn verify_metadata(public_key: &Key, metadata: &Metadata, body: Option<&[u8]>) -> io::Result<()> {
@@ -425,11 +429,11 @@ pub fn verify_metadata(public_key: &Key, metadata: &Metadata, body: Option<&[u8]
     match (body, &metadata.body_hash) {
         (Some(b), Some(hash)) => {
             if hash.value != sha256(b) {
-                return Err(io_err("body hash mismatch"));
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "body hash mismatch"));
             }
         }
-        (Some(_), None) => return Err(io_err("file metadata must contain body_hash")),
-        (None, Some(_)) => return Err(io_err("dir metadata must not contain body_hash")),
+        (Some(_), None) => return Err(io::Error::new(io::ErrorKind::InvalidData, "file metadata must contain body_hash")),
+        (None, Some(_)) => return Err(io::Error::new(io::ErrorKind::InvalidData, "dir metadata must not contain body_hash")),
         (None, None) => {}
     }
 
@@ -454,7 +458,7 @@ fn apply_permission(
     for addr in addresses {
         let wire = cli_address_to_wire(addr);
         if wire == "*" && encrypted {
-            return Err(io_invalid_input("cannot add public member to encrypted file"));
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "cannot add public member to encrypted file"));
         }
 
         match members.iter_mut().find(|m| m.address == wire) {
@@ -541,10 +545,10 @@ fn apply_field(metadata: &mut PartialMetadata, key: &str, value: &str) -> io::Re
         FIELD_ENCRYPTION_ALGORITHM => metadata.encryption_algorithm = Some(value.to_string()),
         FIELD_BODY_HASH_ALGORITHM => metadata.body_hash_algorithm = Some(value.to_string()),
         FIELD_BODY_HASH_VALUE => metadata.body_hash_value = Some(decode_base64url(value)
-            .map_err(|_| io_err("body_hash_value is not base64url encoded"))?),
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "body_hash_value is not base64url encoded"))?),
         FIELD_SIGNATURE_ALGORITHM => metadata.signature_algorithm = Some(value.to_string()),
         FIELD_SIGNATURE_VALUE => metadata.signature_value = Some(decode_base64url(value)
-            .map_err(|_| io_err("signature is not base64url encoded"))?),
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "signature is not base64url encoded"))?),
         _ => {
             if let Some((index, member_field_key)) = split_member_key(&metadata_key) {
                 while metadata.members.len() <= index {
@@ -554,11 +558,11 @@ fn apply_field(metadata: &mut PartialMetadata, key: &str, value: &str) -> io::Re
                 match member_field_key.as_str() {
                     FIELD_MEMBER_ADDRESS => metadata.members[index].address = Some(value.to_string()),
                     FIELD_MEMBER_PERMISSION => metadata.members[index].permission = Some(
-                        Permission::parse(value).ok_or_else(|| io_err(&format!("unknown permission: {}", value)))?
+                        Permission::parse(value).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("unknown permission: {}", value)))?
                     ),
                     FIELD_MEMBER_KEY_ALGORITHM => metadata.members[index].key_algorithm = Some(value.to_string()),
                     FIELD_MEMBER_KEY_VALUE => metadata.members[index].key_value = Some(decode_base64url(value)
-                        .map_err(|_| io_err("key_value is not base64url encoded"))?),
+                        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "key_value is not base64url encoded"))?),
                     _ => {}
                 }
             }
@@ -569,16 +573,16 @@ fn apply_field(metadata: &mut PartialMetadata, key: &str, value: &str) -> io::Re
 }
 
 fn validate_partial_metadata(metadata: &PartialMetadata) -> io::Result<()> {
-    if metadata.id.is_none() { return Err(io_err("missing id field")); }
-    if metadata.created.is_none() { return Err(io_err("missing created field")); }
-    if metadata.modified.is_none() { return Err(io_err("missing modified field")); }
-    if metadata.modified_by.is_none() { return Err(io_err("missing modified_by field")); }
-    if metadata.signature_algorithm.is_none() { return Err(io_err("missing signature_algorithm field")); }
-    if metadata.signature_value.is_none() { return Err(io_err("missing signature field")); }
+    if metadata.id.is_none() { return Err(io::Error::new(io::ErrorKind::InvalidData, "missing id field")); }
+    if metadata.created.is_none() { return Err(io::Error::new(io::ErrorKind::InvalidData, "missing created field")); }
+    if metadata.modified.is_none() { return Err(io::Error::new(io::ErrorKind::InvalidData, "missing modified field")); }
+    if metadata.modified_by.is_none() { return Err(io::Error::new(io::ErrorKind::InvalidData, "missing modified_by field")); }
+    if metadata.signature_algorithm.is_none() { return Err(io::Error::new(io::ErrorKind::InvalidData, "missing signature_algorithm field")); }
+    if metadata.signature_value.is_none() { return Err(io::Error::new(io::ErrorKind::InvalidData, "missing signature field")); }
 
     for member in &metadata.members {
-        if member.address.is_none() { return Err(io_err("missing member address field")); }
-        if member.permission.is_none() { return Err(io_err("missing member permission field")); }
+        if member.address.is_none() { return Err(io::Error::new(io::ErrorKind::InvalidData, "missing member address field")); }
+        if member.permission.is_none() { return Err(io::Error::new(io::ErrorKind::InvalidData, "missing member permission field")); }
     }
 
     Ok(())

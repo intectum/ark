@@ -1,7 +1,6 @@
 use std::env::current_dir;
 use std::fs;
 use std::io;
-use std::io::{Error, ErrorKind};
 use std::path::Path;
 
 use crate::identity::{create_identity, read_identity, read_identity_key, write_identity, write_identity_key};
@@ -19,7 +18,7 @@ pub fn create_client_context() -> io::Result<IdentityContext> {
     while !fs::exists(root.join(".ark"))? {
         root = root
             .parent()
-            .ok_or_else(|| Error::new(ErrorKind::NotFound, "no .ark dir found"))?;
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no .ark dir found"))?;
     }
 
     read_context(root)

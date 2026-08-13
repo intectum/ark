@@ -9,12 +9,11 @@ use rustls::pki_types::ServerName;
 use url::Url;
 
 use crate::types::{ReadWrite, StreamEvent};
-use crate::util::io_err;
 
 const PATH_ENCODE_SET: &AsciiSet = &CONTROLS.add(b' ').add(b'"').add(b'#').add(b'<').add(b'>').add(b'?').add(b'`').add(b'{').add(b'}');
 
 pub fn connect(url: &Url, read_timeout: Duration) -> io::Result<Box<dyn ReadWrite>> {
-    let host = url.host_str().ok_or_else(|| io_err("URL missing host"))?;
+    let host = url.host_str().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "URL missing host"))?;
     let https = url.scheme() == "https";
     let default_port = if https { 443 } else { 80 };
     let port = url.port().unwrap_or(default_port);
@@ -23,9 +22,9 @@ pub fn connect(url: &Url, read_timeout: Duration) -> io::Result<Box<dyn ReadWrit
 
     if https {
         let server_name = ServerName::try_from(host.to_string())
-            .map_err(|e| io_err(&format!("invalid TLS server name {}: {}", host, e)))?;
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid TLS server name {}: {}", host, e)))?;
         let connection = ClientConnection::new(tls_config(), server_name)
-            .map_err(|e| io_err(&format!("TLS setup failed: {}", e)))?;
+            .map_err(|e| io::Error::other(format!("TLS setup failed: {}", e)))?;
         Ok(Box::new(StreamOwned::new(connection, stream)))
     } else {
         Ok(Box::new(stream))
@@ -37,7 +36,7 @@ pub fn read_request(stream: &mut dyn Read, skip_body: bool) -> io::Result<(Strin
 
     let request_line_parts: Vec<&str> = first_line.split_whitespace().collect();
     if request_line_parts.len() != 3 {
-        return Err(io_err("bad request line"));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad request line"));
     }
 
     let method = request_line_parts[0].to_string();
@@ -45,13 +44,13 @@ pub fn read_request(stream: &mut dyn Read, skip_body: bool) -> io::Result<(Strin
     let target = percent_decode_str(request_line_parts[1])
         .decode_utf8()
         .map(|s| s.into_owned())
-        .map_err(|_| io_err("invalid percent-encoded path"))?;
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid percent-encoded path"))?;
 
     Ok((method, target, headers, body))
 }
 
 pub fn write_request(stream: &mut dyn Write, url: &Url, method: &str, headers: &[(&str, &str)], body: &[u8]) -> io::Result<()> {
-    let host = url.host_str().ok_or_else(|| io_err("URL missing host"))?;
+    let host = url.host_str().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "URL missing host"))?;
     let target = match url.query() {
         Some(q) => format!("{}?{}", utf8_percent_encode(url.path(), PATH_ENCODE_SET), q),
         None => utf8_percent_encode(url.path(), PATH_ENCODE_SET).to_string(),
@@ -75,9 +74,9 @@ pub fn read_response(stream: &mut dyn Read, skip_body: bool) -> io::Result<(u16,
     let code: u16 = first_line
         .split_whitespace()
         .nth(1)
-        .ok_or_else(|| io_err("no status code"))?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no status code"))?
         .parse()
-        .map_err(|_| io_err("bad status code"))?;
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad status code"))?;
 
     Ok((code, headers, body))
 }
@@ -110,17 +109,17 @@ where
 
     let mut status = String::new();
     if reader.read_line(&mut status)? == 0 {
-        return Err(io_err("connection closed before status"));
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed before status"));
     }
 
     if !status.starts_with("HTTP/1.1 200") {
-        return Err(io_err(&format!("stream open failed: {}", status.trim_end())));
+        return Err(io::Error::other(format!("stream open failed: {}", status.trim_end())));
     }
 
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line)? == 0 {
-            return Err(io_err("connection closed in headers"));
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed in headers"));
         }
         if line.trim_end_matches(&['\r', '\n'][..]).is_empty() { break; }
     }
@@ -130,7 +129,7 @@ where
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line)? == 0 {
-            return Err(io_err("stream closed"));
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "stream closed"));
         }
         let line = line.trim_end_matches(&['\r', '\n'][..]);
 
@@ -171,12 +170,27 @@ pub fn write_stream_keepalive(stream: &mut dyn Write) -> io::Result<()> {
     stream.flush()
 }
 
+pub fn check_response_code(code: u16, body: &[u8]) -> io::Result<()> {
+    if (200..300).contains(&code) {
+        return Ok(());
+    }
+
+    let message = format!("HTTP {}: {}", code, String::from_utf8_lossy(body));
+    match code {
+        400 => Err(io::Error::new(io::ErrorKind::InvalidInput, message)),
+        401 | 403 => Err(io::Error::new(io::ErrorKind::PermissionDenied, message)),
+        404 => Err(io::Error::new(io::ErrorKind::NotFound, message)),
+        405 => Err(io::Error::new(io::ErrorKind::Unsupported, message)),
+        _ => Err(io::Error::other(message)),
+    }
+}
+
 fn read_message(stream: &mut dyn Read, skip_body: bool) -> io::Result<(String, Vec<(String, String)>, Vec<u8>)> {
     let mut reader = BufReader::new(stream);
 
     let mut first_line = String::new();
     if reader.read_line(&mut first_line)? == 0 {
-        return Err(io_err("empty message"));
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "empty message"));
     }
 
     let mut headers = Vec::new();
@@ -212,7 +226,7 @@ fn read_message(stream: &mut dyn Read, skip_body: bool) -> io::Result<(String, V
     Ok((first_line, headers, body))
 }
 
-pub fn write_message(stream: &mut dyn Write, first_line: &str, headers: &[(&str, &str)], body: &[u8]) -> io::Result<()> {
+fn write_message(stream: &mut dyn Write, first_line: &str, headers: &[(&str, &str)], body: &[u8]) -> io::Result<()> {
     stream.write_all(first_line.as_bytes())?;
 
     let mut final_headers = headers.to_vec();

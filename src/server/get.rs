@@ -5,7 +5,6 @@ use std::path::Path;
 use crate::http::{write_response, write_text};
 use crate::metadata::{read_metadata_attributes, write_metadata_headers};
 use crate::types::{DirEntry, DirEntryKind};
-use crate::util::io_err;
 
 pub fn serve_get(fs_path: &Path, stream: &mut dyn Write, send_body: bool, prefix: Option<&str>) -> io::Result<()> {
     let fs_metadata = match fs::metadata(fs_path) {
@@ -69,7 +68,7 @@ fn list_dir(path: &Path, prefix: Option<&str>) -> io::Result<String> {
             })
         })
         .collect::<io::Result<_>>()?;
-    serde_json::to_string(&items).map_err(|e| io_err(&e.to_string()))
+    serde_json::to_string(&items).map_err(|e| io::Error::other(e.to_string()))
 }
 
 fn content_type(path: &Path) -> &'static str {

@@ -1,6 +1,5 @@
 use std::env::current_dir;
 use std::io;
-use std::io::{Error, ErrorKind};
 use std::path::{Component, Path, PathBuf};
 
 use base64::{DecodeError, Engine};
@@ -61,7 +60,7 @@ pub fn resolve_client_url_raw(root: &Path, path: &str, address: &str) -> io::Res
     }
 
     let mut url = Url::parse(&s)
-        .map_err(|e| io_invalid_input(&format!("invalid URL {}: {}", path, e)))?;
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid URL {}: {}", path, e)))?;
 
     if !had_scheme && url.host_str().map(is_loopback_host).unwrap_or(false) {
         url.set_scheme("http").expect("http is a valid scheme");
@@ -89,7 +88,7 @@ pub fn resolve_local_path(ctx: &IdentityContext, path: &str) -> io::Result<PathB
 
 pub fn resolve_server_url(path: &str) -> io::Result<Url> {
     let url = Url::parse(&format!("http://localhost{}", path))
-        .map_err(|e| io_invalid_input(&format!("invalid URL {}: {}", path, e)))?;
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("invalid URL {}: {}", path, e)))?;
 
     reject_path_traversal(&url)?;
 
@@ -103,7 +102,7 @@ pub fn is_loopback_host(host: &str) -> bool {
 fn reject_path_traversal(url: &Url) -> io::Result<()> {
     for component in Path::new(url.path()).components() {
         if matches!(component, Component::ParentDir) {
-            return Err(io_invalid_input("path traversal not allowed"));
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "path traversal not allowed"));
         }
     }
 
@@ -128,7 +127,7 @@ pub fn request_to_bytes(method: &str, host: &str, path: &str, timestamp: u64, bo
 
 pub fn parse_request_entry(entry_bytes: &[u8]) -> io::Result<RequestEntry> {
     let boundary = entry_bytes.windows(4).position(|w| w == b"\r\n\r\n")
-        .ok_or_else(|| io_err("no header separator"))?;
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no header separator"))?;
 
     let request_bytes = &entry_bytes[..boundary];
     let response_bytes = &entry_bytes[boundary + 4..];
@@ -140,7 +139,7 @@ pub fn parse_request_entry(entry_bytes: &[u8]) -> io::Result<RequestEntry> {
 }
 
 pub fn create_authorization_header(ctx: &IdentityContext, method: &str, host: &str, path: &str, timestamp: u64, body: &[u8]) -> io::Result<String> {
-    let identity_key = ctx.identity_key.as_ref().ok_or_else(|| io_err("context missing identity_key"))?;
+    let identity_key = ctx.identity_key.as_ref().ok_or_else(|| io::Error::other("context missing identity_key"))?;
     let request_bytes = request_to_bytes(method, host, path, timestamp, body);
     let signature = sign_bytes(identity_key, &request_bytes)?;
     Ok(format_authorization_header(
@@ -189,14 +188,6 @@ pub fn sha256(data: &[u8]) -> Vec<u8> {
     let mut hash = Sha256::new();
     hash.update(data);
     hash.finalize().to_vec()
-}
-
-pub fn io_err(s: &str) -> Error {
-    Error::other(s.to_string())
-}
-
-pub fn io_invalid_input(msg: &str) -> Error {
-    Error::new(ErrorKind::InvalidInput, msg.to_string())
 }
 
 #[cfg(test)]

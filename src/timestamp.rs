@@ -9,8 +9,6 @@ use time::format_description::well_known::Rfc3339;
 use time::macros::format_description;
 use time::OffsetDateTime;
 
-use crate::util::io_err;
-
 const OUTPUT_FORMAT: &[FormatItem<'static>] = format_description!(
     "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
 );
@@ -46,14 +44,14 @@ pub fn format_fs_safe(dt: OffsetDateTime) -> String {
 pub fn parse(s: &str) -> io::Result<OffsetDateTime> {
     OffsetDateTime::parse(s, &Rfc3339)
         .map(truncate_to_millis)
-        .map_err(|e| io_err(&format!("invalid rfc3339 timestamp: {}", e)))
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("invalid rfc3339 timestamp: {}", e)))
 }
 
 /// Inverse of [`format_fs_safe`]: restore the `:` characters in the time
 /// portion and delegate to [`parse`].
 pub fn parse_fs_safe(s: &str) -> io::Result<OffsetDateTime> {
     let (date, time) = s.split_once('T')
-        .ok_or_else(|| io_err(&format!("invalid rfc3339 timestamp: missing 'T' in {}", s)))?;
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("invalid rfc3339 timestamp: missing 'T' in {}", s)))?;
     parse(&format!("{}T{}", date, time.replacen('-', ":", 2)))
 }
 

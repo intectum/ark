@@ -6,10 +6,11 @@ use std::path::Path;
 use super::{decrypt_stream, request};
 
 use crate::crypto::DEFAULT_HASH_ALGORITHM;
+use crate::http::check_response_code;
 use crate::identity::resolve_identity;
-use crate::metadata::{read_metadata_headers, verify_metadata, write_local_metadata_attributes, write_metadata_attributes};
+use crate::metadata::{has_metadata_headers, read_metadata_headers, verify_metadata, write_local_metadata_attributes, write_metadata_attributes};
 use crate::types::{Hash, IdentityContext, LocalMetadata, Metadata};
-use crate::util::{io_err, resolve_client_url, resolve_local_path, sha256};
+use crate::util::{resolve_client_url, resolve_local_path, sha256};
 
 /// Download the body of a file at `path` (decrypting when encrypted).
 ///
@@ -82,13 +83,17 @@ pub fn get_stream(
     let url = resolve_client_url(ctx, path)?;
 
     let (code, headers, body) = request(Some(ctx), "GET", &url, &[], &[])?;
-    if code != 200 {
-        return Err(io_err(&format!("HTTP {}: {}", code, String::from_utf8_lossy(&body))));
+    check_response_code(code, &body)?;
+    if !has_metadata_headers(&headers) {
+        return Err(io::Error::new(io::ErrorKind::NotFound, format!("no metadata: {}", path)));
     }
 
     let metadata = read_metadata_headers(&headers)?;
 
-    let modifier_identity = resolve_identity(ctx, &metadata.modified_by)?;
+    // An unresolvable modifier is a verification failure, not a missing
+    // target, and must not read as one to callers matching on the kind.
+    let modifier_identity = resolve_identity(ctx, &metadata.modified_by)
+        .map_err(|e| io::Error::other(format!("modifier {}: {}", metadata.modified_by, e)))?;
     let verify_body = if metadata.body_hash.is_some() { Some(body.as_slice()) } else { None };
     verify_metadata(&modifier_identity.public_key, &metadata, verify_body)?;
 

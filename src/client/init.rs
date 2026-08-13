@@ -7,11 +7,12 @@ use super::{decrypt_stream, put, request};
 
 use crate::context::create_client_context;
 use crate::crypto::{DEFAULT_PASSWORD_ALGORITHM, create_secret_key_from_password, restore_secret_key_from_password, to_public_key};
+use crate::http::check_response_code;
 use crate::identity::{create_identity, parse_address, sign_identity, validate_identity, write_identity, write_identity_key};
 use crate::metadata::{read_metadata_headers, write_metadata_attributes};
 use crate::permissions::{reader, writer};
 use crate::types::{Identity, IdentityContext, Key, Signature};
-use crate::util::{decode_base64url, io_err, io_invalid_input, resolve_client_url_raw};
+use crate::util::{decode_base64url, resolve_client_url_raw};
 
 /// Initialize the ark account at `address` under `root`.
 ///
@@ -44,7 +45,7 @@ pub fn init(root: &Path, address: &str, password: Option<&str>, local_only: bool
 
     if local_only {
         if password.is_some() {
-            return Err(io_invalid_input("--password not supported with --local-only"));
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "--password not supported with --local-only"));
         }
         init_local(root, address)?;
         return Ok(());
@@ -53,12 +54,12 @@ pub fn init(root: &Path, address: &str, password: Option<&str>, local_only: bool
     let url = resolve_client_url_raw(root, "/.ark/identity.json", address)?;
     let (code, _, body) = request(None, "GET", &url, &[], &[])?;
     match code {
-        200 => {
+        200..300 => {
             let identity: Identity = serde_json::from_slice(&body)
-                .map_err(|e| io_err(&format!("identity json: {}", e)))?;
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("identity json: {}", e)))?;
             validate_identity(&identity)?;
             if identity.address != address {
-                return Err(io_err(&format!("server identity address {} does not match {}", identity.address, address)));
+                return Err(io::Error::new(io::ErrorKind::InvalidData, format!("server identity address {} does not match {}", identity.address, address)));
             }
             fs::create_dir_all(&dot_ark_dir)?;
             write_identity(&identity_path, &identity)?;
@@ -85,7 +86,7 @@ pub fn init(root: &Path, address: &str, password: Option<&str>, local_only: bool
                 push_secret_key_with_password(&ctx, pw)?;
             }
         }
-        _ => return Err(io_err(&format!("HTTP {}: {}", code, String::from_utf8_lossy(&body)))),
+        _ => check_response_code(code, &body)?,
     }
 
     Ok(())
@@ -113,12 +114,10 @@ fn pull_secret_key_with_password(
     let password_address = format!("{}/.ark/passwords/primary.json", identity.address);
     let password_url = resolve_client_url_raw(root, &password_address, &identity.address)?;
     let (password_code, _, password_body) = request(None, "GET", &password_url, &[], &[])?;
-    if password_code != 200 {
-        return Err(io_err(&format!("HTTP {}: {}", password_code, String::from_utf8_lossy(&password_body))));
-    }
+    check_response_code(password_code, &password_body)?;
 
     let password_identity: Identity = serde_json::from_slice(&password_body)
-        .map_err(|e| io_err(&format!("password json: {}", e)))?;
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("password json: {}", e)))?;
     validate_identity(&password_identity)?;
 
     let password_ctx = IdentityContext {
@@ -130,9 +129,7 @@ fn pull_secret_key_with_password(
 
     let identity_key_url = resolve_client_url_raw(root, "/.ark/identity.key", &identity.address)?;
     let (identity_key_code, identity_key_headers, identity_key_body) = request(Some(&password_ctx), "GET", &identity_key_url, &[], &[])?;
-    if identity_key_code != 200 {
-        return Err(io_err(&format!("HTTP {}: {}", identity_key_code, String::from_utf8_lossy(&identity_key_body))));
-    }
+    check_response_code(identity_key_code, &identity_key_body)?;
 
     let identity_key_metadata = read_metadata_headers(&identity_key_headers)?;
 
@@ -140,9 +137,9 @@ fn pull_secret_key_with_password(
     decrypt_stream(&password_ctx, &identity_key_metadata, &mut identity_key_body.as_slice(), &mut identity_key_bytes)?;
 
     let identity_key_b64 = from_utf8(&identity_key_bytes)
-        .map_err(|_| io_err("identity.key plaintext not utf8"))?;
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "identity.key plaintext not utf8"))?;
     let secret_key = decode_base64url(identity_key_b64.trim())
-        .map_err(|_| io_err("identity.key plaintext not base64url"))?;
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "identity.key plaintext not base64url"))?;
 
     let identity_key_path = root.join(".ark").join("identity.key");
     write_identity_key(&identity_key_path, &secret_key)?;
@@ -185,7 +182,6 @@ fn push_secret_key_with_password(
 #[cfg(test)]
 mod tests {
     use std::env::{current_dir, set_current_dir};
-    use std::io::ErrorKind;
 
     use ed25519_dalek::SigningKey;
 
@@ -324,7 +320,7 @@ mod tests {
         in_test_dir("ark_init_test", |_temp_dir| {
             let err = init(&current_dir().unwrap(), "gyan@127.0.0.1:1", None, false).unwrap_err();
             assert!(
-                matches!(err.kind(), ErrorKind::ConnectionRefused | ErrorKind::PermissionDenied | ErrorKind::Other),
+                matches!(err.kind(), io::ErrorKind::ConnectionRefused | io::ErrorKind::PermissionDenied | io::ErrorKind::Other),
                 "unexpected error kind: {:?} ({})", err.kind(), err
             );
         });
@@ -336,7 +332,7 @@ mod tests {
             fs::create_dir_all(temp_dir.join(".ark")).unwrap();
             fs::write(temp_dir.join(".ark/identity.json"), b"placeholder").unwrap();
             let err = init(&current_dir().unwrap(), "gyan@127.0.0.1:1", None, false).unwrap_err();
-            assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+            assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
         });
     }
 

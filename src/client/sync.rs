@@ -10,7 +10,7 @@ use crate::identity::parse_address;
 use crate::metadata::{has_metadata_attributes, read_local_metadata_attributes, read_metadata_attributes, read_metadata_headers, remove_local_metadata_attributes, write_local_metadata_attributes, write_metadata_attributes};
 use crate::timestamp;
 use crate::types::{DirEntryKind, EntryAction, EntryEvent, IdentityContext, Metadata};
-use crate::util::{io_err, parse_request_entry, resolve_client_url, sha256};
+use crate::util::{parse_request_entry, resolve_client_url, sha256};
 
 struct SyncEntry {
     relative_path: String,
@@ -54,16 +54,16 @@ where
         thread::scope(|s| {
             s.spawn(|| {
                 if let Err(e) = pull_watch(ctx, path, decrypt, &on_event, &on_error) {
-                    on_error(io_err(&format!("pull watch: {}", e)));
+                    on_error(io::Error::other(format!("pull watch: {}", e)));
                 }
             });
             s.spawn(|| {
                 if let Err(e) = push_watch(ctx, path, &on_event, &on_error) {
-                    on_error(io_err(&format!("push watch: {}", e)));
+                    on_error(io::Error::other(format!("push watch: {}", e)));
                 }
             });
             if let Err(e) = initial_sync(ctx, path, decrypt, &on_event, &on_error) {
-                on_error(io_err(&format!("initial sync: {}", e)));
+                on_error(io::Error::other(format!("initial sync: {}", e)));
             }
         });
     } else {
@@ -87,7 +87,7 @@ where
             Ok(false) => {}
             Err(e) => {
                 failed = true;
-                on_error(io_err(&format!("sync failed for {}: {}", entry.relative_path, e)));
+                on_error(io::Error::other(format!("sync failed for {}: {}", entry.relative_path, e)));
             }
         }
     }
@@ -137,7 +137,7 @@ where
                 match sync_entry(ctx, &entry, decrypt, on_event) {
                     Ok(true) => return true,
                     Ok(false) => {}
-                    Err(e) => { on_error(io_err(&format!("sync failed for {}: {}", relative_path, e))); }
+                    Err(e) => { on_error(io::Error::other(format!("sync failed for {}: {}", relative_path, e))); }
                 }
             }
             EntryAction::Deleted => {
@@ -150,7 +150,7 @@ where
                             path: PathBuf::from(&relative_path),
                             conflict: false,
                         }) { return true; },
-                        Err(e) => { on_error(io_err(&format!("pull delete {}: {}", relative_path, e))); }
+                        Err(e) => { on_error(io::Error::other(format!("pull delete {}: {}", relative_path, e))); }
                     }
                 }
             }
@@ -178,10 +178,10 @@ where
             Ok(Some(entry)) => match sync_entry(ctx, &entry, false, on_event) {
                 Ok(true) => return true,
                 Ok(false) => {}
-                Err(e) => { on_error(io_err(&format!("push failed for {}: {}", absolute.display(), e))); }
+                Err(e) => { on_error(io::Error::other(format!("push failed for {}: {}", absolute.display(), e))); }
             },
             Ok(None) => {}
-            Err(e) => { on_error(io_err(&format!("check {}: {}", absolute.display(), e))); }
+            Err(e) => { on_error(io::Error::other(format!("check {}: {}", absolute.display(), e))); }
         }
 
         false
@@ -272,7 +272,7 @@ where
             match check_entry(ctx, &path) {
                 Ok(Some(e)) => { entries.insert(e.relative_path.clone(), e); }
                 Ok(None) => {}
-                Err(e) => { on_error(io_err(&format!("check {}: {}", path.display(), e))); }
+                Err(e) => { on_error(io::Error::other(format!("check {}: {}", path.display(), e))); }
             }
         }
     }
@@ -325,23 +325,35 @@ where
 
     if entry.modified_local_body && entry.modified_remote_body {
         let sidecar_path = sidecar_path_for(&local_path);
-        get(ctx, &target, sidecar_path.to_str(), decrypt)?;
+        match get(ctx, &target, sidecar_path.to_str(), decrypt) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        }
         remove_local_metadata_attributes(&sidecar_path)?;
         return Ok(emit(EntryAction::Modified, true));
     } else if entry.modified_local_body {
         put_content(ctx, &target)?;
         return Ok(emit(EntryAction::Modified, false));
     } else if entry.modified_remote_body {
-        get(ctx, &target, local_path.to_str(), decrypt)?;
+        match get(ctx, &target, local_path.to_str(), decrypt) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        }
         return Ok(emit(EntryAction::Modified, false));
     } else if entry.modified_remote_metadata {
-        let (_, metadata) = head(ctx, &target)?;
+        let metadata = match head(ctx, &target) {
+            Ok((_, metadata)) => metadata,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        };
 
         if metadata.body_hash.is_none() {
             fs::create_dir_all(&local_path)?;
         }
         if !local_path.exists() {
-            return Err(io_err(&format!("local path missing: {}", local_path.display())));
+            return Err(io::Error::new(io::ErrorKind::NotFound, format!("local path missing: {}", local_path.display())));
         }
         write_metadata_attributes(&local_path, &metadata)?;
 
@@ -395,7 +407,7 @@ where
         let (relative_path, metadata) = match parse_put(&entry_body, &account_prefix) {
             Ok(Some(v)) => v,
             Ok(None) => continue,
-            Err(e) => { on_error(io_err(&format!("bad log entry: {}", e))); continue; }
+            Err(e) => { on_error(io::Error::new(io::ErrorKind::InvalidData, format!("bad log entry: {}", e))); continue; }
         };
 
         if !under_prefix(&relative_path, &rel_prefix) { continue; }
@@ -430,7 +442,7 @@ fn parse_put(entry_bytes: &[u8], account_prefix: &str) -> io::Result<Option<(Str
 
 fn to_relative_path(ctx: &IdentityContext, path: &Path) -> io::Result<String> {
     Ok(path.strip_prefix(&ctx.root)
-        .map_err(|_| io_err("path is not within this account"))?
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path is not within this account"))?
         .to_string_lossy()
         .into_owned())
 }

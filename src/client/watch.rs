@@ -11,7 +11,7 @@ use url::Url;
 use crate::http::{connect, read_stream_events, write_request};
 use crate::timestamp;
 use crate::types::{DirEntry, DirEntryKind, EntryAction, EntryEvent, IdentityContext, StreamEvent};
-use crate::util::{create_authorization_header, io_err};
+use crate::util::create_authorization_header;
 
 const REMOTE_READ_TIMEOUT: Duration = Duration::from_secs(45);
 const REMOTE_RECONNECT_DELAY: Duration = Duration::from_secs(2);
@@ -32,16 +32,16 @@ where
     let mut watcher = RecommendedWatcher::new(
         move |res| { let _ = tx.send(res); },
         Config::default(),
-    ).map_err(|e| io_err(&format!("watcher: {}", e)))?;
+    ).map_err(|e| io::Error::other(format!("watcher: {}", e)))?;
 
     watcher.watch(path, RecursiveMode::Recursive)
-        .map_err(|e| io_err(&format!("watch {}: {}", path.display(), e)))?;
+        .map_err(|e| io::Error::other(format!("watch {}: {}", path.display(), e)))?;
 
     loop {
         let event = match rx.recv() {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => {
-                if on_error(io_err(&format!("watch: {}", e))) { return Ok(()); }
+                if on_error(io::Error::other(format!("watch: {}", e))) { return Ok(()); }
                 continue;
             }
             Err(_) => return Ok(()),
@@ -69,7 +69,7 @@ where
     G: Fn(io::Error) -> bool,
 {
     loop {
-        let host = url.host_str().ok_or_else(|| io_err("URL missing host"))?;
+        let host = url.host_str().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "URL missing host"))?;
         let host_header = match url.port() {
             Some(p) => format!("{}:{}", host, p),
             None => host.to_string(),
@@ -122,7 +122,7 @@ fn to_entry_event_remote<G: Fn(io::Error) -> bool>(event: &StreamEvent, on_error
     let entry: DirEntry = match serde_json::from_str(&event.data) {
         Ok(e) => e,
         Err(e) => {
-            on_error(io_err(&format!("bad SSE payload: {}", e)));
+            on_error(io::Error::new(io::ErrorKind::InvalidData, format!("bad SSE payload: {}", e)));
             return None;
         }
     };

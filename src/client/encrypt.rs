@@ -6,7 +6,7 @@ use std::path::Path;
 use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, DEFAULT_HASH_ALGORITHM, encrypt_bytes};
 use crate::metadata::{apply_key_to_metadata, create_metadata, has_metadata_attributes, read_local_metadata_attributes, read_metadata_attributes, resolve_key_from_members, validate_metadata, write_local_metadata_attributes, write_metadata_attributes};
 use crate::types::{Hash, IdentityContext, Key, LocalMetadata, Metadata};
-use crate::util::{decode_base64url, io_err, io_invalid_input, sha256};
+use crate::util::{decode_base64url, sha256};
 
 /// Encrypt a file with an ark file key.
 ///
@@ -31,14 +31,14 @@ pub fn encrypt(
     encryption_algorithm: Option<&str>,
 ) -> io::Result<()> {
     if in_place.is_some() && (input.is_some() || output.is_some()) {
-        return Err(io_err("--in-place is mutually exclusive with -i/--input and -o/--output"));
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "--in-place is mutually exclusive with -i/--input and -o/--output"));
     }
 
     let source: Option<&str> = in_place.or(input);
     let destination: Option<&str> = in_place.or(output);
     if let Some(p) = source {
         if !fs::exists(Path::new(p))? {
-            return Err(io_invalid_input("input does not exist"));
+            return Err(io::Error::new(io::ErrorKind::NotFound, "input does not exist"));
         }
     }
 
@@ -49,11 +49,11 @@ pub fn encrypt(
 
     // TODO: probably should be possible
     if source_has_metadata && (key.is_some() || encryption_algorithm.is_some()) {
-        return Err(io_err("-k/--key and -e/--encryption-algortihm cannot override existing metadata"));
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "-k/--key and -e/--encryption-algortihm cannot override existing metadata"));
     }
 
     if !source_has_metadata && key.is_none() {
-        return Err(io_err("no file key available: pass --key or use -i/--in-place on a file with metadata"));
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "no file key available: pass --key or use -i/--in-place on a file with metadata"));
     }
 
     let plaintext_bytes = match source {
@@ -71,7 +71,7 @@ pub fn encrypt(
             let key = Key {
                 algorithm: encryption_algorithm.map(str::to_string).unwrap_or(DEFAULT_ENCRYPTION_ALGORITHM.to_string()),
                 value: decode_base64url(key.expect("key presence checked above").trim())
-                    .map_err(|e| io_err(&format!("--key decode: {}", e)))?
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("--key decode: {}", e)))?
             };
 
             let mut metadata = create_metadata(&ctx.identity.address, Some(&key.algorithm));
@@ -88,7 +88,7 @@ pub fn encrypt(
     };
 
     if let Some(true) = local_metadata.encrypted {
-        return Err(io_err("file is already encrypted"));
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "file is already encrypted"));
     }
 
     let mut ciphertext_bytes: Vec<u8> = Vec::new();
@@ -121,10 +121,10 @@ pub fn encrypt_stream(
     ciphertext: &mut dyn Write,
 ) -> io::Result<()> {
     let file_key = resolve_key_from_members(ctx, &metadata.members)?
-        .ok_or_else(|| io_err(&format!("no key for {}", ctx.identity.address)))?;
+        .ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, format!("no key for {}", ctx.identity.address)))?;
 
     let encryption_algorithm = metadata.encryption_algorithm.clone()
-        .ok_or_else(|| io_err("metadata missing encryption_algorithm"))?;
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "metadata missing encryption_algorithm"))?;
 
     let mut plaintext_bytes = Vec::new();
     plaintext.read_to_end(&mut plaintext_bytes)?;
@@ -138,7 +138,6 @@ pub fn encrypt_stream(
 #[cfg(test)]
 mod tests {
     use std::env::set_current_dir;
-    use std::io::ErrorKind;
 
     use super::*;
 
@@ -306,7 +305,7 @@ mod tests {
             let ctx = create_client_context().unwrap();
             let missing = temp_dir.join("nope.bin");
             let err = encrypt(&ctx, Some(missing.to_str().unwrap()), None, None, None, None).unwrap_err();
-            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert_eq!(err.kind(), io::ErrorKind::NotFound);
             assert!(format!("{}", err).contains("input does not exist"));
         });
     }

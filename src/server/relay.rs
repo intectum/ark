@@ -13,7 +13,7 @@ use crate::identity::parse_address;
 use crate::metadata::resolve_member_addresses;
 use crate::timestamp;
 use crate::types::{IdentityContext, Metadata, RelayMode};
-use crate::util::{create_authorization_header, io_err, is_loopback_host};
+use crate::util::{create_authorization_header, is_loopback_host};
 
 pub fn relay(
     server_ctx: &Arc<IdentityContext>,
@@ -83,7 +83,7 @@ pub fn relay(
             let url_string = format!("{}://{}{}", scheme, member_host, member_target);
             if verbose { println!("{}(relay) {}", method, url_string); }
 
-            let url = Url::parse(&url_string).map_err(|e| io_err(&format!("invalid remote URL {}: {}", url_string, e)))?;
+            let url = Url::parse(&url_string).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("invalid remote URL {}: {}", url_string, e)))?;
             let ref_headers: Vec<(&str, &str)> = final_headers.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
             request(Some(server_ctx.as_ref()), method, &url, &ref_headers, body)
         };

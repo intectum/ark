@@ -8,7 +8,7 @@ mod relay;
 
 use std::env;
 use std::fs;
-use std::io::{self, ErrorKind, Write};
+use std::io::{self, Write};
 use std::net::{TcpListener, TcpStream};
 #[cfg(any(test, feature = "test-utils"))]
 use std::path::PathBuf;
@@ -148,7 +148,7 @@ fn handle_parsed_inner(
 
     let target_ctx = match create_target_context(server_root, name) {
         Ok(c) => c,
-        Err(e) if e.kind() == ErrorKind::NotFound =>
+        Err(e) if e.kind() == io::ErrorKind::NotFound =>
             return write_text(stream, 403, b"forbidden"),
         Err(e) => return Err(e),
     };

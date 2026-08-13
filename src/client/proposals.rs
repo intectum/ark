@@ -2,10 +2,11 @@ use std::io;
 
 use super::{delete, get_stream, head, list, request};
 
+use crate::http::check_response_code;
 use crate::identity::parse_address;
 use crate::metadata::{read_metadata_headers, write_metadata_headers};
 use crate::types::{IdentityContext, Metadata, Permission, Proposal};
-use crate::util::{io_err, io_invalid_input, parse_request_entry, resolve_client_url, sha256};
+use crate::util::{parse_request_entry, resolve_client_url, sha256};
 
 /// List pending share proposals — requests where another account's PUT was
 /// rejected with `403` at a path the current account owns. Returned in
@@ -53,12 +54,12 @@ pub fn accept_proposal(ctx: &IdentityContext, index_or_id: &str, force: bool) ->
     let mut entry_body: Vec<u8> = Vec::new();
     get_stream(ctx, &entry_path, &mut entry_body, false)?;
     let proposal = parse_proposal(&id, &entry_body)?
-        .ok_or_else(|| io_invalid_input("entry is not a valid proposal"))?;
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "entry is not a valid proposal"))?;
 
     let (account_name, _, _) = parse_address(&ctx.identity.address)?;
     let prefix = format!("/ark/{}/", account_name);
     let relative_path = proposal.target.strip_prefix(&prefix)
-        .ok_or_else(|| io_invalid_input("target path is not within this account"))?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "target path is not within this account"))?
         .to_string();
 
     let target_is_dir = proposal.metadata.body_hash.is_none();
@@ -75,9 +76,9 @@ pub fn accept_proposal(ctx: &IdentityContext, index_or_id: &str, force: bool) ->
         let mut buf: Vec<u8> = Vec::new();
         let (metadata, _) = get_stream(ctx, &modifier_path, &mut buf, false)?;
         let expected_hash = metadata.body_hash.as_ref()
-            .ok_or_else(|| io_err("file metadata missing body_hash"))?;
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "file metadata missing body_hash"))?;
         if sha256(&buf) != expected_hash.value {
-            return Err(io_err("fetched body hash does not match metadata"));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "fetched body hash does not match metadata"));
         }
         (metadata, buf)
     };
@@ -97,9 +98,7 @@ pub fn accept_proposal(ctx: &IdentityContext, index_or_id: &str, force: bool) ->
     let header_refs: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
     let (code, _, resp_body) = request(Some(ctx), "PUT", &own_url, &header_refs, &body)?;
-    if code != 201 && code != 204 {
-        return Err(io_err(&format!("HTTP {}: {}", code, String::from_utf8_lossy(&resp_body))));
-    }
+    check_response_code(code, &resp_body)?;
 
     delete(ctx, &entry_path)?;
 
@@ -122,7 +121,7 @@ fn resolve_id(ctx: &IdentityContext, index_or_id: &str) -> io::Result<String> {
     if let Ok(index) = index_or_id.parse::<usize>() {
         let proposals = list_proposals(ctx)?;
         if index == 0 || index > proposals.len() {
-            return Err(io_invalid_input(&format!("no proposal at index {}", index)));
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("no proposal at index {}", index)));
         }
         Ok(proposals[index - 1].id.clone())
     } else {
@@ -149,7 +148,7 @@ fn parse_proposal(filename: &str, entry_bytes: &[u8]) -> io::Result<Option<Propo
 
 fn verify_metadata_changes(proposal: &Metadata, current: &Metadata, self_address: &str) -> io::Result<()> {
     if current.id != proposal.id {
-        return Err(io_err("id is wrong"));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "id is wrong"));
     }
 
     if let Some(msg) = check_member_changes(proposal, current, self_address) {
@@ -157,7 +156,7 @@ fn verify_metadata_changes(proposal: &Metadata, current: &Metadata, self_address
         for member in &current.members {
             listing.push_str(&format!("\n  {} = {}", member.address, member.permission.as_str()));
         }
-        return Err(io_err(&format!("{}. Current members:{}\nUse --force to accept anyway.", msg, listing)));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("{}. Current members:{}\nUse --force to accept anyway.", msg, listing)));
     }
 
     Ok(())

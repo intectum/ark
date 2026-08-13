@@ -6,12 +6,12 @@ use url::Url;
 use crate::http::{connect, read_response, write_request};
 use crate::timestamp;
 use crate::types::IdentityContext;
-use crate::util::{create_authorization_header, io_err};
+use crate::util::create_authorization_header;
 
 pub fn request(ctx: Option<&IdentityContext>, method: &str, url: &Url, headers: &[(&str, &str)], body: &[u8]) -> io::Result<(u16, Vec<(String, String)>, Vec<u8>)> {
     let mut final_headers = headers.to_vec();
 
-    let host = url.host_str().ok_or_else(|| io_err("URL missing host"))?;
+    let host = url.host_str().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "URL missing host"))?;
     let host_header = match url.port() {
         Some(p) => format!("{}:{}", host, p),
         None => host.to_string(),

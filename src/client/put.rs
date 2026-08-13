@@ -7,10 +7,11 @@ use super::encrypt_stream;
 
 use crate::client::request;
 use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, DEFAULT_HASH_ALGORITHM, create_secret_key};
+use crate::http::check_response_code;
 use crate::metadata::{apply_key_to_metadata, apply_permissions, create_metadata, has_metadata_attributes, read_local_metadata_attributes, read_metadata_attributes, resolve_key_from_members, sign_metadata, write_local_metadata_attributes, write_metadata_attributes, write_metadata_headers};
 use crate::timestamp;
 use crate::types::{Hash, IdentityContext, LocalMetadata, Metadata, Permissions};
-use crate::util::{io_err, io_invalid_input, resolve_client_url, resolve_local_path, sha256};
+use crate::util::{resolve_client_url, resolve_local_path, sha256};
 
 /// Upload the body of a local file (or create a directory) at `path`.
 ///
@@ -70,7 +71,7 @@ pub fn put(ctx: &IdentityContext, path: &str, input: Option<&str>, permissions: 
     let input_path: Option<PathBuf> = input.map(PathBuf::from);
     if let Some(i) = input_path.as_deref() {
         if !fs::exists(i)? {
-            return Err(io_invalid_input("input does not exist"));
+            return Err(io::Error::new(io::ErrorKind::NotFound, "input does not exist"));
         }
     }
 
@@ -151,10 +152,10 @@ pub fn put_stream(
     let is_dir = body.is_none() && !metadata_only;
 
     if is_dir && encryption_algorithm.is_some() {
-        return Err(io_invalid_input("--encryption-algorithm not supported for directories"));
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "--encryption-algorithm not supported for directories"));
     }
     if metadata_only && encryption_algorithm.is_some() {
-        return Err(io_invalid_input("--encryption-algorithm not supported for metadata-only puts"));
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "--encryption-algorithm not supported for metadata-only puts"));
     }
 
     let mut metadata = match existing_metadata {
@@ -166,14 +167,14 @@ pub fn put_stream(
         }
         None => {
             if metadata_only {
-                return Err(io_err("metadata-only put requires existing metadata"));
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "metadata-only put requires existing metadata"));
             }
             create_metadata(&ctx.identity.address, Some(encryption_algorithm.unwrap_or(DEFAULT_ENCRYPTION_ALGORITHM)))
         }
     };
 
     if !metadata.members.iter().any(|m| m.address == ctx.identity.address) {
-        return Err(io_err("no member entry for current account"));
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "no member entry for current account"));
     }
 
     if is_dir || encryption_algorithm == Some("none") {
@@ -239,9 +240,7 @@ pub fn put_stream(
     let headers: Vec<(&str, &str)> = metadata_headers.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
 
     let (response_code, _, response_body) = request(Some(ctx), "PUT", &url, &headers, &final_body)?;
-    if response_code != 201 && response_code != 204 {
-        return Err(io_err(&format!("HTTP {}: {}", response_code, String::from_utf8_lossy(&response_body))));
-    }
+    check_response_code(response_code, &response_body)?;
 
     Ok((metadata, local_metadata))
 }
@@ -249,7 +248,6 @@ pub fn put_stream(
 #[cfg(test)]
 mod tests {
     use std::env::set_current_dir;
-    use std::io::ErrorKind;
     use std::path::Path;
 
     use super::*;
@@ -566,7 +564,7 @@ mod tests {
             let input_dir = temp_dir.join("shared_input");
             fs::create_dir_all(&input_dir).unwrap();
             let err = put(&ctx, "shared", Some(input_dir.to_str().unwrap()), &Permissions::default(), Some(DEFAULT_ENCRYPTION_ALGORITHM), false).unwrap_err();
-            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         });
     }
 
@@ -596,7 +594,7 @@ mod tests {
 
             let missing = temp_dir.join("does_not_exist.bin");
             let err = put(&ctx, "notes.txt", Some(missing.to_str().unwrap()), &Permissions::default(), None, false).unwrap_err();
-            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert_eq!(err.kind(), io::ErrorKind::NotFound);
             assert!(format!("{}", err).contains("input does not exist"));
         });
     }
@@ -611,7 +609,7 @@ mod tests {
             let input_dir = temp_dir.join("input_dir");
             fs::create_dir_all(&input_dir).unwrap();
             let err = put(&ctx, "shared", Some(input_dir.to_str().unwrap()), &Permissions::default(), Some(DEFAULT_ENCRYPTION_ALGORITHM), false).unwrap_err();
-            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         });
     }
 

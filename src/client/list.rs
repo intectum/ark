@@ -2,8 +2,9 @@ use std::io;
 
 use super::request;
 
+use crate::http::check_response_code;
 use crate::types::{DirEntry, IdentityContext};
-use crate::util::{io_err, resolve_client_url};
+use crate::util::resolve_client_url;
 
 /// List the entries of a directory at `path`.
 ///
@@ -26,12 +27,10 @@ pub fn list(ctx: &IdentityContext, path: &str, prefix: Option<&str>) -> io::Resu
     if code == 404 {
         return Ok(Vec::new());
     }
-    if code != 200 {
-        return Err(io_err(&format!("HTTP {}: {}", code, String::from_utf8_lossy(&body))));
-    }
+    check_response_code(code, &body)?;
 
     serde_json::from_slice(&body)
-        .map_err(|e| io_err(&format!("dir listing: {}", e)))
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("dir listing: {}", e)))
 }
 
 #[cfg(test)]
