@@ -6,6 +6,7 @@ use std::str::from_utf8;
 use std::time::Duration;
 
 use crate::crypto::{DEFAULT_SIGNING_ALGORITHM, sign_bytes};
+use crate::http::read_response;
 use crate::metadata::{sign_metadata, write_metadata_attributes, write_metadata_headers};
 pub use crate::server::start_test_server;
 use crate::testing::fs::create_plain_test_metadata;
@@ -96,6 +97,37 @@ pub fn signed_request_with_headers(
     let mut headers: Vec<(&str, &str)> = vec![("Authorization", &auth)];
     headers.extend_from_slice(extra);
     request(port, method, target, body, &headers)
+}
+
+/// Open an SSE subscription to `path` and return its status and headers. The
+/// connection is closed before returning, so no events are read.
+pub fn signed_stream_request(
+    port: u16,
+    requestor: &Identity,
+    secret_key: &Key,
+    path: &str,
+) -> (u16, Vec<(String, String)>) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    let ts = timestamp::now_ms();
+    let sig_b64 = sign_request(&secret_key.value, port, "GET", path, ts, &[]);
+    let auth = format_authorization_header(&requestor.address, ts, &sig_b64);
+    let head = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nContent-Length: 0\r\nAuthorization: {}\r\nAccept: text/event-stream\r\n\r\n",
+        path,
+        test_host(port),
+        auth
+    );
+    stream.write_all(head.as_bytes()).unwrap();
+
+    // Skip the body: an accepted subscription never sends one that ends.
+    let (code, headers, _) = read_response(&mut stream, true).unwrap();
+    let headers = headers.into_iter()
+        .map(|(name, value)| (name.to_ascii_lowercase(), value))
+        .collect();
+
+    (code, headers)
 }
 
 pub fn signed_put_with_default_metadata(

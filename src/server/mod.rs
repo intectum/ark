@@ -230,7 +230,7 @@ fn handle_parsed_inner(
 
     match method {
         "GET" => {
-            let wants_stream = fs_path.is_dir() && headers.iter().any(|(n, v)|
+            let wants_stream = headers.iter().any(|(n, v)|
                 n.eq_ignore_ascii_case("accept") && v.contains("text/event-stream"));
             if wants_stream {
                 return serve_stream(&fs_path, stream, verbose);
@@ -418,6 +418,52 @@ mod tests {
             let (code, body, _) = signed_request(port, &identity, &secret_key, "GET", "/ark/gyan/hello.txt", &[]);
             assert_eq!(code, 200);
             assert_eq!(body, b"hi gyan");
+        });
+    }
+
+    #[test]
+    fn streams_dir() {
+        in_test_dir("ark_server_test", |temp_dir| {
+            let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
+            fs::create_dir_all(account_dir.join("sub")).unwrap();
+            let port = start_test_server(temp_dir.to_path_buf());
+            let (code, headers) = signed_stream_request(port, &identity, &secret_key, "/ark/test/sub");
+            assert_eq!(code, 200);
+            assert_eq!(header(&headers, "content-type"), Some("text/event-stream"));
+        });
+    }
+
+    #[test]
+    fn streams_file() {
+        in_test_dir("ark_server_test", |temp_dir| {
+            let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
+            write_plain_test_file(&account_dir.join("hello.txt"), &identity, &secret_key, b"hi");
+            let port = start_test_server(temp_dir.to_path_buf());
+            let (code, headers) = signed_stream_request(port, &identity, &secret_key, "/ark/test/hello.txt");
+            assert_eq!(code, 200);
+            assert_eq!(header(&headers, "content-type"), Some("text/event-stream"));
+        });
+    }
+
+    #[test]
+    fn streams_path_that_does_not_exist_yet() {
+        in_test_dir("ark_server_test", |temp_dir| {
+            let (identity, secret_key, _) = create_test_account(temp_dir, TEST_ADDRESS);
+            let port = start_test_server(temp_dir.to_path_buf());
+            let (code, headers) = signed_stream_request(port, &identity, &secret_key, "/ark/test/apps/msg");
+            assert_eq!(code, 200);
+            assert_eq!(header(&headers, "content-type"), Some("text/event-stream"));
+        });
+    }
+
+    #[test]
+    fn stream_forbidden_without_permission() {
+        in_test_dir("ark_server_test", |temp_dir| {
+            let (_, _, _) = create_test_account(temp_dir, TEST_ADDRESS);
+            let (other_identity, other_key, _) = create_test_account(temp_dir, "mallory@example.com");
+            let port = start_test_server(temp_dir.to_path_buf());
+            let (code, _) = signed_stream_request(port, &other_identity, &other_key, "/ark/test/apps/msg");
+            assert_eq!(code, 403);
         });
     }
 }
