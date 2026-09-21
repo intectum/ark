@@ -1,16 +1,17 @@
-use std::env::current_dir;
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 
 use base64::{DecodeError, Engine};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sha2::{Digest, Sha256};
 use url::Url;
+use uuid::Uuid;
 
 use crate::crypto::sign_bytes;
 use crate::http::{read_request, read_response};
-use crate::identity::parse_address;
-use crate::types::{IdentityContext, RequestEntry};
+use crate::metadata::{verify_metadata, verify_metadata_signature};
+use crate::storage::to_account_path_raw;
+use crate::types::{Context, Key, Metadata, RequestEntry};
 
 /// Expand a CLI/library path argument into a fully-qualified address string
 /// (`name@host[:port][/path]`).
@@ -22,7 +23,7 @@ use crate::types::{IdentityContext, RequestEntry};
 ///
 /// Relative and account-absolute forms take name/host from `ctx.identity.address`.
 /// An omitted path stays omitted.
-pub fn resolve_address(ctx: &IdentityContext, path: &str) -> io::Result<String> {
+pub fn resolve_address(ctx: &Context, path: &str) -> io::Result<String> {
     let url = resolve_client_url(ctx, path)?;
 
     let name = url.username();
@@ -37,22 +38,14 @@ pub fn resolve_address(ctx: &IdentityContext, path: &str) -> io::Result<String> 
     Ok(format!("{}@{}{}", name, host, account_path))
 }
 
-pub fn resolve_client_url(ctx: &IdentityContext, path: &str) -> io::Result<Url> {
+pub fn resolve_client_url(ctx: &Context, path: &str) -> io::Result<Url> {
     resolve_client_url_raw(&ctx.root, path, &ctx.identity.address)
 }
 
 pub fn resolve_client_url_raw(root: &Path, path: &str, address: &str) -> io::Result<Url> {
     let mut s = path.to_string();
     if !s.contains('@') {
-        if !s.starts_with('/') {
-            let cwd = current_dir()?;
-            let rel = cwd.strip_prefix(root).unwrap_or(Path::new("")).to_string_lossy();
-            s = match rel.as_ref() {
-                "" => format!("/{}", s),
-                _ => format!("/{}/{}", rel, s),
-            };
-        }
-        s = format!("{}{}", address, s);
+        s = format!("{}{}", address, to_account_path_raw(root, &s)?);
     }
     let had_scheme = s.contains("://");
     if !had_scheme {
@@ -71,19 +64,6 @@ pub fn resolve_client_url_raw(root: &Path, path: &str, address: &str) -> io::Res
     reject_path_traversal(&url)?;
 
     Ok(url)
-}
-
-pub fn resolve_local_path(ctx: &IdentityContext, path: &str) -> io::Result<PathBuf> {
-    let rel = if path.contains('@') {
-        let (_, _, path_part) = parse_address(path)?;
-        path_part.trim_start_matches('/').to_string()
-    } else if path.starts_with('/') {
-        path.trim_start_matches('/').to_string()
-    } else {
-        return Ok(PathBuf::from(path));
-    };
-
-    Ok(ctx.root.join(rel))
 }
 
 pub fn resolve_server_url(path: &str) -> io::Result<Url> {
@@ -138,7 +118,7 @@ pub fn parse_request_entry(entry_bytes: &[u8]) -> io::Result<RequestEntry> {
     Ok(RequestEntry { method, target, request_headers, status })
 }
 
-pub fn create_authorization_header(ctx: &IdentityContext, method: &str, host: &str, path: &str, timestamp: u64, body: &[u8]) -> io::Result<String> {
+pub fn create_authorization_header(ctx: &Context, method: &str, host: &str, path: &str, timestamp: u64, body: &[u8]) -> io::Result<String> {
     let identity_key = ctx.identity_key.as_ref().ok_or_else(|| io::Error::other("context missing identity_key"))?;
     let request_bytes = request_to_bytes(method, host, path, timestamp, body);
     let signature = sign_bytes(identity_key, &request_bytes)?;
@@ -190,36 +170,104 @@ pub fn sha256(data: &[u8]) -> Vec<u8> {
     hash.finalize().to_vec()
 }
 
+/// Validate a change received from another node, against the copy of the file
+/// it replaces.
+///
+/// Checks that the metadata is signed by the account that made the change and
+/// matches the body that arrived with it, and that `existing_metadata` — the
+/// copy being replaced, where there is one — is being continued rather than
+/// overwritten by an unrelated or older file.
+///
+/// Whether the change is a directory is taken from the metadata, which carries
+/// a `body_hash` only for a file. A change may not turn one into the other.
+///
+/// `body` is what arrived with the metadata. `None` on a directory, which has
+/// no body; `None` on a file means the change keeps the body the existing copy
+/// already has, so only the signature is checked and `existing_metadata` is
+/// required.
+///
+/// `Err` carries the kind the rejection corresponds to, as
+/// [`crate::http::error_response_code`] maps it: `InvalidData` where the
+/// metadata does not verify or is malformed, `NotFound` where the copy it
+/// continues is missing, `AlreadyExists` where it loses to the copy already
+/// held.
+///
+/// Whether the modifier was allowed to change the members is not covered: that
+/// needs the authoritative member list, which only the account's own server
+/// holds.
+pub fn validate_update(
+    modifier_public_key: &Key,
+    metadata: &Metadata,
+    existing_metadata: Option<&Metadata>,
+    body: Option<&[u8]>,
+) -> io::Result<()> {
+    let is_dir = metadata.body_hash.is_none();
+
+    if body.is_none() && !is_dir {
+        let existing_metadata = match existing_metadata {
+            Some(m) => m,
+            None => return Err(io::Error::new(io::ErrorKind::NotFound, "metadata-only update requires existing file")),
+        };
+
+        let new_hash = metadata.body_hash.as_ref().map(|h| &h.value);
+        let old_hash = existing_metadata.body_hash.as_ref().map(|h| &h.value);
+        if new_hash != old_hash {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "metadata-only update must not change body_hash"));
+        }
+
+        verify_metadata_signature(modifier_public_key, metadata)?;
+    } else {
+        verify_metadata(modifier_public_key, metadata, body)?;
+    }
+
+    if let Some(existing_metadata) = existing_metadata {
+        if existing_metadata.id != metadata.id {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "id is wrong"));
+        }
+        if existing_metadata.body_hash.is_none() != is_dir {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, if is_dir { "existing is a file" } else { "existing is a dir" }));
+        }
+        if metadata.modified < existing_metadata.modified {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "modified is older than existing"));
+        }
+    }
+
+    Ok(())
+}
+
+/// The UUID `value` spells.
+///
+/// Only the plain hyphenated lowercase form is accepted — the braced, URN and
+/// unhyphenated forms parse as UUIDs but carry characters, or a case, that a
+/// value read from outside is not expected to use, and such a value may become
+/// a path segment.
+pub fn parse_uuid(value: &str) -> io::Result<Uuid> {
+    let uuid = Uuid::try_parse(value)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("not a uuid: {}", value)))?;
+
+    if uuid.hyphenated().to_string() != value {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("uuid is not hyphenated lowercase: {}", value)));
+    }
+
+    Ok(uuid)
+}
+
 #[cfg(test)]
 mod tests {
     use std::env;
 
     use super::*;
 
-    use crate::client::init_local;
-    use crate::context::create_client_context;
-    use crate::testing::fs::in_test_dir;
-
     #[test]
-    fn resolve_local_path_address_without_path_is_account_root() {
-        in_test_dir("ark_util_test", |temp_dir| {
-            init_local(temp_dir, "alice@example.com").unwrap();
-            let ctx = create_client_context().unwrap();
-
-            let path = resolve_local_path(&ctx, "bob@example.com").unwrap();
-            assert_eq!(path, ctx.root);
-        });
-    }
-
-    #[test]
-    fn resolve_local_path_address_with_path_is_under_account_root() {
-        in_test_dir("ark_util_test", |temp_dir| {
-            init_local(temp_dir, "alice@example.com").unwrap();
-            let ctx = create_client_context().unwrap();
-
-            let path = resolve_local_path(&ctx, "bob@example.com/notes/todo.txt").unwrap();
-            assert_eq!(path, ctx.root.join("notes/todo.txt"));
-        });
+    fn parse_uuid_accepts_only_the_plain_hyphenated_lowercase_form() {
+        let id = "0f3e1c62-9a4b-4d7e-8c11-2b5a6d9e4f30";
+        assert_eq!(parse_uuid(id).unwrap().hyphenated().to_string(), id);
+        assert!(parse_uuid(&format!("{{{}}}", id)).is_err());
+        assert!(parse_uuid(&format!("urn:uuid:{}", id)).is_err());
+        assert!(parse_uuid(&id.replace('-', "")).is_err());
+        assert!(parse_uuid(&id.to_uppercase()).is_err());
+        assert!(parse_uuid("../../etc").is_err());
+        assert!(parse_uuid("").is_err());
     }
 
     #[test]
@@ -320,4 +368,5 @@ mod tests {
         let url = resolve_server_url("/ark/gyan/notes.txt?x=1").unwrap();
         assert_eq!(url.path(), "/ark/gyan/notes.txt");
     }
+
 }

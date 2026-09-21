@@ -4,7 +4,7 @@ use crate::client::request;
 use crate::http::check_response_code;
 use crate::identity::resolve_identity;
 use crate::metadata::{has_metadata_headers, read_metadata_headers, verify_metadata_signature};
-use crate::types::{IdentityContext, Metadata};
+use crate::types::{Context, Metadata};
 use crate::util::resolve_client_url;
 
 /// Fetch response headers and signed metadata for `path` without downloading
@@ -12,7 +12,7 @@ use crate::util::resolve_client_url;
 ///
 /// `path` accepts relative, absolute account, or address form. See the
 /// [module documentation](../index.html) for path resolution details.
-pub fn head(ctx: &IdentityContext, path: &str) -> io::Result<(Vec<(String, String)>, Metadata)> {
+pub fn head(ctx: &Context, path: &str) -> io::Result<(Vec<(String, String)>, Metadata)> {
     let url = resolve_client_url(ctx, path)?;
 
     let (code, headers, body) = request(Some(ctx), "HEAD", &url, &[], &[])?;
@@ -37,11 +37,10 @@ mod tests {
     use super::*;
 
     use crate::crypto::DEFAULT_ENCRYPTION_ALGORITHM;
-    use crate::identity::read_identity;
     use crate::metadata::read_metadata_attributes;
-    use crate::testing::fs::{in_test_dir, init_with_server, write_encrypted_test_file, write_plain_test_file};
+    use crate::testing::fs::{account_context, in_test_dir, init_with_server, write_encrypted_test_file, write_plain_test_file};
     use crate::testing::http::start_test_server;
-    use crate::util::{encode_base64url, resolve_client_url_raw};
+    use crate::util::encode_base64url;
 
     #[test]
     fn head_returns_headers_without_body() {
@@ -51,8 +50,7 @@ mod tests {
             let ctx = init_with_server(temp_dir, &address);
             write_plain_test_file(&temp_dir.join("ark/gyan/file.bin"), &ctx.identity, ctx.identity_key.as_ref().unwrap(), b"hello world");
 
-            let identity = read_identity(&temp_dir.join(".ark").join("identity.json")).unwrap();
-            let url = resolve_client_url_raw(temp_dir, "file.bin", &identity.address).unwrap();
+            let url = resolve_client_url(&ctx, "file.bin").unwrap();
             let (code, headers, body) = request(Some(&ctx), "HEAD", &url, &[], &[]).unwrap();
             assert_eq!(code, 200);
             assert!(body.is_empty());
@@ -71,11 +69,11 @@ mod tests {
             let ctx = init_with_server(temp_dir, &address);
             let f = temp_dir.join("ark/gyan/secret");
             write_encrypted_test_file(&f, &ctx.identity, ctx.identity_key.as_ref().unwrap(), b"plaintext");
-            let expected_key_b64 = encode_base64url(&read_metadata_attributes(&f).unwrap()
+            let (server_ctx, server_path) = account_context(&f);
+            let expected_key_b64 = encode_base64url(&read_metadata_attributes(&server_ctx, &server_path).unwrap()
                 .members[0].key.as_ref().unwrap().value);
 
-            let identity = read_identity(&temp_dir.join(".ark").join("identity.json")).unwrap();
-            let url = resolve_client_url_raw(temp_dir, "secret", &identity.address).unwrap();
+            let url = resolve_client_url(&ctx, "secret").unwrap();
             let (code, headers, body) = request(Some(&ctx), "HEAD", &url, &[], &[]).unwrap();
             assert_eq!(code, 200);
             assert!(body.is_empty());

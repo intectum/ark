@@ -7,6 +7,7 @@ mod put;
 mod relay;
 
 use std::env;
+#[cfg(test)]
 use std::fs;
 use std::io::{self, Write};
 use std::net::{TcpListener, TcpStream};
@@ -29,7 +30,8 @@ use crate::context::{create_server_context, create_target_context};
 use crate::http::{read_request, write_text};
 use crate::identity::resolve_identity;
 use crate::metadata::{read_metadata_attributes, read_metadata_headers};
-use crate::types::{IdentityContext, Permission, RelayMode};
+use crate::storage::{is_file, is_symlink, parent_path};
+use crate::types::{Context, Permission, RelayMode};
 use crate::util::resolve_server_url;
 
 pub const MAX_CLOCK_SKEW_MS: u64 = 300_000;
@@ -57,8 +59,9 @@ pub fn start_test_server(root: PathBuf) -> u16 {
     port
 }
 
-pub fn serve(listener: TcpListener, server_ctx: IdentityContext, verbose: bool) {
+pub fn serve(listener: TcpListener, server_ctx: Context, verbose: bool) {
     let server_ctx = Arc::new(server_ctx);
+
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
@@ -80,7 +83,7 @@ pub fn serve(listener: TcpListener, server_ctx: IdentityContext, verbose: bool) 
     }
 }
 
-fn handle(mut stream: TcpStream, server_ctx: &Arc<IdentityContext>, verbose: bool) -> io::Result<()> {
+fn handle(mut stream: TcpStream, server_ctx: &Arc<Context>, verbose: bool) -> io::Result<()> {
     let (method, target, headers, body) = read_request(&mut stream, false)?;
     if verbose {
         println!("{} {}", method, target);
@@ -91,7 +94,7 @@ fn handle(mut stream: TcpStream, server_ctx: &Arc<IdentityContext>, verbose: boo
 
 pub fn handle_parsed(
     stream: &mut dyn Write,
-    server_ctx: &Arc<IdentityContext>,
+    server_ctx: &Arc<Context>,
     method: &str,
     target: &str,
     headers: &[(String, String)],
@@ -112,7 +115,7 @@ pub fn handle_parsed(
 
 fn handle_parsed_inner(
     stream: &mut dyn Write,
-    server_ctx: &Arc<IdentityContext>,
+    server_ctx: &Arc<Context>,
     method: &str,
     target: &str,
     headers: &[(String, String)],
@@ -136,14 +139,22 @@ fn handle_parsed_inner(
 
     let server_root = server_ctx.root.parent().unwrap().parent().unwrap();
     let name = segments[1];
-    let target_identity_path = server_root.join("ark").join(name).join(".ark").join("identity.json");
 
-    if method == "PUT" && url.path() == format!("/ark/{}/.ark/identity.json", name) && !target_identity_path.exists() {
+    let target_path = match url.path().strip_prefix(&format!("/ark/{}", name)) {
+        Some("") => "/".to_string(),
+        Some(rest) => rest.to_string(),
+        None => return write_text(stream, 403, b"forbidden"),
+    };
+
+    let account_root = server_root.join("ark").join(name);
+    let target_identity_path = account_root.join(".ark").join("identity.json");
+
+    if method == "PUT" && target_path == "/.ark/identity.json" && !target_identity_path.exists() {
         let metadata = match read_metadata_headers(headers) {
             Ok(m) => m,
             Err(e) => return write_text(stream, 400, e.to_string().as_bytes()),
         };
-        return serve_put_init(stream, &metadata, body, &target_identity_path);
+        return serve_put_init(&account_root, &target_path, stream, body, &metadata);
     }
 
     let target_ctx = match create_target_context(server_root, name) {
@@ -153,33 +164,30 @@ fn handle_parsed_inner(
         Err(e) => return Err(e),
     };
 
-    let fs_path = server_root.join(url.path().trim_start_matches('/'));
-
-    if fs::symlink_metadata(&fs_path).map(|m| m.is_symlink()).unwrap_or(false) {
+    if is_symlink(&target_ctx, &target_path) {
         return write_text(stream, 403, b"symlinks not allowed");
     }
 
-    let existing_metadata = read_metadata_attributes(&fs_path).ok();
-    if fs_path.is_file() && existing_metadata.is_none() {
+    let existing_metadata = read_metadata_attributes(&target_ctx, &target_path).ok();
+    if is_file(&target_ctx, &target_path) && existing_metadata.is_none() {
         return write_text(stream, 500, b"file missing metadata");
     }
 
-    let effective_members = match existing_metadata.as_ref() {
-        Some(m) => Some(m.members.clone()),
-        None => {
-            let mut ancestor = None;
-            let mut current = fs_path.parent();
-            while let Some(dir) = current {
-                if !dir.starts_with(&target_ctx.root) { break; }
-                if let Ok(m) = read_metadata_attributes(dir) {
-                    ancestor = Some(m.members);
-                    break;
-                }
-                current = dir.parent();
+    // A path with no metadata of its own — a new file, or a directory created
+    // as a side effect of a nested put — inherits the members of the nearest
+    // metadata-bearing directory above it. `target_path` is account-absolute,
+    // so the walk ends at the account root.
+    let mut effective_members = existing_metadata.as_ref().map(|m| m.members.clone());
+    if effective_members.is_none() {
+        let mut current = parent_path(&target_path);
+        while let Some(dir) = current {
+            if let Ok(metadata) = read_metadata_attributes(&target_ctx, dir) {
+                effective_members = Some(metadata.members);
+                break;
             }
-            ancestor
+            current = parent_path(dir);
         }
-    };
+    }
 
     let public_member = effective_members
         .as_deref()
@@ -190,7 +198,7 @@ fn handle_parsed_inner(
         .map(|(_, v)| v.into_owned());
 
     if public_member.is_some() && (method == "GET" || method == "HEAD") {
-        return serve_get(&fs_path, stream, method == "GET", prefix.as_deref());
+        return serve_get(&target_ctx, &target_path, stream, method == "GET", prefix.as_deref());
     }
 
     let requestor_identity = match authenticate(server_ctx, &url, method, headers, body) {
@@ -229,15 +237,15 @@ fn handle_parsed_inner(
     }
 
     match method {
-        "GET" => {
+        "GET" | "HEAD" => {
             let wants_stream = headers.iter().any(|(n, v)|
                 n.eq_ignore_ascii_case("accept") && v.contains("text/event-stream"));
-            if wants_stream {
-                return serve_stream(&fs_path, stream, verbose);
+            if method == "GET" && wants_stream {
+                return serve_stream(&target_ctx, &target_path, stream, verbose);
             }
-            serve_get(&fs_path, stream, true, prefix.as_deref())
+
+            serve_get(&target_ctx, &target_path, stream, method == "GET", prefix.as_deref())
         },
-        "HEAD" => serve_get(&fs_path, stream, false, prefix.as_deref()),
         "PUT" => {
             let metadata = metadata.as_ref().expect("metadata presence checked above");
             let modifier = modifier_identity.as_ref().expect("modifier presence checked above");
@@ -252,7 +260,7 @@ fn handle_parsed_inner(
                 }
             }
 
-            serve_put(&fs_path, stream, body, metadata, modifier, existing_metadata.as_ref(), permission, metadata_only)?;
+            serve_put(&target_ctx, &target_path, stream, body, metadata, modifier, existing_metadata.as_ref(), permission, metadata_only)?;
 
             if let Some(mode) = relay_mode {
                 let server_ctx = Arc::clone(server_ctx);
@@ -272,7 +280,7 @@ fn handle_parsed_inner(
 
             Ok(())
         }
-        "DELETE" => serve_delete(&fs_path, stream),
+        "DELETE" => serve_delete(&target_ctx, &target_path, stream),
         _ => write_text(stream, 405, b"method not allowed"),
     }
 }

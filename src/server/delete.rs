@@ -1,19 +1,18 @@
-use std::fs;
 use std::io::{self, Write};
-use std::path::Path;
 
 use crate::http::write_text;
+use crate::storage::{exists, is_dir, remove_dir_all, remove_file};
+use crate::types::Context;
 
-pub fn serve_delete(fs_path: &Path, stream: &mut dyn Write) -> io::Result<()> {
-    let fs_metadata = match fs::metadata(fs_path) {
-        Ok(m) => m,
-        Err(_) => return write_text(stream, 404, b"not found"),
-    };
+pub fn serve_delete(ctx: &Context, path: &str, stream: &mut dyn Write) -> io::Result<()> {
+    if !exists(ctx, path) {
+        return write_text(stream, 404, b"not found");
+    }
 
-    let result = if fs_metadata.is_dir() {
-        fs::remove_dir_all(fs_path)
+    let result = if is_dir(ctx, path) {
+        remove_dir_all(ctx, path)
     } else {
-        fs::remove_file(fs_path)
+        remove_file(ctx, path)
     };
 
     match result {

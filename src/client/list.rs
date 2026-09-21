@@ -3,7 +3,7 @@ use std::io;
 use super::request;
 
 use crate::http::check_response_code;
-use crate::types::{DirEntry, IdentityContext};
+use crate::types::{Context, DirEntry};
 use crate::util::resolve_client_url;
 
 /// List the entries of a directory at `path`.
@@ -17,7 +17,7 @@ use crate::util::resolve_client_url;
 /// When `prefix` is `Some`, only entries whose name starts with the given
 /// string are returned. Filtering happens server-side, so unmatched entries
 /// never cross the wire.
-pub fn list(ctx: &IdentityContext, path: &str, prefix: Option<&str>) -> io::Result<Vec<DirEntry>> {
+pub fn list(ctx: &Context, path: &str, prefix: Option<&str>) -> io::Result<Vec<DirEntry>> {
     let mut url = resolve_client_url(ctx, path)?;
     if let Some(p) = prefix {
         url.query_pairs_mut().append_pair("prefix", p);

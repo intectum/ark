@@ -12,7 +12,8 @@ use url::Url;
 
 use crate::http::{connect, read_stream_events, write_request};
 use crate::timestamp;
-use crate::types::{DirEntry, DirEntryKind, EntryAction, EntryEvent, IdentityContext, StreamEvent};
+use crate::types::{Context, DirEntry, DirEntryKind, EntryAction, EntryEvent, StreamEvent};
+use crate::storage::is_temp_path;
 use crate::util::create_authorization_header;
 
 const REMOTE_READ_TIMEOUT: Duration = Duration::from_secs(45);
@@ -74,6 +75,8 @@ where
         };
 
         for event_path in event.paths {
+            if is_temp_path(&event_path.to_string_lossy()) { continue; }
+
             let relative_path = event_path.strip_prefix(path).unwrap_or(&event_path);
             let watch_event = to_entry_event_local(&event.kind, relative_path);
             if let Some(e) = watch_event {
@@ -89,7 +92,7 @@ where
 /// stops the watcher (skipping reconnect); `on_error` receives stream errors
 /// prior to each reconnect and bad payload parse failures. `ctx` authenticates
 /// the subscription.
-pub fn watch_remote<F, G>(ctx: &IdentityContext, url: &Url, mut on_event: F, on_error: G) -> io::Result<()>
+pub fn watch_remote<F, G>(ctx: &Context, url: &Url, mut on_event: F, on_error: G) -> io::Result<()>
 where
     F: FnMut(EntryEvent) -> bool,
     G: Fn(io::Error) -> bool,
@@ -163,11 +166,15 @@ fn to_entry_event_remote<G: Fn(io::Error) -> bool>(event: &StreamEvent, on_error
 
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc::channel;
+    use std::sync::mpsc::{RecvTimeoutError, channel};
 
+    use crate::storage::temp_path_for;
     use crate::testing::fs::in_test_dir;
 
     use super::*;
+
+    const WATCHER_STARTUP: Duration = Duration::from_millis(300);
+    const EVENT_TIMEOUT: Duration = Duration::from_secs(3);
 
     /// Watch `dir` in the background, run `act`, and report whether an event
     /// for `expected` arrives before `LOCAL_REWATCH_INTERVAL * 2` elapses.
@@ -221,6 +228,43 @@ mod tests {
             });
 
             assert!(seen);
+        });
+    }
+
+    #[test]
+    fn watch_local_reports_an_atomic_write_only_at_its_real_path() {
+        in_test_dir("ark_watch_test", |temp_dir| {
+            let watch_root = temp_dir.to_path_buf();
+            let (tx, rx) = channel();
+
+            thread::spawn(move || {
+                let _ = watch_local(&watch_root, |event| {
+                    let done = event.path == Path::new("notes.txt");
+                    let _ = tx.send(event);
+                    done
+                }, |_| false);
+            });
+
+            thread::sleep(WATCHER_STARTUP);
+            let path = temp_dir.join("notes.txt");
+            let temp = temp_dir.join(temp_path_for("notes.txt"));
+            fs::write(&temp, b"hello").unwrap();
+            fs::rename(&temp, &path).unwrap();
+
+            let mut paths = Vec::new();
+            loop {
+                match rx.recv_timeout(EVENT_TIMEOUT) {
+                    Ok(event) => {
+                        let reached_target = event.path == Path::new("notes.txt");
+                        paths.push(event.path);
+                        if reached_target { break; }
+                    }
+                    Err(RecvTimeoutError::Timeout) => panic!("no event for notes.txt, saw {:?}", paths),
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            }
+
+            assert_eq!(paths, vec![PathBuf::from("notes.txt")], "temp path must not be reported");
         });
     }
 }

@@ -1,14 +1,13 @@
-use std::fs;
 use std::io;
 use std::path::Path;
 
-use getrandom::getrandom;
 use url::Url;
 
 use crate::client::request;
 use crate::crypto::{DEFAULT_SIGNING_ALGORITHM, create_secret_key, sign_json, to_public_key, verify_json};
 use crate::http::check_response_code;
-use crate::types::{Identity, IdentityContext, Key, Signature};
+use crate::storage::{Body, create_dir_all, exists, exists_raw, read_to_string, read_to_string_raw, to_fs_path_raw, write_atomic_without_metadata, write_raw};
+use crate::types::{Context, Identity, Key, Signature};
 use crate::util::{decode_base64url, encode_base64url, resolve_client_url};
 
 /// Create a fresh identity keypair for `address`.
@@ -16,10 +15,7 @@ use crate::util::{decode_base64url, encode_base64url, resolve_client_url};
 /// When `members` is `Some`, the identity is a group and those addresses are
 /// included in the signed document.
 pub fn create_identity(address: &str, members: Option<Vec<String>>) -> io::Result<(Identity, Key)> {
-    let mut secret_key = create_secret_key(DEFAULT_SIGNING_ALGORITHM)?;
-
-    getrandom(&mut secret_key.value)
-        .map_err(|e| io::Error::other(e.to_string()))?;
+    let secret_key = create_secret_key(DEFAULT_SIGNING_ALGORITHM)?;
 
     let mut identity = Identity {
         public_key: to_public_key(&secret_key)?,
@@ -37,8 +33,15 @@ pub fn create_identity(address: &str, members: Option<Vec<String>>) -> io::Resul
     Ok((identity, secret_key))
 }
 
-pub fn read_identity(path: &Path) -> io::Result<Identity> {
-    let content = fs::read_to_string(path)?;
+pub fn read_identity(ctx: &Context, path: &str) -> io::Result<Identity> {
+    read_identity_raw(&ctx.root, path)
+}
+
+/// As [`read_identity`], for a caller holding only the account root — one
+/// running before its [`Context`] can be built, or reading another account
+/// under the server root.
+pub fn read_identity_raw(root: &Path, path: &str) -> io::Result<Identity> {
+    let content = read_to_string_raw(root, path)?;
     let identity: Identity = serde_json::from_str(&content)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("identity.json parse: {}", e)))?;
     validate_identity(&identity)?;
@@ -46,7 +49,7 @@ pub fn read_identity(path: &Path) -> io::Result<Identity> {
     Ok(identity)
 }
 
-pub fn resolve_identity(ctx: &IdentityContext, address: &str) -> io::Result<Identity> {
+pub fn resolve_identity(ctx: &Context, address: &str) -> io::Result<Identity> {
     if address == ctx.identity.address {
         return Ok(ctx.identity.clone());
     }
@@ -56,21 +59,23 @@ pub fn resolve_identity(ctx: &IdentityContext, address: &str) -> io::Result<Iden
         path = "/.ark/identity.json".to_string();
     }
 
-    let peer_path = ctx.root.parent().unwrap()
-        .join(&name).join(path.trim_start_matches('/'));
+    // A peer account is a sibling of this one under the same server root, so
+    // its identity is reached against that root rather than this account's —
+    // the account-path form refuses anything outside the root it is given.
+    let accounts_root = ctx.root.parent().unwrap();
+    let peer_path = format!("/{}{}", name, path);
 
-    if fs::exists(&peer_path)? {
-        let peer_identity = read_identity(&peer_path)?;
+    if exists_raw(accounts_root, &peer_path) {
+        let peer_identity = read_identity_raw(accounts_root, &peer_path)?;
         if peer_identity.address == address {
             return Ok(peer_identity);
         }
     }
 
-    let cache_dir = ctx.root.join(".ark").join("identities");
-    let cache_path = cache_dir.join(format!("{}.json", address.replace('/', "_")));
+    let cache_path = format!("/.ark/identities/{}.json", address.replace('/', "_"));
 
-    if fs::exists(&cache_path)? {
-        return read_identity(&cache_path);
+    if exists(ctx, &cache_path) {
+        return read_identity(ctx, &cache_path);
     }
 
     let url = resolve_client_url(ctx, &format!("{}@{}{}", name, host, path))?;
@@ -81,16 +86,22 @@ pub fn resolve_identity(ctx: &IdentityContext, address: &str) -> io::Result<Iden
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("identity.json parse: {}", e)))?;
     validate_identity(&identity)?;
 
-    fs::create_dir_all(&cache_dir)?;
-    fs::write(&cache_path, &body)?;
+    create_dir_all(ctx, "/.ark/identities")?;
+    write_atomic_without_metadata(ctx, &cache_path, Body::Bytes(&body))?;
 
     Ok(identity)
 }
 
-pub fn write_identity(path: &Path, identity: &Identity) -> io::Result<()> {
-    let pretty = serde_json::to_string_pretty(identity)
+pub fn write_identity(ctx: &Context, path: &str, identity: &Identity) -> io::Result<()> {
+    write_identity_raw(&ctx.root, path, identity)
+}
+
+/// As [`write_identity`], for a caller holding only the account root — one
+/// running before its [`Context`] can be built.
+pub fn write_identity_raw(root: &Path, path: &str, identity: &Identity) -> io::Result<()> {
+    let pretty = serde_json::to_vec_pretty(identity)
         .map_err(|e| io::Error::other(e.to_string()))?;
-    fs::write(path, pretty)
+    write_raw(root, path, &pretty)
 }
 
 pub fn sign_identity(secret_key: &Key, identity: &mut Identity) -> io::Result<()> {
@@ -152,32 +163,42 @@ fn identity_for_signing(identity: &Identity) -> Identity {
     clone
 }
 
-pub fn read_identity_key(path: &Path) -> io::Result<Vec<u8>> {
-    let content = fs::read_to_string(path)?;
-    let key = decode_base64url(content)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "public key is not base64url encoded"))?;
+pub fn read_identity_key(ctx: &Context, path: &str) -> io::Result<Vec<u8>> {
+    let content = read_to_string(ctx, path)?;
+    let key = decode_base64url(content.trim())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "key is not base64url encoded"))?;
 
     Ok(key)
 }
 
+pub fn write_identity_key(ctx: &Context, path: &str, key: &[u8]) -> io::Result<()> {
+    write_identity_key_raw(&ctx.root, path, key)
+}
+
+/// As [`write_identity_key`], for a caller holding only the account root —
+/// one running before its [`Context`] can be built.
+///
+/// The key is created private to the current user, and never over a key that
+/// is already there.
 #[cfg(unix)]
-pub fn write_identity_key(path: &Path, key: &[u8]) -> io::Result<()> {
+pub fn write_identity_key_raw(root: &Path, path: &str, key: &[u8]) -> io::Result<()> {
+    use std::fs::OpenOptions;
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
 
-    let mut file = fs::OpenOptions::new()
+    let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(path)?;
+        .open(to_fs_path_raw(root, path)?)?;
     file.write_all(encode_base64url(key).as_bytes())?;
 
     Ok(())
 }
 
 #[cfg(not(unix))]
-pub fn write_identity_key(path: &Path, key: &[u8]) -> io::Result<()> {
-    fs::write(path, encode_base64url(key))
+pub fn write_identity_key_raw(root: &Path, path: &str, key: &[u8]) -> io::Result<()> {
+    write_raw(root, path, encode_base64url(key).as_bytes())
 }
 
 fn is_valid_account_name(name: &str) -> bool {
@@ -194,12 +215,13 @@ fn is_valid_account_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::env::set_current_dir;
+    use std::fs;
 
     use super::*;
 
     use crate::client::init_local;
     use crate::context::create_client_context;
-    use crate::testing::fs::{create_test_account, in_test_dir};
+    use crate::testing::fs::{account_context, create_test_account, in_test_dir};
     use crate::testing::http::start_test_server;
 
 
@@ -260,9 +282,8 @@ mod tests {
     fn read_write_identity_round_trip() {
         in_test_dir("ark_identity_test", |temp_dir| {
             let (identity, _) = create_identity("alice@example.com", None).unwrap();
-            let path = temp_dir.join("identity.json");
-            write_identity(&path, &identity).unwrap();
-            let loaded = read_identity(&path).unwrap();
+            write_identity_raw(temp_dir, "/identity.json", &identity).unwrap();
+            let loaded = read_identity_raw(temp_dir, "/identity.json").unwrap();
             assert_eq!(loaded.address, identity.address);
             assert_eq!(loaded.public_key.algorithm, identity.public_key.algorithm);
             assert_eq!(loaded.public_key.value, identity.public_key.value);
@@ -338,11 +359,15 @@ mod tests {
 
     #[test]
     fn read_write_identity_key_round_trip() {
+        use crate::testing::fs::account_context;
+
         in_test_dir("ark_identity_test", |temp_dir| {
+            let (_, _, account_dir) = create_test_account(temp_dir, "alice@example.com");
             let key = [77u8; 32];
-            let path = temp_dir.join("identity.key");
-            write_identity_key(&path, &key).unwrap();
-            let loaded = read_identity_key(&path).unwrap();
+            write_identity_key_raw(&account_dir, "/group.key", &key).unwrap();
+
+            let (ctx, account_path) = account_context(&account_dir.join("group.key"));
+            let loaded = read_identity_key(&ctx, &account_path).unwrap();
             assert_eq!(loaded, key);
         });
     }
@@ -353,10 +378,9 @@ mod tests {
             init_local(temp_dir, "alice@example.com").unwrap();
             let ctx = create_client_context().unwrap();
 
-            let cache_dir = temp_dir.join(".ark/identities");
-            fs::create_dir_all(&cache_dir).unwrap();
+            create_dir_all(&ctx, "/.ark/identities").unwrap();
             let (identity, _) = create_identity("bob@example.com", None).unwrap();
-            write_identity(&cache_dir.join("bob@example.com.json"), &identity).unwrap();
+            write_identity(&ctx, "/.ark/identities/bob@example.com.json", &identity).unwrap();
 
             let loaded = resolve_identity(&ctx, "bob@example.com").unwrap();
             assert_eq!(loaded.address, identity.address);
@@ -401,7 +425,8 @@ mod tests {
 
             let peer_address = format!("bob@127.0.0.1:{}", port);
             let (_, _, bob_dir) = create_test_account(temp_dir, &peer_address);
-            let expected = read_identity(&bob_dir.join(".ark/identity.json")).unwrap();
+            let (bob_ctx, bob_account_path) = account_context(&bob_dir.join(".ark/identity.json"));
+            let expected = read_identity(&bob_ctx, &bob_account_path).unwrap();
 
             set_current_dir(&account_dir).unwrap();
             let ctx = create_client_context().unwrap();
@@ -439,8 +464,9 @@ mod tests {
             let mut meta = create_metadata(&bob_address, None);
             meta.members.push(Member { address: "*".to_string(), permission: Permission::Reader, key: None });
             sign_metadata(&bob_key, &mut meta, Some(&body)).unwrap();
-            write_metadata_attributes(&bob_identity_path, &meta).unwrap();
-            let expected = read_identity(&bob_identity_path).unwrap();
+            let (bob_ctx, bob_account_path) = account_context(&bob_identity_path);
+            write_metadata_attributes(&bob_ctx, &bob_account_path, &meta).unwrap();
+            let expected = read_identity(&bob_ctx, &bob_account_path).unwrap();
 
             set_current_dir(&alice_dir).unwrap();
             let ctx = create_client_context().unwrap();
@@ -450,9 +476,9 @@ mod tests {
             assert_eq!(fetched.public_key.value, expected.public_key.value);
             assert_eq!(fetched.signature.value, expected.signature.value);
 
-            let cache_path = alice_dir.join(".ark/identities").join(format!("{}.json", bob_address));
-            assert!(cache_path.exists(), "cache file not written: {:?}", cache_path);
-            let cached = read_identity(&cache_path).unwrap();
+            let cache_path = format!("/.ark/identities/{}.json", bob_address);
+            assert!(exists(&ctx, &cache_path), "cache file not written: {}", cache_path);
+            let cached = read_identity(&ctx, &cache_path).unwrap();
             assert_eq!(cached.public_key.value, expected.public_key.value);
         });
     }
@@ -463,9 +489,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         in_test_dir("ark_identity_test", |temp_dir| {
-            let path = temp_dir.join("identity.key");
-            write_identity_key(&path, &[78u8; 32]).unwrap();
-            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            write_identity_key_raw(temp_dir, "/identity.key", &[78u8; 32]).unwrap();
+            let mode = fs::metadata(temp_dir.join("identity.key")).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         });
     }

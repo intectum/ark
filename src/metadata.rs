@@ -1,6 +1,4 @@
-use std::fs;
 use std::io;
-use std::path::Path;
 
 use uuid::Uuid;
 
@@ -8,10 +6,11 @@ use crate::client::decrypt_stream;
 use crate::crypto::{DEFAULT_HASH_ALGORITHM, decrypt_bytes, encrypt_bytes, sign_json, verify_json};
 use crate::identity::{parse_address, read_identity_key, resolve_identity};
 use crate::permissions::cli_address_to_wire;
+use crate::storage::{exists, list_attributes, read, read_attribute, remove_attribute, write_attribute};
 use crate::timestamp;
 use crate::types::{Hash, Key, LocalMetadata, Member, Metadata, Permission, Permissions, Signature};
-use crate::types::IdentityContext;
-use crate::util::{decode_base64url, encode_base64url, sha256};
+use crate::types::Context;
+use crate::util::{decode_base64url, encode_base64url, parse_uuid, sha256};
 
 const ATTRIBUTE_PREFIX: &str = "user.ark.";
 const LOCAL_ATTRIBUTE_PREFIX: &str = "user.ark_local.";
@@ -50,7 +49,7 @@ pub fn create_metadata(owner_address: &str, encryption_algorithm: Option<&str>) 
     let now = timestamp::now();
 
     Metadata {
-        id: Uuid::new_v4().to_string(),
+        id: Uuid::new_v4(),
         created: now,
         modified: now,
         modified_by: owner_address.to_string(),
@@ -68,20 +67,19 @@ pub fn create_metadata(owner_address: &str, encryption_algorithm: Option<&str>) 
     }
 }
 
-pub fn has_metadata_attributes(path: &Path) -> io::Result<bool> {
-    Ok(xattr::get(path, format!("{}{}", ATTRIBUTE_PREFIX, FIELD_ID))?.is_some())
+pub fn has_metadata_attributes(ctx: &Context, path: &str) -> io::Result<bool> {
+    Ok(read_attribute(ctx, path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_ID))?.is_some())
 }
 
-pub fn read_metadata_attributes(path: &Path) -> io::Result<Metadata> {
+pub fn read_metadata_attributes(ctx: &Context, path: &str) -> io::Result<Metadata> {
     let mut partial_metadata = PartialMetadata::default();
 
-    for attribute in xattr::list(path)? {
-        let name = attribute.to_string_lossy().into_owned();
+    for name in list_attributes(ctx, path)? {
         if !name.starts_with(ATTRIBUTE_PREFIX) {
             continue;
         }
 
-        let value = match xattr::get(path, &name)? {
+        let value = match read_attribute(ctx, path, &name)? {
             Some(v) => String::from_utf8(v)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, format!("xattr {} not utf8", name)))?,
             None => continue,
@@ -98,59 +96,57 @@ pub fn read_metadata_attributes(path: &Path) -> io::Result<Metadata> {
     Ok(metadata)
 }
 
-pub fn write_metadata_attributes(path: &Path, metadata: &Metadata) -> io::Result<()> {
-    remove_metadata_attributes(path)?;
+pub fn write_metadata_attributes(ctx: &Context, path: &str, metadata: &Metadata) -> io::Result<()> {
+    remove_metadata_attributes(ctx, path)?;
 
-    xattr::set(path, format!("{}{}", ATTRIBUTE_PREFIX, FIELD_ID), metadata.id.as_bytes())?;
-    xattr::set(path, format!("{}{}", ATTRIBUTE_PREFIX, FIELD_CREATED), timestamp::format(metadata.created).as_bytes())?;
-    xattr::set(path, format!("{}{}", ATTRIBUTE_PREFIX, FIELD_MODIFIED), timestamp::format(metadata.modified).as_bytes())?;
-    xattr::set(path, format!("{}{}", ATTRIBUTE_PREFIX, FIELD_MODIFIED_BY), metadata.modified_by.as_bytes())?;
+    write_attribute(ctx, path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_ID), metadata.id.hyphenated().to_string().as_bytes())?;
+    write_attribute(ctx, path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_CREATED), timestamp::format(metadata.created).as_bytes())?;
+    write_attribute(ctx, path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_MODIFIED), timestamp::format(metadata.modified).as_bytes())?;
+    write_attribute(ctx, path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_MODIFIED_BY), metadata.modified_by.as_bytes())?;
     if let Some(alg) = &metadata.encryption_algorithm {
-        xattr::set(path, format!("{}{}", ATTRIBUTE_PREFIX, FIELD_ENCRYPTION_ALGORITHM), alg.as_bytes())?;
+        write_attribute(ctx, path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_ENCRYPTION_ALGORITHM), alg.as_bytes())?;
     }
     if let Some(body_hash) = &metadata.body_hash {
-        xattr::set(path, format!("{}{}", ATTRIBUTE_PREFIX, FIELD_BODY_HASH_ALGORITHM), body_hash.algorithm.as_bytes())?;
-        xattr::set(path, format!("{}{}", ATTRIBUTE_PREFIX, FIELD_BODY_HASH_VALUE), encode_base64url(&body_hash.value).as_bytes())?;
+        write_attribute(ctx, path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_BODY_HASH_ALGORITHM), body_hash.algorithm.as_bytes())?;
+        write_attribute(ctx, path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_BODY_HASH_VALUE), encode_base64url(&body_hash.value).as_bytes())?;
     }
-    xattr::set(path, format!("{}{}", ATTRIBUTE_PREFIX, FIELD_SIGNATURE_ALGORITHM), metadata.signature.algorithm.as_bytes())?;
-    xattr::set(path, format!("{}{}", ATTRIBUTE_PREFIX, FIELD_SIGNATURE_VALUE), encode_base64url(&metadata.signature.value).as_bytes())?;
+    write_attribute(ctx, path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_SIGNATURE_ALGORITHM), metadata.signature.algorithm.as_bytes())?;
+    write_attribute(ctx, path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_SIGNATURE_VALUE), encode_base64url(&metadata.signature.value).as_bytes())?;
 
     for (index, member) in metadata.members.iter().enumerate() {
-        xattr::set(path, format!("{}member_{}_address", ATTRIBUTE_PREFIX, index), member.address.as_bytes())?;
-        xattr::set(path, format!("{}member_{}_permission", ATTRIBUTE_PREFIX, index), member.permission.as_str().as_bytes())?;
+        write_attribute(ctx, path, &format!("{}member_{}_address", ATTRIBUTE_PREFIX, index), member.address.as_bytes())?;
+        write_attribute(ctx, path, &format!("{}member_{}_permission", ATTRIBUTE_PREFIX, index), member.permission.as_str().as_bytes())?;
         if let Some(key) = &member.key {
-            xattr::set(path, format!("{}member_{}_key_algorithm", ATTRIBUTE_PREFIX, index), key.algorithm.as_bytes())?;
-            xattr::set(path, format!("{}member_{}_key_value", ATTRIBUTE_PREFIX, index), encode_base64url(&key.value).as_bytes())?;
+            write_attribute(ctx, path, &format!("{}member_{}_key_algorithm", ATTRIBUTE_PREFIX, index), key.algorithm.as_bytes())?;
+            write_attribute(ctx, path, &format!("{}member_{}_key_value", ATTRIBUTE_PREFIX, index), encode_base64url(&key.value).as_bytes())?;
         }
     }
 
     Ok(())
 }
 
-pub fn remove_metadata_attributes(path: &Path) -> io::Result<()> {
-    for attribute in xattr::list(path)? {
-        let name = attribute.to_string_lossy();
+pub fn remove_metadata_attributes(ctx: &Context, path: &str) -> io::Result<()> {
+    for name in list_attributes(ctx, path)? {
         if name.starts_with(ATTRIBUTE_PREFIX) {
-            xattr::remove(path, &*name)?;
+            remove_attribute(ctx, path, &name)?;
         }
     }
 
     Ok(())
 }
 
-pub fn read_local_metadata_attributes(path: &Path) -> io::Result<LocalMetadata> {
+pub fn read_local_metadata_attributes(ctx: &Context, path: &str) -> io::Result<LocalMetadata> {
     let mut local = LocalMetadata::default();
     let mut sync_body_hash_algorithm: Option<String> = None;
     let mut sync_body_hash_value: Option<Vec<u8>> = None;
 
-    for attribute in xattr::list(path)? {
-        let name = attribute.to_string_lossy().into_owned();
+    for name in list_attributes(ctx, path)? {
         let field = match name.strip_prefix(LOCAL_ATTRIBUTE_PREFIX) {
             Some(f) => f,
             None => continue,
         };
 
-        let value = match xattr::get(path, &name)? {
+        let value = match read_attribute(ctx, path, &name)? {
             Some(v) => String::from_utf8(v)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, format!("xattr {} not utf8", name)))?,
             None => continue,
@@ -186,28 +182,27 @@ pub fn read_local_metadata_attributes(path: &Path) -> io::Result<LocalMetadata> 
     Ok(local)
 }
 
-pub fn write_local_metadata_attributes(path: &Path, local: &LocalMetadata) -> io::Result<()> {
-    remove_local_metadata_attributes(path)?;
+pub fn write_local_metadata_attributes(ctx: &Context, path: &str, local: &LocalMetadata) -> io::Result<()> {
+    remove_local_metadata_attributes(ctx, path)?;
 
     if let Some(encrypted) = local.encrypted {
-        xattr::set(path, format!("{}{}", LOCAL_ATTRIBUTE_PREFIX, LOCAL_FIELD_ENCRYPTED), if encrypted { b"true" } else { b"false" })?;
+        write_attribute(ctx, path, &format!("{}{}", LOCAL_ATTRIBUTE_PREFIX, LOCAL_FIELD_ENCRYPTED), if encrypted { b"true" } else { b"false" })?;
     }
     if let Some(sync_body_hash) = &local.sync_body_hash {
-        xattr::set(path, format!("{}{}", LOCAL_ATTRIBUTE_PREFIX, LOCAL_FIELD_SYNC_BODY_HASH_ALGORITHM), sync_body_hash.algorithm.as_bytes())?;
-        xattr::set(path, format!("{}{}", LOCAL_ATTRIBUTE_PREFIX, LOCAL_FIELD_SYNC_BODY_HASH_VALUE), encode_base64url(&sync_body_hash.value).as_bytes())?;
+        write_attribute(ctx, path, &format!("{}{}", LOCAL_ATTRIBUTE_PREFIX, LOCAL_FIELD_SYNC_BODY_HASH_ALGORITHM), sync_body_hash.algorithm.as_bytes())?;
+        write_attribute(ctx, path, &format!("{}{}", LOCAL_ATTRIBUTE_PREFIX, LOCAL_FIELD_SYNC_BODY_HASH_VALUE), encode_base64url(&sync_body_hash.value).as_bytes())?;
     }
     if let Some(sync_modified) = &local.sync_modified {
-        xattr::set(path, format!("{}{}", LOCAL_ATTRIBUTE_PREFIX, LOCAL_FIELD_SYNC_MODIFIED), timestamp::format(*sync_modified).as_bytes())?;
+        write_attribute(ctx, path, &format!("{}{}", LOCAL_ATTRIBUTE_PREFIX, LOCAL_FIELD_SYNC_MODIFIED), timestamp::format(*sync_modified).as_bytes())?;
     }
 
     Ok(())
 }
 
-pub fn remove_local_metadata_attributes(path: &Path) -> io::Result<()> {
-    for attribute in xattr::list(path)? {
-        let name = attribute.to_string_lossy();
+pub fn remove_local_metadata_attributes(ctx: &Context, path: &str) -> io::Result<()> {
+    for name in list_attributes(ctx, path)? {
         if name.starts_with(LOCAL_ATTRIBUTE_PREFIX) {
-            xattr::remove(path, &*name)?;
+            remove_attribute(ctx, path, &name)?;
         }
     }
 
@@ -236,7 +231,7 @@ pub fn read_metadata_headers(headers: &[(String, String)]) -> io::Result<Metadat
 pub fn write_metadata_headers(metadata: &Metadata) -> Vec<(String, String)> {
     let mut out = Vec::new();
 
-    out.push((format!("{}Id", HEADER_PREFIX), metadata.id.clone()));
+    out.push((format!("{}Id", HEADER_PREFIX), metadata.id.hyphenated().to_string()));
     out.push((format!("{}Created", HEADER_PREFIX), timestamp::format(metadata.created)));
     out.push((format!("{}Modified", HEADER_PREFIX), timestamp::format(metadata.modified)));
     out.push((format!("{}Modified-By", HEADER_PREFIX), metadata.modified_by.clone()));
@@ -271,7 +266,7 @@ pub fn validate_metadata(metadata: &Metadata) -> io::Result<()> {
 }
 
 pub fn apply_permissions(
-    ctx: &IdentityContext,
+    ctx: &Context,
     metadata: &mut Metadata,
     permissions: &Permissions,
     file_key: Option<&[u8]>,
@@ -295,7 +290,7 @@ pub fn apply_permissions(
 }
 
 pub fn apply_key_to_metadata(
-    ctx: &IdentityContext,
+    ctx: &Context,
     metadata: &mut Metadata,
     secret_key: &Key,
 ) -> io::Result<()> {
@@ -316,7 +311,7 @@ pub fn apply_key_to_metadata(
     Ok(())
 }
 
-pub fn resolve_member_addresses(ctx: &IdentityContext, members: &[Member]) -> io::Result<Vec<String>> {
+pub fn resolve_member_addresses(ctx: &Context, members: &[Member]) -> io::Result<Vec<String>> {
     let mut member_addresses: Vec<String> = Vec::new();
 
     for member in members {
@@ -340,7 +335,7 @@ pub fn resolve_member_addresses(ctx: &IdentityContext, members: &[Member]) -> io
 /// Unwrapping via a group needs the group's private key beside its identity
 /// document in the local mirror. When that key is itself held encrypted, it is
 /// unwrapped from its own members first.
-pub fn resolve_key_from_members(ctx: &IdentityContext, members: &[Member]) -> io::Result<Option<Vec<u8>>> {
+pub fn resolve_key_from_members(ctx: &Context, members: &[Member]) -> io::Result<Option<Vec<u8>>> {
     if let Some(member) = members.iter().find(|m| m.address == ctx.identity.address) {
         let identity_key = ctx.identity_key.as_ref().expect("context missing identity_key");
 
@@ -353,7 +348,11 @@ pub fn resolve_key_from_members(ctx: &IdentityContext, members: &[Member]) -> io
     }
 
     for member in members {
-        let group_identity = resolve_identity(ctx, &member.address)?;
+        let group_identity = match resolve_identity(ctx, &member.address) {
+            Ok(identity) => identity,
+            Err(_) => continue,
+        };
+
         if !group_identity.members.as_ref().is_some_and(|m| m.contains(&ctx.identity.address)) {
             continue;
         }
@@ -365,17 +364,18 @@ pub fn resolve_key_from_members(ctx: &IdentityContext, members: &[Member]) -> io
             _ => continue,
         };
 
-        let key_path = ctx.root.join(format!("{}.key", path.trim_start_matches('/').trim_end_matches(".json")));
-        if !fs::exists(&key_path)? {
+        let key_path = format!("/{}.key", path.trim_start_matches('/').trim_end_matches(".json"));
+        if !exists(ctx, &key_path) {
             continue;
         }
 
-        let group_key_value = if read_local_metadata_attributes(&key_path)?.encrypted == Some(true) {
-            let key_metadata = read_metadata_attributes(&key_path)?;
+        let group_key_value = if read_local_metadata_attributes(ctx, &key_path)?.encrypted == Some(true) {
+            let key_metadata = read_metadata_attributes(ctx, &key_path)?;
 
             // Recurses, the key file is wrapped for its own members.
+            let key_ciphertext = read(ctx, &key_path)?;
             let mut plaintext = Vec::new();
-            if decrypt_stream(ctx, &key_metadata, &mut fs::File::open(&key_path)?, &mut plaintext).is_err() {
+            if decrypt_stream(ctx, &key_metadata, &mut key_ciphertext.as_slice(), &mut plaintext).is_err() {
                 continue;
             }
 
@@ -384,7 +384,7 @@ pub fn resolve_key_from_members(ctx: &IdentityContext, members: &[Member]) -> io
             decode_base64url(encoded)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "group key is not base64url encoded"))?
         } else {
-            read_identity_key(&key_path)?
+            read_identity_key(ctx, &key_path)?
         };
 
         let group_key = Key {
@@ -434,7 +434,11 @@ pub fn verify_metadata(public_key: &Key, metadata: &Metadata, body: Option<&[u8]
         }
         (Some(_), None) => return Err(io::Error::new(io::ErrorKind::InvalidData, "file metadata must contain body_hash")),
         (None, Some(_)) => return Err(io::Error::new(io::ErrorKind::InvalidData, "dir metadata must not contain body_hash")),
-        (None, None) => {}
+        (None, None) => {
+            if metadata.encryption_algorithm.is_some() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "dir metadata must not contain encryption_algorithm"));
+            }
+        }
     }
 
     Ok(())
@@ -448,7 +452,7 @@ fn metadata_for_signing(metadata: &Metadata) -> Metadata {
 }
 
 fn apply_permission(
-    ctx: &IdentityContext,
+    ctx: &Context,
     members: &mut Vec<Member>,
     addresses: &[String],
     permission: Permission,
@@ -485,7 +489,7 @@ fn apply_permission(
 
 #[derive(Default)]
 struct PartialMetadata {
-    id: Option<String>,
+    id: Option<Uuid>,
     modified_by: Option<String>,
     created: Option<String>,
     modified: Option<String>,
@@ -538,7 +542,7 @@ fn apply_field(metadata: &mut PartialMetadata, key: &str, value: &str) -> io::Re
     };
 
     match metadata_key.as_str() {
-        FIELD_ID => metadata.id = Some(value.to_string()),
+        FIELD_ID => metadata.id = Some(parse_uuid(value)?),
         FIELD_CREATED => metadata.created = Some(value.to_string()),
         FIELD_MODIFIED => metadata.modified = Some(value.to_string()),
         FIELD_MODIFIED_BY => metadata.modified_by = Some(value.to_string()),
@@ -612,13 +616,12 @@ fn split_member_key(key: &str) -> Option<(usize, String)> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-
     use super::*;
 
     use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, DEFAULT_HASH_ALGORITHM};
     use crate::identity::create_identity;
-    use crate::testing::fs::{TEST_ADDRESS, create_plain_test_metadata, in_test_dir};
+    use crate::storage::{Body, write_atomic_with_metadata};
+    use crate::testing::fs::{TEST_ADDRESS, account_context, create_plain_test_metadata, create_test_account, in_test_dir};
 
     #[test]
     fn resolve_key_unwraps_via_group() {
@@ -626,6 +629,7 @@ mod tests {
         use crate::context::create_client_context;
         use crate::crypto::create_secret_key;
         use crate::identity::{write_identity, write_identity_key};
+        use crate::storage::create_dir_all;
 
         in_test_dir("ark_metadata_test", |temp_dir| {
             init_local(temp_dir, "bob@example.com").unwrap();
@@ -634,10 +638,10 @@ mod tests {
             let group_address = "alice@example.com/team.json";
             let (group_identity, group_key) = create_identity(group_address, Some(vec![ctx.identity.address.clone()])).unwrap();
 
-            let cache_dir = temp_dir.join(".ark").join("identities");
-            fs::create_dir_all(&cache_dir).unwrap();
-            write_identity(&cache_dir.join(group_address.replace('/', "_") + ".json"), &group_identity).unwrap();
-            write_identity_key(&temp_dir.join("team.key"), &group_key.value).unwrap();
+            create_dir_all(&ctx, "/.ark/identities").unwrap();
+            let cache_path = format!("/.ark/identities/{}.json", group_address.replace('/', "_"));
+            write_identity(&ctx, &cache_path, &group_identity).unwrap();
+            write_identity_key(&ctx, "/team.key", &group_key.value).unwrap();
 
             let file_key = create_secret_key(DEFAULT_ENCRYPTION_ALGORITHM).unwrap();
             let (wrap_algorithm, wrapped) = encrypt_bytes(&group_identity.public_key, &file_key.value).unwrap();
@@ -659,6 +663,7 @@ mod tests {
         use crate::context::create_client_context;
         use crate::crypto::create_secret_key;
         use crate::identity::write_identity;
+        use crate::storage::create_dir_all;
 
         in_test_dir("ark_metadata_test", |temp_dir| {
             init_local(temp_dir, "bob@example.com").unwrap();
@@ -667,17 +672,14 @@ mod tests {
             let group_address = "alice@example.com/team.json";
             let (group_identity, group_key) = create_identity(group_address, Some(vec![ctx.identity.address.clone()])).unwrap();
 
-            let cache_dir = temp_dir.join(".ark").join("identities");
-            fs::create_dir_all(&cache_dir).unwrap();
-            write_identity(&cache_dir.join(group_address.replace('/', "_") + ".json"), &group_identity).unwrap();
+            create_dir_all(&ctx, "/.ark/identities").unwrap();
+            let cache_path = format!("/.ark/identities/{}.json", group_address.replace('/', "_"));
+            write_identity(&ctx, &cache_path, &group_identity).unwrap();
 
             // The group key file as mirrored without decrypting: its body is
             // the group key, encrypted with a file key wrapped for the account.
             let key_file_key = create_secret_key(DEFAULT_ENCRYPTION_ALGORITHM).unwrap();
             let (_, key_file_body) = encrypt_bytes(&key_file_key, encode_base64url(&group_key.value).as_bytes()).unwrap();
-            let key_path = temp_dir.join("team.key");
-            fs::write(&key_path, &key_file_body).unwrap();
-
             let (key_wrap_algorithm, wrapped_key_file_key) = encrypt_bytes(&ctx.identity.public_key, &key_file_key.value).unwrap();
             let mut key_file_metadata = create_metadata("alice@example.com", Some(DEFAULT_ENCRYPTION_ALGORITHM));
             key_file_metadata.members.push(Member {
@@ -685,8 +687,8 @@ mod tests {
                 permission: Permission::Reader,
                 key: Some(Key { algorithm: key_wrap_algorithm, value: wrapped_key_file_key }),
             });
-            write_metadata_attributes(&key_path, &key_file_metadata).unwrap();
-            write_local_metadata_attributes(&key_path, &LocalMetadata { encrypted: Some(true), ..LocalMetadata::default() }).unwrap();
+            let key_file_local = LocalMetadata { encrypted: Some(true), ..LocalMetadata::default() };
+            write_atomic_with_metadata(&ctx, "/team.key", Body::Bytes(&key_file_body), &key_file_metadata, Some(&key_file_local)).unwrap();
 
             let file_key = create_secret_key(DEFAULT_ENCRYPTION_ALGORITHM).unwrap();
             let (wrap_algorithm, wrapped) = encrypt_bytes(&group_identity.public_key, &file_key.value).unwrap();
@@ -770,12 +772,12 @@ mod tests {
     #[test]
     fn attribute_round_trip_preserves_all_fields() {
         in_test_dir("ark_metadata_test", |temp_dir| {
-            let p = temp_dir.join("file");
-            fs::write(&p, b"x").unwrap();
-            let (owner, owner_key) = create_identity(TEST_ADDRESS, None).unwrap();
+            let (owner, owner_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
+            let (ctx, _) = account_context(&account_dir);
             let m = create_plain_test_metadata(&owner, &owner_key, b"x");
-            write_metadata_attributes(&p, &m).unwrap();
-            let back = read_metadata_attributes(&p).unwrap();
+            write_atomic_with_metadata(&ctx, "/file", Body::Bytes(b"x"), &m, None).unwrap();
+
+            let back = read_metadata_attributes(&ctx, "/file").unwrap();
             assert_eq!(back.id, m.id);
             assert_eq!(back.signature.value, m.signature.value);
         });
@@ -784,12 +786,15 @@ mod tests {
     #[test]
     fn local_attribute_round_trip_preserves_all_fields() {
         in_test_dir("ark_metadata_test", |temp_dir| {
-            let p = temp_dir.join("file");
-            fs::write(&p, b"x").unwrap();
+            let (owner, owner_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
+            let (ctx, _) = account_context(&account_dir);
+            let m = create_plain_test_metadata(&owner, &owner_key, b"x");
             let sync_modified = timestamp::parse("2026-01-01T00:00:00Z").unwrap();
             let local = LocalMetadata { encrypted: Some(true), sync_body_hash: Some(Hash { algorithm: DEFAULT_HASH_ALGORITHM.to_string(), value: vec![0xAB, 0xCD] }), sync_modified: Some(sync_modified) };
-            write_local_metadata_attributes(&p, &local).unwrap();
-            let back = read_local_metadata_attributes(&p).unwrap();
+            write_atomic_with_metadata(&ctx, "/file", Body::Bytes(b"x"), &m, None).unwrap();
+            write_local_metadata_attributes(&ctx, "/file", &local).unwrap();
+
+            let back = read_local_metadata_attributes(&ctx, "/file").unwrap();
             assert_eq!(back.encrypted, Some(true));
             let back_hash = back.sync_body_hash.as_ref().unwrap();
             assert_eq!(back_hash.algorithm, DEFAULT_HASH_ALGORITHM);
@@ -801,12 +806,17 @@ mod tests {
     #[test]
     fn write_local_metadata_attributes_clears_stale_fields() {
         in_test_dir("ark_metadata_test", |temp_dir| {
-            let p = temp_dir.join("file");
-            fs::write(&p, b"x").unwrap();
+            let (owner, owner_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
+            let (ctx, _) = account_context(&account_dir);
+            let p = account_dir.join("file");
+            let m = create_plain_test_metadata(&owner, &owner_key, b"x");
             let full = LocalMetadata { encrypted: Some(true), sync_body_hash: Some(Hash { algorithm: DEFAULT_HASH_ALGORITHM.to_string(), value: vec![1, 2, 3] }), sync_modified: Some(timestamp::parse("2026-01-01T00:00:00Z").unwrap()) };
-            write_local_metadata_attributes(&p, &full).unwrap();
-            let cleared = LocalMetadata::default();
-            write_local_metadata_attributes(&p, &cleared).unwrap();
+            write_atomic_with_metadata(&ctx, "/file", Body::Bytes(b"x"), &m, None).unwrap();
+            write_local_metadata_attributes(&ctx, "/file", &full).unwrap();
+
+            write_local_metadata_attributes(&ctx, "/file", &LocalMetadata::default()).unwrap();
+
+            assert_eq!(read_metadata_attributes(&ctx, "/file").unwrap().id, m.id, "the metadata is left alone");
             assert_eq!(xattr::get(&p, "user.ark_local.encrypted").unwrap(), None);
             assert_eq!(xattr::get(&p, "user.ark_local.sync_body_hash_algorithm").unwrap(), None);
             assert_eq!(xattr::get(&p, "user.ark_local.sync_body_hash_value").unwrap(), None);
@@ -878,6 +888,24 @@ mod tests {
     }
 
     #[test]
+    fn read_headers_rejects_an_id_that_is_not_a_hyphenated_lowercase_uuid() {
+        let m = create_metadata(TEST_ADDRESS, None);
+        for id in [m.id.hyphenated().to_string().to_uppercase(), m.id.simple().to_string(), "not-a-uuid".to_string()] {
+            let mut headers = write_metadata_headers(&m);
+            for entry in headers.iter_mut() {
+                if entry.0 == "X-Ark-Meta-Id" {
+                    entry.1 = id.clone();
+                }
+            }
+            let err = match read_metadata_headers(&headers) {
+                Err(e) => e,
+                Ok(_) => panic!("expected id error for {}", id),
+            };
+            assert!(err.to_string().contains("uuid"), "msg was {}", err);
+        }
+    }
+
+    #[test]
     fn read_headers_rejects_invalid_base64_in_member_field() {
         let mut m = create_metadata(TEST_ADDRESS, None);
         m.members[0].key = Some(Key {
@@ -898,22 +926,22 @@ mod tests {
     }
 
     #[test]
-    fn write_metadata_attributes_removes_stale_member_xattrs() {
+    fn write_metadata_removes_stale_member_xattrs() {
         in_test_dir("ark_metadata_test", |temp_dir| {
-            let p = temp_dir.join("file");
-            fs::write(&p, b"x").unwrap();
-            let (owner, owner_key) = create_identity(TEST_ADDRESS, None).unwrap();
+            let (owner, owner_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
+            let (ctx, _) = account_context(&account_dir);
+            let p = account_dir.join("file");
             let mut two = create_plain_test_metadata(&owner, &owner_key, b"x");
             two.members.push(Member { address: "b@y".to_string(), permission: Permission::Owner, key: None });
             sign_metadata(&owner_key, &mut two, Some(b"x")).unwrap();
-            write_metadata_attributes(&p, &two).unwrap();
+            write_atomic_with_metadata(&ctx, "/file", Body::Bytes(b"x"), &two, None).unwrap();
             assert!(xattr::get(&p, "user.ark.member_1_address").unwrap().is_some());
 
             let one = create_plain_test_metadata(&owner, &owner_key, b"x");
-            write_metadata_attributes(&p, &one).unwrap();
+            write_metadata_attributes(&ctx, "/file", &one).unwrap();
             assert_eq!(xattr::get(&p, "user.ark.member_1_address").unwrap(), None);
 
-            let loaded = read_metadata_attributes(&p).unwrap();
+            let loaded = read_metadata_attributes(&ctx, "/file").unwrap();
             assert_eq!(loaded.members.len(), 1);
         });
     }

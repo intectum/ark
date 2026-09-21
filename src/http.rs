@@ -185,6 +185,17 @@ pub fn check_response_code(code: u16, body: &[u8]) -> io::Result<()> {
     }
 }
 
+pub fn error_response_code(error: &io::Error) -> u16 {
+    match error.kind() {
+        io::ErrorKind::InvalidData | io::ErrorKind::InvalidInput => 400,
+        io::ErrorKind::PermissionDenied => 403,
+        io::ErrorKind::NotFound => 404,
+        io::ErrorKind::Unsupported => 405,
+        io::ErrorKind::AlreadyExists => 409,
+        _ => 500,
+    }
+}
+
 fn read_message(stream: &mut dyn Read, skip_body: bool) -> io::Result<(String, Vec<(String, String)>, Vec<u8>)> {
     let mut reader = BufReader::new(stream);
 

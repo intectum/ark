@@ -1,7 +1,5 @@
-use std::fs;
 use std::io;
 use std::io::Read;
-use std::path::PathBuf;
 
 use super::encrypt_stream;
 
@@ -9,9 +7,10 @@ use crate::client::request;
 use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, DEFAULT_HASH_ALGORITHM, create_secret_key};
 use crate::http::check_response_code;
 use crate::metadata::{apply_key_to_metadata, apply_permissions, create_metadata, has_metadata_attributes, read_local_metadata_attributes, read_metadata_attributes, resolve_key_from_members, sign_metadata, write_local_metadata_attributes, write_metadata_attributes, write_metadata_headers};
+use crate::storage::{is_dir, read};
 use crate::timestamp;
-use crate::types::{Hash, IdentityContext, LocalMetadata, Metadata, Permissions};
-use crate::util::{resolve_client_url, resolve_local_path, sha256};
+use crate::types::{Context, Hash, LocalMetadata, Metadata, Permissions};
+use crate::util::{resolve_client_url, sha256};
 
 /// Upload the body of a local file (or create a directory) at `path`.
 ///
@@ -22,9 +21,8 @@ use crate::util::{resolve_client_url, resolve_local_path, sha256};
 ///
 /// Missing intermediate parent directories on `path` are created on the
 /// server automatically. Writes are relayed to co-members.
-pub fn put_content(ctx: &IdentityContext, path: &str) -> io::Result<()> {
-    let input = resolve_local_path(ctx, path)?;
-    put(ctx, path, input.to_str(), &Permissions::default(), None, false)
+pub fn put_content(ctx: &Context, path: &str) -> io::Result<()> {
+    put(ctx, path, &Permissions::default(), None, false)
 }
 
 /// Change members and permissions on a file or directory at `path`.
@@ -39,17 +37,17 @@ pub fn put_content(ctx: &IdentityContext, path: &str) -> io::Result<()> {
 ///
 /// Requires the file to exist locally and on the server. The caller must be
 /// an owner. Writes are relayed to co-members.
-pub fn put_permissions(ctx: &IdentityContext, path: &str, permissions: &Permissions) -> io::Result<()> {
-    let input = resolve_local_path(ctx, path)?;
-    put(ctx, path, input.to_str(), permissions, None, true)
+pub fn put_permissions(ctx: &Context, path: &str, permissions: &Permissions) -> io::Result<()> {
+    put(ctx, path, permissions, None, true)
 }
 
 /// Upload a file body (or create a directory) at `path`, with optional
 /// permission changes and encryption control.
 ///
 /// `path` accepts relative, absolute account (leading `/`), or address form
-/// (`<name>@<host>/...`). Reads the body from `input` (or stdin when `None`).
-/// If `input` is a directory, uploads an empty-body directory entry.
+/// (`<name>@<host>/...`). The body is read from the account's own copy of
+/// `path`, which must exist; a directory there uploads an empty-body
+/// directory entry.
 ///
 /// `permissions` applies member/permission changes to the metadata before
 /// the upload — on the initial upload this seeds who else can read/write;
@@ -65,46 +63,32 @@ pub fn put_permissions(ctx: &IdentityContext, path: &str, permissions: &Permissi
 /// (including any member/permission changes) is sent to the server. Requires
 /// the file to exist on the server. Rejects any `encryption_algorithm`.
 ///
+/// The signed metadata is written back to the local copy as `user.ark.*`
+/// xattrs, plus local metadata as `user.ark_local.*` xattrs.
+///
 /// Missing intermediate parent directories on `path` are created on the
 /// server automatically. Writes are relayed to co-members.
-pub fn put(ctx: &IdentityContext, path: &str, input: Option<&str>, permissions: &Permissions, encryption_algorithm: Option<&str>, metadata_only: bool) -> io::Result<()> {
-    let input_path: Option<PathBuf> = input.map(PathBuf::from);
-    if let Some(i) = input_path.as_deref() {
-        if !fs::exists(i)? {
-            return Err(io::Error::new(io::ErrorKind::NotFound, "input does not exist"));
-        }
-    }
-
-    let is_dir = input_path.as_deref().map(|p| p.is_dir()).unwrap_or(false);
-
-    let existing_metadata = match input_path.as_deref() {
-        Some(p) if has_metadata_attributes(p)? => Some(read_metadata_attributes(p)?),
-        _ => None,
+pub fn put(ctx: &Context, path: &str, permissions: &Permissions, encryption_algorithm: Option<&str>, metadata_only: bool) -> io::Result<()> {
+    let existing_metadata = match has_metadata_attributes(ctx, path)? {
+        true => Some(read_metadata_attributes(ctx, path)?),
+        false => None,
     };
-    let existing_local_metadata = match input_path.as_deref() {
-        Some(p) => Some(read_local_metadata_attributes(p)?),
-        None => None,
-    };
+    let existing_local_metadata = read_local_metadata_attributes(ctx, path)?;
 
-    let stdin = io::stdin();
-    let mut file_body;
-    let mut stdin_body;
-    let body: Option<&mut dyn Read> = if is_dir || metadata_only {
+    let file_body;
+    let mut body_reader;
+    let body: Option<&mut dyn Read> = if is_dir(ctx, path) || metadata_only {
         None
-    } else if let Some(p) = input_path.as_deref() {
-        file_body = fs::File::open(p)?;
-        Some(&mut file_body)
     } else {
-        stdin_body = stdin.lock();
-        Some(&mut stdin_body)
+        file_body = read(ctx, path)?;
+        body_reader = file_body.as_slice();
+        Some(&mut body_reader)
     };
 
-    let (metadata, local_metadata) = put_stream(ctx, path, body, permissions, encryption_algorithm, existing_metadata, existing_local_metadata, metadata_only)?;
+    let (metadata, local_metadata) = put_stream(ctx, path, body, permissions, encryption_algorithm, existing_metadata, Some(existing_local_metadata), metadata_only)?;
 
-    if let Some(i) = input_path.as_deref() {
-        write_metadata_attributes(i, &metadata)?;
-        write_local_metadata_attributes(i, &local_metadata)?;
-    }
+    write_metadata_attributes(ctx, path, &metadata)?;
+    write_local_metadata_attributes(ctx, path, &local_metadata)?;
 
     Ok(())
 }
@@ -136,7 +120,7 @@ pub fn put(ctx: &IdentityContext, path: &str, input: Option<&str>, permissions: 
 /// Missing intermediate parent directories on `path` are created on the
 /// server automatically. Writes are relayed to co-members.
 pub fn put_stream(
-    ctx: &IdentityContext,
+    ctx: &Context,
     path: &str,
     body: Option<&mut dyn Read>,
     permissions: &Permissions,
@@ -248,36 +232,39 @@ pub fn put_stream(
 #[cfg(test)]
 mod tests {
     use std::env::set_current_dir;
-    use std::path::Path;
+    use std::fs;
+    use std::io::ErrorKind;
+    use std::path::{Path, PathBuf};
 
     use super::*;
 
     use crate::context::create_client_context;
+    use crate::metadata::read_metadata_attributes;
+    use crate::storage::{create_dir_all, to_fs_path, write};
     use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, decrypt_bytes, encrypt_bytes};
     use crate::identity::{create_identity, write_identity};
     use crate::metadata::verify_metadata;
     use crate::permissions::{drop, reader, writer};
-    use crate::testing::fs::{in_test_dir, init_with_server, write_plain_test_file};
+    use crate::testing::fs::{account_context, in_test_dir, init_with_server, write_plain_test_file};
     use crate::testing::http::start_test_server;
-    use crate::types::{IdentityContext, Identity, Key, Permission};
+    use crate::types::{Context, Identity, Key, Permission};
 
-    fn cache_identity(ctx: &IdentityContext, identity: &Identity) {
-        let cache_dir = ctx.root.join(".ark").join("identities");
-        fs::create_dir_all(&cache_dir).unwrap();
-        write_identity(&cache_dir.join(format!("{}.json", identity.address)), identity).unwrap();
+    fn cache_identity(ctx: &Context, identity: &Identity) {
+        create_dir_all(ctx, "/.ark/identities").unwrap();
+        write_identity(ctx, &format!("/.ark/identities/{}.json", identity.address), identity).unwrap();
     }
 
-    fn put_plain(ctx: &IdentityContext, dir: &Path, name: &str, body: &[u8]) -> PathBuf {
+    fn put_plain(ctx: &Context, dir: &Path, name: &str, body: &[u8]) -> PathBuf {
         let path = dir.join(name);
         fs::write(&path, body).unwrap();
-        put(ctx, name, Some(path.to_str().unwrap()), &Permissions::default(), Some("none"), false).unwrap();
+        put(ctx, name, &Permissions::default(), Some("none"), false).unwrap();
         path
     }
 
-    fn put_encrypted(ctx: &IdentityContext, dir: &Path, name: &str, body: &[u8]) -> PathBuf {
+    fn put_encrypted(ctx: &Context, dir: &Path, name: &str, body: &[u8]) -> PathBuf {
         let path = dir.join(name);
         fs::write(&path, body).unwrap();
-        put(ctx, name, Some(path.to_str().unwrap()), &Permissions::default(), None, false).unwrap();
+        put(ctx, name, &Permissions::default(), None, false).unwrap();
         path
     }
 
@@ -285,19 +272,25 @@ mod tests {
         decrypt_bytes(&Key { algorithm: DEFAULT_ENCRYPTION_ALGORITHM.to_string(), value: key.to_vec() }, ciphertext)
     }
 
-    fn put_via_io(temp_dir: &Path, arg: &str, plaintext: &[u8], cwd_subpath: &str) -> PathBuf {
-        let input = temp_dir.join("input.bin");
-        fs::write(&input, plaintext).unwrap();
+    fn put_from_cwd(temp_dir: &Path, arg: &str, plaintext: &[u8], cwd_subpath: &str) -> PathBuf {
         let cwd = temp_dir.join(cwd_subpath);
         fs::create_dir_all(&cwd).unwrap();
         set_current_dir(&cwd).unwrap();
         let ctx = create_client_context().unwrap();
-        put(&ctx, arg, Some(input.to_str().unwrap()), &Permissions::default(), None, false).unwrap();
-        input
+
+        let local_path = to_fs_path(&ctx, arg).unwrap();
+        if let Some(parent) = local_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        write(&ctx, arg, plaintext).unwrap();
+
+        put(&ctx, arg, &Permissions::default(), None, false).unwrap();
+        local_path
     }
 
     fn unwrap_first_member_key(path: &Path, identity_seed: &[u8]) -> Vec<u8> {
-        let m = read_metadata_attributes(path).unwrap();
+        let (context, account_path) = account_context(path);
+        let m = read_metadata_attributes(&context, &account_path).unwrap();
         let key = m.members[0].key.as_ref().expect("key set");
         decrypt_bytes(&Key { algorithm: key.algorithm.clone(), value: identity_seed.to_vec() }, &key.value).expect("unwrap")
     }
@@ -309,7 +302,7 @@ mod tests {
             let address = format!("gyan@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &address);
 
-            put_via_io(temp_dir, "notes.txt", b"plaintext", "");
+            put_from_cwd(temp_dir, "notes.txt", b"plaintext", "");
 
             let server_path = temp_dir.join("ark/gyan/notes.txt");
             let on_disk = fs::read(&server_path).unwrap();
@@ -330,7 +323,7 @@ mod tests {
             let address = format!("gyan@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &address);
 
-            let input = put_via_io(temp_dir, "out.bin", b"hello", "");
+            let input = put_from_cwd(temp_dir, "out.bin", b"hello", "");
             assert_eq!(
                 xattr::get(&input, "user.ark.encryption_algorithm").unwrap().as_deref(),
                 Some(DEFAULT_ENCRYPTION_ALGORITHM.as_bytes())
@@ -346,15 +339,15 @@ mod tests {
             let address = format!("gyan@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &address);
 
-            let input = temp_dir.join("input.bin");
+            let input = temp_dir.join("notes.txt");
             write_plain_test_file(&input, &ctx.identity, ctx.identity_key.as_ref().unwrap(), b"hello");
             let mut preset_meta = create_metadata(&ctx.identity.address, Some(DEFAULT_ENCRYPTION_ALGORITHM));
             let preset_file_key = create_secret_key(DEFAULT_ENCRYPTION_ALGORITHM).unwrap();
             apply_key_to_metadata(&ctx, &mut preset_meta, &preset_file_key).unwrap();
             sign_metadata(ctx.identity_key.as_ref().unwrap(), &mut preset_meta, Some(b"hello")).unwrap();
-            write_metadata_attributes(&input, &preset_meta).unwrap();
+            write_metadata_attributes(&ctx, "/notes.txt", &preset_meta).unwrap();
 
-            put(&ctx, "notes.txt", Some(input.to_str().unwrap()), &Permissions::default(), None, false).unwrap();
+            put(&ctx, "notes.txt", &Permissions::default(), None, false).unwrap();
 
             let server_path = temp_dir.join("ark/gyan/notes.txt");
             let server_key = unwrap_first_member_key(&server_path, &ctx.identity_key.as_ref().unwrap().value);
@@ -374,13 +367,13 @@ mod tests {
             let ctx = init_with_server(temp_dir, &address);
             let account_key = ctx.identity_key.as_ref().unwrap().value.clone();
 
-            let input = temp_dir.join("input.bin");
+            let input = temp_dir.join("notes.txt");
             fs::write(&input, b"v1").unwrap();
-            put(&ctx, "notes.txt", Some(input.to_str().unwrap()), &Permissions::default(), None, false).unwrap();
+            put(&ctx, "notes.txt", &Permissions::default(), None, false).unwrap();
             let key1 = unwrap_first_member_key(&input, &account_key);
 
             fs::write(&input, b"v2").unwrap();
-            put(&ctx, "notes.txt", Some(input.to_str().unwrap()), &Permissions::default(), None, false).unwrap();
+            put(&ctx, "notes.txt", &Permissions::default(), None, false).unwrap();
             let key2 = unwrap_first_member_key(&input, &account_key);
 
             assert_ne!(key1, key2);
@@ -399,7 +392,7 @@ mod tests {
             let address = format!("gyan@127.0.0.1:{}", port);
             init_with_server(temp_dir, &address);
 
-            put_via_io(temp_dir, "notes.txt", b"hello", "");
+            put_from_cwd(temp_dir, "notes.txt", b"hello", "");
 
             assert!(temp_dir.join("ark/gyan/notes.txt").exists());
         });
@@ -412,11 +405,11 @@ mod tests {
             let address = format!("gyan@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &address);
 
-            let input = temp_dir.join("input.bin");
+            let input = temp_dir.join("x.txt");
             fs::write(&input, b"old").unwrap();
-            put(&ctx, "x.txt", Some(input.to_str().unwrap()), &Permissions::default(), None, false).unwrap();
+            put(&ctx, "x.txt", &Permissions::default(), None, false).unwrap();
             fs::write(&input, b"new plaintext").unwrap();
-            put(&ctx, "x.txt", Some(input.to_str().unwrap()), &Permissions::default(), None, false).unwrap();
+            put(&ctx, "x.txt", &Permissions::default(), None, false).unwrap();
 
             let on_disk = fs::read(temp_dir.join("ark/gyan/x.txt")).unwrap();
             assert_ne!(on_disk, b"old");
@@ -433,7 +426,7 @@ mod tests {
             let server_notes = temp_dir.join("ark/gyan/notes");
             fs::create_dir_all(&server_notes).unwrap();
 
-            put_via_io(temp_dir, "todo.txt", b"buy milk", "notes");
+            put_from_cwd(temp_dir, "todo.txt", b"buy milk", "notes");
 
             assert!(temp_dir.join("ark/gyan/notes/todo.txt").exists());
         });
@@ -446,7 +439,7 @@ mod tests {
             let address = format!("gyan@127.0.0.1:{}", port);
             init_with_server(temp_dir, &address);
 
-            put_via_io(temp_dir, "/sub/file.txt", b"absolute", "");
+            put_from_cwd(temp_dir, "/sub/file.txt", b"absolute", "");
 
             assert!(temp_dir.join("ark/gyan/sub/file.txt").exists());
         });
@@ -460,7 +453,7 @@ mod tests {
             init_with_server(temp_dir, &address);
 
             let arg = format!("gyan@127.0.0.1:{}/explicit.txt", port);
-            put_via_io(temp_dir, &arg, b"via address", "");
+            put_from_cwd(temp_dir, &arg, b"via address", "");
 
             assert!(temp_dir.join("ark/gyan/explicit.txt").exists());
         });
@@ -475,15 +468,16 @@ mod tests {
 
             let file_key = create_secret_key(DEFAULT_ENCRYPTION_ALGORITHM).unwrap();
             let ciphertext = encrypt_bytes(&file_key, b"hidden").unwrap().1;
-            let input = temp_dir.join("input.bin");
+            let input = temp_dir.join("file.bin");
             fs::write(&input, &ciphertext).unwrap();
             let mut m = create_metadata(&ctx.identity.address, Some(DEFAULT_ENCRYPTION_ALGORITHM));
             apply_key_to_metadata(&ctx, &mut m, &file_key).unwrap();
             sign_metadata(ctx.identity_key.as_ref().unwrap(), &mut m, Some(&ciphertext)).unwrap();
-            write_metadata_attributes(&input, &m).unwrap();
-            write_local_metadata_attributes(&input, &LocalMetadata { encrypted: Some(true), sync_body_hash: None, sync_modified: None }).unwrap();
+            let local = LocalMetadata { encrypted: Some(true), sync_body_hash: None, sync_modified: None };
+            write_metadata_attributes(&ctx, "/file.bin", &m).unwrap();
+            write_local_metadata_attributes(&ctx, "/file.bin", &local).unwrap();
 
-            put(&ctx, "file.bin", Some(input.to_str().unwrap()), &Permissions::default(), None, false).unwrap();
+            put(&ctx, "file.bin", &Permissions::default(), None, false).unwrap();
 
             let server_path = temp_dir.join("ark/gyan/file.bin");
             let server_body = fs::read(&server_path).unwrap();
@@ -504,7 +498,7 @@ mod tests {
             let address = format!("gyan@127.0.0.1:{}", port);
             init_with_server(temp_dir, &address);
 
-            let input = put_via_io(temp_dir, "out.bin", b"plain", "");
+            let input = put_from_cwd(temp_dir, "out.bin", b"plain", "");
             assert_eq!(
                 xattr::get(&input, "user.ark_local.encrypted").unwrap().as_deref(),
                 Some(b"false".as_slice())
@@ -519,13 +513,13 @@ mod tests {
             let address = format!("gyan@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &address);
 
-            let input = temp_dir.join("input.bin");
+            let input = temp_dir.join("raw.bin");
             fs::write(&input, b"plain bytes").unwrap();
             let mut m = create_metadata(&ctx.identity.address, None);
             sign_metadata(ctx.identity_key.as_ref().unwrap(), &mut m, Some(b"plain bytes")).unwrap();
-            write_metadata_attributes(&input, &m).unwrap();
+            write_metadata_attributes(&ctx, "/raw.bin", &m).unwrap();
 
-            put(&ctx, "raw.bin", Some(input.to_str().unwrap()), &Permissions::default(), None, false).unwrap();
+            put(&ctx, "raw.bin", &Permissions::default(), None, false).unwrap();
 
             let server_path = temp_dir.join("ark/gyan/raw.bin");
             assert_eq!(fs::read(&server_path).unwrap(), b"plain bytes");
@@ -541,13 +535,13 @@ mod tests {
             let address = format!("gyan@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &address);
 
-            let input_dir = temp_dir.join("shared_input");
-            fs::create_dir_all(&input_dir).unwrap();
-            put(&ctx, "shared", Some(input_dir.to_str().unwrap()), &Permissions::default(), None, false).unwrap();
+            fs::create_dir_all(temp_dir.join("shared")).unwrap();
+            put(&ctx, "shared", &Permissions::default(), None, false).unwrap();
 
             let dir = temp_dir.join("ark/gyan/shared");
             assert!(dir.is_dir());
-            let meta = read_metadata_attributes(&dir).unwrap();
+            let (server_ctx, server_dir) = account_context(&dir);
+            let meta = read_metadata_attributes(&server_ctx, &server_dir).unwrap();
             assert_eq!(meta.modified_by, address);
             assert_eq!(meta.encryption_algorithm, None);
             assert!(meta.members[0].key.is_none());
@@ -561,10 +555,9 @@ mod tests {
             let address = format!("gyan@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &address);
 
-            let input_dir = temp_dir.join("shared_input");
-            fs::create_dir_all(&input_dir).unwrap();
-            let err = put(&ctx, "shared", Some(input_dir.to_str().unwrap()), &Permissions::default(), Some(DEFAULT_ENCRYPTION_ALGORITHM), false).unwrap_err();
-            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            fs::create_dir_all(temp_dir.join("shared")).unwrap();
+            let err = put(&ctx, "shared", &Permissions::default(), Some(DEFAULT_ENCRYPTION_ALGORITHM), false).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
         });
     }
 
@@ -575,9 +568,9 @@ mod tests {
             let address = format!("gyan@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &address);
 
-            let input = temp_dir.join("input.bin");
+            let input = temp_dir.join("raw.bin");
             fs::write(&input, b"plain bytes").unwrap();
-            put(&ctx, "raw.bin", Some(input.to_str().unwrap()), &Permissions::default(), Some("none"), false).unwrap();
+            put(&ctx, "raw.bin", &Permissions::default(), Some("none"), false).unwrap();
 
             let server_path = temp_dir.join("ark/gyan/raw.bin");
             assert_eq!(fs::read(&server_path).unwrap(), b"plain bytes");
@@ -586,16 +579,14 @@ mod tests {
     }
 
     #[test]
-    fn put_missing_input_errors() {
+    fn put_missing_local_copy_errors() {
         in_test_dir("ark_put_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &address);
 
-            let missing = temp_dir.join("does_not_exist.bin");
-            let err = put(&ctx, "notes.txt", Some(missing.to_str().unwrap()), &Permissions::default(), None, false).unwrap_err();
-            assert_eq!(err.kind(), io::ErrorKind::NotFound);
-            assert!(format!("{}", err).contains("input does not exist"));
+            let err = put(&ctx, "notes.txt", &Permissions::default(), None, false).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::NotFound);
         });
     }
 
@@ -606,10 +597,9 @@ mod tests {
             let address = format!("gyan@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &address);
 
-            let input_dir = temp_dir.join("input_dir");
-            fs::create_dir_all(&input_dir).unwrap();
-            let err = put(&ctx, "shared", Some(input_dir.to_str().unwrap()), &Permissions::default(), Some(DEFAULT_ENCRYPTION_ALGORITHM), false).unwrap_err();
-            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            fs::create_dir_all(temp_dir.join("shared")).unwrap();
+            let err = put(&ctx, "shared", &Permissions::default(), Some(DEFAULT_ENCRYPTION_ALGORITHM), false).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
         });
     }
 
@@ -628,11 +618,11 @@ mod tests {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &address);
-            let path = put_plain(&ctx, temp_dir, "notes.txt", b"hello");
+            put_plain(&ctx, temp_dir, "notes.txt", b"hello");
 
-            put(&ctx, "notes.txt", Some(path.to_str().unwrap()), &reader("john@example.com"), None, true).unwrap();
+            put(&ctx, "notes.txt", &reader("john@example.com"), None, true).unwrap();
 
-            let m = read_metadata_attributes(&path).unwrap();
+            let m = read_metadata_attributes(&ctx, "notes.txt").unwrap();
             let john = m.members.iter().find(|m| m.address == "john@example.com").unwrap();
             assert_eq!(john.permission, Permission::Reader);
             assert!(m.members.iter().any(|m| m.address == address && m.permission == Permission::Owner));
@@ -645,11 +635,11 @@ mod tests {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &address);
-            let path = put_plain(&ctx, temp_dir, "public.txt", b"open");
+            put_plain(&ctx, temp_dir, "public.txt", b"open");
 
-            put(&ctx, "public.txt", Some(path.to_str().unwrap()), &reader("public"), None, true).unwrap();
+            put(&ctx, "public.txt", &reader("public"), None, true).unwrap();
 
-            let m = read_metadata_attributes(&path).unwrap();
+            let m = read_metadata_attributes(&ctx, "public.txt").unwrap();
             let pub_member = m.members.iter().find(|m| m.address == "*").unwrap();
             assert_eq!(pub_member.permission, Permission::Reader);
             assert!(pub_member.key.is_none());
@@ -662,9 +652,9 @@ mod tests {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &address);
-            let path = put_encrypted(&ctx, temp_dir, "enc.bin", b"plaintext");
+            put_encrypted(&ctx, temp_dir, "enc.bin", b"plaintext");
 
-            let err = put(&ctx, "enc.bin", Some(path.to_str().unwrap()), &reader("public"), None, true).unwrap_err();
+            let err = put(&ctx, "enc.bin", &reader("public"), None, true).unwrap_err();
             assert!(err.to_string().contains("public member to encrypted"), "msg was {}", err);
         });
     }
@@ -679,18 +669,18 @@ mod tests {
             let (bob_identity, bob_secret_key) = create_identity("bob@example.com", None).unwrap();
             cache_identity(&ctx, &bob_identity);
 
-            let path = put_encrypted(&ctx, temp_dir, "enc.bin", b"plaintext");
+            put_encrypted(&ctx, temp_dir, "enc.bin", b"plaintext");
 
-            let owner_wrapped = read_metadata_attributes(&path).unwrap().members[0].key.clone().unwrap();
+            let owner_wrapped = read_metadata_attributes(&ctx, "enc.bin").unwrap().members[0].key.clone().unwrap();
             let owner_secret = ctx.identity_key.clone().unwrap();
             let file_key = decrypt_bytes(
                 &Key { algorithm: owner_wrapped.algorithm.clone(), value: owner_secret.value.clone() },
                 &owner_wrapped.value,
             ).unwrap();
 
-            put(&ctx, "enc.bin", Some(path.to_str().unwrap()), &reader("bob@example.com"), None, true).unwrap();
+            put(&ctx, "enc.bin", &reader("bob@example.com"), None, true).unwrap();
 
-            let m = read_metadata_attributes(&path).unwrap();
+            let m = read_metadata_attributes(&ctx, "enc.bin").unwrap();
             let bob = m.members.iter().find(|m| m.address == "bob@example.com").unwrap();
             assert_eq!(bob.permission, Permission::Reader);
             let bob_wrapped = bob.key.as_ref().expect("bob's wrapped key");
@@ -714,11 +704,11 @@ mod tests {
 
             let path = temp_dir.join("doc.txt");
             fs::write(&path, b"body").unwrap();
-            put(&ctx, "doc.txt", Some(path.to_str().unwrap()), &reader("sam@example.com"), Some("none"), false).unwrap();
+            put(&ctx, "doc.txt", &reader("sam@example.com"), Some("none"), false).unwrap();
 
-            put(&ctx, "doc.txt", Some(path.to_str().unwrap()), &writer("sam@example.com"), None, true).unwrap();
+            put(&ctx, "doc.txt", &writer("sam@example.com"), None, true).unwrap();
 
-            let m = read_metadata_attributes(&path).unwrap();
+            let m = read_metadata_attributes(&ctx, "doc.txt").unwrap();
             let sam = m.members.iter().find(|m| m.address == "sam@example.com").unwrap();
             assert_eq!(sam.permission, Permission::Writer);
         });
@@ -736,11 +726,11 @@ mod tests {
 
             let path = temp_dir.join("doc.txt");
             fs::write(&path, b"body").unwrap();
-            put(&ctx, "doc.txt", Some(path.to_str().unwrap()), &reader("sam@example.com"), Some("none"), false).unwrap();
+            put(&ctx, "doc.txt", &reader("sam@example.com"), Some("none"), false).unwrap();
 
-            put(&ctx, "doc.txt", Some(path.to_str().unwrap()), &drop("sam@example.com"), None, true).unwrap();
+            put(&ctx, "doc.txt", &drop("sam@example.com"), None, true).unwrap();
 
-            let m = read_metadata_attributes(&path).unwrap();
+            let m = read_metadata_attributes(&ctx, "doc.txt").unwrap();
             assert!(!m.members.iter().any(|m| m.address == "sam@example.com"));
         });
     }
@@ -751,9 +741,9 @@ mod tests {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("gyan@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &address);
-            let path = put_plain(&ctx, temp_dir, "doc.txt", b"body");
+            put_plain(&ctx, temp_dir, "doc.txt", b"body");
 
-            let err = put(&ctx, "doc.txt", Some(path.to_str().unwrap()), &drop(&address), None, true).unwrap_err();
+            let err = put(&ctx, "doc.txt", &drop(&address), None, true).unwrap_err();
             assert!(err.to_string().contains("at least one owner"), "msg was {}", err);
         });
     }
@@ -766,11 +756,11 @@ mod tests {
             let ctx = init_with_server(temp_dir, &address);
             let path = temp_dir.join("notes.txt");
             fs::write(&path, b"hello").unwrap();
-            put(&ctx, "notes.txt", Some(path.to_str().unwrap()), &Permissions::default(), Some("none"), false).unwrap();
+            put(&ctx, "notes.txt", &Permissions::default(), Some("none"), false).unwrap();
 
             put_permissions(&ctx, "/notes.txt", &reader("john@example.com")).unwrap();
 
-            let m = read_metadata_attributes(&path).unwrap();
+            let m = read_metadata_attributes(&ctx, "/notes.txt").unwrap();
             assert!(m.members.iter().any(|m| m.address == "john@example.com"));
         });
     }
@@ -783,9 +773,9 @@ mod tests {
             let ctx = init_with_server(temp_dir, &address);
             let path = put_plain(&ctx, temp_dir, "doc.txt", b"body");
 
-            put(&ctx, "doc.txt", Some(path.to_str().unwrap()), &reader("john@example.com"), None, true).unwrap();
+            put(&ctx, "doc.txt", &reader("john@example.com"), None, true).unwrap();
 
-            let m = read_metadata_attributes(&path).unwrap();
+            let m = read_metadata_attributes(&ctx, "doc.txt").unwrap();
             let body = fs::read(&path).unwrap();
             verify_metadata(&ctx.identity.public_key, &m, Some(&body)).unwrap();
         });

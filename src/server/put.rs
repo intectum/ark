@@ -1,17 +1,19 @@
-use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 
-use crate::http::write_text;
+use crate::http::{error_response_code, write_text};
 use crate::identity::validate_identity;
-use crate::metadata::{members_changed, verify_metadata, verify_metadata_signature, write_metadata_attributes};
-use crate::types::{Identity, Metadata, Permission};
+use crate::metadata::{members_changed, write_metadata_attributes};
+use crate::storage::{Body, create_dir_all, exists, parent_path, write_atomic_with_metadata};
+use crate::types::{Context, Identity, Metadata, Permission};
+use crate::util::validate_update;
 
 pub fn serve_put_init(
+    target_root: &Path,
+    target_path: &str,
     stream: &mut dyn Write,
-    metadata: &Metadata,
     body: &[u8],
-    target_path: &Path,
+    metadata: &Metadata,
 ) -> io::Result<()> {
     let body_identity: Identity = match serde_json::from_slice(body) {
         Ok(i) => i,
@@ -22,66 +24,59 @@ pub fn serve_put_init(
         return write_text(stream, 400, e.to_string().as_bytes());
     }
 
-    serve_put(target_path, stream, body, metadata, &body_identity, None, Permission::Owner, false)
+    let target_ctx = Context {
+        root: target_root.to_path_buf(),
+        identity: body_identity.clone(),
+        identity_key: None,
+    };
+
+    serve_put(&target_ctx, target_path, stream, body, metadata, &body_identity, None, Permission::Owner, false)?;
+
+    Ok(())
 }
 
-pub fn serve_put(fs_path: &Path, stream: &mut dyn Write, body: &[u8], metadata: &Metadata, modifier_identity: &Identity, existing_metadata: Option<&Metadata>, permission: Permission, metadata_only: bool) -> io::Result<()> {
+pub fn serve_put(ctx: &Context, path: &str, stream: &mut dyn Write, body: &[u8], metadata: &Metadata, modifier_identity: &Identity, existing_metadata: Option<&Metadata>, permission: Permission, metadata_only: bool) -> io::Result<bool> {
     let is_dir = metadata.body_hash.is_none();
 
-    if is_dir {
-        if !body.is_empty() {
-            return write_text(stream, 400, b"dir put must have empty body");
-        }
-        if metadata.encryption_algorithm.is_some() {
-            return write_text(stream, 400, b"dir metadata must not set encryption_algorithm");
-        }
+    if is_dir && !body.is_empty() {
+        write_text(stream, 400, b"dir put must have empty body")?;
+        return Ok(false);
     }
 
-    if metadata_only && !is_dir {
-        let existing = match existing_metadata {
-            Some(m) => m,
-            None => return write_text(stream, 409, b"metadata put requires existing file"),
-        };
-        let new_hash = metadata.body_hash.as_ref().map(|h| &h.value);
-        let old_hash = existing.body_hash.as_ref().map(|h| &h.value);
-        if new_hash != old_hash {
-            return write_text(stream, 400, b"metadata put must not change body_hash");
-        }
-        if let Err(e) = verify_metadata_signature(&modifier_identity.public_key, metadata) {
-            return write_text(stream, 403, e.to_string().as_bytes());
-        }
-    } else {
-        let verify_body = if is_dir { None } else { Some(body) };
-        if let Err(e) = verify_metadata(&modifier_identity.public_key, metadata, verify_body) {
-            return write_text(stream, 403, e.to_string().as_bytes());
-        }
+    let update_body = if is_dir || metadata_only { None } else { Some(body) };
+    if let Err(error) = validate_update(&modifier_identity.public_key, metadata, existing_metadata, update_body) {
+        write_text(stream, error_response_code(&error), error.to_string().as_bytes())?;
+        return Ok(false);
     }
 
     if let Some(old) = existing_metadata {
-        if old.id != metadata.id {
-            return write_text(stream, 409, b"id is wrong");
-        }
-        if metadata.modified < old.modified {
-            return write_text(stream, 409, b"modified is older than existing");
-        }
         if members_changed(&old.members, &metadata.members) && permission != Permission::Owner {
-            return write_text(stream, 403, b"owner permission required to change members");
+            write_text(stream, 403, b"owner permission required to change members")?;
+            return Ok(false);
         }
     }
 
-    let status_code = if fs_path.exists() { 204 } else { 201 };
+    let status_code = if exists(ctx, path) { 204 } else { 201 };
 
+    // A directory takes its metadata where it stands. It cannot be replaced by
+    // a rename, which only succeeds onto an empty directory, and its children
+    // have to survive the put.
     if is_dir {
-        fs::create_dir_all(fs_path)?;
-    } else if !metadata_only {
-        if let Some(parent) = fs_path.parent() { fs::create_dir_all(parent)?; }
-        let mut file = fs::File::create(fs_path)?;
-        file.write_all(body)?;
+        create_dir_all(ctx, path)?;
+        write_metadata_attributes(ctx, path, metadata)?;
+    } else if metadata_only {
+        write_atomic_with_metadata(ctx, path, Body::CopyOf(path), metadata, None)?;
+    } else {
+        if let Some(parent) = parent_path(path) {
+            create_dir_all(ctx, parent)?;
+        }
+
+        write_atomic_with_metadata(ctx, path, Body::Bytes(body), metadata, None)?;
     }
 
-    write_metadata_attributes(fs_path, metadata)?;
+    write_text(stream, status_code, &[])?;
 
-    write_text(stream, status_code, &[])
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -90,8 +85,8 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use crate::crypto::DEFAULT_ENCRYPTION_ALGORITHM;
-    use crate::metadata::{read_metadata_attributes, sign_metadata, write_metadata_headers};
-    use crate::testing::fs::{TEST_ADDRESS, create_encrypted_test_metadata, create_plain_test_metadata, create_test_account, in_test_dir, write_plain_test_file};
+    use crate::metadata::{create_metadata, read_metadata_attributes, sign_metadata, write_metadata_headers};
+    use crate::testing::fs::{TEST_ADDRESS, account_context, create_encrypted_test_metadata, create_plain_test_metadata, create_test_account, in_test_dir, write_plain_test_file};
     use crate::testing::http::*;
     use crate::testing::http::start_test_server;
     use crate::timestamp::now_ms;
@@ -114,7 +109,8 @@ mod tests {
             let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
             let file = account_dir.join("x");
             write_plain_test_file(&file, &identity, &secret_key, b"old");
-            let existing_id = read_metadata_attributes(&file).unwrap().id;
+            let (account_ctx, account_path) = account_context(&file);
+            let existing_id = read_metadata_attributes(&account_ctx, &account_path).unwrap().id;
             let mut new_meta = create_plain_test_metadata(&identity, &secret_key, b"new content");
             new_meta.id = existing_id;
             sign_metadata(&secret_key, &mut new_meta, Some(b"new content")).unwrap();
@@ -204,7 +200,8 @@ mod tests {
                 xattr::get(&p, "user.ark.encryption_algorithm").unwrap().as_deref(),
                 Some(DEFAULT_ENCRYPTION_ALGORITHM.as_bytes())
             );
-            let loaded = read_metadata_attributes(&p).unwrap();
+            let (account_ctx, account_path) = account_context(&p);
+            let loaded = read_metadata_attributes(&account_ctx, &account_path).unwrap();
             assert_eq!(loaded.members.len(), 1);
             assert_eq!(loaded.members[0].address, alice_identity.address);
             assert_eq!(loaded.members[0].key.as_ref().unwrap().value, sent_key);
@@ -261,7 +258,8 @@ mod tests {
             let file = seed_shared_file(temp_dir, &owner_identity, &owner_key, "ark/owner/file.txt", b"v1", vec![
                 Member { address: writer_identity.address.clone(), permission: Permission::Writer, key: None },
             ]);
-            let existing_id = read_metadata_attributes(&file).unwrap().id;
+            let (account_ctx, account_path) = account_context(&file);
+            let existing_id = read_metadata_attributes(&account_ctx, &account_path).unwrap().id;
 
             let port = start_test_server(temp_dir.to_path_buf());
 
@@ -339,7 +337,8 @@ mod tests {
             let file = seed_shared_file(temp_dir, &owner_identity, &owner_key, "ark/owner/file.txt", b"v1", vec![
                 Member { address: writer_identity.address.clone(), permission: Permission::Writer, key: None },
             ]);
-            let existing_id = read_metadata_attributes(&file).unwrap().id;
+            let (account_ctx, account_path) = account_context(&file);
+            let existing_id = read_metadata_attributes(&account_ctx, &account_path).unwrap().id;
 
             let port = start_test_server(temp_dir.to_path_buf());
 
@@ -369,7 +368,8 @@ mod tests {
             let file = seed_shared_file(temp_dir, &owner_identity, &owner_key, "ark/owner/file.txt", b"v1", vec![
                 Member { address: co_owner_identity.address.clone(), permission: Permission::Owner, key: None },
             ]);
-            let existing_id = read_metadata_attributes(&file).unwrap().id;
+            let (account_ctx, account_path) = account_context(&file);
+            let existing_id = read_metadata_attributes(&account_ctx, &account_path).unwrap().id;
 
             let port = start_test_server(temp_dir.to_path_buf());
 
@@ -403,7 +403,8 @@ mod tests {
             assert_eq!(code, 201);
             let dir = temp_dir.join("ark/test/notes");
             assert!(dir.is_dir());
-            let back = read_metadata_attributes(&dir).unwrap();
+            let (account_ctx, account_path) = account_context(&dir);
+            let back = read_metadata_attributes(&account_ctx, &account_path).unwrap();
             assert_eq!(back.id, meta.id);
         });
     }
@@ -489,7 +490,8 @@ mod tests {
             let dir = seed_shared_dir(temp_dir, &owner_identity, &owner_key, "ark/owner/shared", vec![
                 Member { address: writer_identity.address.clone(), permission: Permission::Writer, key: None },
             ]);
-            let existing_id = read_metadata_attributes(&dir).unwrap().id;
+            let (account_ctx, account_path) = account_context(&dir);
+            let existing_id = read_metadata_attributes(&account_ctx, &account_path).unwrap().id;
 
             let port = start_test_server(temp_dir.to_path_buf());
             let mut new_meta = create_plain_test_metadata(&writer_identity, &writer_key, b"");
@@ -530,17 +532,18 @@ mod tests {
             let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
             let file = account_dir.join("x");
             write_plain_test_file(&file, &identity, &secret_key, b"body");
-            let existing = read_metadata_attributes(&file).unwrap();
+            let (account_ctx, account_path) = account_context(&file);
+            let existing = read_metadata_attributes(&account_ctx, &account_path).unwrap();
 
             let mut new_meta = create_plain_test_metadata(&identity, &secret_key, b"body");
-            new_meta.id = existing.id.clone();
+            new_meta.id = existing.id;
             sign_metadata(&secret_key, &mut new_meta, Some(b"body")).unwrap();
 
             let port = start_test_server(temp_dir.to_path_buf());
             let code = signed_put_metadata(port, &identity, &secret_key, "/ark/test/x?metadata", b"", &new_meta);
             assert_eq!(code, 204);
             assert_eq!(fs::read(temp_dir.join("ark/test/x")).unwrap(), b"body");
-            let after = read_metadata_attributes(&file).unwrap();
+            let after = read_metadata_attributes(&account_ctx, &account_path).unwrap();
             assert_eq!(after.modified, new_meta.modified);
         });
     }
@@ -551,10 +554,11 @@ mod tests {
             let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
             let file = account_dir.join("x");
             write_plain_test_file(&file, &identity, &secret_key, b"body");
-            let existing = read_metadata_attributes(&file).unwrap();
+            let (account_ctx, account_path) = account_context(&file);
+            let existing = read_metadata_attributes(&account_ctx, &account_path).unwrap();
 
             let mut new_meta = create_plain_test_metadata(&identity, &secret_key, b"different");
-            new_meta.id = existing.id.clone();
+            new_meta.id = existing.id;
             sign_metadata(&secret_key, &mut new_meta, Some(b"different")).unwrap();
 
             let port = start_test_server(temp_dir.to_path_buf());
@@ -565,13 +569,50 @@ mod tests {
     }
 
     #[test]
-    fn put_metadata_only_on_nonexistent_returns_409() {
+    fn put_dir_with_encryption_algorithm_returns_400() {
+        in_test_dir("ark_server_test", |temp_dir| {
+            let (identity, secret_key, _) = create_test_account(temp_dir, TEST_ADDRESS);
+
+            let mut dir_meta = create_metadata(&identity.address, Some(DEFAULT_ENCRYPTION_ALGORITHM));
+            dir_meta.members[0].key = None;
+            sign_metadata(&secret_key, &mut dir_meta, None).unwrap();
+
+            let port = start_test_server(temp_dir.to_path_buf());
+            let code = signed_put_metadata(port, &identity, &secret_key, "/ark/test/shared", b"", &dir_meta);
+            assert_eq!(code, 400);
+            assert!(!temp_dir.join("ark/test/shared").exists());
+        });
+    }
+
+    #[test]
+    fn put_dir_over_existing_file_returns_409() {
+        in_test_dir("ark_server_test", |temp_dir| {
+            let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
+            let file = account_dir.join("x");
+            write_plain_test_file(&file, &identity, &secret_key, b"body");
+            let (account_ctx, account_path) = account_context(&file);
+            let existing_id = read_metadata_attributes(&account_ctx, &account_path).unwrap().id;
+
+            let mut dir_meta = create_metadata(&identity.address, None);
+            dir_meta.id = existing_id;
+            dir_meta.members[0].key = None;
+            sign_metadata(&secret_key, &mut dir_meta, None).unwrap();
+
+            let port = start_test_server(temp_dir.to_path_buf());
+            let code = signed_put_metadata(port, &identity, &secret_key, "/ark/test/x", b"", &dir_meta);
+            assert_eq!(code, 409);
+            assert_eq!(fs::read(temp_dir.join("ark/test/x")).unwrap(), b"body");
+        });
+    }
+
+    #[test]
+    fn put_metadata_only_on_nonexistent_returns_404() {
         in_test_dir("ark_server_test", |temp_dir| {
             let (identity, secret_key, _) = create_test_account(temp_dir, TEST_ADDRESS);
             let port = start_test_server(temp_dir.to_path_buf());
             let meta = create_plain_test_metadata(&identity, &secret_key, b"body");
             let code = signed_put_metadata(port, &identity, &secret_key, "/ark/test/missing?metadata", b"", &meta);
-            assert_eq!(code, 409);
+            assert_eq!(code, 404);
         });
     }
 

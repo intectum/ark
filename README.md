@@ -79,11 +79,12 @@ mkdir -p apps/notes && cd apps/notes
 
 # Upload and download an encrypted file
 echo 'hello' > note.txt
-ark put -i note.txt note.txt    # encrypt + upload
-ark get note.txt -o out.txt -d  # download + decrypt
+ark put note.txt                # encrypt + upload
+ark get note.txt -d             # download + decrypt, back into the account tree
+ark cat note.txt                # print it instead, without writing it
 
 # Share with another user
-ark put -r bob@localhost:8080 -m -i note.txt note.txt  # metadata-only put
+ark put -r bob@localhost:8080 -m note.txt  # metadata-only put
 
 # On bob's side — review and accept the share
 ark proposals list              # shows pending share proposals
@@ -92,6 +93,7 @@ ark proposals reject 1          # discard instead
 
 # Sync the cwd
 ark sync -w                     # reconcile local and remote; watch continuously
+ark sync notes                  # or just one directory of the account
 ```
 
 Every command takes `-h` for details. Paths accept three forms:
@@ -104,19 +106,21 @@ Every command takes `-h` for details. Paths accept three forms:
 |---|---|
 | `ark server [PORT]` | Run a server. Serves the current directory. |
 | `ark init <ADDR>` | Create or download an account identity. `--password` gates remote key recovery. `--local-only` skips the server. |
-| `ark get <PATH>` | Download a file. `--decrypt` unwraps it, `-o FILE` writes to disk. |
-| `ark put <PATH>` | Upload a file, or create a directory when the input is a directory. `-i FILE` for input, `-o`/`-w`/`-r`/`-d` add or drop members (use `public` for the `*` wildcard), `--encryption-algorithm none` for plaintext, `-m` sends metadata only (server keeps the body). |
+| `ark get <PATH>` | Download a file into the account tree at PATH. `--decrypt` unwraps it. |
+| `ark cat <PATH>` | Print a decrypted file body to stdout, without writing it to the account tree. |
+| `ark put <PATH>` | Upload the account's copy of PATH, or create a directory when that copy is a directory. `-o`/`-w`/`-r`/`-d` add or drop members (use `public` for the `*` wildcard), `--encryption-algorithm none` for plaintext, `-m` sends metadata only (server keeps the body). |
 | `ark head <PATH>` | Fetch response headers only. |
 | `ark list <PATH>` | List entries of a directory. |
 | `ark delete <PATH>` | Delete a file or directory (recursive). |
-| `ark sync` | Reconcile local and remote state in one pass. `-w` watches continuously. Prints one line per reconciled entry. |
+| `ark sync [PATH]` | Reconcile local and remote state under PATH — the working directory by default — in one pass. `-w` watches continuously. Prints one line per reconciled entry. |
 | `ark watch local <PATH>` / `ark watch remote <PATH>` | Print events for local FS changes or the server's SSE stream at PATH. |
 | `ark proposals list` | Show pending share proposals — unauthorized PUTs from other accounts, recorded in `.ark/requests/`. |
 | `ark proposals accept <ID>` | Fetch, verify, and PUT the shared file/dir. `-f` bypasses metadata-change checks. |
 | `ark proposals reject <ID>` | Delete the log entry. |
 | `ark identity create <PATH>` | Create an identity at PATH (plus a companion `.key`). PATH must end with `.json`. With `-m ADDR`, creates a group from the listed members. |
 | `ark identity members <PATH>` | Add (`-a ADDR`) and/or drop (`-d ADDR`) members. Promotes to a group if needed; grants or revokes identity key access. |
-| `ark encrypt` / `ark decrypt` | Local file crypto. `--in-place` rewrites the file. |
+| `ark encrypt <PATH>` | Encrypt a local file in place, under the file key in its own metadata. Generates a fresh key when it has none; `-e NAME` picks the algorithm. |
+| `ark decrypt <PATH>` | Decrypt a local file in place, under the file key in its own metadata. |
 
 ---
 
@@ -136,7 +140,7 @@ start_server(8080, "localhost:8080");           // blocks
 use ark::context::create_client_context;
 use ark::client::{init, put_content, put_permissions, get_content, get_stream, sync, list_proposals,
     accept_proposal, reject_proposal, watch_local, watch_remote};
-use ark::metadata::reader;
+use ark::permissions::reader;
 
 init(&std::env::current_dir()?, "alice@localhost:8080", None, /*local_only=*/ false)?;
 
@@ -160,7 +164,7 @@ accept_proposal(&ctx, "1", /*force=*/ false)?;  // pulls the file, materializes 
 reject_proposal(&ctx, "1")?;                    // discard instead
 
 // Sync the cwd
-sync(&ctx, &std::env::current_dir()?, /*watch=*/ true, /*decrypt=*/ true,
+sync(&ctx, ".", /*watch=*/ true, /*decrypt=*/ true,
     |event| { println!("{} {}", event.action.as_str(), event.path.display()); false },
     |error| { eprintln!("sync: {}", error); false }
 )?;                                             // reconcile local and remote; watch continuously
@@ -181,14 +185,16 @@ watch_remote(&ctx, &url,
 
 // Streaming form when you don't want to touch the filesystem
 let mut buf = Vec::new();
-let (metadata, _) = get_stream(&ctx, "note.txt", &mut buf, true)?;
+let (metadata, _) = get_stream(&ctx, "note.txt", &mut buf, true, /*existing_metadata=*/ None)?;
 ```
 
-Every CLI command has a corresponding library function. Most take file paths and use stdin/stdout when absent. For `encrypt`, `decrypt`, `get`, and `put`, a `_stream` variant (`encrypt_stream`, `decrypt_stream`, `get_stream`, `put_stream`) exposes the same operation over `Read`/`Write` streams and returns values instead of touching the filesystem.
+Every CLI command has a corresponding library function. `get`, `put`, `encrypt`, and `decrypt` all take a single path and act on the account's own copy of it, mirroring the server. For those four, a `_stream` variant (`encrypt_stream`, `decrypt_stream`, `get_stream`, `put_stream`) exposes the same operation over `Read`/`Write` streams and returns values instead of touching the filesystem — `ark cat` is `get_stream` to stdout.
 
-`put` also has two focused wrappers: `put_content(ctx, path)` uploads the body at `path` with default permissions, and `put_permissions(ctx, path, &permissions)` sends a metadata-only PUT to add or drop members without re-uploading the body. Both delegate to `put`, which remains the full form (`input`, `permissions`, `encryption_algorithm`, `metadata_only`). Build a `Permissions` explicitly, or use `ark::permissions::{owner, writer, reader, drop}` (and plural `owners`/`writers`/`readers`/`drops`) for the common cases.
+`put` also has two focused wrappers: `put_content(ctx, path)` uploads the body at `path` with default permissions, and `put_permissions(ctx, path, &permissions)` sends a metadata-only PUT to add or drop members without re-uploading the body. Both delegate to `put`, which remains the full form (`permissions`, `encryption_algorithm`, `metadata_only`). Build a `Permissions` explicitly, or use `ark::permissions::{owner, writer, reader, drop}` (and plural `owners`/`writers`/`readers`/`drops`) for the common cases.
 
-`get` has a matching wrapper: `get_content(ctx, path)` downloads the body at `path` and writes it under the account root, decrypting when encrypted. `get` remains the full form (`output`, `decrypt`).
+`get` has a matching wrapper: `get_content(ctx, path)` downloads the body at `path` and writes it under the account root, decrypting when encrypted. `get` remains the full form (`decrypt`). `get_stream` takes one argument the others don't: `existing_metadata`, the metadata of the copy the download replaces when it replaces one. Pass it and the download is also checked to continue that copy — same `id`, `modified` no older — so a server cannot serve back an older version or an unrelated file at the path. `None` when there is no copy to continue.
+
+Paths in the library are account paths, not filesystem paths. Every client function takes the same three forms the CLI does — relative, account-absolute, or address — and `ark::storage` is the filesystem reached the same way: `read`, `write`, `read_dir`, `create_dir_all`, `rename`, and the `user.ark.*` attribute operations, each the `std::fs` equivalent with an account path in place of a filesystem one, refusing anything outside the account root. Use it rather than `std::fs` and `ctx.root.join(...)`, and app paths stay the same strings you hand to `put` and `get`. `to_account_path(ctx, path)` and `to_fs_path(ctx, path)` convert between the two when you need to hand an entry to something that only speaks filesystem paths.
 
 ---
 

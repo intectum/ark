@@ -1,4 +1,3 @@
-use std::fs;
 use std::io;
 
 use super::{put, put_content, put_permissions};
@@ -8,8 +7,9 @@ use crate::identity::{
     validate_identity, write_identity, write_identity_key,
 };
 use crate::permissions::{reader, readers};
-use crate::types::{Identity, IdentityContext, Key, Permissions};
-use crate::util::{resolve_address, resolve_local_path};
+use crate::storage::{create_dir_all, exists, parent_path};
+use crate::types::{Context, Identity, Key, Permissions};
+use crate::util::resolve_address;
 
 /// Create an identity (keypair document) at `path`.
 ///
@@ -26,21 +26,20 @@ use crate::util::{resolve_address, resolve_local_path};
 /// With no members, the identity has no `members` field.
 ///
 /// Returns the new [`Identity`] and its secret [`Key`].
-pub fn create_identity(ctx: &IdentityContext, path: &str, members: &[String]) -> io::Result<(Identity, Key)> {
+pub fn create_identity(ctx: &Context, path: &str, members: &[String]) -> io::Result<(Identity, Key)> {
     if !path.ends_with(".json") {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "path must end with .json"));
     }
 
-    let local_path = resolve_local_path(ctx, path)?;
     let address = resolve_address(ctx, path)?;
-    let key_path = local_path.with_extension("key");
+    let key_path = key_path_for(path);
 
-    if local_path.exists() {
-        return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{} already exists", local_path.display())));
+    if exists(ctx, path) {
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{} already exists", path)));
     }
 
-    if key_path.exists() {
-        return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{} already exists", key_path.display())));
+    if exists(ctx, &key_path) {
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{} already exists", key_path)));
     }
 
     let final_members = if members.is_empty() {
@@ -58,12 +57,12 @@ pub fn create_identity(ctx: &IdentityContext, path: &str, members: &[String]) ->
     let (identity, secret_key) = create_identity_raw(&address, final_members.clone())?;
     validate_identity(&identity)?;
 
-    if let Some(parent) = local_path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
-        fs::create_dir_all(parent)?;
+    if let Some(parent) = parent_path(path) {
+        create_dir_all(ctx, parent)?;
     }
 
-    write_identity(&local_path, &identity)?;
-    write_identity_key(&key_path, &secret_key.value)?;
+    write_identity(ctx, path, &identity)?;
+    write_identity_key(ctx, &key_path, &secret_key.value)?;
 
     let self_address = ctx.identity.address.as_str();
     let key_permissions = match &final_members {
@@ -71,8 +70,8 @@ pub fn create_identity(ctx: &IdentityContext, path: &str, members: &[String]) ->
         None => Permissions::default(),
     };
 
-    put(ctx, &address, local_path.to_str(), &reader("public"), Some("none"), false)?;
-    put(ctx, &key_path_for(path), key_path.to_str(), &key_permissions, None, false)?;
+    put(ctx, &address, &reader("public"), Some("none"), false)?;
+    put(ctx, &key_path, &key_permissions, None, false)?;
 
     Ok((identity, secret_key))
 }
@@ -91,7 +90,7 @@ pub fn create_identity(ctx: &IdentityContext, path: &str, members: &[String]) ->
 /// the encrypted private key for net membership changes. Does not rotate the
 /// group keypair.
 pub fn change_identity_members(
-    ctx: &IdentityContext,
+    ctx: &Context,
     path: &str,
     add: &[String],
     drop: &[String],
@@ -104,12 +103,10 @@ pub fn change_identity_members(
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "at least one add or drop address is required"));
     }
 
-    let local_path = resolve_local_path(ctx, path)?;
-
-    let mut identity = read_identity(&local_path)?;
+    let mut identity = read_identity(ctx, path)?;
     let secret_key = Key {
         algorithm: identity.public_key.algorithm.clone(),
-        value: read_identity_key(&local_path.with_extension("key"))?,
+        value: read_identity_key(ctx, &key_path_for(path))?,
     };
 
     let mut members = identity.members.take().unwrap_or_default();
@@ -144,7 +141,7 @@ pub fn change_identity_members(
     sign_identity(&secret_key, &mut identity)?;
     validate_identity(&identity)?;
 
-    write_identity(&local_path, &identity)?;
+    write_identity(ctx, path, &identity)?;
 
     put_content(ctx, path)?;
     if !readers.is_empty() || !drops.is_empty() {
@@ -166,23 +163,22 @@ fn key_path_for(json_path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::env::set_current_dir;
-    use std::path::Path;
+    use std::fs;
 
     use super::*;
 
     use crate::client::init_local;
     use crate::context::create_client_context;
     use crate::crypto::DEFAULT_ENCRYPTION_ALGORITHM;
-    use crate::identity::{read_identity, write_identity};
     use crate::metadata::read_metadata_attributes;
-    use crate::testing::fs::{create_test_account, in_test_dir, init_with_server};
+    use crate::storage::{Body, write_atomic_with_metadata};
+    use crate::testing::fs::{account_context, create_test_account, in_test_dir, init_with_server};
     use crate::testing::http::start_test_server;
     use crate::types::Identity;
 
-    fn cache_identity(root: &Path, identity: &Identity) {
-        let cache_dir = root.join(".ark").join("identities");
-        fs::create_dir_all(&cache_dir).unwrap();
-        write_identity(&cache_dir.join(format!("{}.json", identity.address)), identity).unwrap();
+    fn cache_identity(ctx: &Context, identity: &Identity) {
+        create_dir_all(ctx, "/.ark/identities").unwrap();
+        write_identity(ctx, &format!("/.ark/identities/{}.json", identity.address), identity).unwrap();
     }
 
     #[test]
@@ -193,7 +189,7 @@ mod tests {
             let bob_address = format!("bob@127.0.0.1:{}", port);
             let (bob_identity, _, _) = create_test_account(temp_dir, &bob_address);
             let ctx = init_with_server(temp_dir, &alice_address);
-            cache_identity(&ctx.root, &bob_identity);
+            cache_identity(&ctx, &bob_identity);
 
             let (identity, _) = create_identity(&ctx, "team.json", std::slice::from_ref(&bob_address)).unwrap();
 
@@ -205,12 +201,14 @@ mod tests {
 
             let server_identity_path = temp_dir.join("ark/alice/team.json");
             assert!(server_identity_path.exists(), "server identity uploaded");
-            let server_identity = read_identity(&server_identity_path).unwrap();
+            let (alice_ctx, server_account_path) = account_context(&server_identity_path);
+            let server_identity = read_identity(&alice_ctx, &server_account_path).unwrap();
             assert_eq!(server_identity.members.as_ref().unwrap(), members);
 
             let server_key_path = temp_dir.join("ark/alice/team.key");
             assert!(server_key_path.exists(), "server key uploaded");
-            let key_metadata = read_metadata_attributes(&server_key_path).unwrap();
+            let (alice_ctx, key_path) = account_context(&server_key_path);
+            let key_metadata = read_metadata_attributes(&alice_ctx, &key_path).unwrap();
             assert_eq!(key_metadata.encryption_algorithm.as_deref(), Some(DEFAULT_ENCRYPTION_ALGORITHM));
             // Creator is key owner; listed members get reader.
             assert!(key_metadata.members.iter().any(|m| m.address == alice_address));
@@ -333,7 +331,7 @@ mod tests {
 
     #[test]
     fn group_member_can_get_shared_file_via_group() {
-        use crate::metadata::{sign_metadata, write_metadata_attributes};
+        use crate::metadata::sign_metadata;
         use crate::testing::fs::create_plain_test_metadata;
         use crate::testing::http::signed_request;
         use crate::types::{Member, Permission};
@@ -344,7 +342,7 @@ mod tests {
             let bob_address = format!("bob@127.0.0.1:{}", port);
             let (bob_identity, bob_key, _) = create_test_account(temp_dir, &bob_address);
             let ctx = init_with_server(temp_dir, &alice_address);
-            cache_identity(&ctx.root, &bob_identity);
+            cache_identity(&ctx, &bob_identity);
 
             create_identity(&ctx, "team.json", std::slice::from_ref(&bob_address)).unwrap();
             let group_address = format!("{}/team.json", alice_address);
@@ -359,8 +357,8 @@ mod tests {
                 key: None,
             });
             sign_metadata(ctx.identity_key.as_ref().unwrap(), &mut meta, Some(b"secret")).unwrap();
-            fs::write(&shared_path, b"secret").unwrap();
-            write_metadata_attributes(&shared_path, &meta).unwrap();
+            let (alice_ctx, shared_account_path) = account_context(&shared_path);
+            write_atomic_with_metadata(&alice_ctx, &shared_account_path, Body::Bytes(b"secret"), &meta, None).unwrap();
 
             let (code, body, _) = signed_request(port, &bob_identity, &bob_key, "GET", "/ark/alice/shared.txt", &[]);
             assert_eq!(code, 200);
@@ -370,7 +368,7 @@ mod tests {
 
     #[test]
     fn non_group_member_gets_forbidden() {
-        use crate::metadata::{sign_metadata, write_metadata_attributes};
+        use crate::metadata::sign_metadata;
         use crate::testing::fs::create_plain_test_metadata;
         use crate::testing::http::signed_request;
         use crate::types::{Member, Permission};
@@ -383,7 +381,7 @@ mod tests {
             let (bob_identity, _, _) = create_test_account(temp_dir, &bob_address);
             let (charlie_identity, charlie_key, _) = create_test_account(temp_dir, &charlie_address);
             let ctx = init_with_server(temp_dir, &alice_address);
-            cache_identity(&ctx.root, &bob_identity);
+            cache_identity(&ctx, &bob_identity);
 
             create_identity(&ctx, "team.json", std::slice::from_ref(&bob_address)).unwrap();
             let group_address = format!("{}/team.json", alice_address);
@@ -398,8 +396,8 @@ mod tests {
                 key: None,
             });
             sign_metadata(ctx.identity_key.as_ref().unwrap(), &mut meta, Some(b"secret")).unwrap();
-            fs::write(&shared_path, b"secret").unwrap();
-            write_metadata_attributes(&shared_path, &meta).unwrap();
+            let (alice_ctx, shared_account_path) = account_context(&shared_path);
+            write_atomic_with_metadata(&alice_ctx, &shared_account_path, Body::Bytes(b"secret"), &meta, None).unwrap();
 
             let (code, _, _) = signed_request(port, &charlie_identity, &charlie_key, "GET", "/ark/alice/shared.txt", &[]);
             assert_eq!(code, 403);
@@ -409,7 +407,7 @@ mod tests {
     #[test]
     fn nested_group_rejected() {
         use crate::identity::create_identity as generate_identity;
-        use crate::metadata::{sign_metadata, write_metadata_attributes};
+        use crate::metadata::sign_metadata;
         use crate::testing::fs::create_plain_test_metadata;
         use crate::testing::http::signed_request;
         use crate::types::{Member, Permission};
@@ -420,32 +418,34 @@ mod tests {
             let bob_address = format!("bob@127.0.0.1:{}", port);
             let (bob_identity, bob_key, _) = create_test_account(temp_dir, &bob_address);
             let ctx = init_with_server(temp_dir, &alice_address);
-            cache_identity(&ctx.root, &bob_identity);
+            cache_identity(&ctx, &bob_identity);
 
             let inner_address = format!("{}/inner.json", alice_address);
             let (inner_identity, _inner_key) =
                 generate_identity(&inner_address, Some(vec![bob_address.clone()])).unwrap();
             let inner_path = temp_dir.join("ark/alice/inner.json");
             fs::create_dir_all(inner_path.parent().unwrap()).unwrap();
-            write_identity(&inner_path, &inner_identity).unwrap();
+            let (alice_ctx, inner_account_path) = account_context(&inner_path);
+            write_identity(&alice_ctx, &inner_account_path, &inner_identity).unwrap();
             let inner_body = fs::read(&inner_path).unwrap();
             let mut inner_meta = create_plain_test_metadata(&ctx.identity, ctx.identity_key.as_ref().unwrap(), &inner_body);
             inner_meta.encryption_algorithm = None;
             inner_meta.members[0].key = None;
             sign_metadata(ctx.identity_key.as_ref().unwrap(), &mut inner_meta, Some(&inner_body)).unwrap();
-            write_metadata_attributes(&inner_path, &inner_meta).unwrap();
+            write_atomic_with_metadata(&alice_ctx, &inner_account_path, Body::Bytes(&inner_body), &inner_meta, None).unwrap();
 
             let outer_address = format!("{}/outer.json", alice_address);
             let (outer_identity, _outer_key) =
                 generate_identity(&outer_address, Some(vec![inner_address.clone()])).unwrap();
             let outer_path = temp_dir.join("ark/alice/outer.json");
-            write_identity(&outer_path, &outer_identity).unwrap();
+            let (alice_ctx, outer_account_path) = account_context(&outer_path);
+            write_identity(&alice_ctx, &outer_account_path, &outer_identity).unwrap();
             let outer_body = fs::read(&outer_path).unwrap();
             let mut outer_meta = create_plain_test_metadata(&ctx.identity, ctx.identity_key.as_ref().unwrap(), &outer_body);
             outer_meta.encryption_algorithm = None;
             outer_meta.members[0].key = None;
             sign_metadata(ctx.identity_key.as_ref().unwrap(), &mut outer_meta, Some(&outer_body)).unwrap();
-            write_metadata_attributes(&outer_path, &outer_meta).unwrap();
+            write_atomic_with_metadata(&alice_ctx, &outer_account_path, Body::Bytes(&outer_body), &outer_meta, None).unwrap();
 
             let shared_path = temp_dir.join("ark/alice/shared.txt");
             let mut meta = create_plain_test_metadata(&ctx.identity, ctx.identity_key.as_ref().unwrap(), b"secret");
@@ -457,8 +457,8 @@ mod tests {
                 key: None,
             });
             sign_metadata(ctx.identity_key.as_ref().unwrap(), &mut meta, Some(b"secret")).unwrap();
-            fs::write(&shared_path, b"secret").unwrap();
-            write_metadata_attributes(&shared_path, &meta).unwrap();
+            let (alice_ctx, shared_account_path) = account_context(&shared_path);
+            write_atomic_with_metadata(&alice_ctx, &shared_account_path, Body::Bytes(b"secret"), &meta, None).unwrap();
 
             let (code, _, _) = signed_request(port, &bob_identity, &bob_key, "GET", "/ark/alice/shared.txt", &[]);
             assert_eq!(code, 403);
@@ -491,21 +491,23 @@ mod tests {
             let (bob_identity, _, _) = create_test_account(temp_dir, &bob_address);
             let (charlie_identity, _, _) = create_test_account(temp_dir, &charlie_address);
             let ctx = init_with_server(temp_dir, &alice_address);
-            cache_identity(&ctx.root, &bob_identity);
-            cache_identity(&ctx.root, &charlie_identity);
+            cache_identity(&ctx, &bob_identity);
+            cache_identity(&ctx, &charlie_identity);
 
             create_identity(&ctx, "team.json", std::slice::from_ref(&bob_address)).unwrap();
             change_identity_members(&ctx, "team.json", std::slice::from_ref(&charlie_address), &[]).unwrap();
 
-            let identity = read_identity(&temp_dir.join("team.json")).unwrap();
+            let identity = read_identity(&ctx, "/team.json").unwrap();
             let members = identity.members.as_ref().unwrap();
             assert_eq!(members, &vec![bob_address.clone(), charlie_address.clone()]);
             validate_identity(&identity).unwrap();
 
-            let server_identity = read_identity(&temp_dir.join("ark/alice/team.json")).unwrap();
+            let (alice_ctx, server_account_path) = account_context(&temp_dir.join("ark/alice/team.json"));
+            let server_identity = read_identity(&alice_ctx, &server_account_path).unwrap();
             assert_eq!(server_identity.members.as_ref().unwrap(), members);
 
-            let key_metadata = read_metadata_attributes(&temp_dir.join("ark/alice/team.key")).unwrap();
+            let (alice_ctx, key_path) = account_context(&temp_dir.join("ark/alice/team.key"));
+            let key_metadata = read_metadata_attributes(&alice_ctx, &key_path).unwrap();
             assert!(key_metadata.members.iter().any(|m| m.address == charlie_address));
         });
     }
@@ -518,12 +520,12 @@ mod tests {
             let (bob_identity, _, _) = create_test_account(temp_dir, &bob_address);
             let alice_address = format!("alice@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &alice_address);
-            cache_identity(&ctx.root, &bob_identity);
+            cache_identity(&ctx, &bob_identity);
 
             create_identity(&ctx, "team.json", std::slice::from_ref(&bob_address)).unwrap();
             change_identity_members(&ctx, "team.json", std::slice::from_ref(&bob_address), &[]).unwrap();
 
-            let identity = read_identity(&temp_dir.join("team.json")).unwrap();
+            let identity = read_identity(&ctx, "/team.json").unwrap();
             assert_eq!(identity.members.as_ref().unwrap(), &vec![bob_address.clone()]);
         });
     }
@@ -536,17 +538,18 @@ mod tests {
             let bob_address = format!("bob@127.0.0.1:{}", port);
             let (bob_identity, _, _) = create_test_account(temp_dir, &bob_address);
             let ctx = init_with_server(temp_dir, &alice_address);
-            cache_identity(&ctx.root, &bob_identity);
+            cache_identity(&ctx, &bob_identity);
 
             create_identity(&ctx, "team.json", std::slice::from_ref(&bob_address)).unwrap();
             change_identity_members(&ctx, "team.json", &[], std::slice::from_ref(&bob_address)).unwrap();
 
-            let identity = read_identity(&temp_dir.join("team.json")).unwrap();
+            let identity = read_identity(&ctx, "/team.json").unwrap();
             let members = identity.members.as_ref().unwrap();
             assert!(members.is_empty());
             validate_identity(&identity).unwrap();
 
-            let key_metadata = read_metadata_attributes(&temp_dir.join("ark/alice/team.key")).unwrap();
+            let (alice_ctx, key_path) = account_context(&temp_dir.join("ark/alice/team.key"));
+            let key_metadata = read_metadata_attributes(&alice_ctx, &key_path).unwrap();
             assert!(!key_metadata.members.iter().any(|m| m.address == bob_address));
             assert!(key_metadata.members.iter().any(|m| m.address == alice_address));
         });
@@ -560,13 +563,13 @@ mod tests {
             let (bob_identity, _, _) = create_test_account(temp_dir, &bob_address);
             let alice_address = format!("alice@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &alice_address);
-            cache_identity(&ctx.root, &bob_identity);
+            cache_identity(&ctx, &bob_identity);
 
             create_identity(&ctx, "team.json", std::slice::from_ref(&bob_address)).unwrap();
             change_identity_members(&ctx, "team.json", &[], std::slice::from_ref(&bob_address)).unwrap();
             change_identity_members(&ctx, "team.json", &[], std::slice::from_ref(&bob_address)).unwrap();
 
-            let identity = read_identity(&temp_dir.join("team.json")).unwrap();
+            let identity = read_identity(&ctx, "/team.json").unwrap();
             assert!(identity.members.as_ref().unwrap().is_empty());
         });
     }
@@ -579,15 +582,16 @@ mod tests {
             let bob_address = format!("bob@127.0.0.1:{}", port);
             let (bob_identity, _, _) = create_test_account(temp_dir, &bob_address);
             let ctx = init_with_server(temp_dir, &address);
-            cache_identity(&ctx.root, &bob_identity);
+            cache_identity(&ctx, &bob_identity);
 
             create_identity(&ctx, "team.json", &[address.clone(), bob_address.clone()]).unwrap();
             change_identity_members(&ctx, "team.json", &[], std::slice::from_ref(&address)).unwrap();
 
-            let identity = read_identity(&temp_dir.join("team.json")).unwrap();
+            let identity = read_identity(&ctx, "/team.json").unwrap();
             assert_eq!(identity.members.as_ref().unwrap(), &vec![bob_address.clone()]);
 
-            let key_metadata = read_metadata_attributes(&temp_dir.join("ark/alice/team.key")).unwrap();
+            let (alice_ctx, key_path) = account_context(&temp_dir.join("ark/alice/team.key"));
+            let key_metadata = read_metadata_attributes(&alice_ctx, &key_path).unwrap();
             assert!(key_metadata.members.iter().any(|m| m.address == address));
         });
     }
@@ -600,7 +604,7 @@ mod tests {
             let bob_address = format!("bob@127.0.0.1:{}", port);
             let (bob_identity, _, _) = create_test_account(temp_dir, &bob_address);
             let ctx = init_with_server(temp_dir, &alice_address);
-            cache_identity(&ctx.root, &bob_identity);
+            cache_identity(&ctx, &bob_identity);
 
             create_identity(&ctx, "team.json", std::slice::from_ref(&bob_address)).unwrap();
             // Drop wins: bob is not a member afterwards.
@@ -612,14 +616,14 @@ mod tests {
             )
             .unwrap();
 
-            let identity = read_identity(&temp_dir.join("team.json")).unwrap();
+            let identity = read_identity(&ctx, "/team.json").unwrap();
             assert!(identity.members.as_ref().unwrap().is_empty());
         });
     }
 
     #[test]
     fn change_identity_members_drop_then_access_denied() {
-        use crate::metadata::{sign_metadata, write_metadata_attributes};
+        use crate::metadata::sign_metadata;
         use crate::testing::fs::create_plain_test_metadata;
         use crate::testing::http::signed_request;
         use crate::types::{Member, Permission};
@@ -630,7 +634,7 @@ mod tests {
             let bob_address = format!("bob@127.0.0.1:{}", port);
             let (bob_identity, bob_key, _) = create_test_account(temp_dir, &bob_address);
             let ctx = init_with_server(temp_dir, &alice_address);
-            cache_identity(&ctx.root, &bob_identity);
+            cache_identity(&ctx, &bob_identity);
 
             create_identity(&ctx, "team.json", std::slice::from_ref(&bob_address)).unwrap();
             let group_address = format!("{}/team.json", alice_address);
@@ -645,8 +649,8 @@ mod tests {
                 key: None,
             });
             sign_metadata(ctx.identity_key.as_ref().unwrap(), &mut meta, Some(b"secret")).unwrap();
-            fs::write(&shared_path, b"secret").unwrap();
-            write_metadata_attributes(&shared_path, &meta).unwrap();
+            let (alice_ctx, shared_account_path) = account_context(&shared_path);
+            write_atomic_with_metadata(&alice_ctx, &shared_account_path, Body::Bytes(b"secret"), &meta, None).unwrap();
 
             let (code, body, _) = signed_request(port, &bob_identity, &bob_key, "GET", "/ark/alice/shared.txt", &[]);
             assert_eq!(code, 200);
@@ -661,7 +665,7 @@ mod tests {
 
     #[test]
     fn change_identity_members_add_promotes_to_group() {
-        use crate::metadata::{sign_metadata, write_metadata_attributes};
+        use crate::metadata::sign_metadata;
         use crate::testing::fs::create_plain_test_metadata;
         use crate::testing::http::signed_request;
         use crate::types::{Member, Permission};
@@ -672,7 +676,7 @@ mod tests {
             let bob_address = format!("bob@127.0.0.1:{}", port);
             let (bob_identity, bob_key, _) = create_test_account(temp_dir, &bob_address);
             let ctx = init_with_server(temp_dir, &alice_address);
-            cache_identity(&ctx.root, &bob_identity);
+            cache_identity(&ctx, &bob_identity);
 
             let (identity, _) = create_identity(&ctx, "team.json", &[]).unwrap();
             assert!(identity.members.is_none());
@@ -689,15 +693,15 @@ mod tests {
                 key: None,
             });
             sign_metadata(ctx.identity_key.as_ref().unwrap(), &mut meta, Some(b"secret")).unwrap();
-            fs::write(&shared_path, b"secret").unwrap();
-            write_metadata_attributes(&shared_path, &meta).unwrap();
+            let (alice_ctx, shared_account_path) = account_context(&shared_path);
+            write_atomic_with_metadata(&alice_ctx, &shared_account_path, Body::Bytes(b"secret"), &meta, None).unwrap();
 
             let (code, _, _) = signed_request(port, &bob_identity, &bob_key, "GET", "/ark/alice/shared.txt", &[]);
             assert_eq!(code, 403);
 
             change_identity_members(&ctx, "team.json", std::slice::from_ref(&bob_address), &[]).unwrap();
 
-            let identity = read_identity(&temp_dir.join("team.json")).unwrap();
+            let identity = read_identity(&ctx, "/team.json").unwrap();
             assert_eq!(identity.members.as_ref().unwrap(), &vec![bob_address.clone()]);
 
             let (code, body, _) = signed_request(port, &bob_identity, &bob_key, "GET", "/ark/alice/shared.txt", &[]);
@@ -716,8 +720,8 @@ mod tests {
             let (bob_identity, _, _) = create_test_account(temp_dir, &bob_address);
             let (charlie_identity, _, _) = create_test_account(temp_dir, &charlie_address);
             let ctx = init_with_server(temp_dir, &alice_address);
-            cache_identity(&ctx.root, &bob_identity);
-            cache_identity(&ctx.root, &charlie_identity);
+            cache_identity(&ctx, &bob_identity);
+            cache_identity(&ctx, &charlie_identity);
 
             create_identity(&ctx, "team.json", std::slice::from_ref(&bob_address)).unwrap();
             change_identity_members(
@@ -728,10 +732,11 @@ mod tests {
             )
             .unwrap();
 
-            let identity = read_identity(&temp_dir.join("team.json")).unwrap();
+            let identity = read_identity(&ctx, "/team.json").unwrap();
             assert_eq!(identity.members.as_ref().unwrap(), &vec![charlie_address.clone()]);
 
-            let key_metadata = read_metadata_attributes(&temp_dir.join("ark/alice/team.key")).unwrap();
+            let (alice_ctx, key_path) = account_context(&temp_dir.join("ark/alice/team.key"));
+            let key_metadata = read_metadata_attributes(&alice_ctx, &key_path).unwrap();
             assert!(!key_metadata.members.iter().any(|m| m.address == bob_address));
             assert!(key_metadata.members.iter().any(|m| m.address == charlie_address));
         });

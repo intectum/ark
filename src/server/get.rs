@@ -1,21 +1,20 @@
-use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 
 use crate::http::{write_response, write_text};
 use crate::metadata::{read_metadata_attributes, write_metadata_headers};
-use crate::types::{DirEntry, DirEntryKind};
+use crate::storage::{exists, file_name, is_dir, is_symlink, read, read_dir, size};
+use crate::types::{Context, DirEntry, DirEntryKind};
 
-pub fn serve_get(fs_path: &Path, stream: &mut dyn Write, send_body: bool, prefix: Option<&str>) -> io::Result<()> {
-    let fs_metadata = match fs::metadata(fs_path) {
-        Ok(m) => m,
-        Err(_) => return write_text(stream, 404, b"not found"),
-    };
+pub fn serve_get(ctx: &Context, path: &str, stream: &mut dyn Write, send_body: bool, prefix: Option<&str>) -> io::Result<()> {
+    if !exists(ctx, path) {
+        return write_text(stream, 404, b"not found");
+    }
 
-    if fs_metadata.is_dir() {
-        let body = list_dir(fs_path, prefix)?;
+    if is_dir(ctx, path) {
+        let body = list_dir(ctx, path, prefix)?;
         let content_length = body.len().to_string();
-        let metadata_headers = read_metadata_attributes(fs_path).ok()
+        let metadata_headers = read_metadata_attributes(ctx, path).ok()
             .map(|m| write_metadata_headers(&m))
             .unwrap_or_default();
         let mut headers: Vec<(&str, &str)> = metadata_headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
@@ -25,54 +24,46 @@ pub fn serve_get(fs_path: &Path, stream: &mut dyn Write, send_body: bool, prefix
         return write_response(stream, 200, &headers, if send_body { body.as_bytes() } else { &[] });
     }
 
-    let metadata = match read_metadata_attributes(fs_path) {
+    let metadata = match read_metadata_attributes(ctx, path) {
         Ok(m) => m,
         Err(e) => return write_text(stream, 500, e.to_string().as_bytes()),
     };
 
     let metadata_headers = write_metadata_headers(&metadata);
-    let content_length = fs_metadata.len().to_string();
+    let content_length = size(ctx, path)?.to_string();
     let mut headers: Vec<(&str, &str)> = metadata_headers.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
-    headers.push(("Content-Type", content_type(fs_path)));
+    headers.push(("Content-Type", content_type(path)));
     headers.push(("Content-Length", &content_length));
     headers.push(("Connection", "close"));
 
     write_response(stream, 200, &headers, &[])?;
     if send_body {
-        let mut file = fs::File::open(fs_path)?;
-        io::copy(&mut file, stream)?;
+        stream.write_all(&read(ctx, path)?)?;
     }
 
     Ok(())
 }
 
-fn list_dir(path: &Path, prefix: Option<&str>) -> io::Result<String> {
-    let mut entries: Vec<_> = fs::read_dir(path)?
-        .filter_map(|e| e.ok())
-        .filter(|e| match prefix {
-            Some(p) => e.file_name().to_string_lossy().starts_with(p),
+fn list_dir(ctx: &Context, path: &str, prefix: Option<&str>) -> io::Result<String> {
+    let items: Vec<DirEntry> = read_dir(ctx, path)?
+        .into_iter()
+        .filter(|entry| match prefix {
+            Some(prefix) => file_name(entry).starts_with(prefix),
             None => true,
         })
-        .collect();
-    entries.sort_by_key(|e| e.file_name());
-    let items: Vec<DirEntry> = entries
-        .into_iter()
-        .map(|e| {
-            let meta = e.metadata()?;
-            let kind = if meta.is_dir() { DirEntryKind::Dir }
-                else if meta.is_symlink() { DirEntryKind::Symlink }
+        .map(|entry| {
+            let kind = if is_dir(ctx, &entry) { DirEntryKind::Dir }
+                else if is_symlink(ctx, &entry) { DirEntryKind::Symlink }
                 else { DirEntryKind::File };
-            Ok(DirEntry {
-                kind,
-                name: e.file_name().to_string_lossy().into_owned(),
-            })
+            DirEntry { kind, name: file_name(&entry).to_string() }
         })
-        .collect::<io::Result<_>>()?;
+        .collect();
+
     serde_json::to_string(&items).map_err(|e| io::Error::other(e.to_string()))
 }
 
-fn content_type(path: &Path) -> &'static str {
-    match path.extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
+fn content_type(path: &str) -> &'static str {
+    match Path::new(path).extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
         "html" | "htm" => "text/html; charset=utf-8",
         "css" => "text/css; charset=utf-8",
         "js" => "application/javascript",

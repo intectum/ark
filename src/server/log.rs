@@ -1,13 +1,13 @@
-use std::fs;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
 
-use crate::identity::read_identity;
-use crate::metadata::{create_metadata, read_metadata_attributes, sign_metadata, write_metadata_attributes};
+use crate::context::create_target_context;
+use crate::metadata::{create_metadata, read_metadata_attributes, sign_metadata};
+use crate::storage::{Body, exists, is_dir, join_path, write_atomic_with_metadata};
 use crate::timestamp;
-use crate::types::{IdentityContext, Member, Permission};
+use crate::types::{Context, Member, Permission};
 
 const LOG_CAPTURE_LIMIT: usize = 16 * 1024;
+const REQUESTS_DIR: &str = "/.ark/requests";
 
 pub struct LoggingStream<W: Write> {
     inner: W,
@@ -43,7 +43,7 @@ impl<W: Write> Write for LoggingStream<W> {
 }
 
 pub fn try_log_request(
-    server_ctx: &IdentityContext,
+    server_ctx: &Context,
     method: &str,
     target: &str,
     request_headers: &[(String, String)],
@@ -60,14 +60,17 @@ pub fn try_log_request(
 
     let server_root = server_ctx.root.parent().and_then(|p| p.parent())
         .ok_or_else(|| io::Error::other("server root not resolvable"))?;
-    let target_root = server_root.join("ark").join(name);
-    let requests_dir = target_root.join(".ark").join("requests");
 
-    if !requests_dir.is_dir() {
+    let target_ctx = match create_target_context(server_root, name) {
+        Ok(c) => c,
+        Err(_) => return Ok(()),
+    };
+
+    if !is_dir(&target_ctx, REQUESTS_DIR) {
         return Ok(());
     }
 
-    let dir_metadata = match read_metadata_attributes(&requests_dir) {
+    let dir_metadata = match read_metadata_attributes(&target_ctx, REQUESTS_DIR) {
         Ok(m) => m,
         Err(_) => return Ok(()),
     };
@@ -95,15 +98,12 @@ pub fn try_log_request(
         .and_then(|line| line.split_whitespace().nth(1)?.parse().ok())
         .unwrap_or(0);
 
-    let target_identity = read_identity(&target_root.join(".ark").join("identity.json"))?;
-
-    let entry_path = allocate_entry_path(&requests_dir, method, status)?;
-    fs::write(&entry_path, &entry)?;
+    let entry_path = allocate_entry_path(&target_ctx, method, status)?;
 
     let mut metadata = create_metadata(&server_ctx.identity.address, None);
     metadata.members = vec![
         Member {
-            address: target_identity.address,
+            address: target_ctx.identity.address.clone(),
             permission: Permission::Owner,
             key: None,
         },
@@ -116,7 +116,7 @@ pub fn try_log_request(
     let secret_key = server_ctx.identity_key.as_ref()
         .ok_or_else(|| io::Error::other("server context missing identity_key"))?;
     sign_metadata(secret_key, &mut metadata, Some(&entry))?;
-    write_metadata_attributes(&entry_path, &metadata)?;
+    write_atomic_with_metadata(&target_ctx, &entry_path, Body::Bytes(&entry), &metadata, None)?;
 
     Ok(())
 }
@@ -135,12 +135,12 @@ fn find_double_crlf(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
-fn allocate_entry_path(dir: &Path, method: &str, status: u16) -> io::Result<PathBuf> {
+fn allocate_entry_path(ctx: &Context, method: &str, status: u16) -> io::Result<String> {
     let stamp = timestamp::format_fs_safe(timestamp::now());
     for seq in 0..1000 {
         let name = format!("{}_{}_{}_{:03}.http", method, status, stamp, seq);
-        let candidate = dir.join(&name);
-        if !candidate.exists() {
+        let candidate = join_path(REQUESTS_DIR, &name);
+        if !exists(ctx, &candidate) {
             return Ok(candidate);
         }
     }
@@ -156,13 +156,14 @@ mod tests {
 
     use crate::identity::read_identity;
     use crate::metadata::{create_metadata, read_metadata_attributes, sign_metadata, write_metadata_attributes};
-    use crate::testing::fs::{create_test_account, in_test_dir};
+    use crate::testing::fs::{account_context, create_test_account, in_test_dir};
     use crate::testing::http::{signed_request, signed_put_with_default_metadata};
     use crate::testing::http::start_test_server;
     use crate::types::{Identity, Key, Member, Permission};
 
     fn ark_identity(temp_dir: &Path) -> Identity {
-        read_identity(&temp_dir.join("ark/ark/.ark/identity.json")).unwrap()
+        let (ctx, path) = account_context(&temp_dir.join("ark/ark/.ark/identity.json"));
+        read_identity(&ctx, &path).unwrap()
     }
 
     fn grant_ark_write_on_requests(
@@ -182,7 +183,9 @@ mod tests {
             key: None,
         });
         sign_metadata(account_key, &mut metadata, None).unwrap();
-        write_metadata_attributes(&requests_dir, &metadata).unwrap();
+
+        let (account_ctx, account_path) = account_context(&requests_dir);
+        write_metadata_attributes(&account_ctx, &account_path, &metadata).unwrap();
     }
 
     fn list_log_entries(temp_dir: &Path, account_name: &str) -> Vec<PathBuf> {
@@ -248,7 +251,8 @@ mod tests {
             fs::create_dir_all(&requests_dir).unwrap();
             let mut metadata = create_metadata(&identity.address, None);
             sign_metadata(&secret_key, &mut metadata, None).unwrap();
-            write_metadata_attributes(&requests_dir, &metadata).unwrap();
+            let (alice_ctx, requests_path) = account_context(&requests_dir);
+            write_metadata_attributes(&alice_ctx, &requests_path, &metadata).unwrap();
 
             let (_, _, _) = signed_request(port, &identity, &secret_key, "GET", "/ark/alice/missing.txt", &[]);
 
@@ -330,7 +334,8 @@ mod tests {
 
             let entries = list_log_entries(temp_dir, "alice");
             assert!(!entries.is_empty());
-            let meta = read_metadata_attributes(&entries[0]).unwrap();
+            let (alice_ctx, entry_path) = account_context(&entries[0]);
+            let meta = read_metadata_attributes(&alice_ctx, &entry_path).unwrap();
             assert_eq!(meta.modified_by, ark.address);
             assert!(meta.members.iter().any(|m| m.address == identity.address && m.permission == Permission::Owner));
             assert!(meta.members.iter().any(|m| m.address == ark.address && m.permission == Permission::Writer));

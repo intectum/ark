@@ -4,11 +4,11 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::process::exit;
 
-use ark::client::{accept_proposal, create_identity, decrypt, delete, encrypt, get, head, change_identity_members, init, list, list_proposals, put, reject_proposal, sync, watch_local, watch_remote};
+use ark::client::{accept_proposal, create_identity, decrypt, delete, encrypt, get, get_stream, head, change_identity_members, init, list, list_proposals, put, reject_proposal, sync, watch_local, watch_remote};
 use ark::context::create_client_context;
 use ark::identity::parse_address;
 use ark::server::start_server;
-use ark::types::{DirEntryKind, EntryEvent, IdentityContext, Permissions};
+use ark::types::{DirEntryKind, EntryEvent, Context, Permissions};
 use ark::util::resolve_client_url;
 use clap::{Parser, Subcommand};
 
@@ -131,14 +131,17 @@ enum Cmd {
         /// Ark URL or path.
         path: String,
     },
-    /// Fetch a file or directory listing.
+    /// Download a file into the account tree.
     Get {
-        /// Write body to FILE instead of stdout.
-        #[arg(short, long, value_name = "FILE")]
-        output: Option<String>,
-        /// Decrypt the response body using its metadata key.
+        /// Decrypt the body using its metadata key.
         #[arg(short, long)]
         decrypt: bool,
+        /// Ark URL or path.
+        path: String,
+    },
+    /// Print a file body to stdout, decrypting it, without writing it to the
+    /// account tree.
+    Cat {
         /// Ark URL or path.
         path: String,
     },
@@ -150,15 +153,13 @@ enum Cmd {
         /// Ark URL or path.
         path: String,
     },
-    /// Encrypt and upload a file.
+    /// Encrypt and upload the account's copy of a file.
     ///
-    /// If INPUT is a directory, creates or updates a directory (empty body).
-    /// Every encrypted put rotates the file key. If INPUT is already
+    /// The body is read from the account tree at PATH, which must exist. A
+    /// directory there creates or updates a directory (empty body). Every
+    /// encrypted put rotates the file key. If the local copy is already
     /// encrypted (e.g. after `ark encrypt`), the body is uploaded as-is.
     Put {
-        /// Read body from FILE instead of stdin.
-        #[arg(short, long, value_name = "FILE")]
-        input: Option<String>,
         /// Grant `owner` (repeatable). Use "public" for wildcard `*`.
         #[arg(short = 'o', long = "owner", value_name = "ADDR")]
         owner: Vec<String>,
@@ -196,33 +197,24 @@ enum Cmd {
         /// Decrypt pulled files using their metadata key.
         #[arg(short, long)]
         decrypt: bool,
+        /// Directory to reconcile, as an ark URL or path. Defaults to the
+        /// working directory.
+        #[arg(default_value = ".")]
+        path: String,
     },
     /// Watch for changes and print events as they arrive.
     Watch {
         #[command(subcommand)]
         cmd: WatchCmd,
     },
-    /// Decrypt an encrypted file.
+    /// Decrypt an encrypted file in place.
     ///
-    /// If the source has ark metadata, its file key and algorithm are reused
-    /// and --key/--encryption-algorithm are rejected. Otherwise --key is
-    /// required. Refuses to run on files that are not currently encrypted.
+    /// Reuses the file key and algorithm from the file's ark metadata, which
+    /// it must carry. Refuses to run on files that are not currently
+    /// encrypted.
     Decrypt {
-        /// Read ciphertext from FILE (otherwise stdin).
-        #[arg(short, long, value_name = "FILE", conflicts_with = "in_place")]
-        input: Option<String>,
-        /// Write plaintext to FILE (otherwise stdout).
-        #[arg(short, long, value_name = "FILE", conflicts_with = "in_place")]
-        output: Option<String>,
-        /// Decrypt the file in place (rewrites its bytes).
-        #[arg(long, value_name = "FILE")]
-        in_place: Option<String>,
-        /// Base64url-encoded 32-byte file key (required for stdin).
-        #[arg(short, long, value_name = "B64")]
-        key: Option<String>,
-        /// Override encryption algorithm (default from metadata or aes-256-gcm).
-        #[arg(short, long, value_name = "NAME")]
-        encryption_algorithm: Option<String>,
+        /// Ark URL or path.
+        path: String,
     },
     /// Manage identities (keypair documents at a path).
     ///
@@ -243,27 +235,17 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ProposalsCmd,
     },
-    /// Encrypt a plaintext file.
+    /// Encrypt a plaintext file in place.
     ///
-    /// If the source has ark metadata, its file key and algorithm are reused
-    /// and --key/--encryption-algorithm are rejected. Otherwise --key is
-    /// required. Refuses to run on files that are already encrypted.
+    /// If the file has ark metadata, its file key and algorithm are reused and
+    /// --encryption-algorithm is rejected. Otherwise a fresh file key is
+    /// generated. Refuses to run on files that are already encrypted.
     Encrypt {
-        /// Read plaintext from FILE (otherwise stdin).
-        #[arg(short, long, value_name = "FILE", conflicts_with = "in_place")]
-        input: Option<String>,
-        /// Write ciphertext to FILE (otherwise stdout).
-        #[arg(short, long, value_name = "FILE", conflicts_with = "in_place")]
-        output: Option<String>,
-        /// Encrypt the file in place (rewrites its bytes).
-        #[arg(long, value_name = "FILE")]
-        in_place: Option<String>,
-        /// Base64url-encoded 32-byte file key (reuses source metadata key if absent).
-        #[arg(short, long, value_name = "B64")]
-        key: Option<String>,
-        /// Override encryption algorithm (default from metadata or aes-256-gcm).
+        /// Encryption algorithm for a generated file key (default aes-256-gcm).
         #[arg(short, long, value_name = "NAME")]
         encryption_algorithm: Option<String>,
+        /// Ark URL or path.
+        path: String,
     },
 }
 
@@ -281,7 +263,8 @@ fn main() {
         Cmd::Init { address, password, local_only } => current_dir().and_then(|c| init(&c, &address, password.as_deref(), local_only)),
         Cmd::Head { path } => create_client_context().and_then(|c| head_cli(&c, &path)),
         Cmd::Delete { path } => create_client_context().and_then(|c| delete(&c, &path)),
-        Cmd::Get { output, decrypt, path } => create_client_context().and_then(|c| get(&c, &path, output.as_deref(), decrypt)),
+        Cmd::Get { decrypt, path } => create_client_context().and_then(|c| get(&c, &path, decrypt)),
+        Cmd::Cat { path } => create_client_context().and_then(|c| cat_cli(&c, &path)),
         Cmd::List { prefix, path } => create_client_context().and_then(|c| list_cli(&c, &path, prefix.as_deref())),
         Cmd::Identity { cmd } => create_client_context().and_then(|c| match cmd {
             IdentityCmd::Create { path, member } => create_identity(&c, &path, &member).map(|_| ()),
@@ -292,8 +275,8 @@ fn main() {
             ProposalsCmd::Accept { id, force } => accept_proposal(&c, &id, force),
             ProposalsCmd::Reject { id } => reject_proposal(&c, &id),
         }),
-        Cmd::Put { input, owner, writer, reader, drop, encryption_algorithm, metadata_only, path } => create_client_context().and_then(|c| put(&c, &path, input.as_deref(), &Permissions { owners: owner, writers: writer, readers: reader, drops: drop }, encryption_algorithm.as_deref(), metadata_only)),
-        Cmd::Sync { watch, decrypt } => create_client_context().and_then(|c| current_dir().and_then(|d| sync(&c, &d, watch, decrypt, print_event, print_error))),
+        Cmd::Put { owner, writer, reader, drop, encryption_algorithm, metadata_only, path } => create_client_context().and_then(|c| put(&c, &path, &Permissions { owners: owner, writers: writer, readers: reader, drops: drop }, encryption_algorithm.as_deref(), metadata_only)),
+        Cmd::Sync { watch, decrypt, path } => create_client_context().and_then(|c| sync(&c, &path, watch, decrypt, print_event, print_error)),
         Cmd::Watch { cmd } => match cmd {
             WatchCmd::Local { path } => watch_local(Path::new(&path), print_event, print_error),
             WatchCmd::Remote { path } => create_client_context().and_then(|c| {
@@ -301,12 +284,8 @@ fn main() {
                 watch_remote(&c, &url, print_event, print_error)
             }),
         },
-        Cmd::Decrypt { input, output, in_place, key, encryption_algorithm } => {
-            create_client_context().and_then(|c| decrypt(&c, input.as_deref(), output.as_deref(), in_place.as_deref(), key.as_deref(), encryption_algorithm.as_deref()))
-        }
-        Cmd::Encrypt { input, output, in_place, key, encryption_algorithm } => {
-            create_client_context().and_then(|c| encrypt(&c, input.as_deref(), output.as_deref(), in_place.as_deref(), key.as_deref(), encryption_algorithm.as_deref()))
-        }
+        Cmd::Decrypt { path } => create_client_context().and_then(|c| decrypt(&c, &path)),
+        Cmd::Encrypt { encryption_algorithm, path } => create_client_context().and_then(|c| encrypt(&c, &path, encryption_algorithm.as_deref())),
     };
     if let Err(e) = result {
         eprintln!("error: {}", e);
@@ -314,7 +293,14 @@ fn main() {
     }
 }
 
-fn head_cli(ctx: &IdentityContext, path: &str) -> io::Result<()> {
+fn cat_cli(ctx: &Context, path: &str) -> io::Result<()> {
+    let mut stdout = io::stdout().lock();
+    get_stream(ctx, path, &mut stdout, true, None)?;
+
+    Ok(())
+}
+
+fn head_cli(ctx: &Context, path: &str) -> io::Result<()> {
     let (headers, _) = head(ctx, path)?;
 
     let mut stdout = io::stdout().lock();
@@ -325,7 +311,7 @@ fn head_cli(ctx: &IdentityContext, path: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn list_cli(ctx: &IdentityContext, path: &str, prefix: Option<&str>) -> io::Result<()> {
+fn list_cli(ctx: &Context, path: &str, prefix: Option<&str>) -> io::Result<()> {
     let entries = list(ctx, path, prefix)?;
     let mut stdout = io::stdout().lock();
     for entry in &entries {
@@ -339,7 +325,7 @@ fn list_cli(ctx: &IdentityContext, path: &str, prefix: Option<&str>) -> io::Resu
     Ok(())
 }
 
-fn list_proposals_cli(ctx: &IdentityContext) -> io::Result<()> {
+fn list_proposals_cli(ctx: &Context) -> io::Result<()> {
     let proposals = list_proposals(ctx)?;
     if proposals.is_empty() {
         println!("No pending proposals.");

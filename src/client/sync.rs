@@ -1,15 +1,15 @@
 use std::collections::HashMap;
-use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::thread;
 
 use super::{get, get_stream, head, list, put_content, watch_local, watch_remote};
 
 use crate::identity::parse_address;
-use crate::metadata::{has_metadata_attributes, read_local_metadata_attributes, read_metadata_attributes, read_metadata_headers, remove_local_metadata_attributes, write_local_metadata_attributes, write_metadata_attributes};
+use crate::metadata::{has_metadata_attributes, read_local_metadata_attributes, read_metadata_attributes, read_metadata_headers, write_local_metadata_attributes, write_metadata_attributes};
+use crate::storage::{Body, create_dir_all, exists, file_name, is_dir, is_file, is_symlink, join_path, parent_path, read, read_dir, read_to_string, remove_file, to_account_path, to_fs_path, write_atomic_with_metadata, write_atomic_without_metadata};
 use crate::timestamp;
-use crate::types::{DirEntryKind, EntryAction, EntryEvent, IdentityContext, Metadata};
+use crate::types::{Context, DirEntryKind, EntryAction, EntryEvent, Metadata};
 use crate::util::{parse_request_entry, resolve_client_url, sha256};
 
 struct SyncEntry {
@@ -19,8 +19,8 @@ struct SyncEntry {
     modified_remote_metadata: bool,
 }
 
-/// Reconcile local and remote state under `path` in a single pass. `path`
-/// must be `ctx.root` or a descendant.
+/// Reconcile local and remote state under the directory `path` in a single
+/// pass.
 ///
 /// Per tracked file/dir: push if only local changed; pull if only remote
 /// changed; pull metadata alone when only remote permissions/members changed;
@@ -39,8 +39,8 @@ struct SyncEntry {
 /// fires once per reconciled entry; `on_error` receives non-fatal per-entry
 /// failures and watch stream errors.
 pub fn sync<F, G>(
-    ctx: &IdentityContext,
-    path: &Path,
+    ctx: &Context,
+    path: &str,
     watch: bool,
     decrypt: bool,
     on_event: F,
@@ -50,30 +50,32 @@ where
     F: Fn(EntryEvent) -> bool + Send + Sync,
     G: Fn(io::Error) -> bool + Send + Sync,
 {
+    let target_path = to_account_path(ctx, path)?;
+
     if watch {
         thread::scope(|s| {
             s.spawn(|| {
-                if let Err(e) = pull_watch(ctx, path, decrypt, &on_event, &on_error) {
+                if let Err(e) = pull_watch(ctx, &target_path, decrypt, &on_event, &on_error) {
                     on_error(io::Error::other(format!("pull watch: {}", e)));
                 }
             });
             s.spawn(|| {
-                if let Err(e) = push_watch(ctx, path, &on_event, &on_error) {
+                if let Err(e) = push_watch(ctx, &target_path, &on_event, &on_error) {
                     on_error(io::Error::other(format!("push watch: {}", e)));
                 }
             });
-            if let Err(e) = initial_sync(ctx, path, decrypt, &on_event, &on_error) {
+            if let Err(e) = initial_sync(ctx, &target_path, decrypt, &on_event, &on_error) {
                 on_error(io::Error::other(format!("initial sync: {}", e)));
             }
         });
     } else {
-        initial_sync(ctx, path, decrypt, &on_event, &on_error)?;
+        initial_sync(ctx, &target_path, decrypt, &on_event, &on_error)?;
     }
 
     Ok(())
 }
 
-fn initial_sync<F, G>(ctx: &IdentityContext, path: &Path, decrypt: bool, on_event: &F, on_error: &G) -> io::Result<()>
+fn initial_sync<F, G>(ctx: &Context, path: &str, decrypt: bool, on_event: &F, on_error: &G) -> io::Result<()>
 where
     F: Fn(EntryEvent) -> bool,
     G: Fn(io::Error) -> bool,
@@ -99,21 +101,21 @@ where
     }
 
     if let Some(l) = last_sync_request {
-        let ark_dir = path.join(".ark");
-        fs::create_dir_all(&ark_dir)?;
-        fs::write(ark_dir.join("last_sync_request"), &l)?;
+        let marker_path = last_sync_request_path(path);
+        create_dir_all(ctx, parent_path(&marker_path).unwrap_or("/"))?;
+        write_atomic_without_metadata(ctx, &marker_path, Body::Bytes(l.as_bytes()))?;
     }
 
     Ok(())
 }
 
-fn pull_watch<F, G>(ctx: &IdentityContext, path: &Path, decrypt: bool, on_event: &F, on_error: &G) -> io::Result<()>
+fn pull_watch<F, G>(ctx: &Context, path: &str, decrypt: bool, on_event: &F, on_error: &G) -> io::Result<()>
 where
     F: Fn(EntryEvent) -> bool,
     G: Fn(io::Error) -> bool,
 {
-    let rel_prefix = to_relative_path(ctx, path)?;
-    let url = resolve_client_url(ctx, &format!("/{}", rel_prefix))?;
+    let rel_prefix = path.trim_start_matches('/').to_string();
+    let url = resolve_client_url(ctx, path)?;
 
     watch_remote(ctx, &url, |event| {
         let subpath = event.path.to_string_lossy();
@@ -141,9 +143,9 @@ where
                 }
             }
             EntryAction::Deleted => {
-                let local_path = ctx.root.join(&relative_path);
-                if local_path.exists() && !is_dir {
-                    match fs::remove_file(&local_path) {
+                let local_path = join_path("/", &relative_path);
+                if exists(ctx, &local_path) && !is_dir {
+                    match remove_file(ctx, &local_path) {
                         Ok(()) => if on_event(EntryEvent {
                             action: EntryAction::Deleted,
                             kind: Some(DirEntryKind::File),
@@ -160,35 +162,35 @@ where
     }, on_error)
 }
 
-fn push_watch<F, G>(ctx: &IdentityContext, path: &Path, on_event: &F, on_error: &G) -> io::Result<()>
+fn push_watch<F, G>(ctx: &Context, path: &str, on_event: &F, on_error: &G) -> io::Result<()>
 where
     F: Fn(EntryEvent) -> bool,
     G: Fn(io::Error) -> bool,
 {
-    watch_local(path, |event| {
+    watch_local(&to_fs_path(ctx, path)?, |event| {
         match event.action {
             EntryAction::Created | EntryAction::Modified => {}
             _ => return false,
         }
 
-        let absolute = path.join(&event.path);
-        if !absolute.is_file() { return false; }
+        let absolute = join_path(path, &event.path.to_string_lossy());
+        if !is_file(ctx, &absolute) { return false; }
 
         match check_entry(ctx, &absolute) {
             Ok(Some(entry)) => match sync_entry(ctx, &entry, false, on_event) {
                 Ok(true) => return true,
                 Ok(false) => {}
-                Err(e) => { on_error(io::Error::other(format!("push failed for {}: {}", absolute.display(), e))); }
+                Err(e) => { on_error(io::Error::other(format!("push failed for {}: {}", absolute, e))); }
             },
             Ok(None) => {}
-            Err(e) => { on_error(io::Error::other(format!("check {}: {}", absolute.display(), e))); }
+            Err(e) => { on_error(io::Error::other(format!("check {}: {}", absolute, e))); }
         }
 
         false
     }, on_error)
 }
 
-fn check<G>(ctx: &IdentityContext, path: &Path, on_error: &G) -> io::Result<(Vec<SyncEntry>, Option<String>)>
+fn check<G>(ctx: &Context, path: &str, on_error: &G) -> io::Result<(Vec<SyncEntry>, Option<String>)>
 where
     G: Fn(io::Error) -> bool,
 {
@@ -201,16 +203,17 @@ where
         if log.modified_by == ctx.identity.address { continue; }
 
         let is_dir = log.body_hash.is_none();
-        let local_path = ctx.root.join(rel);
-        let has_local_metadata = local_path.exists() && has_metadata_attributes(&local_path)?;
+        let local_path = join_path("/", rel);
+        let local_exists = exists(ctx, &local_path);
+        let has_local_metadata = local_exists && has_metadata_attributes(ctx, &local_path)?;
 
-        if !is_dir && local_path.exists() && !has_local_metadata {
+        if !is_dir && local_exists && !has_local_metadata {
             continue;
         }
 
         let (local_modified, local_body_hash, sync_modified) = if has_local_metadata {
-            let m = read_metadata_attributes(&local_path)?;
-            let l = read_local_metadata_attributes(&local_path)?;
+            let m = read_metadata_attributes(ctx, &local_path)?;
+            let l = read_local_metadata_attributes(ctx, &local_path)?;
             (Some(m.modified), m.body_hash.map(|h| h.value), l.sync_modified)
         } else {
             (None, None, None)
@@ -251,28 +254,25 @@ where
 }
 
 fn check_dir<G>(
-    ctx: &IdentityContext,
-    path: &Path,
+    ctx: &Context,
+    path: &str,
     entries: &mut HashMap<String, SyncEntry>,
     on_error: &G,
 ) -> io::Result<()>
 where
     G: Fn(io::Error) -> bool,
 {
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        if entry.file_type()?.is_symlink() { continue; }
+    for entry in read_dir(ctx, path)? {
+        if is_symlink(ctx, &entry) { continue; }
 
-        let path = entry.path();
-
-        if path.is_dir() {
-            check_dir(ctx, &path, entries, on_error)?;
+        if is_dir(ctx, &entry) {
+            check_dir(ctx, &entry, entries, on_error)?;
         }
-        if path.is_dir() || path.is_file() {
-            match check_entry(ctx, &path) {
+        if is_dir(ctx, &entry) || is_file(ctx, &entry) {
+            match check_entry(ctx, &entry) {
                 Ok(Some(e)) => { entries.insert(e.relative_path.clone(), e); }
                 Ok(None) => {}
-                Err(e) => { on_error(io::Error::other(format!("check {}: {}", path.display(), e))); }
+                Err(e) => { on_error(io::Error::other(format!("check {}: {}", entry, e))); }
             }
         }
     }
@@ -281,40 +281,41 @@ where
 }
 
 fn check_entry(
-    ctx: &IdentityContext,
-    path: &Path,
+    ctx: &Context,
+    path: &str,
 ) -> io::Result<Option<SyncEntry>> {
-    let local = read_local_metadata_attributes(path)?;
-    let is_dir = path.is_dir();
+    let relative_path = path.trim_start_matches('/').to_string();
+
+    let local_metadata = read_local_metadata_attributes(ctx, path)?;
+    let is_dir = is_dir(ctx, path);
 
     if is_dir {
-        if local.sync_modified.is_none() { return Ok(None); }
-    } else if local.sync_body_hash.is_none() {
+        if local_metadata.sync_modified.is_none() { return Ok(None); }
+    } else if local_metadata.sync_body_hash.is_none() {
         return Ok(None);
     }
 
-    let modified_local_body = match &local.sync_body_hash {
-        Some(h) if !is_dir => h.value != sha256(&fs::read(path)?),
+    let modified_local_body = match &local_metadata.sync_body_hash {
+        Some(h) if !is_dir => h.value != sha256(&read(ctx, path)?),
         _ => false,
     };
 
     Ok(Some(SyncEntry {
-        relative_path: to_relative_path(ctx, path)?,
+        relative_path,
         modified_local_body,
         modified_remote_body: false,
         modified_remote_metadata: false,
     }))
 }
 
-fn sync_entry<F>(ctx: &IdentityContext, entry: &SyncEntry, decrypt: bool, on_event: &F) -> io::Result<bool>
+fn sync_entry<F>(ctx: &Context, entry: &SyncEntry, decrypt: bool, on_event: &F) -> io::Result<bool>
 where
     F: Fn(EntryEvent) -> bool,
 {
-    let local_path = ctx.root.join(&entry.relative_path);
-    let target = format!("/{}", entry.relative_path);
+    let target = join_path("/", &entry.relative_path);
 
     let emit = |action: EntryAction, conflict: bool| -> bool {
-        let kind = if local_path.is_dir() { DirEntryKind::Dir } else { DirEntryKind::File };
+        let kind = if is_dir(ctx, &target) { DirEntryKind::Dir } else { DirEntryKind::File };
         on_event(EntryEvent {
             action,
             kind: Some(kind),
@@ -324,19 +325,20 @@ where
     };
 
     if entry.modified_local_body && entry.modified_remote_body {
-        let sidecar_path = sidecar_path_for(&local_path);
-        match get(ctx, &target, sidecar_path.to_str(), decrypt) {
-            Ok(()) => {}
+        let mut body: Vec<u8> = Vec::new();
+        let existing_metadata = read_metadata_attributes(ctx, &target).ok();
+        let (metadata, _) = match get_stream(ctx, &target, &mut body, decrypt, existing_metadata.as_ref()) {
+            Ok(pair) => pair,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(e) => return Err(e),
-        }
-        remove_local_metadata_attributes(&sidecar_path)?;
+        };
+        write_atomic_with_metadata(ctx, &sidecar_path_for(&target), Body::Bytes(&body), &metadata, None)?;
         return Ok(emit(EntryAction::Modified, true));
     } else if entry.modified_local_body {
         put_content(ctx, &target)?;
         return Ok(emit(EntryAction::Modified, false));
     } else if entry.modified_remote_body {
-        match get(ctx, &target, local_path.to_str(), decrypt) {
+        match get(ctx, &target, decrypt) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(e) => return Err(e),
@@ -350,33 +352,33 @@ where
         };
 
         if metadata.body_hash.is_none() {
-            fs::create_dir_all(&local_path)?;
+            create_dir_all(ctx, &target)?;
         }
-        if !local_path.exists() {
-            return Err(io::Error::new(io::ErrorKind::NotFound, format!("local path missing: {}", local_path.display())));
+        if !exists(ctx, &target) {
+            return Err(io::Error::new(io::ErrorKind::NotFound, format!("local path missing: {}", target)));
         }
-        write_metadata_attributes(&local_path, &metadata)?;
+        write_metadata_attributes(ctx, &target, &metadata)?;
 
-        let mut local = read_local_metadata_attributes(&local_path).unwrap_or_default();
+        let mut local = read_local_metadata_attributes(ctx, &target).unwrap_or_default();
         local.sync_modified = Some(metadata.modified);
-        write_local_metadata_attributes(&local_path, &local)?;
+        write_local_metadata_attributes(ctx, &target, &local)?;
         return Ok(emit(EntryAction::Metadata, false));
     }
 
     Ok(false)
 }
 
-fn fetch_log_map<G>(ctx: &IdentityContext, path: &Path, on_error: &G) -> io::Result<(HashMap<String, Metadata>, Option<String>)>
+fn fetch_log_map<G>(ctx: &Context, path: &str, on_error: &G) -> io::Result<(HashMap<String, Metadata>, Option<String>)>
 where
     G: Fn(io::Error) -> bool,
 {
-    let last_sync_request = match fs::read_to_string(path.join(".ark").join("last_sync_request")) {
+    let last_sync_request = match read_to_string(ctx, &last_sync_request_path(path)) {
         Ok(s) => Some(s.trim().to_string()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => None,
         Err(e) => return Err(e),
     };
 
-    let rel_prefix = to_relative_path(ctx, path)?;
+    let rel_prefix = path.trim_start_matches('/');
 
     let mut entries = list(ctx, "/.ark/requests/", Some("PUT_2"))?;
     entries.retain(|entry|
@@ -400,7 +402,7 @@ where
 
         let entry_path = format!("/.ark/requests/{}", entry.name);
         let mut entry_body: Vec<u8> = Vec::new();
-        if get_stream(ctx, &entry_path, &mut entry_body, false).is_err() {
+        if get_stream(ctx, &entry_path, &mut entry_body, false, None).is_err() {
             continue;
         }
 
@@ -410,7 +412,7 @@ where
             Err(e) => { on_error(io::Error::new(io::ErrorKind::InvalidData, format!("bad log entry: {}", e))); continue; }
         };
 
-        if !under_prefix(&relative_path, &rel_prefix) { continue; }
+        if !under_prefix(&relative_path, rel_prefix) { continue; }
 
         match map.get(&relative_path) {
             Some(existing) if metadata.modified < existing.modified => {}
@@ -440,11 +442,8 @@ fn parse_put(entry_bytes: &[u8], account_prefix: &str) -> io::Result<Option<(Str
     Ok(Some((relative_path.trim_end_matches('/').to_string(), metadata)))
 }
 
-fn to_relative_path(ctx: &IdentityContext, path: &Path) -> io::Result<String> {
-    Ok(path.strip_prefix(&ctx.root)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path is not within this account"))?
-        .to_string_lossy()
-        .into_owned())
+fn last_sync_request_path(path: &str) -> String {
+    join_path(&join_path(path, ".ark"), "last_sync_request")
 }
 
 fn under_prefix(rel: &str, prefix: &str) -> bool {
@@ -452,11 +451,13 @@ fn under_prefix(rel: &str, prefix: &str) -> bool {
     rel == prefix || rel.starts_with(&format!("{}/", prefix))
 }
 
-fn sidecar_path_for(local_path: &Path) -> PathBuf {
-    let file_name = local_path.file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "conflict".to_string());
-    local_path.with_file_name(format!("{}.conflict-{}", file_name, timestamp::format_fs_safe(timestamp::now())))
+fn sidecar_path_for(path: &str) -> String {
+    let name = format!("{}.conflict-{}", file_name(path), timestamp::format_fs_safe(timestamp::now()));
+
+    match parent_path(path) {
+        Some(parent) => join_path(parent, &name),
+        None => name,
+    }
 }
 
 #[cfg(test)]
@@ -464,22 +465,31 @@ mod tests {
     use std::env::{current_dir, set_current_dir};
     use std::fs;
     use std::os::unix::fs::symlink;
+    use std::path::Path;
 
     use super::*;
 
     use crate::client::{get::get, init, put::{put, put_permissions}};
+    use crate::metadata::{has_metadata_attributes, read_local_metadata_attributes, read_metadata_attributes};
     use crate::context::create_client_context;
     use crate::permissions::{owner, reader, writer};
-    use crate::testing::fs::{in_test_dir, init_with_server, write_encrypted_test_file, write_plain_test_file};
+    use crate::testing::fs::{account_context, in_test_dir, init_with_server, write_encrypted_test_file, write_plain_test_file};
     use crate::testing::http::start_test_server;
     use crate::types::Permissions;
+    use crate::storage::temp_path_for;
 
-    fn prime_plain(ctx: &IdentityContext, path: &Path, target: &str, body: &[u8]) {
-        fs::write(path, body).unwrap();
-        put(ctx, target, path.to_str(), &Permissions::default(), Some("none"), false).unwrap();
+    fn write_local(root: &Path, relative: &str, body: &[u8]) {
+        let path = root.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, body).unwrap();
     }
 
-    fn init_two_accounts(temp_dir: &Path, port: u16) -> (IdentityContext, IdentityContext) {
+    fn prime_plain(ctx: &Context, path: &Path, target: &str, body: &[u8]) {
+        fs::write(path, body).unwrap();
+        put(ctx, target, &Permissions::default(), Some("none"), false).unwrap();
+    }
+
+    fn init_two_accounts(temp_dir: &Path, port: u16) -> (Context, Context) {
         let alice_dir = temp_dir.join("alice_client");
         let bob_dir = temp_dir.join("bob_client");
         fs::create_dir_all(&alice_dir).unwrap();
@@ -496,10 +506,10 @@ mod tests {
         (alice_ctx, bob_ctx)
     }
 
-    fn seed_shared_dir_with_writer(alice_dir: &Path, alice_ctx: &IdentityContext, writer_addr: &str) {
+    fn seed_shared_dir_with_writer(alice_dir: &Path, alice_ctx: &Context, writer_addr: &str) {
         let shared = alice_dir.join("shared");
         fs::create_dir(&shared).unwrap();
-        put(alice_ctx, "shared/", Some(shared.to_str().unwrap()), &writer(writer_addr), None, false).unwrap();
+        put(alice_ctx, "shared/", &writer(writer_addr), None, false).unwrap();
     }
 
     #[test]
@@ -511,7 +521,7 @@ mod tests {
 
             fs::write(temp_dir.join("bare.txt"), b"hi").unwrap();
 
-            sync(&ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
+            sync(&ctx, ".", false, false, |_| false, |_| false).unwrap();
 
             assert!(!temp_dir.join("ark/gyan/bare.txt").exists(), "untracked file should not upload");
         });
@@ -529,10 +539,55 @@ mod tests {
             prime_plain(&ctx, &local, "a/b/c.txt", b"deep v1");
 
             fs::write(&local, b"deep v2").unwrap();
-            sync(&ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
+            sync(&ctx, ".", false, false, |_| false, |_| false).unwrap();
 
             let server_body = fs::read(temp_dir.join("ark/gyan/a/b/c.txt")).unwrap();
             assert_eq!(server_body, b"deep v2");
+        });
+    }
+
+    #[test]
+    fn sync_of_a_subdir_leaves_the_rest_of_the_account_alone() {
+        in_test_dir("ark_sync_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let address = format!("gyan@127.0.0.1:{}", port);
+            let ctx = init_with_server(temp_dir, &address);
+
+            fs::create_dir_all(temp_dir.join("a")).unwrap();
+            let inside = temp_dir.join("a/c.txt");
+            prime_plain(&ctx, &inside, "a/c.txt", b"inside v1");
+            let outside = temp_dir.join("b.txt");
+            prime_plain(&ctx, &outside, "b.txt", b"outside v1");
+
+            fs::write(&inside, b"inside v2").unwrap();
+            fs::write(&outside, b"outside v2").unwrap();
+            sync(&ctx, "a", false, false, |_| false, |_| false).unwrap();
+
+            assert_eq!(fs::read(temp_dir.join("ark/gyan/a/c.txt")).unwrap(), b"inside v2");
+            assert_eq!(fs::read(temp_dir.join("ark/gyan/b.txt")).unwrap(), b"outside v1", "outside the synced dir");
+        });
+    }
+
+    #[test]
+    fn sync_ignores_a_temp_file_left_behind() {
+        in_test_dir("ark_sync_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let address = format!("gyan@127.0.0.1:{}", port);
+            let ctx = init_with_server(temp_dir, &address);
+
+            let local = temp_dir.join("f.txt");
+            prime_plain(&ctx, &local, "f.txt", b"v1");
+
+            // A write that did not finish: attributes already written, never
+            // renamed into place.
+            let leftover = temp_path_for("/f.txt");
+            let metadata = read_metadata_attributes(&ctx, "f.txt").unwrap();
+            let local_metadata = read_local_metadata_attributes(&ctx, "f.txt").unwrap();
+            write_atomic_with_metadata(&ctx, &leftover, Body::Bytes(b"half"), &metadata, Some(&local_metadata)).unwrap();
+
+            sync(&ctx, ".", false, false, |_| false, |_| false).unwrap();
+
+            assert!(!temp_dir.join("ark/gyan").join(file_name(&leftover)).exists(), "temp file must not be pushed");
         });
     }
 
@@ -549,7 +604,7 @@ mod tests {
             let server_path = temp_dir.join("ark/gyan/f.txt");
             let before = fs::read(&server_path).unwrap();
 
-            sync(&ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
+            sync(&ctx, ".", false, false, |_| false, |_| false).unwrap();
 
             let after = fs::read(&server_path).unwrap();
             assert_eq!(before, after, "server file should be unchanged when content matches cached hash");
@@ -570,7 +625,7 @@ mod tests {
             let before = fs::read(&server_path).unwrap();
 
             fs::write(&local, b"same").unwrap();
-            sync(&ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
+            sync(&ctx, ".", false, false, |_| false, |_| false).unwrap();
 
             let after = fs::read(&server_path).unwrap();
             assert_eq!(before, after, "identical content should skip upload even after rewrite");
@@ -588,10 +643,9 @@ mod tests {
             write_plain_test_file(&server_path, &ctx.identity, ctx.identity_key.as_ref().unwrap(), b"remote body");
             let before = fs::read(&server_path).unwrap();
 
-            let local = temp_dir.join("pulled.txt");
-            get(&ctx, "pulled.txt", Some(local.to_str().unwrap()), false).unwrap();
+            get(&ctx, "pulled.txt", false).unwrap();
 
-            sync(&ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
+            sync(&ctx, ".", false, false, |_| false, |_| false).unwrap();
 
             let after = fs::read(&server_path).unwrap();
             assert_eq!(before, after, "sync after get must not re-upload identical body");
@@ -609,7 +663,7 @@ mod tests {
             prime_plain(&ctx, &local, "f.txt", b"v1");
 
             fs::write(&local, b"v2").unwrap();
-            sync(&ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
+            sync(&ctx, ".", false, false, |_| false, |_| false).unwrap();
 
             let server_body = fs::read(temp_dir.join("ark/gyan/f.txt")).unwrap();
             assert_eq!(server_body, b"v2");
@@ -630,7 +684,7 @@ mod tests {
             symlink(&target, &link).unwrap();
 
             fs::write(&target, b"v2").unwrap();
-            sync(&ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
+            sync(&ctx, ".", false, false, |_| false, |_| false).unwrap();
 
             assert_eq!(fs::read(temp_dir.join("ark/gyan/target.txt")).unwrap(), b"v2");
             assert!(!temp_dir.join("ark/gyan/link.txt").exists(), "symlink must not be uploaded");
@@ -648,17 +702,17 @@ mod tests {
             prime_plain(&ctx, &local, "f.txt", b"v1");
 
             fs::write(&local, b"v2").unwrap();
-            sync(&ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
+            sync(&ctx, ".", false, false, |_| false, |_| false).unwrap();
 
             assert_eq!(
-                read_local_metadata_attributes(&local).unwrap().sync_body_hash.as_ref().unwrap().value,
+                read_local_metadata_attributes(&ctx, "f.txt").unwrap().sync_body_hash.as_ref().unwrap().value,
                 sha256(b"v2"),
                 "sync_body_hash must track uploaded body after push"
             );
 
             let server_path = temp_dir.join("ark/gyan/f.txt");
             let before = fs::read(&server_path).unwrap();
-            sync(&ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
+            sync(&ctx, ".", false, false, |_| false, |_| false).unwrap();
             assert_eq!(fs::read(&server_path).unwrap(), before, "second sync must no-op");
         });
     }
@@ -674,12 +728,12 @@ mod tests {
             write_encrypted_test_file(&server_path, &ctx.identity, ctx.identity_key.as_ref().unwrap(), b"plaintext");
 
             let local = temp_dir.join("secret");
-            get(&ctx, "secret", Some(local.to_str().unwrap()), false).unwrap();
+            get(&ctx, "secret", false).unwrap();
             assert_eq!(xattr::get(&local, "user.ark_local.encrypted").unwrap().as_deref(), Some(b"true".as_slice()));
-            assert!(read_local_metadata_attributes(&local).unwrap().sync_body_hash.is_none(), "encrypted-at-rest file should not carry sync_body_hash");
+            assert!(read_local_metadata_attributes(&ctx, "secret").unwrap().sync_body_hash.is_none(), "encrypted-at-rest file should not carry sync_body_hash");
 
             let before = fs::read(&server_path).unwrap();
-            sync(&ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
+            sync(&ctx, ".", false, false, |_| false, |_| false).unwrap();
             let after = fs::read(&server_path).unwrap();
             assert_eq!(before, after, "encrypted-at-rest file should be skipped by sync");
         });
@@ -698,14 +752,13 @@ mod tests {
             seed_shared_dir_with_writer(&alice_dir, &alice_ctx, &bob_ctx.identity.address);
 
             set_current_dir(&bob_dir).unwrap();
-            let payload = bob_dir.join("payload.bin");
-            fs::write(&payload, b"hello alice").unwrap();
+            write_local(&bob_dir, "shared/foo.txt", b"hello alice");
             let target = format!("alice@127.0.0.1:{}/shared/foo.txt", port);
-            put(&bob_ctx, &target, Some(payload.to_str().unwrap()), &Permissions::default(), Some("none"), false).unwrap();
+            put(&bob_ctx, &target, &Permissions::default(), Some("none"), false).unwrap();
 
             set_current_dir(&alice_dir).unwrap();
             let alice_ctx = create_client_context().unwrap();
-            sync(&alice_ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
+            sync(&alice_ctx, ".", false, false, |_| false, |_| false).unwrap();
 
             let pulled = alice_dir.join("shared/foo.txt");
             assert!(pulled.exists(), "sync should pull remote file");
@@ -724,32 +777,31 @@ mod tests {
             set_current_dir(&alice_dir).unwrap();
             let shared = alice_dir.join("shared");
             fs::create_dir(&shared).unwrap();
-            put(&alice_ctx, "shared/", Some(shared.to_str().unwrap()), &owner(bob_ctx.identity.address.clone()), None, false).unwrap();
+            put(&alice_ctx, "shared/", &owner(bob_ctx.identity.address.clone()), None, false).unwrap();
 
             set_current_dir(&bob_dir).unwrap();
-            let bob_local = bob_dir.join("payload.bin");
-            fs::write(&bob_local, b"v1").unwrap();
+            write_local(&bob_dir, "shared/foo.txt", b"v1");
             let target = format!("alice@127.0.0.1:{}/shared/foo.txt", port);
-            put(&bob_ctx, &target, Some(bob_local.to_str().unwrap()), &Permissions::default(), Some("none"), false).unwrap();
+            put(&bob_ctx, &target, &Permissions::default(), Some("none"), false).unwrap();
 
             set_current_dir(&alice_dir).unwrap();
             let alice_ctx = create_client_context().unwrap();
-            sync(&alice_ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
+            sync(&alice_ctx, ".", false, false, |_| false, |_| false).unwrap();
 
             let pulled = alice_dir.join("shared/foo.txt");
             assert_eq!(fs::read(&pulled).unwrap(), b"v1");
-            let members_before = read_metadata_attributes(&pulled).unwrap().members.len();
-            let modified_before = read_metadata_attributes(&pulled).unwrap().modified;
+            let members_before = read_metadata_attributes(&alice_ctx, "/shared/foo.txt").unwrap().members.len();
+            let modified_before = read_metadata_attributes(&alice_ctx, "/shared/foo.txt").unwrap().modified;
 
             set_current_dir(&bob_dir).unwrap();
-            put(&bob_ctx, &target, Some(bob_local.to_str().unwrap()), &reader("public"), Some("none"), false).unwrap();
+            put(&bob_ctx, &target, &reader("public"), Some("none"), false).unwrap();
 
             set_current_dir(&alice_dir).unwrap();
             let alice_ctx = create_client_context().unwrap();
-            sync(&alice_ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
+            sync(&alice_ctx, ".", false, false, |_| false, |_| false).unwrap();
 
             assert_eq!(fs::read(&pulled).unwrap(), b"v1", "body should be unchanged");
-            let m = read_metadata_attributes(&pulled).unwrap();
+            let m = read_metadata_attributes(&alice_ctx, "/shared/foo.txt").unwrap();
             assert!(m.members.iter().any(|mem| mem.address == "*"), "public member should be present after metadata sync");
             assert!(m.members.len() > members_before, "members count should grow after metadata sync");
             assert_ne!(m.modified, modified_before, "modified stamp should refresh after metadata sync");
@@ -768,19 +820,18 @@ mod tests {
             seed_shared_dir_with_writer(&alice_dir, &alice_ctx, &bob_ctx.identity.address);
 
             set_current_dir(&bob_dir).unwrap();
-            let local_dir = bob_dir.join("sub");
-            fs::create_dir_all(&local_dir).unwrap();
+            fs::create_dir_all(bob_dir.join("shared/sub")).unwrap();
             let target = format!("alice@127.0.0.1:{}/shared/sub", port);
-            put(&bob_ctx, &target, Some(local_dir.to_str().unwrap()), &Permissions::default(), None, false).unwrap();
+            put(&bob_ctx, &target, &Permissions::default(), None, false).unwrap();
 
             set_current_dir(&alice_dir).unwrap();
             let alice_ctx = create_client_context().unwrap();
-            sync(&alice_ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
+            sync(&alice_ctx, ".", false, false, |_| false, |_| false).unwrap();
 
             let pulled_dir = alice_dir.join("shared/sub");
             assert!(pulled_dir.is_dir(), "sync should create dir locally");
-            assert!(has_metadata_attributes(&pulled_dir).unwrap(), "dir metadata should be written locally");
-            let m = read_metadata_attributes(&pulled_dir).unwrap();
+            assert!(has_metadata_attributes(&alice_ctx, "/shared/sub").unwrap(), "dir metadata should be written locally");
+            let m = read_metadata_attributes(&alice_ctx, "/shared/sub").unwrap();
             assert_eq!(m.modified_by, bob_ctx.identity.address, "modifier should be bob");
         });
     }
@@ -797,9 +848,9 @@ mod tests {
 
             let local = alice_dir.join("notes.txt");
             fs::write(&local, b"body").unwrap();
-            put(&alice_ctx, "notes.txt", Some(local.to_str().unwrap()), &Permissions::default(), Some("none"), false).unwrap();
+            put(&alice_ctx, "notes.txt", &Permissions::default(), Some("none"), false).unwrap();
 
-            sync(&alice_ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
+            sync(&alice_ctx, ".", false, false, |_| false, |_| false).unwrap();
 
             let last_sync_request = alice_dir.join(".ark/last_sync_request");
             assert!(last_sync_request.exists(), "last_sync_request should be recorded after sync");
@@ -821,18 +872,17 @@ mod tests {
             seed_shared_dir_with_writer(&alice_dir, &alice_ctx, &bob_ctx.identity.address);
 
             set_current_dir(&bob_dir).unwrap();
-            let payload = bob_dir.join("payload.bin");
-            fs::write(&payload, b"first").unwrap();
+            write_local(&bob_dir, "shared/foo.txt", b"first");
             let target = format!("alice@127.0.0.1:{}/shared/foo.txt", port);
-            put(&bob_ctx, &target, Some(payload.to_str().unwrap()), &Permissions::default(), Some("none"), false).unwrap();
+            put(&bob_ctx, &target, &Permissions::default(), Some("none"), false).unwrap();
 
             set_current_dir(&alice_dir).unwrap();
             let alice_ctx = create_client_context().unwrap();
-            sync(&alice_ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
+            sync(&alice_ctx, ".", false, false, |_| false, |_| false).unwrap();
             assert_eq!(fs::read(alice_dir.join("shared/foo.txt")).unwrap(), b"first");
 
             fs::remove_file(alice_dir.join("shared/foo.txt")).unwrap();
-            sync(&alice_ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
+            sync(&alice_ctx, ".", false, false, |_| false, |_| false).unwrap();
             assert!(!alice_dir.join("shared/foo.txt").exists(), "already-processed log entry must not re-pull");
         });
     }
@@ -849,10 +899,10 @@ mod tests {
 
             let local = alice_dir.join("notes.txt");
             fs::write(&local, b"self body").unwrap();
-            put(&alice_ctx, "notes.txt", Some(local.to_str().unwrap()), &Permissions::default(), Some("none"), false).unwrap();
+            put(&alice_ctx, "notes.txt", &Permissions::default(), Some("none"), false).unwrap();
             fs::remove_file(&local).unwrap();
 
-            sync(&alice_ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
+            sync(&alice_ctx, ".", false, false, |_| false, |_| false).unwrap();
 
             assert!(!local.exists(), "own PUTs must not be pulled back");
         });
@@ -873,24 +923,24 @@ mod tests {
             let local = alice_dir.join("shared/foo.txt");
             fs::create_dir_all(local.parent().unwrap()).unwrap();
             fs::write(&local, b"alice-v1").unwrap();
-            put(&alice_ctx, "/shared/foo.txt", Some(local.to_str().unwrap()), &Permissions::default(), Some("none"), false).unwrap();
+            put(&alice_ctx, "/shared/foo.txt", &Permissions::default(), Some("none"), false).unwrap();
             put_permissions(&alice_ctx, "/shared/foo.txt", &writer(bob_ctx.identity.address.clone())).unwrap();
 
             let alice_ctx = create_client_context().unwrap();
-            sync(&alice_ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
+            sync(&alice_ctx, ".", false, false, |_| false, |_| false).unwrap();
 
             set_current_dir(&bob_dir).unwrap();
-            let bob_payload = bob_dir.join("payload.bin");
+            let bob_local = bob_dir.join("shared/foo.txt");
             let target = format!("alice@127.0.0.1:{}/shared/foo.txt", port);
-            get(&bob_ctx, &target, Some(bob_payload.to_str().unwrap()), false).unwrap();
-            fs::write(&bob_payload, b"bob-v2").unwrap();
-            put(&bob_ctx, &target, Some(bob_payload.to_str().unwrap()), &Permissions::default(), Some("none"), false).unwrap();
+            get(&bob_ctx, &target, false).unwrap();
+            fs::write(&bob_local, b"bob-v2").unwrap();
+            put(&bob_ctx, &target, &Permissions::default(), Some("none"), false).unwrap();
 
             set_current_dir(&alice_dir).unwrap();
             fs::write(&local, b"alice-v2-unpushed").unwrap();
 
             let alice_ctx = create_client_context().unwrap();
-            sync(&alice_ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
+            sync(&alice_ctx, ".", false, false, |_| false, |_| false).unwrap();
 
             assert_eq!(fs::read(&local).unwrap(), b"alice-v2-unpushed", "local edit preserved at original path");
 
@@ -901,8 +951,9 @@ mod tests {
             let sidecar = entries.iter().find(|n| n.starts_with("foo.txt.conflict-")).expect("sidecar file present");
             let sidecar_path = alice_dir.join("shared").join(sidecar);
             assert_eq!(fs::read(&sidecar_path).unwrap(), b"bob-v2", "sidecar carries pulled remote body");
-            assert!(has_metadata_attributes(&sidecar_path).unwrap(), "sidecar carries remote metadata for comparison");
-            assert!(read_local_metadata_attributes(&sidecar_path).unwrap().sync_body_hash.is_none(), "sidecar must not be sync-tracked");
+            let (_, sidecar_account_path) = account_context(&sidecar_path);
+            assert!(has_metadata_attributes(&alice_ctx, &sidecar_account_path).unwrap(), "sidecar carries remote metadata for comparison");
+            assert!(read_local_metadata_attributes(&alice_ctx, &sidecar_account_path).unwrap().sync_body_hash.is_none(), "sidecar must not be sync-tracked");
         });
     }
 
@@ -917,7 +968,7 @@ mod tests {
             prime_plain(&ctx, &local, "f.txt", b"v1");
 
             fs::write(&local, b"v2").unwrap();
-            sync(&ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
+            sync(&ctx, ".", false, false, |_| false, |_| false).unwrap();
 
             assert_eq!(fs::read(temp_dir.join("ark/gyan/f.txt")).unwrap(), b"v2");
             let entries: Vec<_> = fs::read_dir(temp_dir).unwrap()
@@ -945,18 +996,18 @@ mod tests {
             fs::write(&local, b"untracked local").unwrap();
 
             set_current_dir(&bob_dir).unwrap();
-            let payload = bob_dir.join("payload.bin");
-            fs::write(&payload, b"bob body").unwrap();
+            write_local(&bob_dir, "shared/foo.txt", b"bob body");
             let target = format!("alice@127.0.0.1:{}/shared/foo.txt", port);
-            put(&bob_ctx, &target, Some(payload.to_str().unwrap()), &Permissions::default(), Some("none"), false).unwrap();
+            put(&bob_ctx, &target, &Permissions::default(), Some("none"), false).unwrap();
 
             set_current_dir(&alice_dir).unwrap();
             let alice_ctx = create_client_context().unwrap();
-            sync(&alice_ctx, &current_dir().unwrap(), false, false, |_| false, |_| false).unwrap();
+            sync(&alice_ctx, ".", false, false, |_| false, |_| false).unwrap();
 
             assert_eq!(fs::read(&local).unwrap(), b"untracked local", "untracked local must not be clobbered");
         });
     }
+
 
     #[test]
     fn sync_emits_events_for_push_and_conflict() {
@@ -974,30 +1025,30 @@ mod tests {
             let local = alice_dir.join("shared/foo.txt");
             fs::create_dir_all(local.parent().unwrap()).unwrap();
             fs::write(&local, b"v1").unwrap();
-            put(&alice_ctx, "/shared/foo.txt", Some(local.to_str().unwrap()), &Permissions::default(), Some("none"), false).unwrap();
+            put(&alice_ctx, "/shared/foo.txt", &Permissions::default(), Some("none"), false).unwrap();
             put_permissions(&alice_ctx, "/shared/foo.txt", &writer(bob_ctx.identity.address.clone())).unwrap();
 
             let events: Mutex<Vec<EntryEvent>> = Mutex::new(Vec::new());
             let capture = |e| { events.lock().unwrap().push(e); false };
 
             fs::write(&local, b"v2").unwrap();
-            sync(&alice_ctx, &current_dir().unwrap(), false, false, capture, |_| false).unwrap();
+            sync(&alice_ctx, ".", false, false,capture, |_| false).unwrap();
             let modified: Vec<_> = events.lock().unwrap().drain(..).collect();
             assert_eq!(modified.len(), 1, "one event for local body push");
             assert!(matches!(modified[0].action, EntryAction::Modified));
             assert!(!modified[0].conflict);
 
             set_current_dir(&bob_dir).unwrap();
-            let bob_payload = bob_dir.join("payload.bin");
+            let bob_local = bob_dir.join("shared/foo.txt");
             let target = format!("alice@127.0.0.1:{}/shared/foo.txt", port);
-            get(&bob_ctx, &target, Some(bob_payload.to_str().unwrap()), false).unwrap();
-            fs::write(&bob_payload, b"bob-v3").unwrap();
-            put(&bob_ctx, &target, Some(bob_payload.to_str().unwrap()), &Permissions::default(), Some("none"), false).unwrap();
+            get(&bob_ctx, &target, false).unwrap();
+            fs::write(&bob_local, b"bob-v3").unwrap();
+            put(&bob_ctx, &target, &Permissions::default(), Some("none"), false).unwrap();
 
             set_current_dir(&alice_dir).unwrap();
             fs::write(&local, b"alice-v3-unpushed").unwrap();
             let alice_ctx = create_client_context().unwrap();
-            sync(&alice_ctx, &current_dir().unwrap(), false, false, capture, |_| false).unwrap();
+            sync(&alice_ctx, ".", false, false,capture, |_| false).unwrap();
             let conflict: Vec<_> = events.lock().unwrap().drain(..).collect();
             assert_eq!(conflict.len(), 1, "one event for body divergence");
             assert!(matches!(conflict[0].action, EntryAction::Modified));

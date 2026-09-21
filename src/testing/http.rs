@@ -9,7 +9,8 @@ use crate::crypto::{DEFAULT_SIGNING_ALGORITHM, sign_bytes};
 use crate::http::read_response;
 use crate::metadata::{sign_metadata, write_metadata_attributes, write_metadata_headers};
 pub use crate::server::start_test_server;
-use crate::testing::fs::create_plain_test_metadata;
+use crate::storage::{Body, write_atomic_with_metadata};
+use crate::testing::fs::{account_context, create_plain_test_metadata};
 use crate::timestamp;
 use crate::types::{Identity, Key, Member, Metadata};
 use crate::util::{encode_base64url, request_to_bytes};
@@ -130,6 +131,77 @@ pub fn signed_stream_request(
     (code, headers)
 }
 
+/// Open an SSE subscription to `path` and return its status, headers, and the
+/// connection left open, for [`read_stream_event`] to read events from.
+pub fn signed_stream_subscribe(
+    port: u16,
+    requestor: &Identity,
+    secret_key: &Key,
+    path: &str,
+) -> (u16, Vec<(String, String)>, TcpStream) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    let ts = timestamp::now_ms();
+    let sig_b64 = sign_request(&secret_key.value, port, "GET", path, ts, &[]);
+    let auth = format_authorization_header(&requestor.address, ts, &sig_b64);
+    let head = format!(
+        "GET {} HTTP/1.1\r\nHost: {}\r\nContent-Length: 0\r\nAuthorization: {}\r\nAccept: text/event-stream\r\n\r\n",
+        path,
+        test_host(port),
+        auth
+    );
+    stream.write_all(head.as_bytes()).unwrap();
+
+    // A byte at a time, so nothing past the header block is buffered away from
+    // the events that follow it.
+    let mut head_bytes: Vec<u8> = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head_bytes.ends_with(b"\r\n\r\n") {
+        if stream.read(&mut byte).unwrap() == 0 {
+            break;
+        }
+        head_bytes.push(byte[0]);
+    }
+
+    let text = from_utf8(&head_bytes).unwrap();
+    let mut lines = text.lines();
+    let code: u16 = lines.next().unwrap().split_whitespace().nth(1).unwrap().parse().unwrap();
+    let headers = lines
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
+        .collect();
+
+    (code, headers, stream)
+}
+
+/// The next event on an open subscription as `(event, data)`, or `None` when
+/// none arrives before the read timeout. Keepalives are skipped.
+pub fn read_stream_event(stream: &mut TcpStream) -> Option<(String, String)> {
+    let mut block: Vec<u8> = Vec::new();
+    let mut byte = [0u8; 1];
+
+    loop {
+        match stream.read(&mut byte) {
+            Ok(0) | Err(_) => return None,
+            Ok(_) => block.push(byte[0]),
+        }
+
+        if !block.ends_with(b"\n\n") {
+            continue;
+        }
+
+        let text = from_utf8(&block).ok()?;
+        let event = text.lines().find_map(|line| line.strip_prefix("event: "));
+        let data = text.lines().find_map(|line| line.strip_prefix("data: "));
+        if let (Some(event), Some(data)) = (event, data) {
+            return Some((event.to_string(), data.to_string()));
+        }
+
+        block.clear();
+    }
+}
+
 pub fn signed_put_with_default_metadata(
     port: u16,
     requestor: &Identity,
@@ -163,8 +235,10 @@ pub fn seed_shared_file(
         metadata.members.push(member);
     }
     sign_metadata(owner_secret_key, &mut metadata, Some(body)).unwrap();
-    fs::write(&file, body).unwrap();
-    write_metadata_attributes(&file, &metadata).unwrap();
+
+    let (context, account_path) = account_context(&file);
+    write_atomic_with_metadata(&context, &account_path, Body::Bytes(body), &metadata, None).unwrap();
+
     file
 }
 
@@ -184,7 +258,10 @@ pub fn seed_shared_dir(
         metadata.members.push(member);
     }
     sign_metadata(owner_secret_key, &mut metadata, None).unwrap();
-    write_metadata_attributes(&dir, &metadata).unwrap();
+
+    let (context, account_path) = account_context(&dir);
+    write_metadata_attributes(&context, &account_path, &metadata).unwrap();
+
     dir
 }
 

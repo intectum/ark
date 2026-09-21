@@ -12,11 +12,11 @@ use crate::http::read_response;
 use crate::identity::parse_address;
 use crate::metadata::resolve_member_addresses;
 use crate::timestamp;
-use crate::types::{IdentityContext, Metadata, RelayMode};
+use crate::types::{Context, Metadata, RelayMode};
 use crate::util::{create_authorization_header, is_loopback_host};
 
 pub fn relay(
-    server_ctx: &Arc<IdentityContext>,
+    server_ctx: &Arc<Context>,
     method: &str,
     url: &Url,
     headers: &[(String, String)],
@@ -66,7 +66,8 @@ pub fn relay(
             .collect();
 
         if same_host {
-            let authorization = create_authorization_header(server_ctx, method, &server_host, &member_target, timestamp::now_ms(), body)?;
+            let signed_path = member_target.split('?').next().unwrap_or(&member_target);
+            let authorization = create_authorization_header(server_ctx, method, &server_host, signed_path, timestamp::now_ms(), body)?;
             final_headers.push(("Authorization".to_string(), authorization));
             final_headers.push(("Host".to_string(), server_host.clone()));
         }
@@ -129,24 +130,56 @@ fn build_member_target(member_name: &str, rel: &[&str], relay_mode: Option<Relay
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::Path;
     use std::thread::sleep;
     use std::time::{Duration, Instant};
 
-    use crate::metadata::{create_metadata, read_metadata_attributes, sign_metadata, write_metadata_attributes};
-    use crate::testing::fs::{create_plain_test_metadata, create_test_account, in_test_dir};
+    use crate::metadata::{read_metadata_attributes, sign_metadata};
+    use crate::testing::fs::{account_context, create_plain_test_metadata, create_test_account, in_test_dir};
     use crate::testing::http::{seed_shared_dir, signed_put_metadata_with_headers};
     use crate::testing::http::start_test_server;
-    use crate::types::{Key, Member, Permission};
+    use crate::types::{Member, Permission};
 
-    fn make_identity_public(root: &Path, name: &str, address: &str, key: &Key) {
-        let path = root.join("ark").join(name).join(".ark").join("identity.json");
-        let body = fs::read(&path).unwrap();
-        let mut meta = create_metadata(address, None);
-        meta.members[0].key = None;
-        meta.members.push(Member { address: "*".to_string(), permission: Permission::Reader, key: None });
-        sign_metadata(key, &mut meta, Some(&body)).unwrap();
-        write_metadata_attributes(&path, &meta).unwrap();
+    #[test]
+    fn same_host_relay_of_a_metadata_only_put_is_authorized() {
+        in_test_dir("ark_server_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let alice_address = format!("alice@127.0.0.1:{}", port);
+            let bob_address = format!("bob@127.0.0.1:{}", port);
+            let (alice_id, alice_key, _) = create_test_account(temp_dir, &alice_address);
+            let (bob_id, bob_key, _) = create_test_account(temp_dir, &bob_address);
+
+            let members = |peer: &str| vec![
+                Member { address: peer.to_string(), permission: Permission::Writer, key: None },
+            ];
+            seed_shared_dir(temp_dir, &alice_id, &alice_key, "ark/alice/shared", members(&bob_id.address));
+            seed_shared_dir(temp_dir, &bob_id, &bob_key, "ark/bob/shared", members(&alice_id.address));
+
+            let mut metadata = create_plain_test_metadata(&alice_id, &alice_key, b"body");
+            metadata.encryption_algorithm = None;
+            metadata.members[0].key = None;
+            metadata.members.push(Member { address: bob_id.address.clone(), permission: Permission::Writer, key: None });
+            sign_metadata(&alice_key, &mut metadata, Some(b"body")).unwrap();
+
+            let code = signed_put_metadata_with_headers(port, &alice_id, &alice_key, "/ark/alice/shared/n.txt?relay=full", b"body", &metadata, &[]);
+            assert_eq!(code, 201);
+            wait_for(|| temp_dir.join("ark/bob/shared/n.txt").exists());
+
+            // The relayed target carries `?metadata`, which must not end up in
+            // the signed bytes — verification recomputes them from the path.
+            let mut updated = metadata.clone();
+            updated.modified = metadata.modified + time::Duration::seconds(1);
+            sign_metadata(&alice_key, &mut updated, Some(b"body")).unwrap();
+
+            let code = signed_put_metadata_with_headers(port, &alice_id, &alice_key, "/ark/alice/shared/n.txt?relay=full&metadata", b"", &updated, &[]);
+            assert_eq!(code, 204);
+
+            wait_for(|| {
+                let (bob_ctx, bob_path) = account_context(&temp_dir.join("ark/bob/shared/n.txt"));
+                read_metadata_attributes(&bob_ctx, &bob_path)
+                    .map(|m| m.modified == updated.modified)
+                    .unwrap_or(false)
+            });
+        });
     }
 
     fn wait_for<F: Fn() -> bool>(check: F) {
@@ -176,7 +209,8 @@ mod tests {
 
             let group_address = format!("{}/team.json", alice_id.address);
             let (group_identity, _) = create_identity(&group_address, Some(vec![bob_id.address.clone()])).unwrap();
-            write_identity(&temp_dir.join("ark/alice/team.json"), &group_identity).unwrap();
+            let (alice_ctx, group_path) = account_context(&temp_dir.join("ark/alice/team.json"));
+            write_identity(&alice_ctx, &group_path, &group_identity).unwrap();
 
             seed_shared_dir(temp_dir, &bob_id, &bob_key, "ark/bob/shared", vec![
                 Member { address: alice_id.address.clone(), permission: Permission::Writer, key: None },
@@ -221,7 +255,8 @@ mod tests {
             wait_for(|| bob_path.exists());
             assert_eq!(fs::read(&bob_path).unwrap(), b"todo body");
 
-            let bob_meta = read_metadata_attributes(&bob_path).unwrap();
+            let (bob_ctx, bob_account_path) = account_context(&bob_path);
+            let bob_meta = read_metadata_attributes(&bob_ctx, &bob_account_path).unwrap();
             assert_eq!(bob_meta.id, m.id);
         });
     }
@@ -310,7 +345,6 @@ mod tests {
             let port_a = start_test_server(server_a_root.clone());
             let alice_address = format!("alice@127.0.0.1:{}", port_a);
             let (alice_id, alice_key, _) = create_test_account(&server_a_root, &alice_address);
-            make_identity_public(&server_a_root, "alice", &alice_address, &alice_key);
 
             seed_shared_dir(&server_b_root, &bob_id, &bob_key, "ark/bob/shared", vec![
                 Member { address: alice_id.address.clone(), permission: Permission::Writer, key: None },

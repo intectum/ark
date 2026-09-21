@@ -46,13 +46,16 @@ App files live under `apps/<app>/` in each user's account root. This is conventi
 
 ```rust
 use ark::context::create_client_context;
+use ark::storage::create_dir_all;
 
 let ctx = create_client_context()?;   // walks up from cwd to find .ark/
-let app_root = ctx.root.join("apps/notes");
-std::fs::create_dir_all(&app_root)?;
+let app_root = "/apps/notes";
+create_dir_all(&ctx, app_root)?;
 ```
 
-`create_client_context` locates the account root by walking up from the current directory looking for `.ark/`. Cache the returned `IdentityContext` and pass it to every client call — it carries the identity keypair and account root.
+`create_client_context` locates the account root by walking up from the current directory looking for `.ark/`. Cache the returned `Context` and pass it to every client call — it carries the identity keypair and account root.
+
+**Paths are account paths, not filesystem paths.** `"/apps/notes"` is account-absolute; `"notes.md"` is taken against the working directory; `"bob@host/apps/notes"` names another account's tree. Every client function takes all three, and so does `ark::storage` — the filesystem reached the same way. Reach for `storage::read`, `storage::write`, `storage::read_dir` and the rest rather than `std::fs` and `ctx.root.join(...)`: they refuse anything outside the account root, and the path you read a file at is the same string you `put` it at.
 
 **Pick your subtree once, then always work relative to it.** Everything below assumes you have `ctx` and an `app_root` under `apps/<app>/`.
 
@@ -72,14 +75,13 @@ Only **directories without metadata** inherit — an auto-created intermediate d
 ```rust
 use ark::client::put;
 use ark::permissions::writers;
+use ark::storage::create_dir_all;
 
 // Create the container. Members are writers on the dir — they can add items.
-let dir_rel = "apps/notes/team-brainstorm";
-let local_dir = ctx.root.join(dir_rel);
-std::fs::create_dir_all(&local_dir)?;
+let dir = "/apps/notes/team-brainstorm";
+create_dir_all(&ctx, dir)?;
 
-put(&ctx, &format!("/{}", dir_rel), Some(local_dir.to_str().unwrap()),
-    &writers(["bob@host", "carol@host"]), None, /*metadata_only=*/ false)?;
+put(&ctx, dir, &writers(["bob@host", "carol@host"]), None, /*metadata_only=*/ false)?;
 ```
 
 Because path mirroring is guaranteed by the protocol, `apps/notes/team-brainstorm/` lives at that same relative path on every member's server. No rehoming, no per-server IDs — the path *is* the identifier.
@@ -97,7 +99,7 @@ let file_name = format!("msg_{}.md", format_fs_safe(now()));
 // e.g. "msg_2026-07-29T14-22-03.418Z.md"
 ```
 
-`format_fs_safe` produces a filesystem-safe ISO-8601 stamp. Because ISO stamps sort lexically, `std::fs::read_dir` + `sort_by(name)` yields chronological order without any extra index.
+`format_fs_safe` produces a filesystem-safe ISO-8601 stamp. Because ISO stamps sort lexically and `storage::read_dir` returns names in lexical order, listing the directory yields chronological order without any extra index.
 
 Prefix the file with a short type discriminator (`msg_`, `event_`, `photo_`) so multiple item kinds can share a directory without collision, and so `starts_with` gives you a cheap filter when listing. Use `_` as the field separator — timestamps already contain `-`, so hyphens make names harder to split and scan.
 
@@ -135,7 +137,7 @@ use ark::metadata::read_metadata_attributes;
 use ark::permissions::{assign, without};
 use ark::types::Permission;
 
-let meta = read_metadata_attributes(&local_dir)?;
+let meta = read_metadata_attributes(&ctx, dir)?;
 let others = without(&meta.members, &ctx.identity.address);
 let item_perms = assign(&others, Permission::Reader);   // self stays owner via put
 ```
@@ -152,7 +154,7 @@ This keeps the source of truth in one place: the container's metadata. If member
 use ark::client::sync;
 
 // One-shot pass.
-sync(&ctx, &ctx.root.join("apps/notes"),
+sync(&ctx, "/apps/notes",
      /*watch=*/ false, /*decrypt=*/ true,
      |ev| { println!("{} {}", ev.action.as_str(), ev.path.display()); false },
      |err| { eprintln!("sync: {}", err); false })?;
@@ -171,8 +173,7 @@ let ctx = Arc::new(ctx);
     let event_tx = Arc::new(Mutex::new(tx.clone()));
     let error_tx = event_tx.clone();
     thread::spawn(move || {
-        let path = ctx.root.join("apps/notes");
-        let _ = sync(&ctx, &path, true, true,
+        let _ = sync(&ctx, "/apps/notes", true, true,
             move |ev| { let _ = event_tx.lock().unwrap().send(Ok(ev)); false },
             move |e|  { let _ = error_tx.lock().unwrap().send(Err(e));  false });
     });
@@ -267,20 +268,21 @@ For app code that reads shared files repeatedly, sync with `decrypt=true` once a
 
 ```rust
 use ark::metadata::{has_metadata_attributes, read_metadata_attributes};
+use ark::storage::{read, read_dir};
 
-for entry in std::fs::read_dir(&local_dir)? {
-    let entry = entry?;
-    let path = entry.path();
-    if !has_metadata_attributes(&path)? { continue; }
-    let meta = read_metadata_attributes(&path)?;
-    let body = std::fs::read(&path)?;
+for path in read_dir(&ctx, dir)? {
+    if !has_metadata_attributes(&ctx, &path)? { continue; }
+    let meta = read_metadata_attributes(&ctx, &path)?;
+    let body = read(&ctx, &path)?;
     // meta.modified_by = author, meta.modified = timestamp, meta.members = ACL
 }
 ```
 
+`read_dir` hands back account paths, not bare names, so each one feeds straight into the next call. It also skips half-written temporaries, which a raw `std::fs::read_dir` would surface mid-write.
+
 `has_metadata_attributes` is your filter: local files with no ark xattrs are untracked (drafts, editor swap files, sidecars) and should be skipped.
 
-For one-off reads without touching the filesystem, `get_stream(ctx, path, &mut buf, /*decrypt=*/ true)` returns the metadata plus writes the body into `buf`.
+For one-off reads without touching the filesystem, `get_stream(ctx, path, &mut buf, /*decrypt=*/ true, /*existing_metadata=*/ None)` returns the metadata plus writes the body into `buf`. Pass the metadata of the copy you already hold in that last argument, rather than `None`, and the download is also checked to continue that copy instead of replacing it with an older or unrelated file.
 
 ---
 
@@ -291,8 +293,10 @@ When `sync` sees divergence — the local and remote body both changed since las
 Detecting a conflict from an app is a filename check:
 
 ```rust
-for entry in std::fs::read_dir(&local_dir)? {
-    let name = entry?.file_name().to_string_lossy().into_owned();
+use ark::storage::{file_name, read_dir};
+
+for path in read_dir(&ctx, dir)? {
+    let name = file_name(&path);
     if let Some(dot) = name.rfind(".conflict-") {
         let original = &name[..dot];
         // Surface both copies to the user; delete the sidecar once resolved.
@@ -308,7 +312,7 @@ Structure your data model so conflicts are *unlikely*, not impossible: append-on
 
 **Writing outside `apps/<app>/`.** Works today, breaks tomorrow when a second app collides on `notes.md`. Namespace early.
 
-**Assuming server-side ordering.** Ark surfaces `read_dir` order, which is unspecified. Sort in your app, and use timestamped filenames so the sort is chronological for free.
+**Assuming server-side ordering.** Ark stores no order across files. `storage::read_dir` sorts lexically, but that is a listing convenience, not a claim about when entries were written, and the spec promises no ordering for a remote `list` at all. Use timestamped filenames so the lexical order *is* the chronological one.
 
 **Forgetting the "self" member.** When you `put` a file, you're implicitly its owner. You do not need to add yourself to a member list; you'll appear via the PUT. Adding yourself explicitly is harmless but adds noise.
 

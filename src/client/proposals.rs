@@ -8,7 +8,7 @@ use super::{delete, get_stream, head, list, request, watch_remote};
 use crate::http::check_response_code;
 use crate::identity::parse_address;
 use crate::metadata::{read_metadata_headers, write_metadata_headers};
-use crate::types::{EntryAction, IdentityContext, Metadata, Permission, Proposal};
+use crate::types::{Context, EntryAction, Metadata, Permission, Proposal};
 use crate::util::{parse_request_entry, resolve_client_url, sha256};
 
 // A log entry's body lands before its metadata does, so a fetch triggered by
@@ -24,7 +24,7 @@ const ENTRY_FETCH_DELAY: Duration = Duration::from_millis(100);
 ///
 /// Empty when the account has no request log (see [`crate::client::init`],
 /// which sets it up).
-pub fn list_proposals(ctx: &IdentityContext) -> io::Result<Vec<Proposal>> {
+pub fn list_proposals(ctx: &Context) -> io::Result<Vec<Proposal>> {
     let entries = list(ctx, "/.ark/requests/", Some("PUT_403_"))?;
 
     let mut proposals = Vec::new();
@@ -33,7 +33,7 @@ pub fn list_proposals(ctx: &IdentityContext) -> io::Result<Vec<Proposal>> {
 
         let entry_path = format!("/.ark/requests/{}", entry.name);
         let mut entry_body: Vec<u8> = Vec::new();
-        if get_stream(ctx, &entry_path, &mut entry_body, false).is_err() {
+        if get_stream(ctx, &entry_path, &mut entry_body, false, None).is_err() {
             continue;
         }
 
@@ -57,7 +57,7 @@ pub fn list_proposals(ctx: &IdentityContext) -> io::Result<Vec<Proposal>> {
 ///
 /// Only proposals logged after the call started are reported, so callers
 /// wanting the pending ones too should call [`list_proposals`] first.
-pub fn watch_proposals<F, G>(ctx: &IdentityContext, path: &str, mut on_proposal: F, on_error: G) -> io::Result<()>
+pub fn watch_proposals<F, G>(ctx: &Context, path: &str, mut on_proposal: F, on_error: G) -> io::Result<()>
 where
     F: FnMut(Proposal) -> bool,
     G: Fn(io::Error) -> bool,
@@ -107,11 +107,11 @@ where
 ///
 /// With `force=true`, accepts the current metadata as-is even if members were
 /// added or the current account was downgraded since the proposal.
-pub fn accept_proposal(ctx: &IdentityContext, index_or_id: &str, force: bool) -> io::Result<()> {
+pub fn accept_proposal(ctx: &Context, index_or_id: &str, force: bool) -> io::Result<()> {
     let id = resolve_id(ctx, index_or_id)?;
     let entry_path = format!("/.ark/requests/{}", id);
     let mut entry_body: Vec<u8> = Vec::new();
-    get_stream(ctx, &entry_path, &mut entry_body, false)?;
+    get_stream(ctx, &entry_path, &mut entry_body, false, None)?;
     let proposal = parse_proposal(&id, &entry_body)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "entry is not a valid proposal"))?;
 
@@ -133,7 +133,7 @@ pub fn accept_proposal(ctx: &IdentityContext, index_or_id: &str, force: bool) ->
         (metadata, Vec::new())
     } else {
         let mut buf: Vec<u8> = Vec::new();
-        let (metadata, _) = get_stream(ctx, &modifier_path, &mut buf, false)?;
+        let (metadata, _) = get_stream(ctx, &modifier_path, &mut buf, false, None)?;
         let expected_hash = metadata.body_hash.as_ref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "file metadata missing body_hash"))?;
         if sha256(&buf) != expected_hash.value {
@@ -168,7 +168,7 @@ pub fn accept_proposal(ctx: &IdentityContext, index_or_id: &str, force: bool) ->
 /// 1-based index (as returned by [`list_proposals`]) or a log entry filename.
 /// The current file/dir on the modifier's server is untouched; any future
 /// attempt by the same account will simply produce a new log entry.
-pub fn reject_proposal(ctx: &IdentityContext, index_or_id: &str) -> io::Result<()> {
+pub fn reject_proposal(ctx: &Context, index_or_id: &str) -> io::Result<()> {
     let id = resolve_id(ctx, index_or_id)?;
     let entry_path = format!("/.ark/requests/{}", id);
     delete(ctx, &entry_path)?;
@@ -176,7 +176,7 @@ pub fn reject_proposal(ctx: &IdentityContext, index_or_id: &str) -> io::Result<(
     Ok(())
 }
 
-fn resolve_id(ctx: &IdentityContext, index_or_id: &str) -> io::Result<String> {
+fn resolve_id(ctx: &Context, index_or_id: &str) -> io::Result<String> {
     if let Ok(index) = index_or_id.parse::<usize>() {
         let proposals = list_proposals(ctx)?;
         if index == 0 || index > proposals.len() {
@@ -188,7 +188,7 @@ fn resolve_id(ctx: &IdentityContext, index_or_id: &str) -> io::Result<String> {
     }
 }
 
-fn fetch_proposal(ctx: &IdentityContext, id: &str) -> io::Result<Option<Proposal>> {
+fn fetch_proposal(ctx: &Context, id: &str) -> io::Result<Option<Proposal>> {
     let entry_path = format!("/.ark/requests/{}", id);
 
     let mut last_error = None;
@@ -196,7 +196,7 @@ fn fetch_proposal(ctx: &IdentityContext, id: &str) -> io::Result<Option<Proposal
         if attempt > 0 { sleep(ENTRY_FETCH_DELAY); }
 
         let mut entry_body: Vec<u8> = Vec::new();
-        match get_stream(ctx, &entry_path, &mut entry_body, false) {
+        match get_stream(ctx, &entry_path, &mut entry_body, false, None) {
             Ok(_) => return parse_proposal(id, &entry_body),
             Err(e) => last_error = Some(e),
         }
@@ -285,7 +285,7 @@ mod tests {
     use crate::testing::http::start_test_server;
     use crate::types::Permissions;
 
-    fn setup(temp_dir: &Path, port: u16) -> (IdentityContext, IdentityContext) {
+    fn setup(temp_dir: &Path, port: u16) -> (Context, Context) {
         let alice_dir = temp_dir.join("alice_client");
         let bob_dir = temp_dir.join("bob_client");
         fs::create_dir_all(&alice_dir).unwrap();
@@ -304,6 +304,7 @@ mod tests {
 
     fn write_payload(dir: &Path, name: &str, body: &[u8]) -> PathBuf {
         let p = dir.join(name);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
         fs::write(&p, body).unwrap();
         p
     }
@@ -315,9 +316,9 @@ mod tests {
             let (_alice_ctx, bob_ctx) = setup(temp_dir, port);
 
             set_current_dir(temp_dir.join("bob_client")).unwrap();
-            let payload = write_payload(&temp_dir.join("bob_client"), "payload.bin", b"hello");
+            write_payload(&temp_dir.join("bob_client"), "apps/notes/foo.md", b"hello");
             let target = format!("alice@127.0.0.1:{}/apps/notes/foo.md", port);
-            let _ = put(&bob_ctx, &target, Some(payload.to_str().unwrap()), &Permissions::default(), Some("none"), false);
+            let _ = put(&bob_ctx, &target, &Permissions::default(), Some("none"), false);
 
             set_current_dir(temp_dir.join("alice_client")).unwrap();
             let alice_ctx = create_client_context().unwrap();
@@ -336,9 +337,9 @@ mod tests {
             let (_alice_ctx, bob_ctx) = setup(temp_dir, port);
 
             set_current_dir(temp_dir.join("bob_client")).unwrap();
-            let payload = write_payload(&temp_dir.join("bob_client"), "payload.bin", b"hello");
+            write_payload(&temp_dir.join("bob_client"), "apps/notes/foo.md", b"hello");
             let target = format!("alice@127.0.0.1:{}/apps/notes/foo.md", port);
-            let _ = put(&bob_ctx, &target, Some(payload.to_str().unwrap()), &Permissions::default(), Some("none"), false);
+            let _ = put(&bob_ctx, &target, &Permissions::default(), Some("none"), false);
 
             set_current_dir(temp_dir.join("alice_client")).unwrap();
             let alice_ctx = create_client_context().unwrap();
@@ -358,11 +359,11 @@ mod tests {
             let (_alice_ctx, bob_ctx) = setup(temp_dir, port);
 
             set_current_dir(temp_dir.join("bob_client")).unwrap();
-            let payload = write_payload(&temp_dir.join("bob_client"), "payload.bin", b"hello alice");
-            put(&bob_ctx, "apps/notes/foo.md", Some(payload.to_str().unwrap()), &Permissions::default(), Some("none"), false).unwrap();
+            write_payload(&temp_dir.join("bob_client"), "apps/notes/foo.md", b"hello alice");
+            put(&bob_ctx, "apps/notes/foo.md", &Permissions::default(), Some("none"), false).unwrap();
 
             let alice_addr = format!("alice@127.0.0.1:{}", port);
-            put(&bob_ctx, "apps/notes/foo.md", Some(payload.to_str().unwrap()), &reader(alice_addr.clone()), Some("none"), false).unwrap();
+            put(&bob_ctx, "apps/notes/foo.md", &reader(alice_addr.clone()), Some("none"), false).unwrap();
 
             set_current_dir(temp_dir.join("alice_client")).unwrap();
             let alice_ctx = create_client_context().unwrap();
@@ -403,11 +404,12 @@ mod tests {
             sleep(Duration::from_millis(500));
 
             set_current_dir(temp_dir.join("bob_client")).unwrap();
-            let payload = write_payload(&temp_dir.join("bob_client"), "payload.bin", b"hello");
+            write_payload(&temp_dir.join("bob_client"), "docs/other.md", b"hello");
             let outside_target = format!("alice@127.0.0.1:{}/docs/other.md", port);
-            let _ = put(&bob_ctx, &outside_target, Some(payload.to_str().unwrap()), &Permissions::default(), Some("none"), false);
+            let _ = put(&bob_ctx, &outside_target, &Permissions::default(), Some("none"), false);
+            write_payload(&temp_dir.join("bob_client"), "apps/notes/foo.md", b"hello");
             let target = format!("alice@127.0.0.1:{}/apps/notes/foo.md", port);
-            let _ = put(&bob_ctx, &target, Some(payload.to_str().unwrap()), &Permissions::default(), Some("none"), false);
+            let _ = put(&bob_ctx, &target, &Permissions::default(), Some("none"), false);
 
             let proposal = rx.recv_timeout(Duration::from_secs(10)).expect("expected a proposal");
             assert_eq!(proposal.target, "/ark/alice/apps/notes/foo.md");
@@ -421,7 +423,7 @@ mod tests {
             "PUT /ark/alice/foo HTTP/1.1\r\n",
             "Host: h\r\n",
             "Authorization: ArkIdentity address=\"ark@h\", timestamp=\"123\", signature=\"sig\"\r\n",
-            "X-Ark-Meta-Id: id1\r\n",
+            "X-Ark-Meta-Id: 0f3e1c62-9a4b-4d7e-8c11-2b5a6d9e4f30\r\n",
             "X-Ark-Meta-Created: 2026-01-01T00:00:00.000Z\r\n",
             "X-Ark-Meta-Modified: 2026-01-02T00:00:00.000Z\r\n",
             "X-Ark-Meta-Modified-By: bob@h\r\n",

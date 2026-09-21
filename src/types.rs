@@ -3,13 +3,14 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use time::OffsetDateTime;
+use uuid::Uuid;
 
 /// Runtime context for an ark account.
 ///
 /// Passed to every client operation. Clients have `identity_key` set (they
 /// can sign requests and unwrap file keys); server-side target contexts have
 /// it as `None` (the server does not hold other accounts' private keys).
-pub struct IdentityContext {
+pub struct Context {
     /// Account root — the directory containing `.ark/`.
     pub root: PathBuf,
     /// The account's identity document (address + public key).
@@ -134,7 +135,8 @@ pub struct Member {
 /// rest, `X-Ark-Meta-*` HTTP headers in transit. See `spec.md` §8.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Metadata {
-    pub id: String,
+    #[serde(with = "hyphenated_uuid")]
+    pub id: Uuid,
     #[serde(with = "crate::timestamp::serde")]
     pub created: OffsetDateTime,
     #[serde(with = "crate::timestamp::serde")]
@@ -266,6 +268,21 @@ mod base64url {
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
         let s = String::deserialize(d)?;
         URL_SAFE_NO_PAD.decode(s).map_err(serde::de::Error::custom)
+    }
+}
+
+mod hyphenated_uuid {
+    use super::*;
+
+    use crate::util::parse_uuid;
+
+    pub fn serialize<S: Serializer>(uuid: &Uuid, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&uuid.hyphenated().to_string())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Uuid, D::Error> {
+        let s = String::deserialize(d)?;
+        parse_uuid(&s).map_err(serde::de::Error::custom)
     }
 }
 

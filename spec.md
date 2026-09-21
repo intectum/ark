@@ -100,7 +100,7 @@ An Ark **server** is an authenticated file server rooted at `/ark/<account>/…`
 
 **Signed request.** Every non-public request carries an `Authorization: ArkIdentity …` header (§5). A `Host` header is required and must match the server's own host.
 
-**Metadata.** File and directory metadata rides as `X-Ark-Meta-*` request/response headers. Kebab-case field names; base64url for binary values. Members are numbered — `X-Ark-Meta-Member-0-Address`, `X-Ark-Meta-Member-0-Permission`, `X-Ark-Meta-Member-0-Key-Algorithm`, `X-Ark-Meta-Member-0-Key-Value`. Unknown `X-Ark-Meta-*` headers are ignored. Servers MUST verify the metadata signature on every PUT before storing, rejecting with `403` on failure; the signature is checked against the public key of the identity named in `modified_by`, and for files `body_hash` MUST also be recomputed from the request body and compared. Clients SHOULD perform the same checks on every GET before trusting the data.
+**Metadata.** File and directory metadata rides as `X-Ark-Meta-*` request/response headers. Kebab-case field names; base64url for binary values. Members are numbered — `X-Ark-Meta-Member-0-Address`, `X-Ark-Meta-Member-0-Permission`, `X-Ark-Meta-Member-0-Key-Algorithm`, `X-Ark-Meta-Member-0-Key-Value`. Unknown `X-Ark-Meta-*` headers are ignored. Servers MUST verify the metadata signature on every PUT before storing, rejecting with `403` on failure; the signature is checked against the public key of the identity named in `modified_by`, and for files `body_hash` MUST also be recomputed from the request body and compared. Clients SHOULD perform the same checks on every GET before trusting the data, and where the download replaces a copy they already hold, SHOULD also apply the conflict rules of §9 to it — same `id`, `modified` no older — so a server cannot roll a client back or substitute an unrelated file at a path.
 
 **Content-Type on GET.** Not fixed by the protocol. The server picks a value; `application/octet-stream` is a safe default. Directory listings are `application/json`.
 
@@ -267,7 +267,7 @@ Every Ark file and directory has a `Metadata` record (Appendix A.2). Fields:
 
 | Field | Required for file | Required for dir | Description |
 |---|---|---|---|
-| `id` | ✓ | ✓ | UUID. Immutable after creation. |
+| `id` | ✓ | ✓ | UUID, plain hyphenated lowercase form; other UUID spellings are rejected `400`. Immutable after creation. |
 | `created` | ✓ | ✓ | RFC 3339 timestamp, millisecond precision, `Z`-terminated (e.g. `2026-07-24T10:00:00.000Z`). |
 | `modified` | ✓ | ✓ | RFC 3339, same format as `created`. Used for last-write-wins on relay. |
 | `modified_by` | ✓ | ✓ | Address of the identity that signed this metadata. |
@@ -302,7 +302,11 @@ Members must be contiguous from index 0. Sparse indexes are rejected `400`.
 
 Each field is stored as its own extended attribute on the body file, under the `user.ark.` namespace. Names use snake_case: `user.ark.id`, `user.ark.modified_by`, `user.ark.member_0_address`, `user.ark.signature_value`, etc. Binary values are base64url. Ark requires a filesystem with xattr support (ext4, xfs, btrfs, apfs).
 
-Updates should be atomic: write body + xattrs to a temp file in the same directory, then rename over the target.
+Updates should be atomic: write body + xattrs to a temp file in the same directory, then rename over the target. A metadata-only update (§4.5) must do the same — the fields are separate attributes and cannot be replaced as a set where they sit — so it copies the body rather than editing in place.
+
+Directory metadata (§7.3) is the exception. A rename only succeeds onto an empty directory, and a directory being updated holds the entries beneath it, so its attributes are replaced where they stand. An update interrupted part-way can leave a directory without usable metadata, which reverts it to inheriting from its nearest metadata-bearing ancestor.
+
+The rename is atomic against concurrent readers but says nothing about durability. Ark does not require an implementation to flush before renaming; a host that loses power may lose recent writes, which converge again through relay (§9).
 
 ### 7.3 Directories
 
@@ -492,6 +496,7 @@ The client creates a **password identity** — a sub-identity whose keypair is d
 - The compromised server sees all metadata and ciphertext but no plaintext.
 - It cannot forge signatures for existing files (no identity key).
 - It can serve a **different** `identity.json` to a new peer, so first-contact peers who don't verify out of band could be MITM'd. Pinned peers are safe.
+- It can replay an **older** signed version of a file, or a signed file from another path, in place of the current one. A client holding its own copy catches both (§4.2); one fetching a path for the first time has nothing to compare against.
 - If a password identity is configured, the server also holds `identity.key` encrypted under the password identity — see §12.2.
 
 ---

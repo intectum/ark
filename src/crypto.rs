@@ -203,7 +203,7 @@ pub fn encrypt_bytes(public_key: &Key, plaintext: &[u8]) -> io::Result<(String, 
     match public_key.algorithm.as_str() {
         DEFAULT_ENCRYPTION_ALGORITHM => {
             let mut nonce = [0u8; 12];
-            getrandom::getrandom(&mut nonce).map_err(|e| io::Error::other(e.to_string()))?;
+            getrandom(&mut nonce).map_err(|e| io::Error::other(e.to_string()))?;
 
             let public_key_arr: [u8; 32] = public_key.value.clone().try_into()
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "aes-256-gcm requires a 32 byte key"))?;

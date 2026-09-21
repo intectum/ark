@@ -5,10 +5,10 @@ use url::Url;
 
 use crate::http::{connect, read_response, write_request};
 use crate::timestamp;
-use crate::types::IdentityContext;
+use crate::types::Context;
 use crate::util::create_authorization_header;
 
-pub fn request(ctx: Option<&IdentityContext>, method: &str, url: &Url, headers: &[(&str, &str)], body: &[u8]) -> io::Result<(u16, Vec<(String, String)>, Vec<u8>)> {
+pub fn request(ctx: Option<&Context>, method: &str, url: &Url, headers: &[(&str, &str)], body: &[u8]) -> io::Result<(u16, Vec<(String, String)>, Vec<u8>)> {
     let mut final_headers = headers.to_vec();
 
     let host = url.host_str().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "URL missing host"))?;

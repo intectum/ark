@@ -12,13 +12,17 @@
 //! - [`client`] — file, membership, and sync operations.
 //! - [`server`] — [`server::start_server`] runs a listener on the current
 //!   working directory.
-//! - [`context`] — build the [`types::IdentityContext`] passed to every client
+//! - [`context`] — build the [`types::Context`] passed to every client
 //!   function.
+//! - [`storage`] — the filesystem, reached by account path rather than
+//!   filesystem path.
 //!
 //! # Function shapes
 //!
-//! Most [`client`] operations take file paths and use stdin/stdout when a path
-//! is absent, writing metadata to `user.ark.*` xattrs as a side effect.
+//! [`client::get`], [`client::put`], [`client::encrypt`], and
+//! [`client::decrypt`] all take a single path and act on the account's own copy
+//! of it, mirroring the server, writing metadata to `user.ark.*` xattrs as a
+//! side effect.
 //!
 //! For `encrypt`, `decrypt`, `get`, and `put`, a `_stream` variant
 //! (`encrypt_stream`, `decrypt_stream`, `get_stream`, `put_stream`) exposes the
@@ -33,6 +37,7 @@ pub mod identity;
 pub mod metadata;
 pub mod permissions;
 pub mod server;
+pub mod storage;
 #[cfg(test)]
 pub mod testing;
 pub mod timestamp;

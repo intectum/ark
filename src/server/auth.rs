@@ -7,11 +7,11 @@ use super::MAX_CLOCK_SKEW_MS;
 use crate::crypto::verify_bytes;
 use crate::identity::{parse_address, resolve_identity};
 use crate::timestamp;
-use crate::types::{Identity, IdentityContext, Member, Permission, Signature};
+use crate::types::{Context, Identity, Member, Permission, Signature};
 use crate::util::{decode_base64url, parse_authorization_header, request_to_bytes};
 
 pub fn authenticate(
-    server_ctx: &IdentityContext,
+    server_ctx: &Context,
     url: &Url,
     method: &str,
     headers: &[(String, String)],
@@ -52,8 +52,8 @@ pub fn authenticate(
 }
 
 pub fn authorize(
-    server_ctx: &IdentityContext,
-    target_ctx: &IdentityContext,
+    server_ctx: &Context,
+    target_ctx: &Context,
     requestor_identity: &Identity,
     modifier_identity: Option<&Identity>,
     existing_members: Option<&[Member]>,
@@ -85,7 +85,7 @@ pub fn authorize(
 }
 
 fn resolve_member_permission(
-    ctx: &IdentityContext,
+    ctx: &Context,
     members: &[Member],
     address: &str,
 ) -> io::Result<Option<Permission>> {
