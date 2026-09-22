@@ -129,11 +129,11 @@ where
         let is_dir = matches!(event.kind, Some(DirEntryKind::Dir));
 
         match event.action {
-            EntryAction::Created | EntryAction::Modified => {
+            EntryAction::Created | EntryAction::Modified | EntryAction::Metadata => {
                 let entry = SyncEntry {
                     relative_path: relative_path.clone(),
                     modified_local_body: false,
-                    modified_remote_body: !is_dir,
+                    modified_remote_body: !is_dir && !matches!(event.action, EntryAction::Metadata),
                     modified_remote_metadata: true,
                 };
                 match sync_entry(ctx, &entry, decrypt, on_event) {
@@ -156,7 +156,6 @@ where
                     }
                 }
             }
-            _ => {}
         }
         false
     }, on_error)

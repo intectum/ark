@@ -136,6 +136,7 @@ fn to_entry_event_local(event_kind: &EventKind, path: &Path) -> Option<EntryEven
         EventKind::Create(CreateKind::File) => (EntryAction::Created, Some(DirEntryKind::File)),
         EventKind::Create(_) => (EntryAction::Created, None),
         EventKind::Modify(ModifyKind::Data(_)) | EventKind::Modify(ModifyKind::Name(_)) => (EntryAction::Modified, None),
+        EventKind::Modify(ModifyKind::Metadata(_)) => (EntryAction::Metadata, None),
         EventKind::Modify(_) => return None,
         EventKind::Remove(RemoveKind::Folder) => (EntryAction::Deleted, Some(DirEntryKind::Dir)),
         EventKind::Remove(_) => (EntryAction::Deleted, Some(DirEntryKind::File)),
