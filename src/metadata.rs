@@ -315,6 +315,8 @@ pub fn resolve_member_addresses(ctx: &Context, members: &[Member]) -> io::Result
     let mut member_addresses: Vec<String> = Vec::new();
 
     for member in members {
+        if member.address == "*" { continue; }
+
         let member_identity = resolve_identity(ctx, &member.address)?;
 
         for member_address in member_identity.members.unwrap_or_else(|| vec![member.address.clone()]) {
@@ -622,6 +624,26 @@ mod tests {
     use crate::identity::create_identity;
     use crate::storage::{Body, write_atomic_with_metadata};
     use crate::testing::fs::{TEST_ADDRESS, account_context, create_plain_test_metadata, create_test_account, in_test_dir};
+
+    #[test]
+    fn resolve_member_addresses_skips_the_wildcard() {
+        use crate::client::init_local;
+        use crate::context::create_client_context;
+
+        in_test_dir("ark_metadata_wildcard_test", |temp_dir| {
+            init_local(temp_dir, "bob@example.com").unwrap();
+            let ctx = create_client_context().unwrap();
+
+            // A publicly readable file shared with named members too: the
+            // wildcard has no identity to resolve, and must not fail the rest.
+            let members = vec![
+                Member { address: "*".to_string(), permission: Permission::Reader, key: None },
+                Member { address: ctx.identity.address.clone(), permission: Permission::Owner, key: None },
+            ];
+
+            assert_eq!(resolve_member_addresses(&ctx, &members).unwrap(), vec![ctx.identity.address.clone()]);
+        });
+    }
 
     #[test]
     fn resolve_key_unwraps_via_group() {

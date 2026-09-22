@@ -1,12 +1,12 @@
 use std::io;
 
-use super::{put, put_content, put_permissions};
+use super::{put, put_permissions};
 
 use crate::identity::{
     create_identity, read_identity, read_identity_key, sign_identity, validate_identity,
     write_identity, write_identity_key,
 };
-use crate::permissions::{reader, readers};
+use crate::permissions::readers;
 use crate::storage::{create_dir_all, exists, parent_path};
 use crate::types::{Context, Identity, Key, Permissions};
 use crate::util::resolve_address;
@@ -21,7 +21,10 @@ use crate::util::resolve_address;
 /// key encrypted for the account owner (and any group members).
 ///
 /// When `members` is non-empty, creates a group: listed addresses appear in the
-/// identity document and each is granted `reader` on the encrypted private key.
+/// identity document and each is granted `reader` on it and on the encrypted
+/// private key. A member reads the document by the public entry either way;
+/// the entry of their own is what carries it to their mirror, and keeps it
+/// current as the membership changes.
 /// Members must be regular account addresses — nested groups are not supported.
 /// With no members, the identity has no `members` field.
 ///
@@ -65,13 +68,18 @@ pub fn create_client_identity(ctx: &Context, path: &str, members: &[String]) -> 
     write_identity_key(ctx, &key_path, &secret_key.value)?;
 
     let self_address = ctx.identity.address.as_str();
-    let key_permissions = match &final_members {
-        Some(list) => readers(list.iter().filter(|address| *address != self_address).cloned()),
-        None => Permissions::default(),
+    let member_addresses: Vec<String> = match &final_members {
+        Some(list) => list.iter().filter(|address| *address != self_address).cloned().collect(),
+        None => Vec::new(),
     };
 
-    put(ctx, &address, &reader("public"), Some("none"), false)?;
-    put(ctx, &key_path, &key_permissions, None, false)?;
+    let identity_permissions = Permissions {
+        readers: std::iter::once("public".to_string()).chain(member_addresses.iter().cloned()).collect(),
+        ..Permissions::default()
+    };
+
+    put(ctx, &address, &identity_permissions, Some("none"), false)?;
+    put(ctx, &key_path, &readers(member_addresses), None, false)?;
 
     Ok((identity, secret_key))
 }
@@ -87,8 +95,9 @@ pub fn create_client_identity(ctx: &Context, path: &str, members: &[String]) -> 
 /// members promotes a regular identity to a group.
 ///
 /// Re-signs and publishes the identity document, and adjusts `reader` access on
-/// the encrypted private key for net membership changes. Does not rotate the
-/// group keypair.
+/// it and on the encrypted private key for net membership changes, so that the
+/// document reaches a new member's mirror and stops reaching a dropped one's.
+/// Does not rotate the group keypair.
 pub fn change_identity_members(
     ctx: &Context,
     path: &str,
@@ -143,13 +152,14 @@ pub fn change_identity_members(
 
     write_identity(ctx, path, &identity)?;
 
-    put_content(ctx, path)?;
-    if !readers.is_empty() || !drops.is_empty() {
-        let permissions = Permissions {
-            readers,
-            drops,
-            ..Permissions::default()
-        };
+    let permissions = Permissions {
+        readers,
+        drops,
+        ..Permissions::default()
+    };
+
+    put(ctx, path, &permissions, None, false)?;
+    if !permissions.readers.is_empty() || !permissions.drops.is_empty() {
         put_permissions(ctx, &key_path_for(path), &permissions)?;
     }
 
