@@ -3,8 +3,8 @@ use std::io;
 use super::{put, put_content, put_permissions};
 
 use crate::identity::{
-    create_identity as create_identity_raw, read_identity, read_identity_key, sign_identity,
-    validate_identity, write_identity, write_identity_key,
+    create_identity, read_identity, read_identity_key, sign_identity, validate_identity,
+    write_identity, write_identity_key,
 };
 use crate::permissions::{reader, readers};
 use crate::storage::{create_dir_all, exists, parent_path};
@@ -26,7 +26,7 @@ use crate::util::resolve_address;
 /// With no members, the identity has no `members` field.
 ///
 /// Returns the new [`Identity`] and its secret [`Key`].
-pub fn create_identity(ctx: &Context, path: &str, members: &[String]) -> io::Result<(Identity, Key)> {
+pub fn create_client_identity(ctx: &Context, path: &str, members: &[String]) -> io::Result<(Identity, Key)> {
     if !path.ends_with(".json") {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "path must end with .json"));
     }
@@ -54,7 +54,7 @@ pub fn create_identity(ctx: &Context, path: &str, members: &[String]) -> io::Res
         Some(unique_members)
     };
 
-    let (identity, secret_key) = create_identity_raw(&address, final_members.clone())?;
+    let (identity, secret_key) = create_identity(&address, final_members.clone())?;
     validate_identity(&identity)?;
 
     if let Some(parent) = parent_path(path) {
@@ -182,7 +182,7 @@ mod tests {
     }
 
     #[test]
-    fn create_identity_publishes_identity_and_key() {
+    fn create_client_identity_publishes_identity_and_key() {
         in_test_dir("ark_identity_client_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let alice_address = format!("alice@127.0.0.1:{}", port);
@@ -191,7 +191,7 @@ mod tests {
             let ctx = init_with_server(temp_dir, &alice_address);
             cache_identity(&ctx, &bob_identity);
 
-            let (identity, _) = create_identity(&ctx, "team.json", std::slice::from_ref(&bob_address)).unwrap();
+            let (identity, _) = create_client_identity(&ctx, "team.json", std::slice::from_ref(&bob_address)).unwrap();
 
             let expected_address = format!("{}/team.json", alice_address);
 
@@ -217,26 +217,26 @@ mod tests {
     }
 
     #[test]
-    fn create_identity_rejects_duplicate_path() {
+    fn create_client_identity_rejects_duplicate_path() {
         in_test_dir("ark_identity_client_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("alice@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &address);
 
-            create_identity(&ctx, "team.json", &[]).unwrap();
-            let err = create_identity(&ctx, "team.json", &[]).unwrap_err();
+            create_client_identity(&ctx, "team.json", &[]).unwrap();
+            let err = create_client_identity(&ctx, "team.json", &[]).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
         });
     }
 
     #[test]
-    fn create_identity_without_members_is_not_a_group() {
+    fn create_client_identity_without_members_is_not_a_group() {
         in_test_dir("ark_identity_client_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("alice@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &address);
 
-            let (identity, secret_key) = create_identity(&ctx, "team.json", &[]).unwrap();
+            let (identity, secret_key) = create_client_identity(&ctx, "team.json", &[]).unwrap();
 
             assert!(identity.members.is_none());
             assert_eq!(identity.address, format!("{}/team.json", address));
@@ -250,13 +250,13 @@ mod tests {
     }
 
     #[test]
-    fn create_identity_nested_relative_path() {
+    fn create_client_identity_nested_relative_path() {
         in_test_dir("ark_identity_client_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("alice@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &address);
 
-            let (identity, _) = create_identity(&ctx, "contacts/team.json", &[]).unwrap();
+            let (identity, _) = create_client_identity(&ctx, "contacts/team.json", &[]).unwrap();
 
             assert_eq!(identity.address, format!("{}/contacts/team.json", address));
             assert!(temp_dir.join("contacts/team.key").exists());
@@ -265,25 +265,25 @@ mod tests {
     }
 
     #[test]
-    fn create_identity_requires_json_suffix() {
+    fn create_client_identity_requires_json_suffix() {
         in_test_dir("ark_identity_client_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("alice@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &address);
 
-            let err = create_identity(&ctx, "team", &[]).unwrap_err();
+            let err = create_client_identity(&ctx, "team", &[]).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         });
     }
 
     #[test]
-    fn create_identity_account_absolute_path() {
+    fn create_client_identity_account_absolute_path() {
         in_test_dir("ark_identity_client_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("alice@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &address);
 
-            let (identity, _) = create_identity(&ctx, "/groups/team.json", &[]).unwrap();
+            let (identity, _) = create_client_identity(&ctx, "/groups/team.json", &[]).unwrap();
 
             assert_eq!(identity.address, format!("{}/groups/team.json", address));
             assert!(temp_dir.join("groups/team.key").exists());
@@ -292,7 +292,7 @@ mod tests {
     }
 
     #[test]
-    fn create_identity_address_form_path() {
+    fn create_client_identity_address_form_path() {
         in_test_dir("ark_identity_client_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let alice_address = format!("alice@127.0.0.1:{}", port);
@@ -301,7 +301,7 @@ mod tests {
             // Same-account address form; local files still land under the path portion
             // of the address.
             let path = format!("{}/team.json", alice_address);
-            let (identity, _) = create_identity(&ctx, &path, &[]).unwrap();
+            let (identity, _) = create_client_identity(&ctx, &path, &[]).unwrap();
 
             assert_eq!(identity.address, format!("{}/team.json", alice_address));
             assert!(temp_dir.join("team.key").exists());
@@ -310,13 +310,13 @@ mod tests {
     }
 
     #[test]
-    fn create_identity_rejects_bare_address_without_path() {
+    fn create_client_identity_rejects_bare_address_without_path() {
         in_test_dir("ark_identity_client_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("alice@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &address);
 
-            let err = create_identity(&ctx, &address, &[]).unwrap_err();
+            let err = create_client_identity(&ctx, &address, &[]).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         });
     }
@@ -344,7 +344,7 @@ mod tests {
             let ctx = init_with_server(temp_dir, &alice_address);
             cache_identity(&ctx, &bob_identity);
 
-            create_identity(&ctx, "team.json", std::slice::from_ref(&bob_address)).unwrap();
+            create_client_identity(&ctx, "team.json", std::slice::from_ref(&bob_address)).unwrap();
             let group_address = format!("{}/team.json", alice_address);
 
             let shared_path = temp_dir.join("ark/alice/shared.txt");
@@ -383,7 +383,7 @@ mod tests {
             let ctx = init_with_server(temp_dir, &alice_address);
             cache_identity(&ctx, &bob_identity);
 
-            create_identity(&ctx, "team.json", std::slice::from_ref(&bob_address)).unwrap();
+            create_client_identity(&ctx, "team.json", std::slice::from_ref(&bob_address)).unwrap();
             let group_address = format!("{}/team.json", alice_address);
 
             let shared_path = temp_dir.join("ark/alice/shared.txt");
@@ -406,7 +406,7 @@ mod tests {
 
     #[test]
     fn nested_group_rejected() {
-        use crate::identity::create_identity as generate_identity;
+        use crate::identity::create_identity;
         use crate::metadata::sign_metadata;
         use crate::testing::fs::create_plain_test_metadata;
         use crate::testing::http::signed_request;
@@ -422,7 +422,7 @@ mod tests {
 
             let inner_address = format!("{}/inner.json", alice_address);
             let (inner_identity, _inner_key) =
-                generate_identity(&inner_address, Some(vec![bob_address.clone()])).unwrap();
+                create_identity(&inner_address, Some(vec![bob_address.clone()])).unwrap();
             let inner_path = temp_dir.join("ark/alice/inner.json");
             fs::create_dir_all(inner_path.parent().unwrap()).unwrap();
             let (alice_ctx, inner_account_path) = account_context(&inner_path);
@@ -436,7 +436,7 @@ mod tests {
 
             let outer_address = format!("{}/outer.json", alice_address);
             let (outer_identity, _outer_key) =
-                generate_identity(&outer_address, Some(vec![inner_address.clone()])).unwrap();
+                create_identity(&outer_address, Some(vec![inner_address.clone()])).unwrap();
             let outer_path = temp_dir.join("ark/alice/outer.json");
             let (alice_ctx, outer_account_path) = account_context(&outer_path);
             write_identity(&alice_ctx, &outer_account_path, &outer_identity).unwrap();
@@ -466,13 +466,13 @@ mod tests {
     }
 
     #[test]
-    fn create_identity_self_signature_verifies() {
+    fn create_client_identity_self_signature_verifies() {
         in_test_dir("ark_identity_client_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
             let address = format!("alice@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &address);
 
-            let (identity, _) = create_identity(&ctx, "team.json", &[]).unwrap();
+            let (identity, _) = create_client_identity(&ctx, "team.json", &[]).unwrap();
 
             set_current_dir(temp_dir).unwrap();
             let _ = create_client_context().unwrap();
@@ -494,7 +494,7 @@ mod tests {
             cache_identity(&ctx, &bob_identity);
             cache_identity(&ctx, &charlie_identity);
 
-            create_identity(&ctx, "team.json", std::slice::from_ref(&bob_address)).unwrap();
+            create_client_identity(&ctx, "team.json", std::slice::from_ref(&bob_address)).unwrap();
             change_identity_members(&ctx, "team.json", std::slice::from_ref(&charlie_address), &[]).unwrap();
 
             let identity = read_identity(&ctx, "/team.json").unwrap();
@@ -522,7 +522,7 @@ mod tests {
             let ctx = init_with_server(temp_dir, &alice_address);
             cache_identity(&ctx, &bob_identity);
 
-            create_identity(&ctx, "team.json", std::slice::from_ref(&bob_address)).unwrap();
+            create_client_identity(&ctx, "team.json", std::slice::from_ref(&bob_address)).unwrap();
             change_identity_members(&ctx, "team.json", std::slice::from_ref(&bob_address), &[]).unwrap();
 
             let identity = read_identity(&ctx, "/team.json").unwrap();
@@ -540,7 +540,7 @@ mod tests {
             let ctx = init_with_server(temp_dir, &alice_address);
             cache_identity(&ctx, &bob_identity);
 
-            create_identity(&ctx, "team.json", std::slice::from_ref(&bob_address)).unwrap();
+            create_client_identity(&ctx, "team.json", std::slice::from_ref(&bob_address)).unwrap();
             change_identity_members(&ctx, "team.json", &[], std::slice::from_ref(&bob_address)).unwrap();
 
             let identity = read_identity(&ctx, "/team.json").unwrap();
@@ -565,7 +565,7 @@ mod tests {
             let ctx = init_with_server(temp_dir, &alice_address);
             cache_identity(&ctx, &bob_identity);
 
-            create_identity(&ctx, "team.json", std::slice::from_ref(&bob_address)).unwrap();
+            create_client_identity(&ctx, "team.json", std::slice::from_ref(&bob_address)).unwrap();
             change_identity_members(&ctx, "team.json", &[], std::slice::from_ref(&bob_address)).unwrap();
             change_identity_members(&ctx, "team.json", &[], std::slice::from_ref(&bob_address)).unwrap();
 
@@ -584,7 +584,7 @@ mod tests {
             let ctx = init_with_server(temp_dir, &address);
             cache_identity(&ctx, &bob_identity);
 
-            create_identity(&ctx, "team.json", &[address.clone(), bob_address.clone()]).unwrap();
+            create_client_identity(&ctx, "team.json", &[address.clone(), bob_address.clone()]).unwrap();
             change_identity_members(&ctx, "team.json", &[], std::slice::from_ref(&address)).unwrap();
 
             let identity = read_identity(&ctx, "/team.json").unwrap();
@@ -606,7 +606,7 @@ mod tests {
             let ctx = init_with_server(temp_dir, &alice_address);
             cache_identity(&ctx, &bob_identity);
 
-            create_identity(&ctx, "team.json", std::slice::from_ref(&bob_address)).unwrap();
+            create_client_identity(&ctx, "team.json", std::slice::from_ref(&bob_address)).unwrap();
             // Drop wins: bob is not a member afterwards.
             change_identity_members(
                 &ctx,
@@ -636,7 +636,7 @@ mod tests {
             let ctx = init_with_server(temp_dir, &alice_address);
             cache_identity(&ctx, &bob_identity);
 
-            create_identity(&ctx, "team.json", std::slice::from_ref(&bob_address)).unwrap();
+            create_client_identity(&ctx, "team.json", std::slice::from_ref(&bob_address)).unwrap();
             let group_address = format!("{}/team.json", alice_address);
 
             let shared_path = temp_dir.join("ark/alice/shared.txt");
@@ -678,7 +678,7 @@ mod tests {
             let ctx = init_with_server(temp_dir, &alice_address);
             cache_identity(&ctx, &bob_identity);
 
-            let (identity, _) = create_identity(&ctx, "team.json", &[]).unwrap();
+            let (identity, _) = create_client_identity(&ctx, "team.json", &[]).unwrap();
             assert!(identity.members.is_none());
 
             let group_address = format!("{}/team.json", alice_address);
@@ -723,7 +723,7 @@ mod tests {
             cache_identity(&ctx, &bob_identity);
             cache_identity(&ctx, &charlie_identity);
 
-            create_identity(&ctx, "team.json", std::slice::from_ref(&bob_address)).unwrap();
+            create_client_identity(&ctx, "team.json", std::slice::from_ref(&bob_address)).unwrap();
             change_identity_members(
                 &ctx,
                 "team.json",

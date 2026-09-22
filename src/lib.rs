@@ -7,39 +7,54 @@
 //! See [`README.md`](../../README.md) for the user-facing guide and [`spec.md`](../../spec.md)
 //! for the wire protocol.
 //!
+//! Everything is exported at the crate root — `ark::put`, `ark::Context`, and
+//! so on. There are no submodules to reach through.
+//!
 //! # Entrypoints
 //!
-//! - [`client`] — file, membership, and sync operations.
-//! - [`server`] — [`server::start_server`] runs a listener on the current
-//!   working directory.
-//! - [`context`] — build the [`types::Context`] passed to every client
+//! - [`init`], [`get`], [`put`], [`list`], [`sync`] — file, membership, and
+//!   sync operations.
+//! - [`start_server`] runs a listener on the current working directory.
+//! - [`create_client_context`] builds the [`Context`] passed to every client
 //!   function.
-//! - [`storage`] — the filesystem, reached by account path rather than
-//!   filesystem path.
+//! - [`read`], [`write()`], [`read_dir`] and the rest — the filesystem, reached
+//!   by account path rather than filesystem path.
 //!
 //! # Function shapes
 //!
-//! [`client::get`], [`client::put`], [`client::encrypt`], and
-//! [`client::decrypt`] all take a single path and act on the account's own copy
-//! of it, mirroring the server, writing metadata to `user.ark.*` xattrs as a
-//! side effect.
+//! [`get`], [`put`], [`encrypt`], and [`decrypt`] all take a single path and
+//! act on the account's own copy of it, mirroring the server, writing metadata
+//! to `user.ark.*` xattrs as a side effect.
 //!
 //! For `encrypt`, `decrypt`, `get`, and `put`, a `_stream` variant
 //! (`encrypt_stream`, `decrypt_stream`, `get_stream`, `put_stream`) exposes the
 //! same operation over [`std::io::Read`]/[`std::io::Write`] streams and returns
 //! values instead of touching the filesystem.
 
-pub mod client;
-pub mod context;
-pub mod crypto;
-pub mod http;
-pub mod identity;
-pub mod metadata;
-pub mod permissions;
-pub mod server;
-pub mod storage;
+mod client;
+mod context;
+mod crypto;
+mod http;
+mod identity;
+mod metadata;
+mod permissions;
+mod server;
+mod storage;
 #[cfg(test)]
 pub mod testing;
-pub mod timestamp;
-pub mod types;
-pub mod util;
+mod timestamp;
+mod types;
+mod util;
+
+pub use client::*;
+pub use context::*;
+pub use crypto::*;
+pub use http::*;
+pub use identity::*;
+pub use metadata::*;
+pub use permissions::*;
+pub use server::*;
+pub use storage::*;
+pub use timestamp::*;
+pub use types::*;
+pub use util::*;

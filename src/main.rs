@@ -4,12 +4,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::process::exit;
 
-use ark::client::{accept_proposal, create_identity, decrypt, delete, encrypt, get, get_stream, head, change_identity_members, init, list, list_proposals, put, reject_proposal, sync, watch_local, watch_remote};
-use ark::context::create_client_context;
-use ark::identity::parse_address;
-use ark::server::start_server;
-use ark::types::{DirEntryKind, EntryEvent, Context, Permissions};
-use ark::util::resolve_client_url;
+use ark::{accept_proposal, create_client_context, create_client_identity, decrypt, delete, encrypt, get, get_stream, head, change_identity_members, init, list, list_proposals, parse_address, put, reject_proposal, resolve_client_url, start_server, sync, watch_local, watch_remote, Context, DirEntryKind, EntryEvent, Permissions};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -267,7 +262,7 @@ fn main() {
         Cmd::Cat { path } => create_client_context().and_then(|c| cat_cli(&c, &path)),
         Cmd::List { prefix, path } => create_client_context().and_then(|c| list_cli(&c, &path, prefix.as_deref())),
         Cmd::Identity { cmd } => create_client_context().and_then(|c| match cmd {
-            IdentityCmd::Create { path, member } => create_identity(&c, &path, &member).map(|_| ()),
+            IdentityCmd::Create { path, member } => create_client_identity(&c, &path, &member).map(|_| ()),
             IdentityCmd::Members { path, add, drop } => change_identity_members(&c, &path, &add, &drop),
         }),
         Cmd::Proposals { cmd } => create_client_context().and_then(|c| match cmd {

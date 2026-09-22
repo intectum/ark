@@ -4,6 +4,8 @@ A guide for app developers. Wire-level details live in the [spec](spec.md); the 
 
 If you're new to Ark, read the [README](README.md) first, then come back here.
 
+Everything in the library is exported at the crate root, so the snippets below spell out the `ark::` prefix rather than importing.
+
 ## Table of Contents
 
 1. [Mental model](#1-mental-model)
@@ -45,17 +47,14 @@ Keep this reflex: **when you'd reach for an endpoint, reach for a path instead.*
 App files live under `apps/<app>/` in each user's account root. This is convention, not enforcement — Ark won't stop you writing elsewhere — but staying in your namespace is what lets multiple apps coexist on the same account without stepping on each other.
 
 ```rust
-use ark::context::create_client_context;
-use ark::storage::create_dir_all;
-
-let ctx = create_client_context()?;   // walks up from cwd to find .ark/
+let ctx = ark::create_client_context()?;   // walks up from cwd to find .ark/
 let app_root = "/apps/notes";
-create_dir_all(&ctx, app_root)?;
+ark::create_dir_all(&ctx, app_root)?;
 ```
 
 `create_client_context` locates the account root by walking up from the current directory looking for `.ark/`. Cache the returned `Context` and pass it to every client call — it carries the identity keypair and account root.
 
-**Paths are account paths, not filesystem paths.** `"/apps/notes"` is account-absolute; `"notes.md"` is taken against the working directory; `"bob@host/apps/notes"` names another account's tree. Every client function takes all three, and so does `ark::storage` — the filesystem reached the same way. Reach for `storage::read`, `storage::write`, `storage::read_dir` and the rest rather than `std::fs` and `ctx.root.join(...)`: they refuse anything outside the account root, and the path you read a file at is the same string you `put` it at.
+**Paths are account paths, not filesystem paths.** `"/apps/notes"` is account-absolute; `"notes.md"` is taken against the working directory; `"bob@host/apps/notes"` names another account's tree. Every client function takes all three, and so do the storage functions — the filesystem reached the same way. Reach for `ark::read`, `ark::write`, `ark::read_dir` and the rest rather than `std::fs` and `ctx.root.join(...)`: they refuse anything outside the account root, and the path you read a file at is the same string you `put` it at.
 
 **Pick your subtree once, then always work relative to it.** Everything below assumes you have `ctx` and an `app_root` under `apps/<app>/`.
 
@@ -73,15 +72,11 @@ Two levels of membership fall naturally out of this:
 Only **directories without metadata** inherit — an auto-created intermediate dir on a nested PUT path picks up member checks from its nearest metadata-bearing ancestor. Files always carry their own metadata (author, body hash, member list), so there's no file-level inheritance. Set every item's members explicitly at PUT time.
 
 ```rust
-use ark::client::put;
-use ark::permissions::writers;
-use ark::storage::create_dir_all;
-
 // Create the container. Members are writers on the dir — they can add items.
 let dir = "/apps/notes/team-brainstorm";
-create_dir_all(&ctx, dir)?;
+ark::create_dir_all(&ctx, dir)?;
 
-put(&ctx, dir, &writers(["bob@host", "carol@host"]), None, /*metadata_only=*/ false)?;
+ark::put(&ctx, dir, &ark::writers(["bob@host", "carol@host"]), None, /*metadata_only=*/ false)?;
 ```
 
 Because path mirroring is guaranteed by the protocol, `apps/notes/team-brainstorm/` lives at that same relative path on every member's server. No rehoming, no per-server IDs — the path *is* the identifier.
@@ -93,13 +88,11 @@ Because path mirroring is guaranteed by the protocol, `apps/notes/team-brainstor
 Ark preserves no server-side ordering across files. If your app needs chronological order (messages, log entries, events), bake the timestamp into the filename.
 
 ```rust
-use ark::timestamp::{format_fs_safe, now};
-
-let file_name = format!("msg_{}.md", format_fs_safe(now()));
+let file_name = format!("msg_{}.md", ark::format_fs_safe(ark::now()));
 // e.g. "msg_2026-07-29T14-22-03.418Z.md"
 ```
 
-`format_fs_safe` produces a filesystem-safe ISO-8601 stamp. Because ISO stamps sort lexically and `storage::read_dir` returns names in lexical order, listing the directory yields chronological order without any extra index.
+`format_fs_safe` produces a filesystem-safe ISO-8601 stamp. Because ISO stamps sort lexically and `ark::read_dir` returns names in lexical order, listing the directory yields chronological order without any extra index.
 
 Prefix the file with a short type discriminator (`msg_`, `event_`, `photo_`) so multiple item kinds can share a directory without collision, and so `starts_with` gives you a cheap filter when listing. Use `_` as the field separator — timestamps already contain `-`, so hyphens make names harder to split and scan.
 
@@ -112,20 +105,17 @@ Two dedicated wrappers cover the common membership ops without re-uploading bodi
 - `put_content(ctx, path)` — upload the body at `path` with default permissions.
 - `put_permissions(ctx, path, &permissions)` — metadata-only PUT that adds or drops members.
 
-Compose them with the `ark::permissions` helpers (`owner`, `writer`, `reader`, `drop`, `assign`, `without`).
+Compose them with the permission helpers (`ark::owner`, `ark::writer`, `ark::reader`, `ark::drop`, `ark::assign`, `ark::without`).
 
 ```rust
-use ark::client::put_permissions;
-use ark::permissions::{drop, owner, reader, writer};
-
 // Add a new writer to the container.
-put_permissions(&ctx, "/apps/notes/team-brainstorm", &writer("dave@host"))?;
+ark::put_permissions(&ctx, "/apps/notes/team-brainstorm", &ark::writer("dave@host"))?;
 
 // Drop a member.
-put_permissions(&ctx, "/apps/notes/team-brainstorm", &drop("carol@host"))?;
+ark::put_permissions(&ctx, "/apps/notes/team-brainstorm", &ark::drop("carol@host"))?;
 
 // Promote to owner.
-put_permissions(&ctx, "/apps/notes/team-brainstorm", &owner("bob@host"))?;
+ark::put_permissions(&ctx, "/apps/notes/team-brainstorm", &ark::owner("bob@host"))?;
 ```
 
 Each `put_permissions` on a directory is one PUT. If you have per-item permission (message files, per-photo ACLs), the same membership change may need to fan out across the children — that's app-side today. Batch it under one user action so latency is one visible cost, not N.
@@ -133,13 +123,9 @@ Each `put_permissions` on a directory is one PUT. If you have per-item permissio
 **When creating a new item, derive its member list from the container's members**, not from your own state:
 
 ```rust
-use ark::metadata::read_metadata_attributes;
-use ark::permissions::{assign, without};
-use ark::types::Permission;
-
-let meta = read_metadata_attributes(&ctx, dir)?;
-let others = without(&meta.members, &ctx.identity.address);
-let item_perms = assign(&others, Permission::Reader);   // self stays owner via put
+let meta = ark::read_metadata_attributes(&ctx, dir)?;
+let others = ark::without(&meta.members, &ctx.identity.address);
+let item_perms = ark::assign(&others, ark::Permission::Reader);   // self stays owner via put
 ```
 
 This keeps the source of truth in one place: the container's metadata. If members join or leave, the next item you send picks up the new list automatically.
@@ -151,10 +137,8 @@ This keeps the source of truth in one place: the container's metadata. If member
 `sync` walks a subtree and reconciles local and remote state. Point it at your app root, not the account root — you don't need to touch other apps' files.
 
 ```rust
-use ark::client::sync;
-
 // One-shot pass.
-sync(&ctx, "/apps/notes",
+ark::sync(&ctx, "/apps/notes",
      /*watch=*/ false, /*decrypt=*/ true,
      |ev| { println!("{} {}", ev.action.as_str(), ev.path.display()); false },
      |err| { eprintln!("sync: {}", err); false })?;
@@ -173,7 +157,7 @@ let ctx = Arc::new(ctx);
     let event_tx = Arc::new(Mutex::new(tx.clone()));
     let error_tx = event_tx.clone();
     thread::spawn(move || {
-        let _ = sync(&ctx, "/apps/notes", true, true,
+        let _ = ark::sync(&ctx, "/apps/notes", true, true,
             move |ev| { let _ = event_tx.lock().unwrap().send(Ok(ev)); false },
             move |e|  { let _ = error_tx.lock().unwrap().send(Err(e));  false });
     });
@@ -193,13 +177,11 @@ let ctx = Arc::new(ctx);
 When someone adds you as a member of a file or directory, their server relays the PUT to yours. Your server rejects it (you weren't a member yet) and records the attempt in `/.ark/requests/`. That record is a **proposal**: pending consent to receive the file.
 
 ```rust
-use ark::client::{accept_proposal, list_proposals, reject_proposal};
-
-for p in list_proposals(&ctx)? {
+for p in ark::list_proposals(&ctx)? {
     // p.target is the relative path the sender tried to write to.
     // p.metadata.modified_by is the sender's address.
     if p.target.starts_with("apps/notes/") {
-        accept_proposal(&ctx, &p.id, /*force=*/ false)?;
+        ark::accept_proposal(&ctx, &p.id, /*force=*/ false)?;
         // On accept: your client fetches, verifies, and PUTs the file locally.
     }
 }
@@ -216,7 +198,7 @@ use std::collections::BTreeMap;
 
 let marker = "/apps/notes/";
 let mut by_dir: BTreeMap<String, Vec<String>> = BTreeMap::new();
-for p in list_proposals(&ctx)? {
+for p in ark::list_proposals(&ctx)? {
     let Some(i) = p.target.find(marker) else { continue };
     let after = &p.target[i + marker.len()..];
     let dir = after.split('/').next().unwrap_or("").to_string();
@@ -233,9 +215,7 @@ Accept all proposal IDs in the group in one user action.
 `watch_proposals` streams proposals arriving at a path or below it. It blocks like `sync(watch=true)`, so run it on its own thread, and it only reports proposals logged after the call started — call `list_proposals` first for the pending ones.
 
 ```rust
-use ark::client::watch_proposals;
-
-watch_proposals(&ctx, "/apps/notes", |p| {
+ark::watch_proposals(&ctx, "/apps/notes", |p| {
     // Same Proposal as list_proposals returns; accept/reject by p.id.
     let _ = tx.send(p);
     false // true stops the watcher
@@ -254,7 +234,7 @@ You rarely call the identity API directly — `put`/`put_permissions` do it for 
 
 Mitigations, from cheapest to most involved:
 
-1. **Fetch identities at "add contact" time**, not at first shared PUT. Call `resolve_identity` (from `ark::identity`) when the user first pastes a peer's address into your app. That warms the cache and surfaces a bad address immediately.
+1. **Fetch identities at "add contact" time**, not at first shared PUT. Call `ark::resolve_identity` when the user first pastes a peer's address into your app. That warms the cache and surfaces a bad address immediately.
 2. **Retry on transient failures.** Split the user action into add-and-share, so an outage during share doesn't block adding.
 3. **Batch shares.** If you're adding one peer to many files, put the identity fetch on the critical path once, then loop.
 
@@ -267,13 +247,10 @@ Once `sync` has pulled a shared file (either from a first-pass reconcile or a wa
 For app code that reads shared files repeatedly, sync with `decrypt=true` once and treat the local mirror as your source of truth:
 
 ```rust
-use ark::metadata::{has_metadata_attributes, read_metadata_attributes};
-use ark::storage::{read, read_dir};
-
-for path in read_dir(&ctx, dir)? {
-    if !has_metadata_attributes(&ctx, &path)? { continue; }
-    let meta = read_metadata_attributes(&ctx, &path)?;
-    let body = read(&ctx, &path)?;
+for path in ark::read_dir(&ctx, dir)? {
+    if !ark::has_metadata_attributes(&ctx, &path)? { continue; }
+    let meta = ark::read_metadata_attributes(&ctx, &path)?;
+    let body = ark::read(&ctx, &path)?;
     // meta.modified_by = author, meta.modified = timestamp, meta.members = ACL
 }
 ```
@@ -293,10 +270,8 @@ When `sync` sees divergence — the local and remote body both changed since las
 Detecting a conflict from an app is a filename check:
 
 ```rust
-use ark::storage::{file_name, read_dir};
-
-for path in read_dir(&ctx, dir)? {
-    let name = file_name(&path);
+for path in ark::read_dir(&ctx, dir)? {
+    let name = ark::file_name(&path);
     if let Some(dot) = name.rfind(".conflict-") {
         let original = &name[..dot];
         // Surface both copies to the user; delete the sidecar once resolved.
@@ -312,7 +287,7 @@ Structure your data model so conflicts are *unlikely*, not impossible: append-on
 
 **Writing outside `apps/<app>/`.** Works today, breaks tomorrow when a second app collides on `notes.md`. Namespace early.
 
-**Assuming server-side ordering.** Ark stores no order across files. `storage::read_dir` sorts lexically, but that is a listing convenience, not a claim about when entries were written, and the spec promises no ordering for a remote `list` at all. Use timestamped filenames so the lexical order *is* the chronological one.
+**Assuming server-side ordering.** Ark stores no order across files. `ark::read_dir` sorts lexically, but that is a listing convenience, not a claim about when entries were written, and the spec promises no ordering for a remote `list` at all. Use timestamped filenames so the lexical order *is* the chronological one.
 
 **Forgetting the "self" member.** When you `put` a file, you're implicitly its owner. You do not need to add yourself to a member list; you'll appear via the PUT. Adding yourself explicitly is harmless but adds noise.
 
@@ -330,4 +305,4 @@ Structure your data model so conflicts are *unlikely*, not impossible: append-on
 
 - [README](README.md) — install, CLI, library quickstart.
 - [Spec](spec.md) — wire protocol, authentication, encryption, federation.
-- Rustdoc on the `ark::client`, `ark::metadata`, and `ark::identity` modules — the authoritative per-function reference.
+- Rustdoc on the `ark` crate root — the authoritative per-function reference.

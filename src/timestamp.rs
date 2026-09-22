@@ -61,22 +61,6 @@ fn truncate_to_millis(dt: OffsetDateTime) -> OffsetDateTime {
     dt.replace_nanosecond(millis * 1_000_000).expect("valid nanosecond")
 }
 
-/// Serde adapter for `OffsetDateTime` fields serialized as spec-format RFC
-/// 3339 strings. Use with `#[serde(with = "crate::timestamp::serde")]`.
-pub mod serde {
-    use serde::{Deserialize, Deserializer, Serializer};
-    use time::OffsetDateTime;
-
-    pub fn serialize<S: Serializer>(dt: &OffsetDateTime, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&super::format(*dt))
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<OffsetDateTime, D::Error> {
-        let s = String::deserialize(d)?;
-        super::parse(&s).map_err(serde::de::Error::custom)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use time::macros::datetime;

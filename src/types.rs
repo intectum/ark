@@ -137,9 +137,9 @@ pub struct Member {
 pub struct Metadata {
     #[serde(with = "hyphenated_uuid")]
     pub id: Uuid,
-    #[serde(with = "crate::timestamp::serde")]
+    #[serde(with = "timestamp")]
     pub created: OffsetDateTime,
-    #[serde(with = "crate::timestamp::serde")]
+    #[serde(with = "timestamp")]
     pub modified: OffsetDateTime,
     pub modified_by: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -283,6 +283,21 @@ mod hyphenated_uuid {
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Uuid, D::Error> {
         let s = String::deserialize(d)?;
         parse_uuid(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+mod timestamp {
+    use super::*;
+
+    use crate::timestamp::{format, parse};
+
+    pub fn serialize<S: Serializer>(dt: &OffsetDateTime, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&format(*dt))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<OffsetDateTime, D::Error> {
+        let s = String::deserialize(d)?;
+        parse(&s).map_err(serde::de::Error::custom)
     }
 }
 

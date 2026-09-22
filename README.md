@@ -126,75 +126,70 @@ Every command takes `-h` for details. Paths accept three forms:
 
 ## Rust library quickstart
 
+Everything is exported at the crate root — `ark::put`, `ark::Context`, and so on. There are no submodules to reach through.
+
 ```rust
 // Terminal 1 — run a server (serves the current directory)
 // cwd = ./server
-use ark::server::start_server;
-
-start_server(8080, "localhost:8080");           // blocks
+ark::start_server(8080, "localhost:8080");      // blocks
 ```
 
 ```rust
 // Terminal 2 — create an account on that server
 // cwd = ./alice
-use ark::context::create_client_context;
-use ark::client::{init, put_content, put_permissions, get_content, get_stream, sync, list_proposals,
-    accept_proposal, reject_proposal, watch_local, watch_remote};
-use ark::permissions::reader;
-
-init(&std::env::current_dir()?, "alice@localhost:8080", None, /*local_only=*/ false)?;
+ark::init(&std::env::current_dir()?, "alice@localhost:8080", None, /*local_only=*/ false)?;
 
 // Convention: apps namespace their files under apps/<app>/. Work from there.
 std::fs::create_dir_all("apps/notes")?;
 std::env::set_current_dir("apps/notes")?;
 
-let ctx = create_client_context()?;             // walks up from cwd to find .ark/
+let ctx = ark::create_client_context()?;        // walks up from cwd to find .ark/
 
 // Upload and download an encrypted file
 std::fs::write("note.txt", b"hello")?;
-put_content(&ctx, "note.txt")?;                 // encrypt + upload
-get_content(&ctx, "note.txt")?;                 // download + decrypt
+ark::put_content(&ctx, "note.txt")?;            // encrypt + upload
+ark::get_content(&ctx, "note.txt")?;            // download + decrypt
 
 // Share with another user
-put_permissions(&ctx, "note.txt", &reader("bob@localhost:8080"))?;
+ark::put_permissions(&ctx, "note.txt", &ark::reader("bob@localhost:8080"))?;
 
 // On bob's side — review and accept the share
-let proposals = list_proposals(&ctx)?;          // pending share proposals
-accept_proposal(&ctx, "1", /*force=*/ false)?;  // pulls the file, materializes it on bob's server
-reject_proposal(&ctx, "1")?;                    // discard instead
+let proposals = ark::list_proposals(&ctx)?;          // pending share proposals
+ark::accept_proposal(&ctx, "1", /*force=*/ false)?;  // pulls the file, materializes it on bob's server
+ark::reject_proposal(&ctx, "1")?;                    // discard instead
 
 // Sync the cwd
-sync(&ctx, ".", /*watch=*/ true, /*decrypt=*/ true,
+ark::sync(&ctx, ".", /*watch=*/ true, /*decrypt=*/ true,
     |event| { println!("{} {}", event.action.as_str(), event.path.display()); false },
     |error| { eprintln!("sync: {}", error); false }
 )?;                                             // reconcile local and remote; watch continuously
 
 // Watch for local changes
 let cwd = std::env::current_dir()?;
-watch_local(&cwd,
+ark::watch_local(&cwd,
     |event| { println!("{} {}", event.action.as_str(), event.path.display()); false },
     |error| { eprintln!("watch: {}", error); false }
 )?;
 
 // Watch for remote changes
-let url = ark::util::resolve_client_url(&ctx, ".")?;
-watch_remote(&ctx, &url,
+let url = ark::resolve_client_url(&ctx, ".")?;
+ark::watch_remote(&ctx, &url,
     |event| { println!("{} {}", event.action.as_str(), event.path.display()); false },
     |error| { eprintln!("watch: {}", error); false }
 )?;
 
 // Streaming form when you don't want to touch the filesystem
 let mut buf = Vec::new();
-let (metadata, _) = get_stream(&ctx, "note.txt", &mut buf, true, /*existing_metadata=*/ None)?;
+let (metadata, _) = ark::get_stream(&ctx, "note.txt", &mut buf, true, /*existing_metadata=*/ None)?;
 ```
 
 Every CLI command has a corresponding library function. `get`, `put`, `encrypt`, and `decrypt` all take a single path and act on the account's own copy of it, mirroring the server. For those four, a `_stream` variant (`encrypt_stream`, `decrypt_stream`, `get_stream`, `put_stream`) exposes the same operation over `Read`/`Write` streams and returns values instead of touching the filesystem — `ark cat` is `get_stream` to stdout.
 
-`put` also has two focused wrappers: `put_content(ctx, path)` uploads the body at `path` with default permissions, and `put_permissions(ctx, path, &permissions)` sends a metadata-only PUT to add or drop members without re-uploading the body. Both delegate to `put`, which remains the full form (`permissions`, `encryption_algorithm`, `metadata_only`). Build a `Permissions` explicitly, or use `ark::permissions::{owner, writer, reader, drop}` (and plural `owners`/`writers`/`readers`/`drops`) for the common cases.
+`put` also has two focused wrappers: `put_content(ctx, path)` uploads the body at `path` with default permissions, and `put_permissions(ctx, path, &permissions)` sends a metadata-only PUT to add or drop members without re-uploading the body. Both delegate to `put`, which remains the full form (`permissions`, `encryption_algorithm`, `metadata_only`). Build a `Permissions` explicitly, or use `ark::owner`, `ark::writer`, `ark::reader`, and `ark::drop` (and plural `ark::owners`/`ark::writers`/`ark::readers`/`ark::drops`) for the common cases.
 
 `get` has a matching wrapper: `get_content(ctx, path)` downloads the body at `path` and writes it under the account root, decrypting when encrypted. `get` remains the full form (`decrypt`). `get_stream` takes one argument the others don't: `existing_metadata`, the metadata of the copy the download replaces when it replaces one. Pass it and the download is also checked to continue that copy — same `id`, `modified` no older — so a server cannot serve back an older version or an unrelated file at the path. `None` when there is no copy to continue.
 
-Paths in the library are account paths, not filesystem paths. Every client function takes the same three forms the CLI does — relative, account-absolute, or address — and `ark::storage` is the filesystem reached the same way: `read`, `write`, `read_dir`, `create_dir_all`, `rename`, and the `user.ark.*` attribute operations, each the `std::fs` equivalent with an account path in place of a filesystem one, refusing anything outside the account root. Use it rather than `std::fs` and `ctx.root.join(...)`, and app paths stay the same strings you hand to `put` and `get`. `to_account_path(ctx, path)` and `to_fs_path(ctx, path)` convert between the two when you need to hand an entry to something that only speaks filesystem paths.
+Paths in the library are account paths, not filesystem paths. Every client function takes the same three forms the CLI does — relative, account-absolute, or address — the storage functions are the filesystem reached the same way: `ark::read`, `ark::write`, `ark::read_dir`, `ark::create_dir_all`, `ark::rename`, and the `user.ark.*` attribute operations, each the `std::fs` equivalent with an account path in place of a filesystem one, refusing anything outside the account root. Use them rather than `std::fs` and `ctx.root.join(...)`, and app paths stay the same strings you hand to `put` and `get`. `ark::to_account_path(ctx, path)` and `ark::to_fs_path(ctx, path)` convert between the two when you need to hand an entry to something that only speaks filesystem paths.
 
 ---
 
