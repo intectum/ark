@@ -1,5 +1,5 @@
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -10,6 +10,7 @@ use url::Url;
 
 use crate::types::{ReadWrite, StreamEvent};
 
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const PATH_ENCODE_SET: &AsciiSet = &CONTROLS.add(b' ').add(b'"').add(b'#').add(b'<').add(b'>').add(b'?').add(b'`').add(b'{').add(b'}');
 
 pub fn connect(url: &Url, read_timeout: Duration) -> io::Result<Box<dyn ReadWrite>> {
@@ -17,7 +18,25 @@ pub fn connect(url: &Url, read_timeout: Duration) -> io::Result<Box<dyn ReadWrit
     let https = url.scheme() == "https";
     let default_port = if https { 443 } else { 80 };
     let port = url.port().unwrap_or(default_port);
-    let stream = TcpStream::connect((host, port))?;
+    let mut stream = None;
+
+    let mut last_error = None;
+    for address in (host, port).to_socket_addrs()? {
+        match TcpStream::connect_timeout(&address, CONNECT_TIMEOUT) {
+            Ok(connected) => {
+                stream = Some(connected);
+                break;
+            },
+            Err(e) => last_error = Some(e),
+        }
+    }
+
+    let stream = match stream {
+        Some(stream) => stream,
+        None => return Err(last_error.unwrap_or_else(||
+            io::Error::new(io::ErrorKind::NotFound, format!("no address for {}:{}", host, port)))),
+    };
+
     stream.set_read_timeout(Some(read_timeout))?;
 
     if https {
