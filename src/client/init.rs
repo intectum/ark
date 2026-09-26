@@ -142,7 +142,7 @@ fn pull_secret_key_with_password(
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "identity.key plaintext not base64url"))?;
 
     write_identity_key(&ctx, "/.ark/identity.key", &secret_key)?;
-    write_metadata_attributes(&ctx, "/.ark/identity.key", &identity_key_metadata)?;
+    write_metadata_attributes(&ctx, "/.ark/identity.key", &identity_key_metadata, None)?;
 
     Ok(())
 }
@@ -247,7 +247,7 @@ mod tests {
             });
             sign_metadata(&server_secret_key, &mut meta, Some(&identity_bytes)).unwrap();
             let (server_ctx, server_account_path) = account_context(&server_identity_path);
-            write_metadata_attributes(&server_ctx, &server_account_path, &meta).unwrap();
+            write_metadata_attributes(&server_ctx, &server_account_path, &meta, None).unwrap();
 
             let client_dir = temp_dir.join("client");
             fs::create_dir_all(&client_dir).unwrap();

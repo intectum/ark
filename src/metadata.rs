@@ -6,11 +6,14 @@ use crate::client::decrypt_stream;
 use crate::crypto::{DEFAULT_HASH_ALGORITHM, decrypt_bytes, encrypt_bytes, sign_json, verify_json};
 use crate::identity::{parse_address, read_identity_key, resolve_identity};
 use crate::permissions::cli_address_to_wire;
-use crate::storage::{exists, list_attributes, read, read_attribute, remove_attribute, write_attribute};
+use crate::lock::{Lock, lock_exclusive, lock_shared};
+use crate::storage::{Body, create_dir_all, exists, is_dir, join_path, list_attributes, read, read_attribute, remove_attribute, remove_file, to_path_segment, write_atomic_with_metadata, write_atomic_without_metadata, write_attribute};
 use crate::timestamp;
 use crate::types::{Hash, Key, LocalMetadata, Member, Metadata, Permission, Permissions, Signature};
 use crate::types::Context;
 use crate::util::{decode_base64url, encode_base64url, parse_uuid, sha256};
+
+const PREVIOUS_METADATA_DIR: &str = "/.ark/previous_metadata";
 
 const ATTRIBUTE_PREFIX: &str = "user.ark.";
 const LOCAL_ATTRIBUTE_PREFIX: &str = "user.ark_local.";
@@ -68,16 +71,40 @@ pub fn create_metadata(owner_address: &str, encryption_algorithm: Option<&str>) 
 }
 
 pub fn has_metadata_attributes(ctx: &Context, path: &str) -> io::Result<bool> {
+    let lock = lock_directory_shared(ctx, path)?;
+    let _lock = recover_directory(ctx, path, lock)?;
+
     Ok(read_attribute(ctx, path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_ID))?.is_some())
 }
 
+/// The metadata `path` carries.
+///
+/// Errors with `NotFound` where `path` carries none at all, and `InvalidData`
+/// where what it carries cannot be read as a whole record. A caller deciding
+/// access must tell the two apart: only the first means "inherits from above".
+///
+/// Reading a directory first puts back the metadata an update that did not
+/// finish had set aside, so it may take the exclusive lock and write. An
+/// interrupted update is therefore not what `InvalidData` reports — that is
+/// damage nothing can be put back over: an entry tampered with, or an update
+/// interrupted with nothing set aside.
 pub fn read_metadata_attributes(ctx: &Context, path: &str) -> io::Result<Metadata> {
+    let lock = lock_directory_shared(ctx, path)?;
+    let _lock = recover_directory(ctx, path, lock)?;
+
+    read_metadata_attributes_unlocked(ctx, path)
+}
+
+fn read_metadata_attributes_unlocked(ctx: &Context, path: &str) -> io::Result<Metadata> {
     let mut partial_metadata = PartialMetadata::default();
+    let mut found_attribute = false;
 
     for name in list_attributes(ctx, path)? {
         if !name.starts_with(ATTRIBUTE_PREFIX) {
             continue;
         }
+
+        found_attribute = true;
 
         let value = match read_attribute(ctx, path, &name)? {
             Some(v) => String::from_utf8(v)
@@ -88,6 +115,10 @@ pub fn read_metadata_attributes(ctx: &Context, path: &str) -> io::Result<Metadat
         apply_field(&mut partial_metadata, &name, &value)?;
     }
 
+    if !found_attribute {
+        return Err(io::Error::new(io::ErrorKind::NotFound, format!("no metadata at {}", path)));
+    }
+
     validate_partial_metadata(&partial_metadata)?;
 
     let metadata = metadata_from_partial(partial_metadata)?;
@@ -96,8 +127,47 @@ pub fn read_metadata_attributes(ctx: &Context, path: &str) -> io::Result<Metadat
     Ok(metadata)
 }
 
-pub fn write_metadata_attributes(ctx: &Context, path: &str, metadata: &Metadata) -> io::Result<()> {
-    remove_metadata_attributes(ctx, path)?;
+/// Replace the metadata `path` carries with `metadata`, and the local metadata
+/// it carries with `local_metadata` where that is given.
+///
+/// Both go on as one change, so a reader never catches a new record beside the
+/// local one that belonged to the record before it.
+///
+/// The fields are separate attributes and cannot be written as a set. For a
+/// directory, which takes them where it stands, the replacement is serialised
+/// by a lock and the records being replaced are set aside first, so an update
+/// interrupted part-way is put back by the next read rather than left to be
+/// read short.
+pub fn write_metadata_attributes(ctx: &Context, path: &str, metadata: &Metadata, local_metadata: Option<&LocalMetadata>) -> io::Result<()> {
+    let lock = lock_directory_exclusive(ctx, path)?;
+
+    // A file is replaced by a rename and cannot be caught part-way, so only a
+    // directory sets aside what it carries while the new records go on. That
+    // happens before the attributes are touched and is removed after the last
+    // of them lands, so its presence is what marks the rewrite as still under
+    // way.
+    if lock.is_some() {
+        restore_previous_metadata_unlocked(ctx, path)?;
+
+        let previous = read_metadata_attributes_unlocked(ctx, path).ok();
+        let previous_local = read_local_metadata_attributes_unlocked(ctx, path)?;
+        save_previous_metadata(ctx, path, previous.as_ref(), &previous_local)?;
+    }
+
+    write_metadata_attributes_unlocked(ctx, path, metadata)?;
+    if let Some(local_metadata) = local_metadata {
+        write_local_metadata_attributes_unlocked(ctx, path, local_metadata)?;
+    }
+
+    if lock.is_some() {
+        remove_file(ctx, &previous_metadata_path_for(path))?;
+    }
+
+    Ok(())
+}
+
+fn write_metadata_attributes_unlocked(ctx: &Context, path: &str, metadata: &Metadata) -> io::Result<()> {
+    remove_metadata_attributes_unlocked(ctx, path)?;
 
     write_attribute(ctx, path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_ID), metadata.id.hyphenated().to_string().as_bytes())?;
     write_attribute(ctx, path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_CREATED), timestamp::format(metadata.created).as_bytes())?;
@@ -126,6 +196,12 @@ pub fn write_metadata_attributes(ctx: &Context, path: &str, metadata: &Metadata)
 }
 
 pub fn remove_metadata_attributes(ctx: &Context, path: &str) -> io::Result<()> {
+    let _lock = lock_directory_exclusive(ctx, path)?;
+
+    remove_metadata_attributes_unlocked(ctx, path)
+}
+
+fn remove_metadata_attributes_unlocked(ctx: &Context, path: &str) -> io::Result<()> {
     for name in list_attributes(ctx, path)? {
         if name.starts_with(ATTRIBUTE_PREFIX) {
             remove_attribute(ctx, path, &name)?;
@@ -136,6 +212,13 @@ pub fn remove_metadata_attributes(ctx: &Context, path: &str) -> io::Result<()> {
 }
 
 pub fn read_local_metadata_attributes(ctx: &Context, path: &str) -> io::Result<LocalMetadata> {
+    let lock = lock_directory_shared(ctx, path)?;
+    let _lock = recover_directory(ctx, path, lock)?;
+
+    read_local_metadata_attributes_unlocked(ctx, path)
+}
+
+fn read_local_metadata_attributes_unlocked(ctx: &Context, path: &str) -> io::Result<LocalMetadata> {
     let mut local = LocalMetadata::default();
     let mut sync_body_hash_algorithm: Option<String> = None;
     let mut sync_body_hash_value: Option<Vec<u8>> = None;
@@ -182,8 +265,8 @@ pub fn read_local_metadata_attributes(ctx: &Context, path: &str) -> io::Result<L
     Ok(local)
 }
 
-pub fn write_local_metadata_attributes(ctx: &Context, path: &str, local: &LocalMetadata) -> io::Result<()> {
-    remove_local_metadata_attributes(ctx, path)?;
+fn write_local_metadata_attributes_unlocked(ctx: &Context, path: &str, local: &LocalMetadata) -> io::Result<()> {
+    remove_local_metadata_attributes_unlocked(ctx, path)?;
 
     if let Some(encrypted) = local.encrypted {
         write_attribute(ctx, path, &format!("{}{}", LOCAL_ATTRIBUTE_PREFIX, LOCAL_FIELD_ENCRYPTED), if encrypted { b"true" } else { b"false" })?;
@@ -200,6 +283,12 @@ pub fn write_local_metadata_attributes(ctx: &Context, path: &str, local: &LocalM
 }
 
 pub fn remove_local_metadata_attributes(ctx: &Context, path: &str) -> io::Result<()> {
+    let _lock = lock_directory_exclusive(ctx, path)?;
+
+    remove_local_metadata_attributes_unlocked(ctx, path)
+}
+
+fn remove_local_metadata_attributes_unlocked(ctx: &Context, path: &str) -> io::Result<()> {
     for name in list_attributes(ctx, path)? {
         if name.starts_with(LOCAL_ATTRIBUTE_PREFIX) {
             remove_attribute(ctx, path, &name)?;
@@ -489,6 +578,65 @@ fn apply_permission(
     Ok(())
 }
 
+fn lock_directory_shared(ctx: &Context, path: &str) -> io::Result<Option<Lock>> {
+    match is_dir(ctx, path) {
+        true => Ok(Some(lock_shared(ctx, path)?)),
+        false => Ok(None),
+    }
+}
+
+fn lock_directory_exclusive(ctx: &Context, path: &str) -> io::Result<Option<Lock>> {
+    match is_dir(ctx, path) {
+        true => Ok(Some(lock_exclusive(ctx, path)?)),
+        false => Ok(None),
+    }
+}
+
+fn previous_metadata_path_for(path: &str) -> String {
+    join_path(PREVIOUS_METADATA_DIR, &to_path_segment(path))
+}
+
+fn save_previous_metadata(ctx: &Context, path: &str, metadata: Option<&Metadata>, local: &LocalMetadata) -> io::Result<()> {
+    create_dir_all(ctx, PREVIOUS_METADATA_DIR)?;
+
+    let previous_path = previous_metadata_path_for(path);
+
+    match metadata {
+        Some(metadata) => write_atomic_with_metadata(ctx, &previous_path, Body::Bytes(&[]), metadata, Some(local)),
+        None => write_atomic_without_metadata(ctx, &previous_path, Body::Bytes(&[])),
+    }
+}
+
+fn recover_directory(ctx: &Context, path: &str, lock: Option<Lock>) -> io::Result<Option<Lock>> {
+    if lock.is_none() || !exists(ctx, &previous_metadata_path_for(path)) {
+        return Ok(lock);
+    }
+
+    drop(lock);
+    let lock = lock_exclusive(ctx, path)?;
+    restore_previous_metadata_unlocked(ctx, path)?;
+
+    Ok(Some(lock))
+}
+
+fn restore_previous_metadata_unlocked(ctx: &Context, path: &str) -> io::Result<()> {
+    let previous_path = previous_metadata_path_for(path);
+    if !exists(ctx, &previous_path) {
+        return Ok(());
+    }
+
+    match read_metadata_attributes_unlocked(ctx, &previous_path) {
+        Ok(previous) => write_metadata_attributes_unlocked(ctx, path, &previous)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => remove_metadata_attributes_unlocked(ctx, path)?,
+        Err(error) => return Err(error),
+    }
+
+    let previous_local = read_local_metadata_attributes_unlocked(ctx, &previous_path)?;
+    write_local_metadata_attributes_unlocked(ctx, path, &previous_local)?;
+
+    remove_file(ctx, &previous_path)
+}
+
 #[derive(Default)]
 struct PartialMetadata {
     id: Option<Uuid>,
@@ -620,10 +768,261 @@ fn split_member_key(key: &str) -> Option<(usize, String)> {
 mod tests {
     use super::*;
 
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::thread;
+
     use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, DEFAULT_HASH_ALGORITHM};
     use crate::identity::create_identity;
-    use crate::storage::{Body, write_atomic_with_metadata};
+    use crate::storage::{Body, create_dir, write_atomic_with_metadata};
     use crate::testing::fs::{TEST_ADDRESS, account_context, create_plain_test_metadata, create_test_account, in_test_dir};
+
+    // A rewrite stopped part-way, as a process killed mid-write leaves it: the
+    // previous metadata set aside, the attributes wiped, and only some of the
+    // new ones on.
+    fn interrupt_a_rewrite(context: &Context, path: &str, previous: Option<&Metadata>, attributes_landed: usize) {
+        save_previous_metadata(context, path, previous, &LocalMetadata::default()).unwrap();
+        remove_metadata_attributes_unlocked(context, path).unwrap();
+
+        for index in 0..attributes_landed {
+            write_attribute(context, path, &format!("{}member_{}_address", ATTRIBUTE_PREFIX, index), b"other@example.com").unwrap();
+        }
+    }
+
+    #[test]
+    fn an_interrupted_write_is_put_back_from_the_metadata_set_aside() {
+        in_test_dir("ark_metadata_recovery_test", |temp_dir| {
+            let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
+            let (context, _) = account_context(&account_dir);
+            create_dir(&context, "/dir").unwrap();
+
+            let mut original = create_metadata(&identity.address, None);
+            sign_metadata(&secret_key, &mut original, None).unwrap();
+            write_metadata_attributes(&context, "/dir", &original, None).unwrap();
+
+            interrupt_a_rewrite(&context, "/dir", Some(&original), 2);
+
+            let read_back = read_metadata_attributes(&context, "/dir").unwrap();
+            assert_eq!(read_back.id, original.id);
+            assert_eq!(read_back.members.len(), 1);
+            assert_eq!(read_back.members[0].address, identity.address);
+            assert!(!exists(&context, &previous_metadata_path_for("/dir")), "the previous metadata outlived being put back");
+        });
+    }
+
+    #[test]
+    fn a_crash_before_any_attribute_lands_is_rolled_back() {
+        in_test_dir("ark_metadata_recovery_test", |temp_dir| {
+            let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
+            let (context, _) = account_context(&account_dir);
+            create_dir(&context, "/dir").unwrap();
+
+            let mut original = create_metadata(&identity.address, None);
+            sign_metadata(&secret_key, &mut original, None).unwrap();
+            write_metadata_attributes(&context, "/dir", &original, None).unwrap();
+
+            // Nothing at all where the wipe landed and the rewrite did not.
+            // Read as "carries no metadata" this would inherit from above.
+            interrupt_a_rewrite(&context, "/dir", Some(&original), 0);
+
+            let read_back = read_metadata_attributes(&context, "/dir").unwrap();
+            assert_eq!(read_back.id, original.id);
+        });
+    }
+
+    #[test]
+    fn an_interrupted_write_that_reads_as_a_whole_record_is_still_rolled_back() {
+        in_test_dir("ark_metadata_recovery_test", |temp_dir| {
+            let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
+            let (context, _) = account_context(&account_dir);
+            create_dir(&context, "/dir").unwrap();
+
+            let mut original = create_metadata(&identity.address, None);
+            for index in 0..5 {
+                original.members.push(Member {
+                    address: format!("member{}@example.com", index),
+                    permission: Permission::Reader,
+                    key: None,
+                });
+            }
+            sign_metadata(&secret_key, &mut original, None).unwrap();
+            write_metadata_attributes(&context, "/dir", &original, None).unwrap();
+
+            // Every field of the new record on except the last two members.
+            // Nothing about this is detectable from the attributes alone: the
+            // members left are contiguous from 0, an owner is among them, and
+            // the signature is there — it parses as a whole record with four
+            // members instead of six. Only the metadata set aside gives it
+            // away.
+            save_previous_metadata(&context, "/dir", Some(&original), &LocalMetadata::default()).unwrap();
+            remove_metadata_attributes_unlocked(&context, "/dir").unwrap();
+            let mut short = original.clone();
+            short.members.truncate(4);
+            write_metadata_attributes_unlocked(&context, "/dir", &short).unwrap();
+
+            assert!(read_metadata_attributes_unlocked(&context, "/dir").is_ok(), "the torn state was meant to parse cleanly");
+
+            let read_back = read_metadata_attributes(&context, "/dir").unwrap();
+            assert_eq!(read_back.members.len(), 6, "a torn record that parses was served instead of being rolled back");
+            assert!(!exists(&context, &previous_metadata_path_for("/dir")));
+        });
+    }
+
+    #[test]
+    fn an_interrupted_first_write_rolls_back_to_carrying_nothing() {
+        in_test_dir("ark_metadata_recovery_test", |temp_dir| {
+            let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
+            let (context, _) = account_context(&account_dir);
+            create_dir(&context, "/dir").unwrap();
+
+            let mut metadata = create_metadata(&identity.address, None);
+            sign_metadata(&secret_key, &mut metadata, None).unwrap();
+
+            // The directory carried nothing, so what is set aside says so and the
+            // roll back has to leave it carrying nothing again.
+            interrupt_a_rewrite(&context, "/dir", None, 2);
+
+            match read_metadata_attributes(&context, "/dir") {
+                Ok(_) => panic!("expected the roll back to leave no metadata"),
+                Err(error) => assert_eq!(error.kind(), io::ErrorKind::NotFound),
+            }
+            assert!(!exists(&context, &previous_metadata_path_for("/dir")));
+        });
+    }
+
+    #[test]
+    fn an_interrupted_write_rolls_back_the_local_metadata_too() {
+        in_test_dir("ark_metadata_recovery_test", |temp_dir| {
+            let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
+            let (context, _) = account_context(&account_dir);
+            create_dir(&context, "/dir").unwrap();
+
+            let mut original = create_metadata(&identity.address, None);
+            sign_metadata(&secret_key, &mut original, None).unwrap();
+
+            // `sync_modified` is what marks a directory as tracked: losing it
+            // leaves the directory silently out of every later sync.
+            let local = LocalMetadata { encrypted: None, sync_body_hash: None, sync_modified: Some(original.modified) };
+            write_metadata_attributes(&context, "/dir", &original, Some(&local)).unwrap();
+
+            save_previous_metadata(&context, "/dir", Some(&original), &local).unwrap();
+            remove_metadata_attributes_unlocked(&context, "/dir").unwrap();
+            remove_local_metadata_attributes_unlocked(&context, "/dir").unwrap();
+
+            read_metadata_attributes(&context, "/dir").unwrap();
+
+            let read_back = read_local_metadata_attributes(&context, "/dir").unwrap();
+            assert_eq!(read_back.sync_modified, Some(original.modified), "the directory came back untracked");
+            assert!(!exists(&context, &previous_metadata_path_for("/dir")));
+        });
+    }
+
+    #[test]
+    fn a_first_write_leaves_no_previous_metadata_behind() {
+        in_test_dir("ark_metadata_recovery_test", |temp_dir| {
+            let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
+            let (context, _) = account_context(&account_dir);
+            create_dir(&context, "/dir").unwrap();
+
+            let mut metadata = create_metadata(&identity.address, None);
+            sign_metadata(&secret_key, &mut metadata, None).unwrap();
+            write_metadata_attributes(&context, "/dir", &metadata, None).unwrap();
+
+            assert!(!exists(&context, &previous_metadata_path_for("/dir")));
+        });
+    }
+
+    #[test]
+    fn a_path_carrying_no_metadata_reads_as_not_found() {
+        in_test_dir("ark_metadata_recovery_test", |temp_dir| {
+            let (_, _, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
+            let (context, _) = account_context(&account_dir);
+            create_dir(&context, "/dir").unwrap();
+
+            match read_metadata_attributes(&context, "/dir") {
+                Ok(_) => panic!("expected a not-found error"),
+                Err(error) => assert_eq!(error.kind(), io::ErrorKind::NotFound),
+            }
+        });
+    }
+
+    #[test]
+    fn a_path_carrying_part_of_a_record_reads_as_invalid() {
+        in_test_dir("ark_metadata_recovery_test", |temp_dir| {
+            let (_, _, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
+            let (context, _) = account_context(&account_dir);
+            create_dir(&context, "/dir").unwrap();
+
+            write_attribute(&context, "/dir", &format!("{}member_0_address", ATTRIBUTE_PREFIX), b"other@example.com").unwrap();
+
+            match read_metadata_attributes(&context, "/dir") {
+                Ok(_) => panic!("expected an invalid-data error"),
+                Err(error) => assert_eq!(error.kind(), io::ErrorKind::InvalidData),
+            }
+        });
+    }
+
+    #[test]
+    fn a_directory_read_never_sees_partial_metadata_while_it_is_rewritten() {
+        in_test_dir("ark_metadata_concurrency_test", |temp_dir| {
+            let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
+            let (context, _) = account_context(&account_dir);
+            create_dir(&context, "/dir").unwrap();
+
+            let mut small = create_metadata(&identity.address, None);
+            sign_metadata(&secret_key, &mut small, None).unwrap();
+
+            let mut large = create_metadata(&identity.address, None);
+            for index in 0..5 {
+                large.members.push(Member {
+                    address: format!("member{}@example.com", index),
+                    permission: Permission::Reader,
+                    key: None,
+                });
+            }
+            sign_metadata(&secret_key, &mut large, None).unwrap();
+
+            write_metadata_attributes(&context, "/dir", &small, None).unwrap();
+
+            let context = Arc::new(context);
+            let stop = Arc::new(AtomicBool::new(false));
+            let reads = Arc::new(AtomicUsize::new(0));
+
+            let writer = thread::spawn({
+                let (context, stop) = (Arc::clone(&context), Arc::clone(&stop));
+                let (small, large) = (small.clone(), large.clone());
+                move || {
+                    for iteration in 0..500 {
+                        let metadata = if iteration % 2 == 0 { &small } else { &large };
+                        write_metadata_attributes(&context, "/dir", metadata, None).unwrap();
+                    }
+                    stop.store(true, Ordering::Relaxed);
+                }
+            });
+
+            let reader = thread::spawn({
+                let (context, stop, reads) = (Arc::clone(&context), Arc::clone(&stop), Arc::clone(&reads));
+                let (small_id, large_id) = (small.id, large.id);
+                move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        assert!(has_metadata_attributes(&context, "/dir").unwrap(), "directory lost its metadata mid-write");
+
+                        let metadata = read_metadata_attributes(&context, "/dir").expect("read a partial attribute set");
+                        let whole = (metadata.id == small_id && metadata.members.len() == 1)
+                            || (metadata.id == large_id && metadata.members.len() == 6);
+                        assert!(whole, "read mixed two records: id {} with {} members", metadata.id, metadata.members.len());
+
+                        reads.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            });
+
+            writer.join().unwrap();
+            reader.join().unwrap();
+
+            assert!(reads.load(Ordering::Relaxed) > 0, "the reader never ran");
+        });
+    }
 
     #[test]
     fn resolve_member_addresses_skips_the_wildcard() {
@@ -650,7 +1049,7 @@ mod tests {
         use crate::client::init_local;
         use crate::context::create_client_context;
         use crate::crypto::create_secret_key;
-        use crate::identity::{write_identity, write_identity_key};
+        use crate::identity::{identity_cache_path, write_identity, write_identity_key};
         use crate::storage::create_dir_all;
 
         in_test_dir("ark_metadata_test", |temp_dir| {
@@ -661,7 +1060,7 @@ mod tests {
             let (group_identity, group_key) = create_identity(group_address, Some(vec![ctx.identity.address.clone()])).unwrap();
 
             create_dir_all(&ctx, "/.ark/identities").unwrap();
-            let cache_path = format!("/.ark/identities/{}.json", group_address.replace('/', "_"));
+            let cache_path = identity_cache_path(group_address);
             write_identity(&ctx, &cache_path, &group_identity).unwrap();
             write_identity_key(&ctx, "/team.key", &group_key.value).unwrap();
 
@@ -684,7 +1083,7 @@ mod tests {
         use crate::client::init_local;
         use crate::context::create_client_context;
         use crate::crypto::create_secret_key;
-        use crate::identity::write_identity;
+        use crate::identity::{identity_cache_path, write_identity};
         use crate::storage::create_dir_all;
 
         in_test_dir("ark_metadata_test", |temp_dir| {
@@ -695,7 +1094,7 @@ mod tests {
             let (group_identity, group_key) = create_identity(group_address, Some(vec![ctx.identity.address.clone()])).unwrap();
 
             create_dir_all(&ctx, "/.ark/identities").unwrap();
-            let cache_path = format!("/.ark/identities/{}.json", group_address.replace('/', "_"));
+            let cache_path = identity_cache_path(group_address);
             write_identity(&ctx, &cache_path, &group_identity).unwrap();
 
             // The group key file as mirrored without decrypting: its body is
@@ -813,8 +1212,7 @@ mod tests {
             let m = create_plain_test_metadata(&owner, &owner_key, b"x");
             let sync_modified = timestamp::parse("2026-01-01T00:00:00Z").unwrap();
             let local = LocalMetadata { encrypted: Some(true), sync_body_hash: Some(Hash { algorithm: DEFAULT_HASH_ALGORITHM.to_string(), value: vec![0xAB, 0xCD] }), sync_modified: Some(sync_modified) };
-            write_atomic_with_metadata(&ctx, "/file", Body::Bytes(b"x"), &m, None).unwrap();
-            write_local_metadata_attributes(&ctx, "/file", &local).unwrap();
+            write_atomic_with_metadata(&ctx, "/file", Body::Bytes(b"x"), &m, Some(&local)).unwrap();
 
             let back = read_local_metadata_attributes(&ctx, "/file").unwrap();
             assert_eq!(back.encrypted, Some(true));
@@ -826,17 +1224,16 @@ mod tests {
     }
 
     #[test]
-    fn write_local_metadata_attributes_clears_stale_fields() {
+    fn writing_local_metadata_clears_stale_fields() {
         in_test_dir("ark_metadata_test", |temp_dir| {
             let (owner, owner_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
             let (ctx, _) = account_context(&account_dir);
             let p = account_dir.join("file");
             let m = create_plain_test_metadata(&owner, &owner_key, b"x");
             let full = LocalMetadata { encrypted: Some(true), sync_body_hash: Some(Hash { algorithm: DEFAULT_HASH_ALGORITHM.to_string(), value: vec![1, 2, 3] }), sync_modified: Some(timestamp::parse("2026-01-01T00:00:00Z").unwrap()) };
-            write_atomic_with_metadata(&ctx, "/file", Body::Bytes(b"x"), &m, None).unwrap();
-            write_local_metadata_attributes(&ctx, "/file", &full).unwrap();
+            write_atomic_with_metadata(&ctx, "/file", Body::Bytes(b"x"), &m, Some(&full)).unwrap();
 
-            write_local_metadata_attributes(&ctx, "/file", &LocalMetadata::default()).unwrap();
+            write_metadata_attributes(&ctx, "/file", &m, Some(&LocalMetadata::default())).unwrap();
 
             assert_eq!(read_metadata_attributes(&ctx, "/file").unwrap().id, m.id, "the metadata is left alone");
             assert_eq!(xattr::get(&p, "user.ark_local.encrypted").unwrap(), None);
@@ -960,7 +1357,7 @@ mod tests {
             assert!(xattr::get(&p, "user.ark.member_1_address").unwrap().is_some());
 
             let one = create_plain_test_metadata(&owner, &owner_key, b"x");
-            write_metadata_attributes(&ctx, "/file", &one).unwrap();
+            write_metadata_attributes(&ctx, "/file", &one, None).unwrap();
             assert_eq!(xattr::get(&p, "user.ark.member_1_address").unwrap(), None);
 
             let loaded = read_metadata_attributes(&ctx, "/file").unwrap();

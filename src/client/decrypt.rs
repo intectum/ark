@@ -76,7 +76,7 @@ mod tests {
 
     use crate::context::create_client_context;
     use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, encrypt_bytes};
-    use crate::metadata::{create_metadata, sign_metadata, write_local_metadata_attributes, write_metadata_attributes};
+    use crate::metadata::{create_metadata, sign_metadata, write_metadata_attributes};
     use crate::testing::fs::{TEST_ADDRESS, account_context, create_test_account, in_test_dir, write_encrypted_test_file};
 
     #[test]
@@ -176,8 +176,7 @@ mod tests {
             sign_metadata(&secret_key, &mut m, Some(&body)).unwrap();
             let local = LocalMetadata { encrypted: Some(true), sync_body_hash: None, sync_modified: None };
             let (account_ctx, account_path) = account_context(&p);
-            write_metadata_attributes(&account_ctx, &account_path, &m).unwrap();
-            write_local_metadata_attributes(&account_ctx, &account_path, &local).unwrap();
+            write_metadata_attributes(&account_ctx, &account_path, &m, Some(&local)).unwrap();
             set_current_dir(&acc).unwrap();
             let ctx = create_client_context().unwrap();
 

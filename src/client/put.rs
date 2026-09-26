@@ -6,8 +6,8 @@ use super::encrypt_stream;
 use crate::client::request;
 use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, DEFAULT_HASH_ALGORITHM, create_secret_key};
 use crate::http::check_response_code;
-use crate::metadata::{apply_key_to_metadata, apply_permissions, create_metadata, has_metadata_attributes, read_local_metadata_attributes, read_metadata_attributes, resolve_key_from_members, sign_metadata, write_local_metadata_attributes, write_metadata_attributes, write_metadata_headers};
-use crate::storage::{is_dir, read};
+use crate::metadata::{apply_key_to_metadata, apply_permissions, create_metadata, has_metadata_attributes, read_local_metadata_attributes, read_metadata_attributes, resolve_key_from_members, sign_metadata, write_metadata_attributes, write_metadata_headers};
+use crate::storage::{Body, is_dir, read, write_atomic_with_metadata};
 use crate::timestamp;
 use crate::types::{Context, Hash, LocalMetadata, Metadata, Permissions};
 use crate::util::{resolve_client_url, sha256};
@@ -75,9 +75,11 @@ pub fn put(ctx: &Context, path: &str, permissions: &Permissions, encryption_algo
     };
     let existing_local_metadata = read_local_metadata_attributes(ctx, path)?;
 
+    let is_dir = is_dir(ctx, path);
+
     let file_body;
     let mut body_reader;
-    let body: Option<&mut dyn Read> = if is_dir(ctx, path) || metadata_only {
+    let body: Option<&mut dyn Read> = if is_dir || metadata_only {
         None
     } else {
         file_body = read(ctx, path)?;
@@ -87,8 +89,11 @@ pub fn put(ctx: &Context, path: &str, permissions: &Permissions, encryption_algo
 
     let (metadata, local_metadata) = put_stream(ctx, path, body, permissions, encryption_algorithm, existing_metadata, Some(existing_local_metadata), metadata_only)?;
 
-    write_metadata_attributes(ctx, path, &metadata)?;
-    write_local_metadata_attributes(ctx, path, &local_metadata)?;
+    if is_dir {
+        write_metadata_attributes(ctx, path, &metadata, Some(&local_metadata))?;
+    } else {
+        write_atomic_with_metadata(ctx, path, Body::CopyOf(path), &metadata, Some(&local_metadata))?;
+    }
 
     Ok(())
 }
@@ -242,7 +247,7 @@ mod tests {
     use crate::metadata::read_metadata_attributes;
     use crate::storage::{create_dir_all, to_fs_path, write};
     use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, decrypt_bytes, encrypt_bytes};
-    use crate::identity::{create_identity, write_identity};
+    use crate::identity::{create_identity, identity_cache_path, write_identity};
     use crate::metadata::verify_metadata;
     use crate::permissions::{drop, reader, writer};
     use crate::testing::fs::{account_context, in_test_dir, init_with_server, write_plain_test_file};
@@ -251,7 +256,7 @@ mod tests {
 
     fn cache_identity(ctx: &Context, identity: &Identity) {
         create_dir_all(ctx, "/.ark/identities").unwrap();
-        write_identity(ctx, &format!("/.ark/identities/{}.json", identity.address), identity).unwrap();
+        write_identity(ctx, &identity_cache_path(&identity.address), identity).unwrap();
     }
 
     fn put_plain(ctx: &Context, dir: &Path, name: &str, body: &[u8]) -> PathBuf {
@@ -345,7 +350,7 @@ mod tests {
             let preset_file_key = create_secret_key(DEFAULT_ENCRYPTION_ALGORITHM).unwrap();
             apply_key_to_metadata(&ctx, &mut preset_meta, &preset_file_key).unwrap();
             sign_metadata(ctx.identity_key.as_ref().unwrap(), &mut preset_meta, Some(b"hello")).unwrap();
-            write_metadata_attributes(&ctx, "/notes.txt", &preset_meta).unwrap();
+            write_metadata_attributes(&ctx, "/notes.txt", &preset_meta, None).unwrap();
 
             put(&ctx, "notes.txt", &Permissions::default(), None, false).unwrap();
 
@@ -474,8 +479,7 @@ mod tests {
             apply_key_to_metadata(&ctx, &mut m, &file_key).unwrap();
             sign_metadata(ctx.identity_key.as_ref().unwrap(), &mut m, Some(&ciphertext)).unwrap();
             let local = LocalMetadata { encrypted: Some(true), sync_body_hash: None, sync_modified: None };
-            write_metadata_attributes(&ctx, "/file.bin", &m).unwrap();
-            write_local_metadata_attributes(&ctx, "/file.bin", &local).unwrap();
+            write_metadata_attributes(&ctx, "/file.bin", &m, Some(&local)).unwrap();
 
             put(&ctx, "file.bin", &Permissions::default(), None, false).unwrap();
 
@@ -517,7 +521,7 @@ mod tests {
             fs::write(&input, b"plain bytes").unwrap();
             let mut m = create_metadata(&ctx.identity.address, None);
             sign_metadata(ctx.identity_key.as_ref().unwrap(), &mut m, Some(b"plain bytes")).unwrap();
-            write_metadata_attributes(&ctx, "/raw.bin", &m).unwrap();
+            write_metadata_attributes(&ctx, "/raw.bin", &m, None).unwrap();
 
             put(&ctx, "raw.bin", &Permissions::default(), None, false).unwrap();
 

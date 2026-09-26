@@ -16,14 +16,21 @@ use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use uuid::Uuid;
 
 use crate::identity::parse_address;
-use crate::metadata::{read_local_metadata_attributes, read_metadata_attributes, write_local_metadata_attributes, write_metadata_attributes};
+use crate::metadata::{read_local_metadata_attributes, read_metadata_attributes, write_metadata_attributes};
 use crate::types::{Context, LocalMetadata, Metadata};
 use crate::util::parse_uuid;
 
 const TEMP_INFIX: &str = ".tmp-";
+
+// The separator must not survive into a name that stands as one entry, and the
+// escape character has to be escaped alongside it — otherwise two names that
+// differ could meet in the same entry, and one would be read under the other's
+// key. Everything else is left readable.
+const SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS.add(b'%').add(b'/');
 
 /// The body of `path`, as [`std::fs::read`] gives it.
 pub fn read(ctx: &Context, path: &str) -> io::Result<Vec<u8>> {
@@ -88,7 +95,8 @@ pub fn read_attribute(ctx: &Context, path: &str, name: &str) -> io::Result<Optio
 ///
 /// Written where the entry stands rather than as a single visible change, so
 /// a reader can see it land on its own. Where that matters, and for a body
-/// and the attributes that belong with it, use [`write_atomic_with_metadata`].
+/// and the attributes that belong with it, use [`write_atomic_with_metadata`]
+/// — or, for a directory, [`crate::metadata::write_metadata_attributes`].
 pub fn write_attribute(ctx: &Context, path: &str, name: &str, value: &[u8]) -> io::Result<()> {
     xattr::set(to_fs_path(ctx, path)?, name, value)
 }
@@ -97,7 +105,8 @@ pub fn write_attribute(ctx: &Context, path: &str, name: &str, value: &[u8]) -> i
 ///
 /// Removed where the entry stands rather than as a single visible change, so
 /// a reader can see it go on its own. Where that matters, and for a body and
-/// the attributes that belong with it, use [`write_atomic_with_metadata`].
+/// the attributes that belong with it, use [`write_atomic_with_metadata`]
+/// — or, for a directory, [`crate::metadata::write_metadata_attributes`].
 pub fn remove_attribute(ctx: &Context, path: &str, name: &str) -> io::Result<()> {
     xattr::remove(to_fs_path(ctx, path)?, name)
 }
@@ -310,6 +319,15 @@ pub fn file_name(path: &str) -> &str {
     }
 }
 
+/// `name` as a single entry name, for a flat directory keyed by something that
+/// is itself a path or an address.
+///
+/// Distinct names always give distinct entries, so nothing keyed this way can
+/// be reached under another key's name.
+pub fn to_path_segment(name: &str) -> String {
+    utf8_percent_encode(name, SEGMENT_ENCODE_SET).to_string()
+}
+
 /// The body a [`write_atomic`] lands with.
 pub enum Body<'a> {
     Bytes(&'a [u8]),
@@ -372,11 +390,7 @@ fn write_atomic_inner(ctx: &Context, path: &str, body: Body, metadata: Option<&M
         }
 
         if let Some(metadata) = metadata {
-            write_metadata_attributes(ctx, &temp_path, metadata)?;
-        }
-
-        if let Some(local_metadata) = local_metadata {
-            write_local_metadata_attributes(ctx, &temp_path, local_metadata)?;
+            write_metadata_attributes(ctx, &temp_path, metadata, local_metadata)?;
         }
 
         fs::rename(&temp, &target)
@@ -419,7 +433,6 @@ mod tests {
     use std::env::set_current_dir;
     use std::io::ErrorKind;
     use std::path::Path;
-
     use super::*;
 
     use crate::testing::fs::{TEST_ADDRESS, create_plain_test_metadata, create_test_account, in_test_dir, write_plain_test_file};

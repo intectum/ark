@@ -185,7 +185,7 @@ mod tests {
         sign_metadata(account_key, &mut metadata, None).unwrap();
 
         let (account_ctx, account_path) = account_context(&requests_dir);
-        write_metadata_attributes(&account_ctx, &account_path, &metadata).unwrap();
+        write_metadata_attributes(&account_ctx, &account_path, &metadata, None).unwrap();
     }
 
     fn list_log_entries(temp_dir: &Path, account_name: &str) -> Vec<PathBuf> {
@@ -252,7 +252,7 @@ mod tests {
             let mut metadata = create_metadata(&identity.address, None);
             sign_metadata(&secret_key, &mut metadata, None).unwrap();
             let (alice_ctx, requests_path) = account_context(&requests_dir);
-            write_metadata_attributes(&alice_ctx, &requests_path, &metadata).unwrap();
+            write_metadata_attributes(&alice_ctx, &requests_path, &metadata, None).unwrap();
 
             let (_, _, _) = signed_request(port, &identity, &secret_key, "GET", "/ark/alice/missing.txt", &[]);
 

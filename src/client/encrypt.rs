@@ -93,7 +93,7 @@ mod tests {
     use crate::client::decrypt;
     use crate::context::create_client_context;
     use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, decrypt_bytes};
-    use crate::metadata::{read_local_metadata_attributes, read_metadata_attributes, write_local_metadata_attributes};
+    use crate::metadata::{read_local_metadata_attributes, read_metadata_attributes, write_metadata_attributes};
     use crate::testing::fs::{TEST_ADDRESS, account_context, create_test_account, in_test_dir, write_encrypted_test_file, write_plain_test_file};
 
     fn aes_decrypt(key: &[u8], ciphertext: &[u8]) -> Vec<u8> {
@@ -209,7 +209,8 @@ mod tests {
             write_plain_test_file(&p, &identity, &secret_key, b"x");
             let (account_ctx, account_path) = account_context(&p);
             let local = LocalMetadata { encrypted: Some(true), sync_body_hash: None, sync_modified: None };
-            write_local_metadata_attributes(&account_ctx, &account_path, &local).unwrap();
+            let metadata = read_metadata_attributes(&account_ctx, &account_path).unwrap();
+            write_metadata_attributes(&account_ctx, &account_path, &metadata, Some(&local)).unwrap();
             set_current_dir(&acc).unwrap();
             let ctx = create_client_context().unwrap();
 

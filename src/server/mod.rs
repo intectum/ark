@@ -18,7 +18,7 @@ use std::str::from_utf8;
 use std::sync::Arc;
 use std::thread;
 
-use self::auth::{authenticate, authorize};
+use self::auth::{authenticate, authorize, inherited_members};
 use self::delete::serve_delete;
 use self::get::serve_get;
 use self::log::{LoggingStream, try_log_request};
@@ -30,7 +30,7 @@ use crate::context::{create_server_context, create_target_context};
 use crate::http::{read_request, write_text};
 use crate::identity::resolve_identity;
 use crate::metadata::{read_metadata_attributes, read_metadata_headers};
-use crate::storage::{is_file, is_symlink, parent_path};
+use crate::storage::{is_file, is_symlink};
 use crate::types::{Context, Permission, RelayMode};
 use crate::util::resolve_server_url;
 
@@ -168,26 +168,28 @@ fn handle_parsed_inner(
         return write_text(stream, 403, b"symlinks not allowed");
     }
 
-    let existing_metadata = read_metadata_attributes(&target_ctx, &target_path).ok();
+    // Metadata that is there but cannot be read is not the same as none at
+    // all: falling through to the members of an ancestor would hand out the
+    // access the unreadable record was there to withhold.
+    let existing_metadata = match read_metadata_attributes(&target_ctx, &target_path) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return write_text(stream, 500, error.to_string().as_bytes()),
+    };
+
     if is_file(&target_ctx, &target_path) && existing_metadata.is_none() {
         return write_text(stream, 500, b"file missing metadata");
     }
 
     // A path with no metadata of its own — a new file, or a directory created
-    // as a side effect of a nested put — inherits the members of the nearest
-    // metadata-bearing directory above it. `target_path` is account-absolute,
-    // so the walk ends at the account root.
-    let mut effective_members = existing_metadata.as_ref().map(|m| m.members.clone());
-    if effective_members.is_none() {
-        let mut current = parent_path(&target_path);
-        while let Some(dir) = current {
-            if let Ok(metadata) = read_metadata_attributes(&target_ctx, dir) {
-                effective_members = Some(metadata.members);
-                break;
-            }
-            current = parent_path(dir);
-        }
-    }
+    // as a side effect of a nested put — inherits from above.
+    let effective_members = match existing_metadata.as_ref() {
+        Some(metadata) => Some(metadata.members.clone()),
+        None => match inherited_members(&target_ctx, &target_path) {
+            Ok(members) => members,
+            Err(error) => return write_text(stream, 500, error.to_string().as_bytes()),
+        },
+    };
 
     let public_member = effective_members
         .as_deref()
@@ -294,6 +296,64 @@ mod tests {
     use crate::testing::fs::{TEST_ADDRESS, create_test_account, in_test_dir, write_plain_test_file};
     use crate::testing::http::*;
     use crate::timestamp::now_ms;
+
+    #[test]
+    fn a_directory_whose_metadata_cannot_be_read_does_not_inherit_from_above() {
+        in_test_dir("ark_server_test", |temp_dir| {
+            use crate::metadata::{create_metadata, remove_metadata_attributes, write_metadata_attributes};
+            use crate::storage::{create_dir_all, write_attribute};
+            use crate::testing::fs::account_context;
+            use crate::types::Member;
+
+            let (owner_identity, owner_key, account_dir) = create_test_account(temp_dir, "owner@example.com");
+            let (context, _) = account_context(&account_dir);
+
+            // Everything under the account root is public to read.
+            let mut public = create_metadata(&owner_identity.address, None);
+            public.members.push(Member { address: "*".to_string(), permission: Permission::Reader, key: None });
+            crate::metadata::sign_metadata(&owner_key, &mut public, None).unwrap();
+            write_metadata_attributes(&context, "/", &public, None).unwrap();
+
+            // This one is not — it names only its owner.
+            create_dir_all(&context, "/private").unwrap();
+            let mut private = create_metadata(&owner_identity.address, None);
+            crate::metadata::sign_metadata(&owner_key, &mut private, None).unwrap();
+            write_metadata_attributes(&context, "/private", &private, None).unwrap();
+
+            // Leave it carrying part of a record and nothing set aside to put back,
+            // as a write interrupted before this change would have.
+            remove_metadata_attributes(&context, "/private").unwrap();
+            write_attribute(&context, "/private", "user.ark.member_0_address", owner_identity.address.as_bytes()).unwrap();
+
+            let port = start_test_server(temp_dir.to_path_buf());
+            let (code, _, _) = request(port, "GET", "/ark/owner/private/", &[], &[]);
+            assert_eq!(code, 500, "an unreadable directory fell through to the public members above it");
+        });
+    }
+
+    #[test]
+    fn a_directory_carrying_no_metadata_still_inherits_from_above() {
+        in_test_dir("ark_server_test", |temp_dir| {
+            use crate::metadata::{create_metadata, write_metadata_attributes};
+            use crate::storage::create_dir_all;
+            use crate::testing::fs::account_context;
+            use crate::types::Member;
+
+            let (owner_identity, owner_key, account_dir) = create_test_account(temp_dir, "owner@example.com");
+            let (context, _) = account_context(&account_dir);
+
+            let mut public = create_metadata(&owner_identity.address, None);
+            public.members.push(Member { address: "*".to_string(), permission: Permission::Reader, key: None });
+            crate::metadata::sign_metadata(&owner_key, &mut public, None).unwrap();
+            write_metadata_attributes(&context, "/", &public, None).unwrap();
+
+            create_dir_all(&context, "/nested").unwrap();
+
+            let port = start_test_server(temp_dir.to_path_buf());
+            let (code, _, _) = request(port, "GET", "/ark/owner/nested/", &[], &[]);
+            assert_eq!(code, 200);
+        });
+    }
 
     #[test]
     fn unsupported_method_returns_405() {

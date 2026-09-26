@@ -6,9 +6,11 @@ use url::Url;
 use crate::client::request;
 use crate::crypto::{DEFAULT_SIGNING_ALGORITHM, create_secret_key, sign_json, to_public_key, verify_json};
 use crate::http::check_response_code;
-use crate::storage::{Body, create_dir_all, exists, exists_raw, read_to_string, read_to_string_raw, to_fs_path_raw, write_atomic_without_metadata, write_raw};
+use crate::storage::{Body, create_dir_all, exists, exists_raw, join_path, read_to_string, read_to_string_raw, to_fs_path_raw, to_path_segment, write_atomic_without_metadata, write_raw};
 use crate::types::{Context, Identity, Key, Signature};
 use crate::util::{decode_base64url, encode_base64url, resolve_client_url};
+
+pub const IDENTITY_CACHE_DIR: &str = "/.ark/identities";
 
 /// Create a fresh identity keypair for `address`.
 ///
@@ -49,6 +51,10 @@ pub fn read_identity_raw(root: &Path, path: &str) -> io::Result<Identity> {
     Ok(identity)
 }
 
+pub fn identity_cache_path(address: &str) -> String {
+    format!("{}.json", join_path(IDENTITY_CACHE_DIR, &to_path_segment(address)))
+}
+
 pub fn resolve_identity(ctx: &Context, address: &str) -> io::Result<Identity> {
     if address == ctx.identity.address {
         return Ok(ctx.identity.clone());
@@ -72,10 +78,13 @@ pub fn resolve_identity(ctx: &Context, address: &str) -> io::Result<Identity> {
         }
     }
 
-    let cache_path = format!("/.ark/identities/{}.json", address.replace('/', "_"));
+    let cache_path = identity_cache_path(address);
 
     if exists(ctx, &cache_path) {
-        return read_identity(ctx, &cache_path);
+        let cached_identity = read_identity(ctx, &cache_path)?;
+        if cached_identity.address == address {
+            return Ok(cached_identity);
+        }
     }
 
     let url = resolve_client_url(ctx, &format!("{}@{}{}", name, host, path))?;
@@ -86,7 +95,7 @@ pub fn resolve_identity(ctx: &Context, address: &str) -> io::Result<Identity> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("identity.json parse: {}", e)))?;
     validate_identity(&identity)?;
 
-    create_dir_all(ctx, "/.ark/identities")?;
+    create_dir_all(ctx, IDENTITY_CACHE_DIR)?;
     write_atomic_without_metadata(ctx, &cache_path, Body::Bytes(&body))?;
 
     Ok(identity)
@@ -373,6 +382,39 @@ mod tests {
     }
 
     #[test]
+    fn identity_cache_path_separates_addresses_that_differ_only_in_a_separator() {
+        // A sub-identity address carries a path. Folding its separators into
+        // an ordinary character would let two of them share a cache entry,
+        // and one would be answered with the other's public key.
+        let slashed = identity_cache_path("alice@example.com/x/y");
+        let underscored = identity_cache_path("alice@example.com/x_y");
+
+        assert_ne!(slashed, underscored);
+        assert_eq!(crate::storage::parent_path(&slashed), Some(IDENTITY_CACHE_DIR), "the address escaped its own entry: {}", slashed);
+    }
+
+    #[test]
+    fn resolve_identity_ignores_a_cache_entry_for_another_address() {
+        in_test_dir("ark_identity_test", |temp_dir| {
+            init_local(temp_dir, "alice@example.com").unwrap();
+            let ctx = create_client_context().unwrap();
+
+            create_dir_all(&ctx, IDENTITY_CACHE_DIR).unwrap();
+
+            // Whatever put it there, an entry answering for the wrong address
+            // must not be handed back — its key is not the one asked for.
+            let (other_identity, _) = create_identity("carol@example.com", None).unwrap();
+            write_identity(&ctx, &identity_cache_path("bob@example.com"), &other_identity).unwrap();
+
+            // Nothing to fall through to, so this fails rather than returning
+            // carol's identity for bob.
+            if let Ok(identity) = resolve_identity(&ctx, "bob@example.com") {
+                panic!("served {} for bob@example.com", identity.address);
+            }
+        });
+    }
+
+    #[test]
     fn resolve_identity_returns_cached_when_present() {
         in_test_dir("ark_identity_test", |temp_dir| {
             init_local(temp_dir, "alice@example.com").unwrap();
@@ -380,7 +422,7 @@ mod tests {
 
             create_dir_all(&ctx, "/.ark/identities").unwrap();
             let (identity, _) = create_identity("bob@example.com", None).unwrap();
-            write_identity(&ctx, "/.ark/identities/bob@example.com.json", &identity).unwrap();
+            write_identity(&ctx, &identity_cache_path("bob@example.com"), &identity).unwrap();
 
             let loaded = resolve_identity(&ctx, "bob@example.com").unwrap();
             assert_eq!(loaded.address, identity.address);
@@ -465,7 +507,7 @@ mod tests {
             meta.members.push(Member { address: "*".to_string(), permission: Permission::Reader, key: None });
             sign_metadata(&bob_key, &mut meta, Some(&body)).unwrap();
             let (bob_ctx, bob_account_path) = account_context(&bob_identity_path);
-            write_metadata_attributes(&bob_ctx, &bob_account_path, &meta).unwrap();
+            write_metadata_attributes(&bob_ctx, &bob_account_path, &meta, None).unwrap();
             let expected = read_identity(&bob_ctx, &bob_account_path).unwrap();
 
             set_current_dir(&alice_dir).unwrap();
@@ -476,7 +518,7 @@ mod tests {
             assert_eq!(fetched.public_key.value, expected.public_key.value);
             assert_eq!(fetched.signature.value, expected.signature.value);
 
-            let cache_path = format!("/.ark/identities/{}.json", bob_address);
+            let cache_path = identity_cache_path(&bob_address);
             assert!(exists(&ctx, &cache_path), "cache file not written: {}", cache_path);
             let cached = read_identity(&ctx, &cache_path).unwrap();
             assert_eq!(cached.public_key.value, expected.public_key.value);

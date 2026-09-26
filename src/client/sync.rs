@@ -6,7 +6,7 @@ use std::thread;
 use super::{get, get_stream, head, list, put_content, watch_local, watch_remote};
 
 use crate::identity::parse_address;
-use crate::metadata::{has_metadata_attributes, read_local_metadata_attributes, read_metadata_attributes, read_metadata_headers, write_local_metadata_attributes, write_metadata_attributes};
+use crate::metadata::{has_metadata_attributes, read_local_metadata_attributes, read_metadata_attributes, read_metadata_headers, write_metadata_attributes};
 use crate::storage::{Body, create_dir_all, exists, file_name, is_dir, is_file, is_symlink, join_path, parent_path, read, read_dir, read_to_string, remove_file, to_account_path, to_fs_path, write_atomic_with_metadata, write_atomic_without_metadata};
 use crate::timestamp;
 use crate::types::{Context, DirEntryKind, EntryAction, EntryEvent, Metadata};
@@ -350,17 +350,23 @@ where
             Err(e) => return Err(e),
         };
 
-        if metadata.body_hash.is_none() {
+        let is_dir = metadata.body_hash.is_none();
+        if is_dir {
             create_dir_all(ctx, &target)?;
         }
         if !exists(ctx, &target) {
             return Err(io::Error::new(io::ErrorKind::NotFound, format!("local path missing: {}", target)));
         }
-        write_metadata_attributes(ctx, &target, &metadata)?;
 
-        let mut local = read_local_metadata_attributes(ctx, &target).unwrap_or_default();
-        local.sync_modified = Some(metadata.modified);
-        write_local_metadata_attributes(ctx, &target, &local)?;
+        let mut local_metadata = read_local_metadata_attributes(ctx, &target).unwrap_or_default();
+        local_metadata.sync_modified = Some(metadata.modified);
+
+        if is_dir {
+            write_metadata_attributes(ctx, &target, &metadata, Some(&local_metadata))?;
+        } else {
+            write_atomic_with_metadata(ctx, &target, Body::CopyOf(&target), &metadata, Some(&local_metadata))?;
+        }
+
         return Ok(emit(EntryAction::Metadata, false));
     }
 

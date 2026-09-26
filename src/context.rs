@@ -3,8 +3,8 @@ use std::io;
 use std::path::Path;
 
 use crate::identity::{create_identity, read_identity_key, read_identity_raw, write_identity, write_identity_key};
-use crate::metadata::{create_metadata, sign_metadata, write_metadata_attributes};
-use crate::storage::{create_dir_all, exists_raw, read};
+use crate::metadata::{create_metadata, sign_metadata};
+use crate::storage::{Body, create_dir_all, exists_raw, read, write_atomic_with_metadata};
 use crate::types::{Context, Key, Member, Permission};
 
 /// Load the [`Context`] for the ark account containing the current
@@ -49,7 +49,7 @@ pub fn create_server_context(server_root: &Path, host: &str) -> io::Result<Conte
         });
         sign_metadata(&secret_key, &mut metadata, Some(&body))?;
 
-        write_metadata_attributes(&ctx, "/.ark/identity.json", &metadata)?;
+        write_atomic_with_metadata(&ctx, "/.ark/identity.json", Body::Bytes(&body), &metadata, None)?;
 
         return Ok(ctx);
     }

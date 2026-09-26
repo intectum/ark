@@ -88,7 +88,7 @@ fn publish_identity(account_dir: &Path, identity: &Identity, secret_key: &Key) {
     sign_metadata(secret_key, &mut metadata, Some(&body)).unwrap();
 
     let (context, account_path) = account_context(&path);
-    write_metadata_attributes(&context, &account_path, &metadata).unwrap();
+    write_metadata_attributes(&context, &account_path, &metadata, None).unwrap();
 }
 
 pub fn create_plain_test_metadata(owner: &Identity, owner_key: &Key, body: &[u8]) -> Metadata {

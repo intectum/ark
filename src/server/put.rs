@@ -58,12 +58,9 @@ pub fn serve_put(ctx: &Context, path: &str, stream: &mut dyn Write, body: &[u8],
 
     let status_code = if exists(ctx, path) { 204 } else { 201 };
 
-    // A directory takes its metadata where it stands. It cannot be replaced by
-    // a rename, which only succeeds onto an empty directory, and its children
-    // have to survive the put.
     if is_dir {
         create_dir_all(ctx, path)?;
-        write_metadata_attributes(ctx, path, metadata)?;
+        write_metadata_attributes(ctx, path, metadata, None)?;
     } else if metadata_only {
         write_atomic_with_metadata(ctx, path, Body::CopyOf(path), metadata, None)?;
     } else {

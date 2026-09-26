@@ -6,7 +6,7 @@ use super::{decrypt_stream, request};
 use crate::crypto::DEFAULT_HASH_ALGORITHM;
 use crate::http::check_response_code;
 use crate::identity::resolve_identity;
-use crate::metadata::{has_metadata_headers, read_metadata_attributes, read_metadata_headers, write_local_metadata_attributes, write_metadata_attributes};
+use crate::metadata::{has_metadata_headers, read_metadata_attributes, read_metadata_headers, write_metadata_attributes};
 use crate::storage::{Body, create_dir_all, parent_path, write_atomic_with_metadata};
 use crate::types::{Context, Hash, LocalMetadata, Metadata};
 use crate::util::{resolve_client_url, sha256, validate_update};
@@ -47,8 +47,7 @@ pub fn get(ctx: &Context, path: &str, decrypt: bool) -> io::Result<()> {
 
     if metadata.body_hash.is_none() {
         create_dir_all(ctx, path)?;
-        write_metadata_attributes(ctx, path, &metadata)?;
-        write_local_metadata_attributes(ctx, path, &local_metadata)?;
+        write_metadata_attributes(ctx, path, &metadata, Some(&local_metadata))?;
     } else {
         if let Some(parent) = parent_path(path) {
             create_dir_all(ctx, parent)?;
@@ -138,7 +137,7 @@ mod tests {
     use crate::client::put;
     use crate::context::create_client_context;
     use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, create_secret_key, encrypt_bytes};
-    use crate::identity::{create_identity, write_identity};
+    use crate::identity::{create_identity, identity_cache_path, write_identity};
     use crate::metadata::{create_metadata, read_local_metadata_attributes, read_metadata_attributes, sign_metadata, write_metadata_attributes};
     use crate::testing::fs::{account_context, in_test_dir, init_with_server, write_encrypted_test_file, write_plain_test_file};
     use crate::testing::http::start_test_server;
@@ -171,7 +170,7 @@ mod tests {
             m.members[0].key = None;
             sign_metadata(ctx.identity_key.as_ref().unwrap(), &mut m, None).unwrap();
             let (server_ctx, server_account_dir) = account_context(&server_dir);
-            write_metadata_attributes(&server_ctx, &server_account_dir, &m).unwrap();
+            write_metadata_attributes(&server_ctx, &server_account_dir, &m, None).unwrap();
 
             let mut buf = Vec::new();
             let (metadata, _) = get_stream(&ctx, "shared", &mut buf, false, None).unwrap();
@@ -193,7 +192,7 @@ mod tests {
             m.members[0].key = None;
             sign_metadata(ctx.identity_key.as_ref().unwrap(), &mut m, None).unwrap();
             let (server_ctx, server_account_dir) = account_context(&server_dir);
-            write_metadata_attributes(&server_ctx, &server_account_dir, &m).unwrap();
+            write_metadata_attributes(&server_ctx, &server_account_dir, &m, None).unwrap();
 
             get(&ctx, "shared", false).unwrap();
 
@@ -318,7 +317,7 @@ mod tests {
             write_encrypted_test_file(&temp_dir.join("ark/gyan/secret"), &other_identity, &other_key, b"raw");
 
             create_dir_all(&ctx, "/.ark/identities").unwrap();
-            write_identity(&ctx, "/.ark/identities/other@example.com.json", &other_identity).unwrap();
+            write_identity(&ctx, &identity_cache_path("other@example.com"), &other_identity).unwrap();
 
             let err = get(&ctx, "secret", true).unwrap_err();
             assert!(err.to_string().contains("no member entry"), "msg was {}", err);

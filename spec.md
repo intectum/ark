@@ -178,7 +178,8 @@ Everything under `/.ark/` is protocol-defined. Applications must not write arbit
 |---|---|---|
 | `identity.json` | `Identity` (A.1) | Public. Self-signed. PUT unauthenticated only when creating the account. |
 | `identity.key` | Encrypted account private key, as a normal Ark file | Owner + recovery members with `reader`. Body is the base64url identity seed, encrypted under a per-file key like any other file (§8). |
-| `identities/<address>.json` | Cached peer `Identity` | **Client-local.** Not required or served by the server; documented so implementations agree on where clients keep their TOFU cache. |
+| `identities/<address>.json` | Cached peer `Identity` | **Client-local.** Not required or served by the server; documented so implementations agree on where clients keep their TOFU cache. `<address>` is percent-encoded per the rule below. A reader MUST check that the entry it finds answers for the address asked for, and ignore it otherwise. |
+| `previous_metadata/<path>` | The metadata a directory carried before a rewrite | **Server-local.** Empty file carrying the previous record in its own attributes, set aside so an interrupted rewrite can be put back. See §7.2. `<path>` is percent-encoded per the rule below. |
 | `passwords/<name>.json` | `Identity` with `algorithm: argon2id-ed25519` | Publicly readable. GET/HEAD unauthenticated. See §11. |
 | `passkeys/<name>.json` | `Identity` with `algorithm: webauthn-prf-ed25519` | Publicly readable. **Status: not yet implemented.** |
 | `groups/<name>.json` | `Identity` with a `members` field | Publicly readable. Path is convention; any identity with `members` is a group (§2). |
@@ -189,6 +190,13 @@ Everything under `/.ark/` is protocol-defined. Applications must not write arbit
 | `blocked/<address>.json` | Per-sender blocklist entry | **Status: not yet implemented.** |
 
 Requests to `/ark/<account>/.ark/requests/` and its entries are **not** themselves logged.
+
+**Where an implementation's own files go.** Beyond the account's content, an implementation writes files of its own. Two placements, and which one applies is not a free choice:
+
+- **Beside the entry**, as a sibling. For a file that has to land by a rename, since a rename across filesystems fails and only a sibling is guaranteed to share one — a temporary copy on the way to replacing an entry (§7.2), named so it is skipped by directory listings. And for a file the user is meant to find next to what it refers to, such as a conflict copy from a sync.
+- **Under `/.ark/<kind>/`**, flat, for everything else — including state about a single path that outlives the operation that wrote it, such as the metadata a rewrite sets aside. A directory of its own can be swept in one pass, and a path with no parent inside the account (the account root) still has somewhere to live.
+
+An entry in a flat directory keyed by something that is itself a path or an address percent-encodes `/` and `%` in that key, leaving the rest readable. Both characters must be encoded: without `%`, two distinct keys could encode to one name, and the entry for one would be served under the other. Folding separators into an ordinary character (`/` to `_`, say) is not sufficient for the same reason.
 
 ---
 
@@ -302,15 +310,30 @@ Members must be contiguous from index 0. Sparse indexes are rejected `400`.
 
 Each field is stored as its own extended attribute on the body file, under the `user.ark.` namespace. Names use snake_case: `user.ark.id`, `user.ark.modified_by`, `user.ark.member_0_address`, `user.ark.signature_value`, etc. Binary values are base64url. Ark requires a filesystem with xattr support (ext4, xfs, btrfs, apfs).
 
-Updates should be atomic: write body + xattrs to a temp file in the same directory, then rename over the target. A metadata-only update (§4.5) must do the same — the fields are separate attributes and cannot be replaced as a set where they sit — so it copies the body rather than editing in place.
+Updates should be atomic: write body + xattrs to a temp file, then rename over the target. A metadata-only update (§4.5) must do the same — the fields are separate attributes and cannot be replaced as a set where they sit — so it copies the body rather than editing in place. This is what keeps a body and its `body_hash` in step: a reader sees both of the old or both of the new, never one of each.
 
-Directory metadata (§7.3) is the exception. A rename only succeeds onto an empty directory, and a directory being updated holds the entries beneath it, so its attributes are replaced where they stand. An update interrupted part-way can leave a directory without usable metadata, which reverts it to inheriting from its nearest metadata-bearing ancestor.
+Directory metadata (§7.3) cannot be written that way. A rename only succeeds onto an empty directory, and a directory being updated holds the entries beneath it, so its attributes are replaced where they stand. Two things make that safe:
+
+- **A lock.** A writer holds an exclusive advisory lock on the directory for the whole replacement, and a reader holds a shared one. Concurrent readers therefore never observe a partial set. The lock is released by the host if the process holding it stops, so it cannot be left stranded. It is advisory and local to one host: an account root MUST live on a local filesystem, and MUST NOT be shared between hosts over a network filesystem.
+- **The previous metadata, set aside.** Before touching a directory's attributes, the writer creates an empty file at `/.ark/previous_metadata/<percent-encoded account path>` carrying what the directory carries in that file's own `user.ark.*` attributes — metadata at rest in the same shape as anywhere else, landed by a rename so what is set aside is never caught part-way itself. A file carrying no attributes records that the directory carried no metadata. The writer removes it only once the new record is whole, so its presence marks a replacement as still under way.
+
+  A reader that holds a lock on the directory knows no writer holds the exclusive one, so previous metadata it can see is what a stopped writer left behind. It takes the exclusive lock, puts back what that file carries — the previous record, or no metadata at all where it carries none — removes it, and reads again.
+
+  A directory's metadata and any local metadata beside it are replaced under the one lock and set aside together, so a reader never sees a new record next to the local state that belonged to the record before it, and neither is lost on its own.
+
+  This is what makes the detection complete. An interrupted replacement is not always visible in the attributes: a write that stopped after four of six members leaves a record that is contiguous from index 0, carries an owner and a signature, and parses as a whole record with the wrong member list. Only the metadata set aside distinguishes it. An update interrupted part-way is therefore put back to the state before it, rather than serving a short member list or leaving the directory to inherit from its nearest metadata-bearing ancestor.
+
+`/.ark/previous_metadata/` is reserved for this. Its entries are not account content.
+
+An implementation MAY also sweep `/.ark/previous_metadata/` at startup to put these back eagerly, rather than waiting for each directory to be read.
 
 The rename is atomic against concurrent readers but says nothing about durability. Ark does not require an implementation to flush before renaming; a host that loses power may lose recent writes, which converge again through relay (§9).
 
 ### 7.3 Directories
 
 A directory may or may not carry metadata. A directory without metadata inherits member checks from its nearest metadata-bearing ancestor. A directory PUT with a body is rejected `400`. Directory metadata rejected if `encryption_algorithm` is set.
+
+Inheritance applies only where a directory genuinely carries no metadata. Metadata that is present but cannot be read as a whole record is rejected `500` — never treated as absent, and never inherited past. The same holds for every directory on the walk up: a server MUST NOT step over an unreadable ancestor to a further one, which would grant the access the unreadable record was there to withhold.
 
 ---
 

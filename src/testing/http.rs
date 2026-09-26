@@ -260,7 +260,7 @@ pub fn seed_shared_dir(
     sign_metadata(owner_secret_key, &mut metadata, None).unwrap();
 
     let (context, account_path) = account_context(&dir);
-    write_metadata_attributes(&context, &account_path, &metadata).unwrap();
+    write_metadata_attributes(&context, &account_path, &metadata, None).unwrap();
 
     dir
 }

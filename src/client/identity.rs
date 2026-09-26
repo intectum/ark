@@ -180,6 +180,7 @@ mod tests {
     use crate::client::init_local;
     use crate::context::create_client_context;
     use crate::crypto::DEFAULT_ENCRYPTION_ALGORITHM;
+    use crate::identity::identity_cache_path;
     use crate::metadata::read_metadata_attributes;
     use crate::storage::{Body, write_atomic_with_metadata};
     use crate::testing::fs::{account_context, create_test_account, in_test_dir, init_with_server};
@@ -188,7 +189,7 @@ mod tests {
 
     fn cache_identity(ctx: &Context, identity: &Identity) {
         create_dir_all(ctx, "/.ark/identities").unwrap();
-        write_identity(ctx, &format!("/.ark/identities/{}.json", identity.address), identity).unwrap();
+        write_identity(ctx, &identity_cache_path(&identity.address), identity).unwrap();
     }
 
     #[test]
