@@ -4,16 +4,17 @@ use uuid::Uuid;
 
 use crate::client::decrypt_stream;
 use crate::crypto::{DEFAULT_HASH_ALGORITHM, decrypt_bytes, encrypt_bytes, sign_json, verify_json};
-use crate::identity::{parse_address, read_identity_key, resolve_identity};
+use crate::identity::{identity_key_path, parse_address, read_identity_key, resolve_identity};
 use crate::permissions::cli_address_to_wire;
 use crate::lock::{Lock, lock_exclusive, lock_shared};
-use crate::storage::{Body, create_dir_all, exists, is_dir, join_path, list_attributes, read, read_attribute, remove_attribute, remove_file, to_path_segment, write_atomic_with_metadata, write_atomic_without_metadata, write_attribute};
+use crate::storage::{Body, create_dir_all, exists, is_dir, list_attributes, read, read_attribute, remove_attribute, remove_file, write_atomic_with_metadata, write_atomic_without_metadata, write_attribute};
 use crate::timestamp;
 use crate::types::{Hash, Key, LocalMetadata, Member, Metadata, Permission, Permissions, Signature};
 use crate::types::Context;
 use crate::util::{decode_base64url, encode_base64url, parse_uuid, sha256};
+use crate::versions::{version_dir_for, version_path_for};
 
-const PREVIOUS_METADATA_DIR: &str = "/.ark/previous_metadata";
+const PREVIOUS_VERSION: &str = ".previous";
 
 const ATTRIBUTE_PREFIX: &str = "user.ark.";
 const LOCAL_ATTRIBUTE_PREFIX: &str = "user.ark_local.";
@@ -23,6 +24,7 @@ const FIELD_ID: &str = "id";
 const FIELD_CREATED: &str = "created";
 const FIELD_MODIFIED: &str = "modified";
 const FIELD_MODIFIED_BY: &str = "modified_by";
+const FIELD_PARENT_VERSION: &str = "parent_version";
 const FIELD_ENCRYPTION_ALGORITHM: &str = "encryption_algorithm";
 const FIELD_MEMBER_PREFIX: &str = "member_";
 const FIELD_MEMBER_ADDRESS: &str = "address";
@@ -56,6 +58,7 @@ pub fn create_metadata(owner_address: &str, encryption_algorithm: Option<&str>) 
         created: now,
         modified: now,
         modified_by: owner_address.to_string(),
+        parent_version: None,
         encryption_algorithm: encryption_algorithm.map(|s| s.to_string()),
         members: vec![Member {
             address: owner_address.to_string(),
@@ -160,7 +163,7 @@ pub fn write_metadata_attributes(ctx: &Context, path: &str, metadata: &Metadata,
     }
 
     if lock.is_some() {
-        remove_file(ctx, &previous_metadata_path_for(path))?;
+        remove_file(ctx, &version_path_for(ctx, path, PREVIOUS_VERSION)?)?;
     }
 
     Ok(())
@@ -173,6 +176,9 @@ fn write_metadata_attributes_unlocked(ctx: &Context, path: &str, metadata: &Meta
     write_attribute(ctx, path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_CREATED), timestamp::format(metadata.created).as_bytes())?;
     write_attribute(ctx, path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_MODIFIED), timestamp::format(metadata.modified).as_bytes())?;
     write_attribute(ctx, path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_MODIFIED_BY), metadata.modified_by.as_bytes())?;
+    if let Some(parent_version) = &metadata.parent_version {
+        write_attribute(ctx, path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_PARENT_VERSION), parent_version.as_bytes())?;
+    }
     if let Some(alg) = &metadata.encryption_algorithm {
         write_attribute(ctx, path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_ENCRYPTION_ALGORITHM), alg.as_bytes())?;
     }
@@ -324,6 +330,9 @@ pub fn write_metadata_headers(metadata: &Metadata) -> Vec<(String, String)> {
     out.push((format!("{}Created", HEADER_PREFIX), timestamp::format(metadata.created)));
     out.push((format!("{}Modified", HEADER_PREFIX), timestamp::format(metadata.modified)));
     out.push((format!("{}Modified-By", HEADER_PREFIX), metadata.modified_by.clone()));
+    if let Some(parent_version) = &metadata.parent_version {
+        out.push((format!("{}Parent-Version", HEADER_PREFIX), parent_version.clone()));
+    }
     if let Some(alg) = &metadata.encryption_algorithm {
         out.push((format!("{}Encryption-Algorithm", HEADER_PREFIX), alg.clone()));
     }
@@ -455,7 +464,7 @@ pub fn resolve_key_from_members(ctx: &Context, members: &[Member]) -> io::Result
             _ => continue,
         };
 
-        let key_path = format!("/{}.key", path.trim_start_matches('/').trim_end_matches(".json"));
+        let key_path = identity_key_path(&path);
         if !exists(ctx, &key_path) {
             continue;
         }
@@ -592,14 +601,10 @@ fn lock_directory_exclusive(ctx: &Context, path: &str) -> io::Result<Option<Lock
     }
 }
 
-fn previous_metadata_path_for(path: &str) -> String {
-    join_path(PREVIOUS_METADATA_DIR, &to_path_segment(path))
-}
-
 fn save_previous_metadata(ctx: &Context, path: &str, metadata: Option<&Metadata>, local: &LocalMetadata) -> io::Result<()> {
-    create_dir_all(ctx, PREVIOUS_METADATA_DIR)?;
+    create_dir_all(ctx, &version_dir_for(ctx, path)?)?;
 
-    let previous_path = previous_metadata_path_for(path);
+    let previous_path = version_path_for(ctx, path, PREVIOUS_VERSION)?;
 
     match metadata {
         Some(metadata) => write_atomic_with_metadata(ctx, &previous_path, Body::Bytes(&[]), metadata, Some(local)),
@@ -608,7 +613,7 @@ fn save_previous_metadata(ctx: &Context, path: &str, metadata: Option<&Metadata>
 }
 
 fn recover_directory(ctx: &Context, path: &str, lock: Option<Lock>) -> io::Result<Option<Lock>> {
-    if lock.is_none() || !exists(ctx, &previous_metadata_path_for(path)) {
+    if lock.is_none() || !exists(ctx, &version_path_for(ctx, path, PREVIOUS_VERSION)?) {
         return Ok(lock);
     }
 
@@ -620,7 +625,7 @@ fn recover_directory(ctx: &Context, path: &str, lock: Option<Lock>) -> io::Resul
 }
 
 fn restore_previous_metadata_unlocked(ctx: &Context, path: &str) -> io::Result<()> {
-    let previous_path = previous_metadata_path_for(path);
+    let previous_path = version_path_for(ctx, path, PREVIOUS_VERSION)?;
     if !exists(ctx, &previous_path) {
         return Ok(());
     }
@@ -643,6 +648,7 @@ struct PartialMetadata {
     modified_by: Option<String>,
     created: Option<String>,
     modified: Option<String>,
+    parent_version: Option<String>,
     encryption_algorithm: Option<String>,
     members: Vec<PartialMember>,
     body_hash_algorithm: Option<String>,
@@ -665,6 +671,7 @@ fn metadata_from_partial(partial: PartialMetadata) -> io::Result<Metadata> {
         created: timestamp::parse(&partial.created.unwrap())?,
         modified: timestamp::parse(&partial.modified.unwrap())?,
         modified_by: partial.modified_by.unwrap(),
+        parent_version: partial.parent_version,
         encryption_algorithm: partial.encryption_algorithm,
         members: partial.members.into_iter().map(|member| Member {
             address: member.address.unwrap(),
@@ -696,6 +703,7 @@ fn apply_field(metadata: &mut PartialMetadata, key: &str, value: &str) -> io::Re
         FIELD_CREATED => metadata.created = Some(value.to_string()),
         FIELD_MODIFIED => metadata.modified = Some(value.to_string()),
         FIELD_MODIFIED_BY => metadata.modified_by = Some(value.to_string()),
+        FIELD_PARENT_VERSION => metadata.parent_version = Some(value.to_string()),
         FIELD_ENCRYPTION_ALGORITHM => metadata.encryption_algorithm = Some(value.to_string()),
         FIELD_BODY_HASH_ALGORITHM => metadata.body_hash_algorithm = Some(value.to_string()),
         FIELD_BODY_HASH_VALUE => metadata.body_hash_value = Some(decode_base64url(value)
@@ -806,7 +814,7 @@ mod tests {
             assert_eq!(read_back.id, original.id);
             assert_eq!(read_back.members.len(), 1);
             assert_eq!(read_back.members[0].address, identity.address);
-            assert!(!exists(&context, &previous_metadata_path_for("/dir")), "the previous metadata outlived being put back");
+            assert!(!exists(&context, &version_path_for(&context, "/dir", PREVIOUS_VERSION).unwrap()), "the previous metadata outlived being put back");
         });
     }
 
@@ -864,7 +872,7 @@ mod tests {
 
             let read_back = read_metadata_attributes(&context, "/dir").unwrap();
             assert_eq!(read_back.members.len(), 6, "a torn record that parses was served instead of being rolled back");
-            assert!(!exists(&context, &previous_metadata_path_for("/dir")));
+            assert!(!exists(&context, &version_path_for(&context, "/dir", PREVIOUS_VERSION).unwrap()));
         });
     }
 
@@ -886,7 +894,7 @@ mod tests {
                 Ok(_) => panic!("expected the roll back to leave no metadata"),
                 Err(error) => assert_eq!(error.kind(), io::ErrorKind::NotFound),
             }
-            assert!(!exists(&context, &previous_metadata_path_for("/dir")));
+            assert!(!exists(&context, &version_path_for(&context, "/dir", PREVIOUS_VERSION).unwrap()));
         });
     }
 
@@ -913,7 +921,7 @@ mod tests {
 
             let read_back = read_local_metadata_attributes(&context, "/dir").unwrap();
             assert_eq!(read_back.sync_modified, Some(original.modified), "the directory came back untracked");
-            assert!(!exists(&context, &previous_metadata_path_for("/dir")));
+            assert!(!exists(&context, &version_path_for(&context, "/dir", PREVIOUS_VERSION).unwrap()));
         });
     }
 
@@ -928,7 +936,7 @@ mod tests {
             sign_metadata(&secret_key, &mut metadata, None).unwrap();
             write_metadata_attributes(&context, "/dir", &metadata, None).unwrap();
 
-            assert!(!exists(&context, &previous_metadata_path_for("/dir")));
+            assert!(!exists(&context, &version_path_for(&context, "/dir", PREVIOUS_VERSION).unwrap()));
         });
     }
 

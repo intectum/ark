@@ -71,7 +71,7 @@ pub struct EntryEvent {
     pub conflict: bool,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Hash {
     pub algorithm: String,
     #[serde(with = "base64url")]
@@ -142,6 +142,10 @@ pub struct Metadata {
     #[serde(with = "timestamp")]
     pub modified: OffsetDateTime,
     pub modified_by: String,
+    /// The version this write was made against, where it was made against
+    /// one. Absent on a file's first write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption_algorithm: Option<String>,
     pub members: Vec<Member>,
@@ -253,6 +257,18 @@ pub struct StreamEvent {
     pub id: String,
     pub event: String,
     pub data: String,
+}
+
+/// One entry of a path's version history. See `spec.md` §4.3.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VersionEntry {
+    pub id: String,
+    #[serde(with = "timestamp")]
+    pub modified: OffsetDateTime,
+    pub modified_by: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_hash: Option<Hash>,
+    pub size: u64,
 }
 
 mod base64url {

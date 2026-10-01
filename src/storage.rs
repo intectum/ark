@@ -48,26 +48,21 @@ pub fn read_to_string_raw(root: &Path, path: &str) -> io::Result<String> {
     fs::read_to_string(to_fs_path_raw(root, path)?)
 }
 
-/// Write `body` to `path`, as [`std::fs::write`] does.
-///
-/// `path` keeps the metadata it already carries, and a reader can see a
-/// half-written body. Where either matters, use [`write_atomic`].
-pub fn write(ctx: &Context, path: &str, body: &[u8]) -> io::Result<()> {
-    write_raw(&ctx.root, path, body)
-}
-
-/// As [`write`], for a caller holding only the account root — one running
-/// before its [`Context`] can be built.
-pub fn write_raw(root: &Path, path: &str, body: &[u8]) -> io::Result<()> {
-    fs::write(to_fs_path_raw(root, path)?, body)
-}
-
 /// Move `from` to `to`, as [`std::fs::rename`] does.
 ///
 /// The entry keeps the metadata it carries, and arrives whole, so a reader
 /// sees either the previous `to` or the moved entry, never a partial write.
 pub fn rename(ctx: &Context, from: &str, to: &str) -> io::Result<()> {
     fs::rename(to_fs_path(ctx, from)?, to_fs_path(ctx, to)?)
+}
+
+/// Create `link` as another name for the entry at `original`, as
+/// [`std::fs::hard_link`] does.
+///
+/// The metadata is the entry's own rather than a copy each name carries, so a
+/// change to it through either name is seen through both.
+pub fn link(ctx: &Context, original: &str, link: &str) -> io::Result<()> {
+    fs::hard_link(to_fs_path(ctx, original)?, to_fs_path(ctx, link)?)
 }
 
 /// Copy the body of `from` to `to`, as [`std::fs::copy`] does, and give back
@@ -378,6 +373,25 @@ pub fn write_atomic_without_metadata(ctx: &Context, path: &str, body: Body) -> i
     write_atomic_inner(ctx, path, body, None, None)
 }
 
+/// As [`write_atomic_without_metadata`], for a caller holding only the account
+/// root — one running before its [`Context`] can be built.
+///
+/// There is no raw form that lands metadata: the metadata at rest is written
+/// through a [`Context`] (see [`write_metadata_attributes`]), so a caller
+/// with a root alone can only write a body.
+pub fn write_atomic_without_metadata_raw(root: &Path, path: &str, body: &[u8]) -> io::Result<()> {
+    let target = to_fs_path_raw(root, path)?;
+    let temp = to_fs_path_raw(root, &temp_path_for(path))?;
+
+    let result = fs::write(&temp, body).and_then(|_| fs::rename(&temp, &target));
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+
+    result
+}
+
 fn write_atomic_inner(ctx: &Context, path: &str, body: Body, metadata: Option<&Metadata>, local_metadata: Option<&LocalMetadata>) -> io::Result<()> {
     let target = to_fs_path(ctx, path)?;
     let temp_path = temp_path_for(path);
@@ -408,6 +422,20 @@ fn write_atomic_inner(ctx: &Context, path: &str, body: Body, metadata: Option<&M
 /// Named `.<name>.tmp-<uuid>`. The leading dot marks it internal.
 pub fn temp_path_for(path: &str) -> String {
     let name = format!(".{}{}{}", file_name(path), TEMP_INFIX, Uuid::new_v4().hyphenated());
+
+    match parent_path(path) {
+        Some(parent) => join_path(parent, &name),
+        None => name,
+    }
+}
+
+/// A sibling name for a copy of `path` the user is meant to find beside what
+/// it refers to.
+///
+/// Named `<name>.<suffix>`, so it sits next to the entry rather than taking
+/// its place.
+pub fn sidecar_path_for(path: &str, suffix: &str) -> String {
+    let name = format!("{}.{}", file_name(path), suffix);
 
     match parent_path(path) {
         Some(parent) => join_path(parent, &name),
@@ -481,6 +509,72 @@ mod tests {
             assert_eq!(read_metadata_attributes(&context, "/moved.txt").unwrap().id, before.id);
             assert!(!exists(&context, "/a.txt"));
         });
+    }
+
+    #[test]
+    fn write_atomic_without_metadata_raw_lands_whole_and_carries_nothing_over() {
+        in_test_dir("ark_storage_test", |context_dir| {
+            let (context, identity, secret_key) = account(context_dir);
+            write_plain_test_file(&context.root.join("a.txt"), &identity, &secret_key, b"before");
+
+            write_atomic_without_metadata_raw(&context.root, "/a.txt", b"after").unwrap();
+
+            assert_eq!(read(&context, "/a.txt").unwrap(), b"after");
+            // The entry behind the name is a new one, so what the old entry
+            // carried does not come with it. write_atomic is what keeps it.
+            assert!(read_metadata_attributes(&context, "/a.txt").is_err());
+        });
+    }
+
+    #[test]
+    fn write_atomic_keeps_the_record_so_a_replaced_body_stays_the_same_file() {
+        in_test_dir("ark_storage_test", |context_dir| {
+            let (context, identity, secret_key) = account(context_dir);
+            write_plain_test_file(&context.root.join("a.txt"), &identity, &secret_key, b"before");
+            let before = read_metadata_attributes(&context, "/a.txt").unwrap();
+
+            write_atomic(&context, "/a.txt", Body::Bytes(b"after")).unwrap();
+
+            assert_eq!(read(&context, "/a.txt").unwrap(), b"after");
+            assert_eq!(read_metadata_attributes(&context, "/a.txt").unwrap().id, before.id,
+                "a put after this must continue the same file, not mint another");
+        });
+    }
+
+    #[test]
+    fn a_link_carries_the_metadata_and_keeps_what_it_held_when_the_original_is_replaced() {
+        in_test_dir("ark_storage_test", |context_dir| {
+            let (context, identity, secret_key) = account(context_dir);
+            write_plain_test_file(&context.root.join("a.txt"), &identity, &secret_key, b"before");
+            let before = read_metadata_attributes(&context, "/a.txt").unwrap();
+
+            link(&context, "/a.txt", "/kept.txt").unwrap();
+            assert_eq!(read_metadata_attributes(&context, "/kept.txt").unwrap().id, before.id);
+
+            // write_atomic replaces the name, not the entry the link also
+            // reaches, so what was linked stays what it was.
+            write_atomic_with_metadata(&context, "/a.txt", Body::Bytes(b"after"), &before, None).unwrap();
+
+            assert_eq!(read(&context, "/a.txt").unwrap(), b"after");
+            assert_eq!(read(&context, "/kept.txt").unwrap(), b"before");
+        });
+    }
+
+    #[test]
+    fn linking_onto_a_name_already_taken_errors() {
+        in_test_dir("ark_storage_test", |context_dir| {
+            let (context, identity, secret_key) = account(context_dir);
+            write_plain_test_file(&context.root.join("a.txt"), &identity, &secret_key, b"a");
+            write_plain_test_file(&context.root.join("b.txt"), &identity, &secret_key, b"b");
+
+            assert_eq!(link(&context, "/a.txt", "/b.txt").unwrap_err().kind(), ErrorKind::AlreadyExists);
+        });
+    }
+
+    #[test]
+    fn a_sidecar_sits_beside_what_it_refers_to() {
+        assert_eq!(sidecar_path_for("/notes/a.txt", "version-1"), "/notes/a.txt.version-1");
+        assert_eq!(sidecar_path_for("a.txt", "conflict-2"), "a.txt.conflict-2");
     }
 
     #[test]

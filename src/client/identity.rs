@@ -3,8 +3,8 @@ use std::io;
 use super::{put, put_permissions};
 
 use crate::identity::{
-    create_identity, read_identity, read_identity_key, sign_identity, validate_identity,
-    write_identity, write_identity_key,
+    create_identity, identity_key_path, read_identity, read_identity_key, sign_identity,
+    validate_identity, write_identity, write_identity_key,
 };
 use crate::permissions::readers;
 use crate::storage::{create_dir_all, exists, parent_path};
@@ -35,7 +35,7 @@ pub fn create_client_identity(ctx: &Context, path: &str, members: &[String]) -> 
     }
 
     let address = resolve_address(ctx, path)?;
-    let key_path = key_path_for(path);
+    let key_path = identity_key_path(path);
 
     if exists(ctx, path) {
         return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{} already exists", path)));
@@ -115,7 +115,7 @@ pub fn change_identity_members(
     let mut identity = read_identity(ctx, path)?;
     let secret_key = Key {
         algorithm: identity.public_key.algorithm.clone(),
-        value: read_identity_key(ctx, &key_path_for(path))?,
+        value: read_identity_key(ctx, &identity_key_path(path))?,
     };
 
     let mut members = identity.members.take().unwrap_or_default();
@@ -160,15 +160,12 @@ pub fn change_identity_members(
 
     put(ctx, path, &permissions, None, false)?;
     if !permissions.readers.is_empty() || !permissions.drops.is_empty() {
-        put_permissions(ctx, &key_path_for(path), &permissions)?;
+        put_permissions(ctx, &identity_key_path(path), &permissions)?;
     }
 
     Ok(())
 }
 
-fn key_path_for(json_path: &str) -> String {
-    format!("{}.key", json_path.strip_suffix(".json").unwrap_or(json_path))
-}
 
 #[cfg(test)]
 mod tests {

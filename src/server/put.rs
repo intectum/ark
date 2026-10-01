@@ -7,6 +7,7 @@ use crate::metadata::{members_changed, write_metadata_attributes};
 use crate::storage::{Body, create_dir_all, exists, parent_path, write_atomic_with_metadata};
 use crate::types::{Context, Identity, Metadata, Permission};
 use crate::util::validate_update;
+use crate::versions::save_version;
 
 pub fn serve_put_init(
     target_root: &Path,
@@ -58,6 +59,10 @@ pub fn serve_put(ctx: &Context, path: &str, stream: &mut dyn Write, body: &[u8],
 
     let status_code = if exists(ctx, path) { 204 } else { 201 };
 
+    if let Some(existing) = existing_metadata {
+        save_version(ctx, path, existing)?;
+    }
+
     if is_dir {
         create_dir_all(ctx, path)?;
         write_metadata_attributes(ctx, path, metadata, None)?;
@@ -86,8 +91,10 @@ mod tests {
     use crate::testing::fs::{TEST_ADDRESS, account_context, create_encrypted_test_metadata, create_plain_test_metadata, create_test_account, in_test_dir, write_plain_test_file};
     use crate::testing::http::*;
     use crate::testing::http::start_test_server;
+    use crate::storage::read;
     use crate::timestamp::now_ms;
     use crate::types::{Member, Permission};
+    use crate::versions::{read_versions, to_version, version_path_for};
 
     #[test]
     fn put_new_file_returns_201() {
@@ -403,6 +410,124 @@ mod tests {
             let (account_ctx, account_path) = account_context(&dir);
             let back = read_metadata_attributes(&account_ctx, &account_path).unwrap();
             assert_eq!(back.id, meta.id);
+        });
+    }
+
+    #[test]
+    fn an_overwrite_keeps_what_the_path_held() {
+        in_test_dir("ark_server_test", |temp_dir| {
+            let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
+            let file = account_dir.join("x");
+            write_plain_test_file(&file, &identity, &secret_key, b"old");
+            let (account_ctx, account_path) = account_context(&file);
+            let existing = read_metadata_attributes(&account_ctx, &account_path).unwrap();
+
+            let mut new_meta = create_plain_test_metadata(&identity, &secret_key, b"new");
+            new_meta.id = existing.id;
+            sign_metadata(&secret_key, &mut new_meta, Some(b"new")).unwrap();
+
+            let port = start_test_server(temp_dir.to_path_buf());
+            assert_eq!(signed_put_metadata(port, &identity, &secret_key, "/ark/test/x", b"new", &new_meta), 204);
+
+            assert_eq!(fs::read(&file).unwrap(), b"new");
+
+            let versions = read_versions(&account_ctx, &account_path).unwrap();
+            assert_eq!(versions.len(), 1);
+            assert_eq!(versions[0].id, to_version(&existing));
+
+            let kept = version_path_for(&account_ctx, &account_path, &versions[0].id).unwrap();
+            assert_eq!(read(&account_ctx, &kept).unwrap(), b"old");
+        });
+    }
+
+    #[test]
+    fn a_new_path_has_nothing_to_keep() {
+        in_test_dir("ark_server_test", |temp_dir| {
+            let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
+            let port = start_test_server(temp_dir.to_path_buf());
+            let (code, _, _) = signed_put_with_default_metadata(port, &identity, &secret_key, "/ark/test/fresh.txt", b"first");
+            assert_eq!(code, 201);
+
+            let (account_ctx, _) = account_context(&account_dir.join(".ark"));
+            assert!(read_versions(&account_ctx, "/fresh.txt").unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn a_metadata_only_put_keeps_the_record_it_replaced() {
+        in_test_dir("ark_server_test", |temp_dir| {
+            let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
+            let file = account_dir.join("x");
+            write_plain_test_file(&file, &identity, &secret_key, b"body");
+            let (account_ctx, account_path) = account_context(&file);
+            let existing = read_metadata_attributes(&account_ctx, &account_path).unwrap();
+
+            let mut new_meta = create_plain_test_metadata(&identity, &secret_key, b"body");
+            new_meta.id = existing.id;
+            new_meta.members.push(Member { address: "other@example.com".to_string(), permission: Permission::Reader, key: None });
+            sign_metadata(&secret_key, &mut new_meta, Some(b"body")).unwrap();
+
+            let port = start_test_server(temp_dir.to_path_buf());
+            assert_eq!(signed_put_metadata(port, &identity, &secret_key, "/ark/test/x?metadata", b"", &new_meta), 204);
+
+            let versions = read_versions(&account_ctx, &account_path).unwrap();
+            assert_eq!(versions.len(), 1);
+
+            let kept = version_path_for(&account_ctx, &account_path, &versions[0].id).unwrap();
+            let kept_metadata = read_metadata_attributes(&account_ctx, &kept).unwrap();
+            assert_eq!(kept_metadata.members.len(), 1, "the version carries the member list it was written with");
+            assert_eq!(read(&account_ctx, &kept).unwrap(), b"body");
+        });
+    }
+
+    #[test]
+    fn a_directory_put_keeps_the_record_it_replaced() {
+        in_test_dir("ark_server_test", |temp_dir| {
+            let (identity, secret_key, _) = create_test_account(temp_dir, TEST_ADDRESS);
+            let port = start_test_server(temp_dir.to_path_buf());
+
+            let mut meta = create_plain_test_metadata(&identity, &secret_key, b"");
+            meta.encryption_algorithm = None;
+            meta.members[0].key = None;
+            meta.body_hash = None;
+            sign_metadata(&secret_key, &mut meta, None).unwrap();
+            assert_eq!(signed_put_metadata(port, &identity, &secret_key, "/ark/test/notes/", b"", &meta), 201);
+
+            let mut second = meta.clone();
+            second.members.push(Member { address: "other@example.com".to_string(), permission: Permission::Reader, key: None });
+            sign_metadata(&secret_key, &mut second, None).unwrap();
+            assert_eq!(signed_put_metadata(port, &identity, &secret_key, "/ark/test/notes/", b"", &second), 204);
+
+            let (account_ctx, account_path) = account_context(&temp_dir.join("ark/test/notes"));
+            let versions = read_versions(&account_ctx, &account_path).unwrap();
+            assert_eq!(versions.len(), 1);
+            assert_eq!(versions[0].id, to_version(&meta));
+        });
+    }
+
+    #[test]
+    fn the_parent_version_a_write_names_is_stored_and_decides_nothing() {
+        in_test_dir("ark_server_test", |temp_dir| {
+            let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
+            let file = account_dir.join("x");
+            write_plain_test_file(&file, &identity, &secret_key, b"old");
+            let (account_ctx, account_path) = account_context(&file);
+            let existing = read_metadata_attributes(&account_ctx, &account_path).unwrap();
+
+            // A parent naming a version this server never held. The write is
+            // a fork, and the server applies it anyway — the record of it is
+            // what the owner reads back, not a rule the server enforces.
+            let mut forked = create_plain_test_metadata(&identity, &secret_key, b"forked");
+            forked.id = existing.id;
+            forked.parent_version = Some("2020-01-01T00-00-00.000Z_AAAAAAAA".to_string());
+            sign_metadata(&secret_key, &mut forked, Some(b"forked")).unwrap();
+
+            let port = start_test_server(temp_dir.to_path_buf());
+            assert_eq!(signed_put_metadata(port, &identity, &secret_key, "/ark/test/x", b"forked", &forked), 204);
+            assert_eq!(fs::read(&file).unwrap(), b"forked");
+
+            let stored = read_metadata_attributes(&account_ctx, &account_path).unwrap();
+            assert_eq!(stored.parent_version.as_deref(), Some("2020-01-01T00-00-00.000Z_AAAAAAAA"));
         });
     }
 

@@ -201,6 +201,29 @@ pub fn validate_update(
     existing_metadata: Option<&Metadata>,
     body: Option<&[u8]>,
 ) -> io::Result<()> {
+    validate_version(modifier_public_key, metadata, existing_metadata, body)?;
+
+    if let Some(existing_metadata) = existing_metadata {
+        if metadata.modified < existing_metadata.modified {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "modified is older than existing"));
+        }
+    }
+
+    Ok(())
+}
+
+/// As [`validate_update`], for a past version of the file `existing_metadata`
+/// describes rather than a change to it: everything is checked except that it
+/// is no older, since a version is older by definition.
+///
+/// It must still be the same file. A version whose `id` differs is a record of
+/// some other file, however validly signed.
+pub fn validate_version(
+    modifier_public_key: &Key,
+    metadata: &Metadata,
+    existing_metadata: Option<&Metadata>,
+    body: Option<&[u8]>,
+) -> io::Result<()> {
     let is_dir = metadata.body_hash.is_none();
 
     if body.is_none() && !is_dir {
@@ -226,9 +249,6 @@ pub fn validate_update(
         }
         if existing_metadata.body_hash.is_none() != is_dir {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, if is_dir { "existing is a file" } else { "existing is a dir" }));
-        }
-        if metadata.modified < existing_metadata.modified {
-            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "modified is older than existing"));
         }
     }
 

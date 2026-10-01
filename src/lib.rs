@@ -17,8 +17,8 @@
 //! - [`start_server`] runs a listener on the current working directory.
 //! - [`create_client_context`] builds the [`Context`] passed to every client
 //!   function.
-//! - [`read`], [`write()`], [`read_dir`] and the rest — the filesystem, reached
-//!   by account path rather than filesystem path.
+//! - [`read`], [`write_atomic`], [`read_dir`] and the rest — the filesystem,
+//!   reached by account path rather than filesystem path.
 //!
 //! # Function shapes
 //!
@@ -46,6 +46,7 @@ pub mod testing;
 mod timestamp;
 mod types;
 mod util;
+mod versions;
 
 pub use client::*;
 pub use context::*;
@@ -60,3 +61,4 @@ pub use storage::*;
 pub use timestamp::*;
 pub use types::*;
 pub use util::*;
+pub use versions::*;

@@ -9,7 +9,8 @@ use crate::identity::resolve_identity;
 use crate::metadata::{has_metadata_headers, read_metadata_attributes, read_metadata_headers, write_metadata_attributes};
 use crate::storage::{Body, create_dir_all, parent_path, write_atomic_with_metadata};
 use crate::types::{Context, Hash, LocalMetadata, Metadata};
-use crate::util::{resolve_client_url, sha256, validate_update};
+use crate::util::{resolve_client_url, sha256, validate_update, validate_version};
+use crate::versions::to_version;
 
 /// Download the body of a file at `path` (decrypting when encrypted).
 ///
@@ -43,7 +44,7 @@ pub fn get(ctx: &Context, path: &str, decrypt: bool) -> io::Result<()> {
     let existing_metadata = read_metadata_attributes(ctx, path).ok();
 
     let mut buf: Vec<u8> = Vec::new();
-    let (metadata, local_metadata) = get_stream(ctx, path, &mut buf, decrypt, existing_metadata.as_ref())?;
+    let (metadata, local_metadata) = get_stream(ctx, path, &mut buf, decrypt, existing_metadata.as_ref(), None)?;
 
     if metadata.body_hash.is_none() {
         create_dir_all(ctx, path)?;
@@ -71,7 +72,14 @@ pub fn get(ctx: &Context, path: &str, decrypt: bool) -> io::Result<()> {
 ///
 /// `existing_metadata`: the metadata of the copy this download replaces, when
 /// it replaces one. The download is then also checked to continue that copy
-/// rather than replace it with an unrelated or older file.
+/// rather than replace it with an unrelated or older file. With `version`, it
+/// is checked to be a version of that copy — the same file — but may be older.
+///
+/// `version`: the id of a past version of `path` to download in place of what
+/// it holds now (see [`list_versions`](super::list_versions)). What came back is checked
+/// to be the version asked for — the id travels outside what the request
+/// signature covers, so a server answering with a different version, or with
+/// the current file, is refused here.
 ///
 /// The returned [`LocalMetadata`] reflects whether the written body is
 /// ciphertext (`encrypted=Some(true)`) or plaintext, and includes a
@@ -83,8 +91,12 @@ pub fn get_stream(
     output: &mut dyn Write,
     decrypt: bool,
     existing_metadata: Option<&Metadata>,
+    version: Option<&str>,
 ) -> io::Result<(Metadata, LocalMetadata)> {
-    let url = resolve_client_url(ctx, path)?;
+    let mut url = resolve_client_url(ctx, path)?;
+    if let Some(id) = version {
+        url.query_pairs_mut().append_pair("version", id);
+    }
 
     let (code, headers, body) = request(Some(ctx), "GET", &url, &[], &[])?;
     check_response_code(code, &body)?;
@@ -100,7 +112,17 @@ pub fn get_stream(
         .map_err(|e| io::Error::other(format!("modifier {}: {}", metadata.modified_by, e)))?;
     let is_dir = metadata.body_hash.is_none();
     let update_body = if is_dir { None } else { Some(body.as_slice()) };
-    validate_update(&modifier_identity.public_key, &metadata, existing_metadata, update_body)?;
+
+    match version {
+        Some(_) => validate_version(&modifier_identity.public_key, &metadata, existing_metadata, update_body)?,
+        None => validate_update(&modifier_identity.public_key, &metadata, existing_metadata, update_body)?,
+    }
+
+    if let Some(id) = version {
+        if to_version(&metadata) != id {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("served version is not {}", id)));
+        }
+    }
 
     let final_body = if decrypt && metadata.encryption_algorithm.is_some() {
         let mut buf = Vec::new();
@@ -173,7 +195,7 @@ mod tests {
             write_metadata_attributes(&server_ctx, &server_account_dir, &m, None).unwrap();
 
             let mut buf = Vec::new();
-            let (metadata, _) = get_stream(&ctx, "shared", &mut buf, false, None).unwrap();
+            let (metadata, _) = get_stream(&ctx, "shared", &mut buf, false, None, None).unwrap();
             assert!(metadata.body_hash.is_none(), "dir metadata should have no body_hash");
             assert!(!buf.is_empty(), "dir listing body should be returned");
         });
@@ -333,7 +355,7 @@ mod tests {
             write_plain_test_file(&temp_dir.join("ark/gyan/piped.txt"), &ctx.identity, ctx.identity_key.as_ref().unwrap(), b"to stdout");
 
             let mut buf = Vec::new();
-            get_stream(&ctx, "piped.txt", &mut buf, false, None).unwrap();
+            get_stream(&ctx, "piped.txt", &mut buf, false, None, None).unwrap();
 
             assert_eq!(buf, b"to stdout");
             assert!(!temp_dir.join("piped.txt").exists());

@@ -4,7 +4,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::process::exit;
 
-use ark::{accept_proposal, create_client_context, create_client_identity, decrypt, delete, encrypt, get, get_stream, head, change_identity_members, init, list, list_proposals, parse_address, put, reject_proposal, resolve_client_url, start_server, sync, watch_local, watch_remote, Context, DirEntryKind, EntryEvent, Permissions};
+use ark::{accept_proposal, create_client_context, create_client_identity, decrypt, delete, encrypt, format as format_timestamp, get, get_stream, get_version, head, change_identity_members, init, list, list_proposals, list_versions, parse_address, put, reject_proposal, resolve_client_url, restore_version, start_server, sync, watch_local, watch_remote, Context, DirEntryKind, EntryEvent, Permissions};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -131,12 +131,19 @@ enum Cmd {
         /// Decrypt the body using its metadata key.
         #[arg(short, long)]
         decrypt: bool,
+        /// Download the version ID instead, to a sibling named
+        /// <name>.version-<ID>. Leaves the file at PATH alone.
+        #[arg(long, value_name = "ID")]
+        version: Option<String>,
         /// Ark URL or path.
         path: String,
     },
     /// Print a file body to stdout, decrypting it, without writing it to the
     /// account tree.
     Cat {
+        /// Print the version ID instead of the current body.
+        #[arg(long, value_name = "ID")]
+        version: Option<String>,
         /// Ark URL or path.
         path: String,
     },
@@ -230,6 +237,22 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ProposalsCmd,
     },
+    /// List what a file or directory held before the writes that replaced it.
+    Versions {
+        /// Ark URL or path.
+        path: String,
+    },
+    /// Put what a version held back into the local copy of its path.
+    ///
+    /// Writes the local copy only. Run `ark put` to publish it, or let
+    /// `ark sync` carry it, as for any other local change; the restore then
+    /// lands as a new version and the one it came from stays beside it.
+    Restore {
+        /// Ark URL or path.
+        path: String,
+        /// Version to restore, as `ark versions` lists it.
+        id: String,
+    },
     /// Encrypt a plaintext file in place.
     ///
     /// If the file has ark metadata, its file key and algorithm are reused and
@@ -258,8 +281,11 @@ fn main() {
         Cmd::Init { address, password, local_only } => current_dir().and_then(|c| init(&c, &address, password.as_deref(), local_only)),
         Cmd::Head { path } => create_client_context().and_then(|c| head_cli(&c, &path)),
         Cmd::Delete { path } => create_client_context().and_then(|c| delete(&c, &path)),
-        Cmd::Get { decrypt, path } => create_client_context().and_then(|c| get(&c, &path, decrypt)),
-        Cmd::Cat { path } => create_client_context().and_then(|c| cat_cli(&c, &path)),
+        Cmd::Get { decrypt, version, path } => create_client_context().and_then(|c| match version {
+            Some(id) => get_version(&c, &path, &id, decrypt),
+            None => get(&c, &path, decrypt),
+        }),
+        Cmd::Cat { version, path } => create_client_context().and_then(|c| cat_cli(&c, &path, version.as_deref())),
         Cmd::List { prefix, path } => create_client_context().and_then(|c| list_cli(&c, &path, prefix.as_deref())),
         Cmd::Identity { cmd } => create_client_context().and_then(|c| match cmd {
             IdentityCmd::Create { path, member } => create_client_identity(&c, &path, &member).map(|_| ()),
@@ -281,6 +307,8 @@ fn main() {
         },
         Cmd::Decrypt { path } => create_client_context().and_then(|c| decrypt(&c, &path)),
         Cmd::Encrypt { encryption_algorithm, path } => create_client_context().and_then(|c| encrypt(&c, &path, encryption_algorithm.as_deref())),
+        Cmd::Versions { path } => create_client_context().and_then(|c| list_versions_cli(&c, &path)),
+        Cmd::Restore { path, id } => create_client_context().and_then(|c| restore_version(&c, &path, &id)),
     };
     if let Err(e) = result {
         eprintln!("error: {}", e);
@@ -288,9 +316,9 @@ fn main() {
     }
 }
 
-fn cat_cli(ctx: &Context, path: &str) -> io::Result<()> {
+fn cat_cli(ctx: &Context, path: &str, version: Option<&str>) -> io::Result<()> {
     let mut stdout = io::stdout().lock();
-    get_stream(ctx, path, &mut stdout, true, None)?;
+    get_stream(ctx, path, &mut stdout, true, None, version)?;
 
     Ok(())
 }
@@ -341,6 +369,21 @@ fn list_proposals_cli(ctx: &Context) -> io::Result<()> {
         for member in &proposal.metadata.members {
             println!("       {} = {}", member.address, member.permission.as_str());
         }
+    }
+
+    Ok(())
+}
+
+fn list_versions_cli(ctx: &Context, path: &str) -> io::Result<()> {
+    let entries = list_versions(ctx, path)?;
+    if entries.is_empty() {
+        println!("No versions.");
+        return Ok(());
+    }
+
+    let mut stdout = io::stdout().lock();
+    for entry in &entries {
+        writeln!(stdout, "{}  {:>10}  {}  ({})", format_timestamp(entry.modified), entry.size, entry.modified_by, entry.id)?;
     }
 
     Ok(())

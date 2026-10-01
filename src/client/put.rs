@@ -11,6 +11,7 @@ use crate::storage::{Body, is_dir, read, write_atomic_with_metadata};
 use crate::timestamp;
 use crate::types::{Context, Hash, LocalMetadata, Metadata, Permissions};
 use crate::util::{resolve_client_url, sha256};
+use crate::versions::to_version;
 
 /// Upload the body of a local file (or create a directory) at `path`.
 ///
@@ -147,6 +148,8 @@ pub fn put_stream(
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "--encryption-algorithm not supported for metadata-only puts"));
     }
 
+    let existing_version = existing_metadata.as_ref().map(to_version);
+
     let mut metadata = match existing_metadata {
         Some(mut m) => {
             if let Some(a) = encryption_algorithm {
@@ -217,6 +220,7 @@ pub fn put_stream(
         }
     };
 
+    metadata.parent_version = existing_version;
     metadata.modified = timestamp::now();
     metadata.modified_by = ctx.identity.address.clone();
 
@@ -245,7 +249,7 @@ mod tests {
 
     use crate::context::create_client_context;
     use crate::metadata::read_metadata_attributes;
-    use crate::storage::{create_dir_all, to_fs_path, write};
+    use crate::storage::{create_dir_all, to_fs_path, write_atomic_without_metadata};
     use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, decrypt_bytes, encrypt_bytes};
     use crate::identity::{create_identity, identity_cache_path, write_identity};
     use crate::metadata::verify_metadata;
@@ -287,7 +291,7 @@ mod tests {
         if let Some(parent) = local_path.parent() {
             fs::create_dir_all(parent).unwrap();
         }
-        write(&ctx, arg, plaintext).unwrap();
+        write_atomic_without_metadata(&ctx, arg, Body::Bytes(plaintext)).unwrap();
 
         put(&ctx, arg, &Permissions::default(), None, false).unwrap();
         local_path

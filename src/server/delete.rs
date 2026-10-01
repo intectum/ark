@@ -3,6 +3,7 @@ use std::io::{self, Write};
 use crate::http::write_text;
 use crate::storage::{exists, is_dir, remove_dir_all, remove_file};
 use crate::types::Context;
+use crate::versions::remove_versions;
 
 pub fn serve_delete(ctx: &Context, path: &str, stream: &mut dyn Write) -> io::Result<()> {
     if !exists(ctx, path) {
@@ -16,7 +17,13 @@ pub fn serve_delete(ctx: &Context, path: &str, stream: &mut dyn Write) -> io::Re
     };
 
     match result {
-        Ok(_) => write_text(stream, 204, &[]),
+        Ok(_) => {
+            if let Err(e) = remove_versions(ctx, path) {
+                return write_text(stream, 500, e.to_string().as_bytes());
+            }
+
+            write_text(stream, 204, &[])
+        },
         Err(e) => write_text(stream, 500, e.to_string().as_bytes()),
     }
 }
@@ -26,10 +33,50 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::symlink;
 
-    use crate::testing::fs::{TEST_ADDRESS, create_test_account, in_test_dir, write_plain_test_file};
+    use crate::metadata::read_metadata_attributes;
+    use crate::testing::fs::{TEST_ADDRESS, account_context, create_test_account, in_test_dir, write_plain_test_file};
     use crate::testing::http::*;
     use crate::testing::http::start_test_server;
     use crate::types::{Member, Permission};
+    use crate::versions::{read_versions, save_version};
+
+    #[test]
+    fn deleting_a_path_drops_what_it_held_before() {
+        in_test_dir("ark_server_test", |temp_dir| {
+            let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
+            let file = account_dir.join("d.txt");
+            write_plain_test_file(&file, &identity, &secret_key, b"bye");
+            let (account_ctx, account_path) = account_context(&file);
+            let metadata = read_metadata_attributes(&account_ctx, &account_path).unwrap();
+            save_version(&account_ctx, &account_path, &metadata).unwrap();
+            assert_eq!(read_versions(&account_ctx, &account_path).unwrap().len(), 1);
+
+            let port = start_test_server(temp_dir.to_path_buf());
+            let (code, _, _) = signed_request(port, &identity, &secret_key, "DELETE", "/ark/test/d.txt", &[]);
+            assert_eq!(code, 204);
+
+            assert!(read_versions(&account_ctx, &account_path).unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn deleting_a_directory_drops_what_the_paths_beneath_it_held() {
+        in_test_dir("ark_server_test", |temp_dir| {
+            let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
+            let file = account_dir.join("notes").join("a.txt");
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            write_plain_test_file(&file, &identity, &secret_key, b"inside");
+            let (account_ctx, account_path) = account_context(&file);
+            let metadata = read_metadata_attributes(&account_ctx, &account_path).unwrap();
+            save_version(&account_ctx, &account_path, &metadata).unwrap();
+
+            let port = start_test_server(temp_dir.to_path_buf());
+            let (code, _, _) = signed_request(port, &identity, &secret_key, "DELETE", "/ark/test/notes", &[]);
+            assert_eq!(code, 204);
+
+            assert!(read_versions(&account_ctx, &account_path).unwrap().is_empty());
+        });
+    }
 
     #[test]
     fn delete_file_removes_and_returns_204() {

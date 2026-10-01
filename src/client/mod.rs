@@ -10,6 +10,7 @@ mod proposals;
 mod put;
 mod request;
 mod sync;
+mod versions;
 mod watch;
 
 pub use decrypt::{decrypt, decrypt_stream};
@@ -26,4 +27,5 @@ pub use proposals::{accept_proposal, list_proposals, reject_proposal, watch_prop
 pub use put::{put, put_content, put_permissions, put_stream};
 pub use request::request;
 pub use sync::sync;
+pub use versions::{get_version, list_versions, restore_version};
 pub use watch::{watch_local, watch_remote};

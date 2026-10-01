@@ -83,6 +83,13 @@ ark put note.txt                # encrypt + upload
 ark get note.txt -d             # download + decrypt, back into the account tree
 ark cat note.txt                # print it instead, without writing it
 
+# Look at what a write replaced
+echo 'goodbye' > note.txt && ark put note.txt
+ark versions note.txt           # one line per version, newest first
+ark cat note.txt --version <ID> # prints 'hello'
+ark restore note.txt <ID>       # put it back into the local copy
+ark put note.txt                # publish it, as a new version
+
 # Share with another user
 ark put -r bob@localhost:8080 -m note.txt  # metadata-only put
 
@@ -106,12 +113,14 @@ Every command takes `-h` for details. Paths accept three forms:
 |---|---|
 | `ark server [PORT]` | Run a server. Serves the current directory. |
 | `ark init <ADDR>` | Create or download an account identity. `--password` gates remote key recovery. `--local-only` skips the server. |
-| `ark get <PATH>` | Download a file into the account tree at PATH. `--decrypt` unwraps it. |
-| `ark cat <PATH>` | Print a decrypted file body to stdout, without writing it to the account tree. |
+| `ark get <PATH>` | Download a file into the account tree at PATH. `--decrypt` unwraps it. `--version ID` fetches that version instead, beside the account's own copy. |
+| `ark cat <PATH>` | Print a decrypted file body to stdout, without writing it to the account tree. `--version ID` prints that version instead. |
 | `ark put <PATH>` | Upload the account's copy of PATH, or create a directory when that copy is a directory. `-o`/`-w`/`-r`/`-d` add or drop members (use `public` for the `*` wildcard), `--encryption-algorithm none` for plaintext, `-m` sends metadata only (server keeps the body). |
 | `ark head <PATH>` | Fetch response headers only. |
 | `ark list <PATH>` | List entries of a directory. |
 | `ark delete <PATH>` | Delete a file or directory (recursive). |
+| `ark versions <PATH>` | List what PATH held before the writes that replaced it, newest first. |
+| `ark restore <PATH> <ID>` | Put a version's body back into the local copy of PATH. `ark put` publishes it, as for any local change. |
 | `ark sync [PATH]` | Reconcile local and remote state under PATH — the working directory by default — in one pass. `-w` watches continuously. Prints one line per reconciled entry. |
 | `ark watch local <PATH>` / `ark watch remote <PATH>` | Print events for local FS changes or the server's SSE stream at PATH. |
 | `ark proposals list` | Show pending share proposals — unauthorized PUTs from other accounts, recorded in `.ark/requests/`. |
@@ -203,6 +212,7 @@ Paths in the library are account paths, not filesystem paths. Every client funct
 | Directories | First-class. Recursive delete. Permissions inherit. |
 | Public files | Supported for plaintext only (any browser can fetch). |
 | Federation | On write, the server relays to co-members' servers. |
+| Versions | A write keeps what it replaced. List, read, and restore past versions of any path. |
 | Sync | One-shot or watch mode; reconciles divergence with a conflict sidecar. |
 | Transport | Server binds plain HTTP. Client URLs default to `https://` (put a reverse proxy in front for TLS); prefix an address with `http://` to override for dev. |
 | Authentication | `ArkIdentity` signed requests. No tokens, no sessions. |

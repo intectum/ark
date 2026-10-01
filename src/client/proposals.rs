@@ -33,7 +33,7 @@ pub fn list_proposals(ctx: &Context) -> io::Result<Vec<Proposal>> {
 
         let entry_path = format!("/.ark/requests/{}", entry.name);
         let mut entry_body: Vec<u8> = Vec::new();
-        if get_stream(ctx, &entry_path, &mut entry_body, false, None).is_err() {
+        if get_stream(ctx, &entry_path, &mut entry_body, false, None, None).is_err() {
             continue;
         }
 
@@ -111,7 +111,7 @@ pub fn accept_proposal(ctx: &Context, index_or_id: &str, force: bool) -> io::Res
     let id = resolve_id(ctx, index_or_id)?;
     let entry_path = format!("/.ark/requests/{}", id);
     let mut entry_body: Vec<u8> = Vec::new();
-    get_stream(ctx, &entry_path, &mut entry_body, false, None)?;
+    get_stream(ctx, &entry_path, &mut entry_body, false, None, None)?;
     let proposal = parse_proposal(&id, &entry_body)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "entry is not a valid proposal"))?;
 
@@ -133,7 +133,7 @@ pub fn accept_proposal(ctx: &Context, index_or_id: &str, force: bool) -> io::Res
         (metadata, Vec::new())
     } else {
         let mut buf: Vec<u8> = Vec::new();
-        let (metadata, _) = get_stream(ctx, &modifier_path, &mut buf, false, None)?;
+        let (metadata, _) = get_stream(ctx, &modifier_path, &mut buf, false, None, None)?;
         let expected_hash = metadata.body_hash.as_ref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "file metadata missing body_hash"))?;
         if sha256(&buf) != expected_hash.value {
@@ -196,7 +196,7 @@ fn fetch_proposal(ctx: &Context, id: &str) -> io::Result<Option<Proposal>> {
         if attempt > 0 { sleep(ENTRY_FETCH_DELAY); }
 
         let mut entry_body: Vec<u8> = Vec::new();
-        match get_stream(ctx, &entry_path, &mut entry_body, false, None) {
+        match get_stream(ctx, &entry_path, &mut entry_body, false, None, None) {
             Ok(_) => return parse_proposal(id, &entry_body),
             Err(e) => last_error = Some(e),
         }

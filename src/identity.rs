@@ -6,7 +6,7 @@ use url::Url;
 use crate::client::request;
 use crate::crypto::{DEFAULT_SIGNING_ALGORITHM, create_secret_key, sign_json, to_public_key, verify_json};
 use crate::http::check_response_code;
-use crate::storage::{Body, create_dir_all, exists, exists_raw, join_path, read_to_string, read_to_string_raw, to_fs_path_raw, to_path_segment, write_atomic_without_metadata, write_raw};
+use crate::storage::{Body, create_dir_all, exists, exists_raw, join_path, read_to_string, read_to_string_raw, to_fs_path_raw, to_path_segment, write_atomic, write_atomic_without_metadata, write_atomic_without_metadata_raw};
 use crate::types::{Context, Identity, Key, Signature};
 use crate::util::{decode_base64url, encode_base64url, resolve_client_url};
 
@@ -55,6 +55,15 @@ pub fn identity_cache_path(address: &str) -> String {
     format!("{}.json", join_path(IDENTITY_CACHE_DIR, &to_path_segment(address)))
 }
 
+/// The path of the `.key` companion to the identity document at `json_path`.
+///
+/// `path` keeps the form it was given — a relative path answers with a
+/// relative one — so a caller comparing this against a path of its own must
+/// resolve both the same way.
+pub fn identity_key_path(json_path: &str) -> String {
+    format!("{}.key", json_path.strip_suffix(".json").unwrap_or(json_path))
+}
+
 pub fn resolve_identity(ctx: &Context, address: &str) -> io::Result<Identity> {
     if address == ctx.identity.address {
         return Ok(ctx.identity.clone());
@@ -101,16 +110,19 @@ pub fn resolve_identity(ctx: &Context, address: &str) -> io::Result<Identity> {
     Ok(identity)
 }
 
+/// Write `identity` to `path`, keeping the ark metadata `path` already
+/// carries so a later put continues the same file.
 pub fn write_identity(ctx: &Context, path: &str, identity: &Identity) -> io::Result<()> {
-    write_identity_raw(&ctx.root, path, identity)
+    write_atomic(ctx, path, Body::Bytes(&serialize_identity(identity)?))
 }
 
 /// As [`write_identity`], for a caller holding only the account root — one
 /// running before its [`Context`] can be built.
+///
+/// Carries no metadata over, so this is for an identity being created rather
+/// than replaced.
 pub fn write_identity_raw(root: &Path, path: &str, identity: &Identity) -> io::Result<()> {
-    let pretty = serde_json::to_vec_pretty(identity)
-        .map_err(|e| io::Error::other(e.to_string()))?;
-    write_raw(root, path, &pretty)
+    write_atomic_without_metadata_raw(root, path, &serialize_identity(identity)?)
 }
 
 pub fn sign_identity(secret_key: &Key, identity: &mut Identity) -> io::Result<()> {
@@ -165,13 +177,6 @@ pub fn parse_address(address: &str) -> io::Result<(String, String, String)> {
     Ok((name.to_string(), host, path))
 }
 
-fn identity_for_signing(identity: &Identity) -> Identity {
-    let mut clone = identity.clone();
-    clone.signature.algorithm = String::new();
-    clone.signature.value = Vec::new();
-    clone
-}
-
 pub fn read_identity_key(ctx: &Context, path: &str) -> io::Result<Vec<u8>> {
     let content = read_to_string(ctx, path)?;
     let key = decode_base64url(content.trim())
@@ -207,7 +212,18 @@ pub fn write_identity_key_raw(root: &Path, path: &str, key: &[u8]) -> io::Result
 
 #[cfg(not(unix))]
 pub fn write_identity_key_raw(root: &Path, path: &str, key: &[u8]) -> io::Result<()> {
-    write_raw(root, path, encode_base64url(key).as_bytes())
+    write_atomic_without_metadata_raw(root, path, encode_base64url(key).as_bytes())
+}
+
+fn serialize_identity(identity: &Identity) -> io::Result<Vec<u8>> {
+    serde_json::to_vec_pretty(identity).map_err(|e| io::Error::other(e.to_string()))
+}
+
+fn identity_for_signing(identity: &Identity) -> Identity {
+    let mut clone = identity.clone();
+    clone.signature.algorithm = String::new();
+    clone.signature.value = Vec::new();
+    clone
 }
 
 fn is_valid_account_name(name: &str) -> bool {
@@ -391,6 +407,21 @@ mod tests {
 
         assert_ne!(slashed, underscored);
         assert_eq!(crate::storage::parent_path(&slashed), Some(IDENTITY_CACHE_DIR), "the address escaped its own entry: {}", slashed);
+    }
+
+    #[test]
+    fn an_identity_key_sits_beside_its_document_under_one_name() {
+        // Whoever writes the key and whoever looks for it must agree, or the
+        // key is written where the reader will not find it and the miss reads
+        // as a permission failure.
+        assert_eq!(identity_key_path("/.ark/groups/team.json"), "/.ark/groups/team.key");
+        assert_eq!(identity_key_path("team.json"), "team.key");
+
+        // Only the extension goes, not every occurrence of it.
+        assert_eq!(identity_key_path("/a/team.json.json"), "/a/team.json.key");
+
+        // A path that is not a document already names the key.
+        assert_eq!(identity_key_path("/a/team"), "/a/team.key");
     }
 
     #[test]

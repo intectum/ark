@@ -7,7 +7,7 @@ use super::{get, get_stream, head, list, put_content, watch_local, watch_remote}
 
 use crate::identity::parse_address;
 use crate::metadata::{has_metadata_attributes, read_local_metadata_attributes, read_metadata_attributes, read_metadata_headers, write_metadata_attributes};
-use crate::storage::{Body, create_dir_all, exists, file_name, is_dir, is_file, is_symlink, join_path, parent_path, read, read_dir, read_to_string, remove_file, to_account_path, to_fs_path, write_atomic_with_metadata, write_atomic_without_metadata};
+use crate::storage::{Body, create_dir_all, exists, is_dir, is_file, is_symlink, join_path, parent_path, read, read_dir, read_to_string, remove_file, sidecar_path_for, to_account_path, to_fs_path, write_atomic_with_metadata, write_atomic_without_metadata};
 use crate::timestamp;
 use crate::types::{Context, DirEntryKind, EntryAction, EntryEvent, Metadata};
 use crate::util::{parse_request_entry, resolve_client_url, sha256};
@@ -326,12 +326,13 @@ where
     if entry.modified_local_body && entry.modified_remote_body {
         let mut body: Vec<u8> = Vec::new();
         let existing_metadata = read_metadata_attributes(ctx, &target).ok();
-        let (metadata, _) = match get_stream(ctx, &target, &mut body, decrypt, existing_metadata.as_ref()) {
+        let (metadata, _) = match get_stream(ctx, &target, &mut body, decrypt, existing_metadata.as_ref(), None) {
             Ok(pair) => pair,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(e) => return Err(e),
         };
-        write_atomic_with_metadata(ctx, &sidecar_path_for(&target), Body::Bytes(&body), &metadata, None)?;
+        let suffix = format!("conflict-{}", timestamp::format_fs_safe(timestamp::now()));
+        write_atomic_with_metadata(ctx, &sidecar_path_for(&target, &suffix), Body::Bytes(&body), &metadata, None)?;
         return Ok(emit(EntryAction::Modified, true));
     } else if entry.modified_local_body {
         put_content(ctx, &target)?;
@@ -407,7 +408,7 @@ where
 
         let entry_path = format!("/.ark/requests/{}", entry.name);
         let mut entry_body: Vec<u8> = Vec::new();
-        if get_stream(ctx, &entry_path, &mut entry_body, false, None).is_err() {
+        if get_stream(ctx, &entry_path, &mut entry_body, false, None, None).is_err() {
             continue;
         }
 
@@ -456,15 +457,6 @@ fn under_prefix(rel: &str, prefix: &str) -> bool {
     rel == prefix || rel.starts_with(&format!("{}/", prefix))
 }
 
-fn sidecar_path_for(path: &str) -> String {
-    let name = format!("{}.conflict-{}", file_name(path), timestamp::format_fs_safe(timestamp::now()));
-
-    match parent_path(path) {
-        Some(parent) => join_path(parent, &name),
-        None => name,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::env::{current_dir, set_current_dir};
@@ -481,7 +473,7 @@ mod tests {
     use crate::testing::fs::{account_context, in_test_dir, init_with_server, write_encrypted_test_file, write_plain_test_file};
     use crate::testing::http::start_test_server;
     use crate::types::Permissions;
-    use crate::storage::temp_path_for;
+    use crate::storage::{file_name, temp_path_for};
 
     fn write_local(root: &Path, relative: &str, body: &[u8]) {
         let path = root.join(relative);

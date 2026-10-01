@@ -5,6 +5,7 @@ mod get;
 mod log;
 mod put;
 mod relay;
+mod versions;
 
 use std::env;
 #[cfg(test)]
@@ -25,6 +26,7 @@ use self::log::{LoggingStream, try_log_request};
 use self::put::{serve_put, serve_put_init};
 use self::relay::relay;
 use self::stream::serve_stream;
+use self::versions::{serve_version, serve_version_list};
 
 use crate::context::{create_server_context, create_target_context};
 use crate::http::{read_request, write_text};
@@ -199,8 +201,13 @@ fn handle_parsed_inner(
         .find(|(k, _)| k == "prefix")
         .map(|(_, v)| v.into_owned());
 
+    let list_versions = url.query_pairs().any(|(k, _)| k == "versions");
+    let version: Option<String> = url.query_pairs()
+        .find(|(k, _)| k == "version")
+        .map(|(_, v)| v.into_owned());
+
     if public_member.is_some() && (method == "GET" || method == "HEAD") {
-        return serve_get(&target_ctx, &target_path, stream, method == "GET", prefix.as_deref());
+        return serve_read(&target_ctx, &target_path, stream, method == "GET", prefix.as_deref(), list_versions, version.as_deref());
     }
 
     let requestor_identity = match authenticate(server_ctx, &url, method, headers, body) {
@@ -246,7 +253,7 @@ fn handle_parsed_inner(
                 return serve_stream(&target_ctx, &target_path, stream, verbose);
             }
 
-            serve_get(&target_ctx, &target_path, stream, method == "GET", prefix.as_deref())
+            serve_read(&target_ctx, &target_path, stream, method == "GET", prefix.as_deref(), list_versions, version.as_deref())
         },
         "PUT" => {
             let metadata = metadata.as_ref().expect("metadata presence checked above");
@@ -285,6 +292,18 @@ fn handle_parsed_inner(
         "DELETE" => serve_delete(&target_ctx, &target_path, stream),
         _ => write_text(stream, 405, b"method not allowed"),
     }
+}
+
+fn serve_read(ctx: &Context, path: &str, stream: &mut dyn Write, send_body: bool, prefix: Option<&str>, list_versions: bool, version: Option<&str>) -> io::Result<()> {
+    if list_versions {
+        return serve_version_list(ctx, path, stream, send_body);
+    }
+
+    if let Some(id) = version {
+        return serve_version(ctx, path, stream, send_body, id);
+    }
+
+    serve_get(ctx, path, stream, send_body, prefix)
 }
 
 #[cfg(test)]
