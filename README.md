@@ -181,7 +181,7 @@ ark::watch_local(&cwd,
 )?;
 
 // Watch for remote changes
-let url = ark::resolve_client_url(&ctx, ".")?;
+let url = ark::to_url(&ctx, ".")?;
 ark::watch_remote(&ctx, &url,
     |event| { println!("{} {}", event.action.as_str(), event.path.display()); false },
     |error| { eprintln!("watch: {}", error); false }

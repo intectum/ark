@@ -7,10 +7,11 @@ use crate::client::request;
 use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, DEFAULT_HASH_ALGORITHM, create_secret_key};
 use crate::http::check_response_code;
 use crate::metadata::{apply_key_to_metadata, apply_permissions, create_metadata, has_metadata_attributes, read_local_metadata_attributes, read_metadata_attributes, resolve_key_from_members, sign_metadata, write_metadata_attributes, write_metadata_headers};
+use crate::paths::to_url;
 use crate::storage::{Body, is_dir, read, write_atomic_with_metadata};
 use crate::timestamp;
 use crate::types::{Context, Hash, LocalMetadata, Metadata, Permissions};
-use crate::util::{resolve_client_url, sha256};
+use crate::util::sha256;
 use crate::versions::to_version;
 
 /// Upload the body of a local file (or create a directory) at `path`.
@@ -135,7 +136,7 @@ pub fn put_stream(
     existing_local_metadata: Option<LocalMetadata>,
     metadata_only: bool,
 ) -> io::Result<(Metadata, LocalMetadata)> {
-    let mut url = resolve_client_url(ctx, path)?;
+    let mut url = to_url(ctx, path)?;
     let query = if metadata_only { "relay=full&metadata" } else { "relay=full" };
     url.set_query(Some(query));
 
@@ -249,7 +250,8 @@ mod tests {
 
     use crate::context::create_client_context;
     use crate::metadata::read_metadata_attributes;
-    use crate::storage::{create_dir_all, to_fs_path, write_atomic_without_metadata};
+    use crate::paths::to_fs_path;
+    use crate::storage::{create_dir_all, write_atomic_without_metadata};
     use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, decrypt_bytes, encrypt_bytes};
     use crate::identity::{create_identity, identity_cache_path, write_identity};
     use crate::metadata::verify_metadata;

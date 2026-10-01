@@ -11,7 +11,8 @@
 use std::io;
 
 use crate::metadata::read_metadata_attributes;
-use crate::storage::{Body, create_dir_all, exists, file_name, is_dir, join_path, link, read_dir, remove_dir_all, size, to_account_path, to_path_segment, write_atomic_with_metadata};
+use crate::paths::{file_name, join_path, to_account_path, to_path_segment};
+use crate::storage::{Body, create_dir_all, exists, is_dir, link, read_dir, remove_dir_all, size, write_atomic_with_metadata};
 use crate::timestamp;
 use crate::types::{Context, Metadata, VersionEntry};
 use crate::util::encode_base64url;
@@ -133,6 +134,7 @@ mod tests {
     use super::*;
 
     use crate::crypto::create_secret_key;
+    use crate::identity::create_identity;
     use crate::metadata::{apply_key_to_metadata, create_metadata, sign_metadata, write_metadata_attributes};
     use crate::storage::{read, write_atomic_with_metadata, write_atomic_without_metadata};
     use crate::testing::fs::{TEST_ADDRESS, create_test_account, in_test_dir, write_plain_test_file};
@@ -156,7 +158,7 @@ mod tests {
 
     #[test]
     fn an_id_names_one_record_and_no_other() {
-        let (identity, secret_key) = crate::identity::create_identity(TEST_ADDRESS, None).unwrap();
+        let (identity, secret_key) = create_identity(TEST_ADDRESS, None).unwrap();
 
         let mut metadata = create_metadata(&identity.address, None);
         sign_metadata(&secret_key, &mut metadata, Some(b"body")).unwrap();

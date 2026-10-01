@@ -10,7 +10,8 @@ use crate::context::create_client_context;
 use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, create_secret_key, encrypt_bytes};
 use crate::identity::{parse_address, read_identity_key, read_identity_raw, write_identity_raw};
 use crate::metadata::{create_metadata, sign_metadata, write_metadata_attributes};
-use crate::storage::{Body, join_path, write_atomic_with_metadata};
+use crate::paths::join_path;
+use crate::storage::{Body, write_atomic_with_metadata};
 use crate::types::{Context, Identity, Key, Member, Metadata, Permission};
 
 static CWD_LOCK: Mutex<()> = Mutex::new(());
@@ -37,6 +38,12 @@ pub fn in_test_dir<R>(prefix: &str, f: impl FnOnce(&Path) -> R) -> R {
     f(&dir)
 }
 
+/// The [`Context`] for the account holding `path`, and `path` in the
+/// account-absolute form the storage and metadata functions take.
+///
+/// For tests that mean one tree specifically — a server's copy of an entry, or
+/// another account's copy. `identity_key` is set only where the account holds
+/// one in the clear.
 pub fn account_context(path: &Path) -> (Context, String) {
     let mut root = path;
     while !root.join(".ark").is_dir() {

@@ -4,8 +4,8 @@ use crate::client::request;
 use crate::http::check_response_code;
 use crate::identity::resolve_identity;
 use crate::metadata::{has_metadata_headers, read_metadata_headers, verify_metadata_signature};
+use crate::paths::to_url;
 use crate::types::{Context, Metadata};
-use crate::util::resolve_client_url;
 
 /// Fetch response headers and signed metadata for `path` without downloading
 /// the body. Verifies the metadata signature against the modifier's identity.
@@ -13,7 +13,7 @@ use crate::util::resolve_client_url;
 /// `path` accepts relative, absolute account, or address form. See the
 /// [module documentation](../index.html) for path resolution details.
 pub fn head(ctx: &Context, path: &str) -> io::Result<(Vec<(String, String)>, Metadata)> {
-    let url = resolve_client_url(ctx, path)?;
+    let url = to_url(ctx, path)?;
 
     let (code, headers, body) = request(Some(ctx), "HEAD", &url, &[], &[])?;
     check_response_code(code, &body)?;
@@ -50,7 +50,7 @@ mod tests {
             let ctx = init_with_server(temp_dir, &address);
             write_plain_test_file(&temp_dir.join("ark/gyan/file.bin"), &ctx.identity, ctx.identity_key.as_ref().unwrap(), b"hello world");
 
-            let url = resolve_client_url(&ctx, "file.bin").unwrap();
+            let url = to_url(&ctx, "file.bin").unwrap();
             let (code, headers, body) = request(Some(&ctx), "HEAD", &url, &[], &[]).unwrap();
             assert_eq!(code, 200);
             assert!(body.is_empty());
@@ -73,7 +73,7 @@ mod tests {
             let expected_key_b64 = encode_base64url(&read_metadata_attributes(&server_ctx, &server_path).unwrap()
                 .members[0].key.as_ref().unwrap().value);
 
-            let url = resolve_client_url(&ctx, "secret").unwrap();
+            let url = to_url(&ctx, "secret").unwrap();
             let (code, headers, body) = request(Some(&ctx), "HEAD", &url, &[], &[]).unwrap();
             assert_eq!(code, 200);
             assert!(body.is_empty());

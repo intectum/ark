@@ -9,7 +9,7 @@ use std::fs;
 use std::io;
 use std::os::unix::io::AsRawFd;
 
-use crate::storage::to_fs_path;
+use crate::paths::to_fs_path;
 use crate::types::Context;
 
 /// An advisory lock on an entry, held until it is dropped.
@@ -54,6 +54,7 @@ fn lock(ctx: &Context, path: &str, operation: i32) -> io::Result<Lock> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::thread;
@@ -75,7 +76,7 @@ mod tests {
     // threads and could pass by luck on a platform where the lock is quietly
     // doing nothing; these cannot.
 
-    fn locked_directory(temp_dir: &std::path::Path) -> Context {
+    fn locked_directory(temp_dir: &Path) -> Context {
         let (_, _, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
         let (context, _) = account_context(&account_dir);
         create_dir(&context, "/dir").unwrap();

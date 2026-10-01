@@ -6,9 +6,10 @@ use url::Url;
 use crate::client::request;
 use crate::crypto::{DEFAULT_SIGNING_ALGORITHM, create_secret_key, sign_json, to_public_key, verify_json};
 use crate::http::check_response_code;
-use crate::storage::{Body, create_dir_all, exists, exists_raw, join_path, read_to_string, read_to_string_raw, to_fs_path_raw, to_path_segment, write_atomic, write_atomic_without_metadata, write_atomic_without_metadata_raw};
+use crate::paths::{join_path, to_path_segment, to_url};
+use crate::storage::{Body, create_dir_all, exists, exists_raw, read_to_string, read_to_string_raw, write_atomic, write_atomic_without_metadata, write_atomic_without_metadata_raw, write_private, write_private_raw};
 use crate::types::{Context, Identity, Key, Signature};
-use crate::util::{decode_base64url, encode_base64url, resolve_client_url};
+use crate::util::{decode_base64url, encode_base64url};
 
 pub const IDENTITY_CACHE_DIR: &str = "/.ark/identities";
 
@@ -36,19 +37,14 @@ pub fn create_identity(address: &str, members: Option<Vec<String>>) -> io::Resul
 }
 
 pub fn read_identity(ctx: &Context, path: &str) -> io::Result<Identity> {
-    read_identity_raw(&ctx.root, path)
+    parse_identity(&read_to_string(ctx, path)?)
 }
 
 /// As [`read_identity`], for a caller holding only the account root — one
 /// running before its [`Context`] can be built, or reading another account
 /// under the server root.
 pub fn read_identity_raw(root: &Path, path: &str) -> io::Result<Identity> {
-    let content = read_to_string_raw(root, path)?;
-    let identity: Identity = serde_json::from_str(&content)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("identity.json parse: {}", e)))?;
-    validate_identity(&identity)?;
-
-    Ok(identity)
+    parse_identity(&read_to_string_raw(root, path)?)
 }
 
 pub fn identity_cache_path(address: &str) -> String {
@@ -96,7 +92,7 @@ pub fn resolve_identity(ctx: &Context, address: &str) -> io::Result<Identity> {
         }
     }
 
-    let url = resolve_client_url(ctx, &format!("{}@{}{}", name, host, path))?;
+    let url = to_url(ctx, &format!("{}@{}{}", name, host, path))?;
     let (code, _, body) = request(Some(ctx), "GET", &url, &[], &[])?;
     check_response_code(code, &body)?;
 
@@ -185,34 +181,25 @@ pub fn read_identity_key(ctx: &Context, path: &str) -> io::Result<Vec<u8>> {
     Ok(key)
 }
 
+/// Write `key` to `path`, base64url encoded, as [`write_private`] does — so
+/// the key is private to the current user, and never goes over one that is
+/// already there.
 pub fn write_identity_key(ctx: &Context, path: &str, key: &[u8]) -> io::Result<()> {
-    write_identity_key_raw(&ctx.root, path, key)
+    write_private(ctx, path, encode_base64url(key).as_bytes())
 }
 
 /// As [`write_identity_key`], for a caller holding only the account root —
 /// one running before its [`Context`] can be built.
-///
-/// The key is created private to the current user, and never over a key that
-/// is already there.
-#[cfg(unix)]
 pub fn write_identity_key_raw(root: &Path, path: &str, key: &[u8]) -> io::Result<()> {
-    use std::fs::OpenOptions;
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(to_fs_path_raw(root, path)?)?;
-    file.write_all(encode_base64url(key).as_bytes())?;
-
-    Ok(())
+    write_private_raw(root, path, encode_base64url(key).as_bytes())
 }
 
-#[cfg(not(unix))]
-pub fn write_identity_key_raw(root: &Path, path: &str, key: &[u8]) -> io::Result<()> {
-    write_atomic_without_metadata_raw(root, path, encode_base64url(key).as_bytes())
+fn parse_identity(content: &str) -> io::Result<Identity> {
+    let identity: Identity = serde_json::from_str(content)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("identity.json parse: {}", e)))?;
+    validate_identity(&identity)?;
+
+    Ok(identity)
 }
 
 fn serialize_identity(identity: &Identity) -> io::Result<Vec<u8>> {
@@ -246,6 +233,7 @@ mod tests {
 
     use crate::client::init_local;
     use crate::context::create_client_context;
+    use crate::paths::parent_path;
     use crate::testing::fs::{account_context, create_test_account, in_test_dir};
     use crate::testing::http::start_test_server;
 
@@ -406,7 +394,7 @@ mod tests {
         let underscored = identity_cache_path("alice@example.com/x_y");
 
         assert_ne!(slashed, underscored);
-        assert_eq!(crate::storage::parent_path(&slashed), Some(IDENTITY_CACHE_DIR), "the address escaped its own entry: {}", slashed);
+        assert_eq!(parent_path(&slashed), Some(IDENTITY_CACHE_DIR), "the address escaped its own entry: {}", slashed);
     }
 
     #[test]

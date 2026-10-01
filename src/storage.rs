@@ -4,33 +4,23 @@
 //! account path in place of a filesystem one, and differs from it only as its
 //! own documentation says.
 //!
-//! Each path argument takes any of the forms [`to_account_path`] accepts, and
-//! an operation errors with `InvalidInput` rather than touching anything
-//! outside the account root.
+//! Each path argument takes any of the forms
+//! [`to_account_path`](crate::paths::to_account_path) accepts, and an
+//! operation errors with `InvalidInput` rather than touching anything outside
+//! the account root.
 //!
 //! A `_raw` variant takes the account root in place of a [`Context`], for a
 //! caller running before its own can be built.
 
-use std::env::current_dir;
 use std::fs;
-use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::io::{self, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
 
-use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
-use uuid::Uuid;
-
-use crate::identity::parse_address;
 use crate::metadata::{read_local_metadata_attributes, read_metadata_attributes, write_metadata_attributes};
+use crate::paths::{is_temp_path, join_path, temp_path_for, to_account_path, to_fs_path, to_fs_path_raw};
 use crate::types::{Context, LocalMetadata, Metadata};
-use crate::util::parse_uuid;
-
-const TEMP_INFIX: &str = ".tmp-";
-
-// The separator must not survive into a name that stands as one entry, and the
-// escape character has to be escaped alongside it — otherwise two names that
-// differ could meet in the same entry, and one would be read under the other's
-// key. Everything else is left readable.
-const SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS.add(b'%').add(b'/');
 
 /// The body of `path`, as [`std::fs::read`] gives it.
 pub fn read(ctx: &Context, path: &str) -> io::Result<Vec<u8>> {
@@ -46,6 +36,32 @@ pub fn read_to_string(ctx: &Context, path: &str) -> io::Result<String> {
 /// running before its [`Context`] can be built.
 pub fn read_to_string_raw(root: &Path, path: &str) -> io::Result<String> {
     fs::read_to_string(to_fs_path_raw(root, path)?)
+}
+
+/// Write `body` to `path` as a new entry no other user can read, for a secret
+/// a reader would be able to act as the account with.
+///
+/// Errors with `AlreadyExists` where `path` is already there rather than
+/// writing over it, so a secret that cannot be recovered is never lost to a
+/// second write. On a platform without unix permissions the body is readable
+/// as any other entry's is.
+pub fn write_private(ctx: &Context, path: &str, body: &[u8]) -> io::Result<()> {
+    write_private_raw(&ctx.root, path, body)
+}
+
+/// As [`write_private`], for a caller holding only the account root — one
+/// running before its [`Context`] can be built.
+pub fn write_private_raw(root: &Path, path: &str, body: &[u8]) -> io::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+
+    // The mode goes on as the entry is created rather than after it, so the
+    // body never sits in an entry anyone else can open — a descriptor taken in
+    // that gap would keep its read on the secret whatever the mode became.
+    #[cfg(unix)]
+    options.mode(0o600);
+
+    options.open(to_fs_path_raw(root, path)?)?.write_all(body)
 }
 
 /// Move `from` to `to`, as [`std::fs::rename`] does.
@@ -217,112 +233,6 @@ pub fn size(ctx: &Context, path: &str) -> io::Result<u64> {
     Ok(fs::metadata(to_fs_path(ctx, path)?)?.len())
 }
 
-/// The account-absolute form of a path argument, which every function here
-/// resolves its argument to first.
-///
-/// Accepts the same forms as the client operations: relative (`team.json`),
-/// account-absolute (`/groups/team.json`), or address (`bob@host/team.json`).
-/// The relative form is taken against the working directory, so callers with
-/// no meaningful one — the server — must pass the account-absolute form.
-///
-/// `.` and `..` are resolved here rather than left to the filesystem, so the
-/// account path of an entry is the same however it was named.
-///
-/// Errors if the path lies outside the account root, `..` included. That check
-/// is what keeps every operation here to the account tree, so it runs on every
-/// call.
-pub fn to_account_path(ctx: &Context, path: &str) -> io::Result<String> {
-    to_account_path_raw(&ctx.root, path)
-}
-
-/// The account-absolute form of a path argument, taken against `root`.
-///
-/// As [`to_account_path`], for a caller holding only the account root — one
-/// running before its [`Context`] can be built.
-pub fn to_account_path_raw(root: &Path, path: &str) -> io::Result<String> {
-    // The absolute form is settled before the address one, so an entry whose
-    // own name carries an `@` is still addressable — an address never starts
-    // with a `/`.
-    let local_path = if let Some(relative) = path.strip_prefix('/') {
-        root.join(relative)
-    } else if path.contains('@') {
-        let (_, _, path_part) = parse_address(path)?;
-        root.join(path_part.trim_start_matches('/'))
-    } else {
-        current_dir()?.join(path)
-    };
-
-    let relative = local_path.strip_prefix(root)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path outside account root"))?;
-
-    let outside = || io::Error::new(io::ErrorKind::InvalidInput, "path outside account root");
-
-    let mut names: Vec<&str> = Vec::new();
-    for component in relative.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => { names.pop().ok_or_else(outside)?; }
-            Component::Normal(name) => names.push(name.to_str()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path is not valid UTF-8"))?),
-            _ => return Err(outside()),
-        }
-    }
-
-    Ok(format!("/{}", names.join("/")))
-}
-
-/// Where `path` sits on the filesystem, the one place an account path becomes
-/// one the standard library can take.
-///
-/// For a caller writing the body itself, or handing the entry to something
-/// that works in filesystem paths; the functions above go through this.
-pub fn to_fs_path(ctx: &Context, path: &str) -> io::Result<PathBuf> {
-    to_fs_path_raw(&ctx.root, path)
-}
-
-/// As [`to_fs_path`], for a caller holding only the account root — one
-/// running before its [`Context`] can be built.
-pub fn to_fs_path_raw(root: &Path, path: &str) -> io::Result<PathBuf> {
-    Ok(root.join(to_account_path_raw(root, path)?.trim_start_matches('/')))
-}
-
-/// The directory `path` sits in, or `None` when it names the account root or
-/// carries no directory of its own.
-pub fn parent_path(path: &str) -> Option<&str> {
-    let trimmed = path.trim_end_matches('/');
-
-    match trimmed.rfind('/') {
-        Some(0) => Some("/"),
-        Some(slash) => Some(&trimmed[..slash]),
-        None => None,
-    }
-}
-
-/// `name` as an entry of the directory `path`.
-pub fn join_path(path: &str, name: &str) -> String {
-    format!("{}/{}", path.trim_end_matches('/'), name)
-}
-
-/// The last component of `path`, as [`std::path::Path::file_name`] gives it,
-/// and empty where that gives nothing.
-pub fn file_name(path: &str) -> &str {
-    let trimmed = path.trim_end_matches('/');
-
-    match trimmed.rfind('/') {
-        Some(slash) => &trimmed[slash + 1..],
-        None => trimmed,
-    }
-}
-
-/// `name` as a single entry name, for a flat directory keyed by something that
-/// is itself a path or an address.
-///
-/// Distinct names always give distinct entries, so nothing keyed this way can
-/// be reached under another key's name.
-pub fn to_path_segment(name: &str) -> String {
-    utf8_percent_encode(name, SEGMENT_ENCODE_SET).to_string()
-}
-
 /// The body a [`write_atomic`] lands with.
 pub enum Body<'a> {
     Bytes(&'a [u8]),
@@ -417,48 +327,8 @@ fn write_atomic_inner(ctx: &Context, path: &str, body: Body, metadata: Option<&M
     result
 }
 
-/// A unique sibling name for a temporary version of `path`.
-///
-/// Named `.<name>.tmp-<uuid>`. The leading dot marks it internal.
-pub fn temp_path_for(path: &str) -> String {
-    let name = format!(".{}{}{}", file_name(path), TEMP_INFIX, Uuid::new_v4().hyphenated());
-
-    match parent_path(path) {
-        Some(parent) => join_path(parent, &name),
-        None => name,
-    }
-}
-
-/// A sibling name for a copy of `path` the user is meant to find beside what
-/// it refers to.
-///
-/// Named `<name>.<suffix>`, so it sits next to the entry rather than taking
-/// its place.
-pub fn sidecar_path_for(path: &str, suffix: &str) -> String {
-    let name = format!("{}.{}", file_name(path), suffix);
-
-    match parent_path(path) {
-        Some(parent) => join_path(parent, &name),
-        None => name,
-    }
-}
-
-/// Whether `path` names a temporary version of a file.
-pub fn is_temp_path(path: &str) -> bool {
-    let stem = match file_name(path).strip_prefix('.') {
-        Some(s) => s,
-        None => return false,
-    };
-
-    match stem.rfind(TEMP_INFIX) {
-        Some(infix) => parse_uuid(&stem[infix + TEMP_INFIX.len()..]).is_ok(),
-        None => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::env::set_current_dir;
     use std::io::ErrorKind;
     use std::path::Path;
     use super::*;
@@ -572,12 +442,6 @@ mod tests {
     }
 
     #[test]
-    fn a_sidecar_sits_beside_what_it_refers_to() {
-        assert_eq!(sidecar_path_for("/notes/a.txt", "version-1"), "/notes/a.txt.version-1");
-        assert_eq!(sidecar_path_for("a.txt", "conflict-2"), "a.txt.conflict-2");
-    }
-
-    #[test]
     fn both_ends_of_a_rename_or_copy_are_checked_against_the_account_root() {
         in_test_dir("ark_storage_test", |temp_dir| {
             let (context, identity, secret_key) = account(temp_dir);
@@ -622,67 +486,6 @@ mod tests {
             assert!(entries.contains(&"/a.txt".to_string()));
             assert_eq!(read(&context, "/a.txt").unwrap(), b"account");
             assert!(entries.iter().all(|entry| !is_temp_path(entry)), "no temporary entries");
-        });
-    }
-
-    #[test]
-    fn to_account_path_address_without_path_is_the_account_root() {
-        in_test_dir("ark_storage_test", |temp_dir| {
-            let (context, _, _) = account(temp_dir);
-
-            assert_eq!(to_account_path(&context, "bob@example.com").unwrap(), "/");
-        });
-    }
-
-    #[test]
-    fn to_account_path_address_with_path_is_under_the_account_root() {
-        in_test_dir("ark_storage_test", |temp_dir| {
-            let (context, _, _) = account(temp_dir);
-
-            assert_eq!(to_account_path(&context, "bob@example.com/notes/todo.txt").unwrap(), "/notes/todo.txt");
-        });
-    }
-
-    #[test]
-    fn to_account_path_absolute_wins_over_an_at_in_the_name() {
-        in_test_dir("ark_storage_test", |temp_dir| {
-            let (context, _, _) = account(temp_dir);
-
-            assert_eq!(to_account_path(&context, "/notes/mail@host.txt").unwrap(), "/notes/mail@host.txt");
-        });
-    }
-
-    #[test]
-    fn to_account_path_relative_is_under_the_working_directory() {
-        in_test_dir("ark_storage_test", |temp_dir| {
-            let (context, _, _) = account(temp_dir);
-            let dir = context.root.join("notes");
-            fs::create_dir_all(&dir).unwrap();
-            set_current_dir(&dir).unwrap();
-
-            assert_eq!(to_account_path(&context, "todo.txt").unwrap(), "/notes/todo.txt");
-        });
-    }
-
-    #[test]
-    fn a_path_climbing_out_of_the_account_root_errors() {
-        in_test_dir("ark_storage_test", |temp_dir| {
-            let (context, _, _) = account(temp_dir);
-
-            let error = to_account_path(&context, "/../outside.txt").unwrap_err();
-            assert_eq!(error.kind(), ErrorKind::InvalidInput);
-        });
-    }
-
-    #[test]
-    fn a_path_outside_the_account_root_errors() {
-        in_test_dir("ark_storage_test", |temp_dir| {
-            let (context, _, _) = account(temp_dir);
-
-            // The test's working directory is the server root, one above the
-            // account's own.
-            let error = to_account_path(&context, "outside.txt").unwrap_err();
-            assert_eq!(error.kind(), ErrorKind::InvalidInput);
         });
     }
 
@@ -757,34 +560,4 @@ mod tests {
         });
     }
 
-    #[test]
-    fn temp_path_for_is_recognised_and_real_names_are_not() {
-        let path = "/notes/todo.txt";
-        let temp = temp_path_for(path);
-        assert!(is_temp_path(&temp));
-        assert_eq!(parent_path(&temp), parent_path(path));
-        assert!(file_name(&temp).starts_with(".todo.txt.tmp-"));
-
-        assert!(!is_temp_path(path));
-        assert!(!is_temp_path("/notes/.todo.txt.tmp-notauuid"));
-        assert!(!is_temp_path("/notes/todo.txt.tmp-1e2b34d0-0000-4000-8000-000000000000"));
-        assert!(!is_temp_path("/notes/todo.txt.conflict-2026-08-10T00-00-00Z"));
-    }
-
-    #[test]
-    fn path_parts_are_taken_account_absolute() {
-        assert_eq!(parent_path("/notes/todo.txt"), Some("/notes"));
-        assert_eq!(parent_path("/notes/"), Some("/"));
-        assert_eq!(parent_path("/todo.txt"), Some("/"));
-        assert_eq!(parent_path("todo.txt"), None);
-        assert_eq!(parent_path("/"), None);
-
-        assert_eq!(file_name("/notes/todo.txt"), "todo.txt");
-        assert_eq!(file_name("/notes/"), "notes");
-        assert_eq!(file_name("/"), "");
-
-        assert_eq!(join_path("/", "notes"), "/notes");
-        assert_eq!(join_path("/notes", "todo.txt"), "/notes/todo.txt");
-        assert_eq!(join_path("/notes/", "todo.txt"), "/notes/todo.txt");
-    }
 }

@@ -4,16 +4,16 @@ use super::{get_stream, request};
 
 use crate::http::check_response_code;
 use crate::metadata::{read_local_metadata_attributes, read_metadata_attributes};
-use crate::storage::{Body, create_dir_all, parent_path, sidecar_path_for, write_atomic_with_metadata};
+use crate::paths::{parent_path, sidecar_path_for, to_url};
+use crate::storage::{Body, create_dir_all, write_atomic_with_metadata};
 use crate::types::{Context, LocalMetadata, VersionEntry};
-use crate::util::resolve_client_url;
 
 /// The version history of the file or directory at `path`, newest first.
 ///
 /// `path` accepts relative, absolute account, or address form. A path with no
 /// history, or none the server kept, gives an empty list.
 pub fn list_versions(ctx: &Context, path: &str) -> io::Result<Vec<VersionEntry>> {
-    let mut url = resolve_client_url(ctx, path)?;
+    let mut url = to_url(ctx, path)?;
     url.query_pairs_mut().append_key_only("versions");
 
     let (code, _, body) = request(Some(ctx), "GET", &url, &[], &[])?;

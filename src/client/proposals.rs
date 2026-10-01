@@ -8,8 +8,9 @@ use super::{delete, get_stream, head, list, request, watch_remote};
 use crate::http::check_response_code;
 use crate::identity::parse_address;
 use crate::metadata::{read_metadata_headers, write_metadata_headers};
+use crate::paths::to_url;
 use crate::types::{Context, EntryAction, Metadata, Permission, Proposal};
-use crate::util::{parse_request_entry, resolve_client_url, sha256};
+use crate::util::{parse_request_entry, sha256};
 
 // A log entry's body lands before its metadata does, so a fetch triggered by
 // the create event can arrive too early to verify.
@@ -62,8 +63,8 @@ where
     F: FnMut(Proposal) -> bool,
     G: Fn(io::Error) -> bool,
 {
-    let target_prefix = resolve_client_url(ctx, path)?.path().trim_end_matches('/').to_string();
-    let requests_url = resolve_client_url(ctx, "/.ark/requests/")?;
+    let target_prefix = to_url(ctx, path)?.path().trim_end_matches('/').to_string();
+    let requests_url = to_url(ctx, "/.ark/requests/")?;
 
     let mut reported: HashSet<String> = HashSet::new();
 
@@ -151,7 +152,7 @@ pub fn accept_proposal(ctx: &Context, index_or_id: &str, force: bool) -> io::Res
     } else {
         format!("/{}", relative_path)
     };
-    let own_url = resolve_client_url(ctx, &own_path)?;
+    let own_url = to_url(ctx, &own_path)?;
 
     let headers = write_metadata_headers(&current_metadata);
     let header_refs: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();

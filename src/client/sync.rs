@@ -7,10 +7,11 @@ use super::{get, get_stream, head, list, put_content, watch_local, watch_remote}
 
 use crate::identity::parse_address;
 use crate::metadata::{has_metadata_attributes, read_local_metadata_attributes, read_metadata_attributes, read_metadata_headers, write_metadata_attributes};
-use crate::storage::{Body, create_dir_all, exists, is_dir, is_file, is_symlink, join_path, parent_path, read, read_dir, read_to_string, remove_file, sidecar_path_for, to_account_path, to_fs_path, write_atomic_with_metadata, write_atomic_without_metadata};
+use crate::paths::{join_path, parent_path, sidecar_path_for, to_account_path, to_fs_path, to_url};
+use crate::storage::{Body, create_dir_all, exists, is_dir, is_file, is_symlink, read, read_dir, read_to_string, remove_file, write_atomic_with_metadata, write_atomic_without_metadata};
 use crate::timestamp;
 use crate::types::{Context, DirEntryKind, EntryAction, EntryEvent, Metadata};
-use crate::util::{parse_request_entry, resolve_client_url, sha256};
+use crate::util::{parse_request_entry, sha256};
 
 struct SyncEntry {
     relative_path: String,
@@ -115,7 +116,7 @@ where
     G: Fn(io::Error) -> bool,
 {
     let rel_prefix = path.trim_start_matches('/').to_string();
-    let url = resolve_client_url(ctx, path)?;
+    let url = to_url(ctx, path)?;
 
     watch_remote(ctx, &url, |event| {
         let subpath = event.path.to_string_lossy();
@@ -473,7 +474,7 @@ mod tests {
     use crate::testing::fs::{account_context, in_test_dir, init_with_server, write_encrypted_test_file, write_plain_test_file};
     use crate::testing::http::start_test_server;
     use crate::types::Permissions;
-    use crate::storage::{file_name, temp_path_for};
+    use crate::paths::{file_name, temp_path_for};
 
     fn write_local(root: &Path, relative: &str, body: &[u8]) {
         let path = root.join(relative);

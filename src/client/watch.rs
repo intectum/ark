@@ -13,7 +13,7 @@ use url::Url;
 use crate::http::{connect, read_stream_events, write_request};
 use crate::timestamp;
 use crate::types::{Context, DirEntry, DirEntryKind, EntryAction, EntryEvent, StreamEvent};
-use crate::storage::is_temp_path;
+use crate::paths::is_temp_path;
 use crate::util::create_authorization_header;
 
 const REMOTE_READ_TIMEOUT: Duration = Duration::from_secs(45);
@@ -169,7 +169,7 @@ fn to_entry_event_remote<G: Fn(io::Error) -> bool>(event: &StreamEvent, on_error
 mod tests {
     use std::sync::mpsc::{RecvTimeoutError, channel};
 
-    use crate::storage::temp_path_for;
+    use crate::paths::temp_path_for;
     use crate::testing::fs::in_test_dir;
 
     use super::*;

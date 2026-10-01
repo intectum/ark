@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use crate::client::watch_local;
 use crate::http::{write_stream_event, write_stream_keepalive, write_stream_start};
-use crate::storage::{is_dir, join_path, to_account_path, to_fs_path};
+use crate::paths::{join_path, to_account_path, to_fs_path};
+use crate::storage::is_dir;
 use crate::timestamp;
 use crate::types::{Context, DirEntry, DirEntryKind, EntryEvent};
 

@@ -1,8 +1,10 @@
 use std::io::{self, Write};
+use std::str::from_utf8;
 
 use crate::context::create_target_context;
 use crate::metadata::{create_metadata, read_metadata_attributes, sign_metadata};
-use crate::storage::{Body, exists, is_dir, join_path, write_atomic_with_metadata};
+use crate::paths::join_path;
+use crate::storage::{Body, exists, is_dir, write_atomic_with_metadata};
 use crate::timestamp;
 use crate::types::{Context, Member, Permission};
 
@@ -94,7 +96,7 @@ pub fn try_log_request(
     }
 
     let status = captured_response.windows(2).position(|w| w == b"\r\n")
-        .and_then(|line_end| std::str::from_utf8(&captured_response[..line_end]).ok())
+        .and_then(|line_end| from_utf8(&captured_response[..line_end]).ok())
         .and_then(|line| line.split_whitespace().nth(1)?.parse().ok())
         .unwrap_or(0);
 

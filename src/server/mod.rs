@@ -32,9 +32,9 @@ use crate::context::{create_server_context, create_target_context};
 use crate::http::{read_request, write_text};
 use crate::identity::resolve_identity;
 use crate::metadata::{read_metadata_attributes, read_metadata_headers};
+use crate::paths::parse_request_target;
 use crate::storage::{is_file, is_symlink};
 use crate::types::{Context, Permission, RelayMode};
-use crate::util::resolve_server_url;
 
 pub const MAX_CLOCK_SKEW_MS: u64 = 300_000;
 
@@ -124,7 +124,7 @@ fn handle_parsed_inner(
     body: &[u8],
     verbose: bool,
 ) -> io::Result<()> {
-    let url = match resolve_server_url(target) {
+    let url = match parse_request_target(target) {
         Ok(u) => u,
         Err(_) => return write_text(stream, 400, b"bad path"),
     };
@@ -312,6 +312,7 @@ mod tests {
 
     use crate::crypto::{DEFAULT_SIGNING_ALGORITHM, create_secret_key};
     use crate::identity::create_identity;
+    use crate::metadata::sign_metadata;
     use crate::testing::fs::{TEST_ADDRESS, create_test_account, in_test_dir, write_plain_test_file};
     use crate::testing::http::*;
     use crate::timestamp::now_ms;
@@ -330,13 +331,13 @@ mod tests {
             // Everything under the account root is public to read.
             let mut public = create_metadata(&owner_identity.address, None);
             public.members.push(Member { address: "*".to_string(), permission: Permission::Reader, key: None });
-            crate::metadata::sign_metadata(&owner_key, &mut public, None).unwrap();
+            sign_metadata(&owner_key, &mut public, None).unwrap();
             write_metadata_attributes(&context, "/", &public, None).unwrap();
 
             // This one is not — it names only its owner.
             create_dir_all(&context, "/private").unwrap();
             let mut private = create_metadata(&owner_identity.address, None);
-            crate::metadata::sign_metadata(&owner_key, &mut private, None).unwrap();
+            sign_metadata(&owner_key, &mut private, None).unwrap();
             write_metadata_attributes(&context, "/private", &private, None).unwrap();
 
             // Leave it carrying part of a record and nothing set aside to put back,
@@ -363,7 +364,7 @@ mod tests {
 
             let mut public = create_metadata(&owner_identity.address, None);
             public.members.push(Member { address: "*".to_string(), permission: Permission::Reader, key: None });
-            crate::metadata::sign_metadata(&owner_key, &mut public, None).unwrap();
+            sign_metadata(&owner_key, &mut public, None).unwrap();
             write_metadata_attributes(&context, "/", &public, None).unwrap();
 
             create_dir_all(&context, "/nested").unwrap();

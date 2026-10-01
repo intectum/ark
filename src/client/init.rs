@@ -9,10 +9,11 @@ use crate::crypto::{DEFAULT_PASSWORD_ALGORITHM, create_secret_key_from_password,
 use crate::http::check_response_code;
 use crate::identity::{create_identity, parse_address, sign_identity, validate_identity, write_identity, write_identity_key, write_identity_key_raw, write_identity_raw};
 use crate::metadata::{read_metadata_headers, write_metadata_attributes};
+use crate::paths::{to_fs_path_raw, to_url, to_url_raw};
 use crate::permissions::{reader, writer};
-use crate::storage::{create_dir_all, create_dir_all_raw, exists_raw, to_fs_path_raw};
+use crate::storage::{create_dir_all, create_dir_all_raw, exists_raw};
 use crate::types::{Context, Identity, Key, Signature};
-use crate::util::{decode_base64url, resolve_client_url, resolve_client_url_raw};
+use crate::util::decode_base64url;
 
 /// Initialize the ark account at `address` under `root`.
 ///
@@ -47,7 +48,7 @@ pub fn init(root: &Path, address: &str, password: Option<&str>, local_only: bool
         return Ok(());
     }
 
-    let url = resolve_client_url_raw(root, "/.ark/identity.json", address)?;
+    let url = to_url_raw(root, "/.ark/identity.json", address)?;
     let (code, _, body) = request(None, "GET", &url, &[], &[])?;
     match code {
         200..300 => {
@@ -112,7 +113,7 @@ fn pull_secret_key_with_password(
     };
 
     let password_address = format!("{}/.ark/passwords/primary.json", identity.address);
-    let password_url = resolve_client_url(&ctx, &password_address)?;
+    let password_url = to_url(&ctx, &password_address)?;
     let (password_code, _, password_body) = request(None, "GET", &password_url, &[], &[])?;
     check_response_code(password_code, &password_body)?;
 
@@ -127,7 +128,7 @@ fn pull_secret_key_with_password(
         identity_key: Some(restore_secret_key_from_password(&password_identity, password)?),
     };
 
-    let identity_key_url = resolve_client_url(&ctx, "/.ark/identity.key")?;
+    let identity_key_url = to_url(&ctx, "/.ark/identity.key")?;
     let (identity_key_code, identity_key_headers, identity_key_body) = request(Some(&password_ctx), "GET", &identity_key_url, &[], &[])?;
     check_response_code(identity_key_code, &identity_key_body)?;
 

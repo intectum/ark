@@ -7,9 +7,10 @@ use crate::crypto::DEFAULT_HASH_ALGORITHM;
 use crate::http::check_response_code;
 use crate::identity::resolve_identity;
 use crate::metadata::{has_metadata_headers, read_metadata_attributes, read_metadata_headers, write_metadata_attributes};
-use crate::storage::{Body, create_dir_all, parent_path, write_atomic_with_metadata};
+use crate::paths::{parent_path, to_url};
+use crate::storage::{Body, create_dir_all, write_atomic_with_metadata};
 use crate::types::{Context, Hash, LocalMetadata, Metadata};
-use crate::util::{resolve_client_url, sha256, validate_update, validate_version};
+use crate::util::{sha256, validate_update, validate_version};
 use crate::versions::to_version;
 
 /// Download the body of a file at `path` (decrypting when encrypted).
@@ -93,7 +94,7 @@ pub fn get_stream(
     existing_metadata: Option<&Metadata>,
     version: Option<&str>,
 ) -> io::Result<(Metadata, LocalMetadata)> {
-    let mut url = resolve_client_url(ctx, path)?;
+    let mut url = to_url(ctx, path)?;
     if let Some(id) = version {
         url.query_pairs_mut().append_pair("version", id);
     }

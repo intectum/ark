@@ -116,6 +116,8 @@ An Ark **server** is an authenticated file server rooted at `/ark/<account>/…`
 
 **Directory (default).** Response body is `[DirectoryEntry]` (Appendix A.5) as JSON — `{type, name}` per entry, `type` in `dir | file | symlink`. If the directory itself has metadata, its `X-Ark-Meta-*` are also returned. No recursion.
 
+**Directory (`?prefix=`).** Lists only the entries whose name starts with the given string. A filter on the name alone, so what it can narrow is whatever the names encode — the request log (§10) leads its names with the method and status for this.
+
 **Optional query param: `versions`.** The response body is `[VersionEntry]` (Appendix A.10) as JSON — the history of the path, newest first, or an empty array where it has none. The path's own metadata is not returned.
 
 **Optional query param: `version=<id>`.** The response is that version's body, with the `X-Ark-Meta-*` set its author signed. `404` where the id names no version the server kept. A version is served under the **current** metadata of the path in the URL, never under the member list its own record carries (§6).
@@ -197,7 +199,7 @@ Everything under `/.ark/` is protocol-defined. Applications must not write arbit
 | `groups/<name>.key` | Group Ed25519 seed as an encrypted Ark file, members-only | Body is the base64url seed; wrapped per member like `identity.key` (§11.2). |
 | `invitations/<token>.json` | `Invitation` (A.9) | **Status: not yet implemented.** |
 | `invitations/<token>.html` | Human landing page | **Status: not yet implemented.** |
-| `requests/<ts>_<seq>.http` | Request log entry | See §10. Owner reads; `ark@<host>` writes. |
+| `requests/<method>_<status>_<ts>_<seq>.http` | Request log entry | See §10. Owner reads; `ark@<host>` writes. |
 | `blocked/<address>.json` | Per-sender blocklist entry | **Status: not yet implemented.** |
 
 Requests to `/ark/<account>/.ark/requests/` and its entries are **not** themselves logged.
@@ -432,8 +434,10 @@ Ark makes federation a server responsibility. A client publishes once; the serve
 
 Every server keeps a per-account append-only log of received requests. It is the record the account owner uses to see what happened to their account.
 
-**Location.** `/ark/<account>/.ark/requests/<timestamp>_<seq>.http`.
+**Location.** `/ark/<account>/.ark/requests/<method>_<status>_<timestamp>_<seq>.http`.
 
+- `<method>` — the request method, e.g. `PUT`.
+- `<status>` — the response status, e.g. `204`. With the method it leads the name so a reader after one kind of entry can ask for it by `prefix` (§4.3) rather than reading the whole log.
 - `<timestamp>` — RFC 3339 (millisecond precision, `Z`-terminated) with `:` replaced by `-` for filesystem safety, e.g. `2026-07-24T10-00-00.000Z`.
 - `<seq>` — zero-padded 3-digit sequence counter, disambiguating concurrent requests within the same instant.
 

@@ -3,7 +3,8 @@ use std::path::Path;
 
 use crate::http::{write_response, write_text};
 use crate::metadata::{read_metadata_attributes, write_metadata_headers};
-use crate::storage::{exists, file_name, is_dir, is_symlink, read, read_dir, size};
+use crate::paths::file_name;
+use crate::storage::{exists, is_dir, is_symlink, read, read_dir, size};
 use crate::types::{Context, DirEntry, DirEntryKind};
 
 pub fn serve_get(ctx: &Context, path: &str, stream: &mut dyn Write, send_body: bool, prefix: Option<&str>) -> io::Result<()> {

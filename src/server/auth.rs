@@ -7,7 +7,7 @@ use super::MAX_CLOCK_SKEW_MS;
 use crate::crypto::verify_bytes;
 use crate::identity::{parse_address, resolve_identity};
 use crate::metadata::read_metadata_attributes;
-use crate::storage::parent_path;
+use crate::paths::parent_path;
 use crate::timestamp;
 use crate::types::{Context, Identity, Member, Permission, Signature};
 use crate::util::{decode_base64url, parse_authorization_header, request_to_bytes};
@@ -159,6 +159,8 @@ fn resolve_member_permission(
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     use crate::metadata::{create_metadata, sign_metadata, write_metadata_attributes};
@@ -168,7 +170,7 @@ mod tests {
 
     // `/top` carries members, `/top/mid` is what the walk has to get past, and
     // `/top/mid/leaf` carries nothing of its own.
-    fn tree(temp_dir: &std::path::Path) -> Context {
+    fn tree(temp_dir: &Path) -> Context {
         let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
         let (context, _) = account_context(&account_dir);
 

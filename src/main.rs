@@ -4,7 +4,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::process::exit;
 
-use ark::{accept_proposal, create_client_context, create_client_identity, decrypt, delete, encrypt, format as format_timestamp, get, get_stream, get_version, head, change_identity_members, init, list, list_proposals, list_versions, parse_address, put, reject_proposal, resolve_client_url, restore_version, start_server, sync, watch_local, watch_remote, Context, DirEntryKind, EntryEvent, Permissions};
+use ark::{accept_proposal, create_client_context, create_client_identity, decrypt, delete, encrypt, format as format_timestamp, get, get_stream, get_version, head, change_identity_members, init, list, list_proposals, list_versions, parse_address, put, reject_proposal, restore_version, start_server, sync, to_url, watch_local, watch_remote, Context, DirEntryKind, EntryEvent, Permissions};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -301,7 +301,7 @@ fn main() {
         Cmd::Watch { cmd } => match cmd {
             WatchCmd::Local { path } => watch_local(Path::new(&path), print_event, print_error),
             WatchCmd::Remote { path } => create_client_context().and_then(|c| {
-                let url = resolve_client_url(&c, &path)?;
+                let url = to_url(&c, &path)?;
                 watch_remote(&c, &url, print_event, print_error)
             }),
         },
