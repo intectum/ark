@@ -167,7 +167,7 @@ mod tests {
             // The relayed target carries `?metadata`, which must not end up in
             // the signed bytes — verification recomputes them from the path.
             let mut updated = metadata.clone();
-            updated.modified = metadata.modified + time::Duration::seconds(1);
+            updated.author_date = metadata.author_date + time::Duration::seconds(1);
             sign_metadata(&alice_key, &mut updated, Some(b"body")).unwrap();
 
             let code = signed_put_metadata_with_headers(port, &alice_id, &alice_key, "/ark/alice/shared/n.txt?relay=full&metadata", b"", &updated, &[]);
@@ -176,7 +176,7 @@ mod tests {
             wait_for(|| {
                 let (bob_ctx, bob_path) = account_context(&temp_dir.join("ark/bob/shared/n.txt"));
                 read_metadata_attributes(&bob_ctx, &bob_path)
-                    .map(|m| m.modified == updated.modified)
+                    .map(|m| m.author_date == updated.author_date)
                     .unwrap_or(false)
             });
         });

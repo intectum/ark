@@ -9,7 +9,7 @@ use crate::crypto::{DEFAULT_SIGNING_ALGORITHM, sign_bytes};
 use crate::http::read_response;
 use crate::metadata::{sign_metadata, write_metadata_attributes, write_metadata_headers};
 pub use crate::server::start_test_server;
-use crate::storage::{Body, write_atomic_with_metadata};
+use crate::storage::write_atomic_with_metadata;
 use crate::testing::fs::{account_context, create_plain_test_metadata};
 use crate::timestamp;
 use crate::types::{Identity, Key, Member, Metadata};
@@ -237,7 +237,7 @@ pub fn seed_shared_file(
     sign_metadata(owner_secret_key, &mut metadata, Some(body)).unwrap();
 
     let (context, account_path) = account_context(&file);
-    write_atomic_with_metadata(&context, &account_path, Body::Bytes(body), &metadata, None).unwrap();
+    write_atomic_with_metadata(&context, &account_path, body, &metadata, None).unwrap();
 
     file
 }

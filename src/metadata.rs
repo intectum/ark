@@ -3,11 +3,11 @@ use std::io;
 use uuid::Uuid;
 
 use crate::client::decrypt_stream;
-use crate::crypto::{DEFAULT_HASH_ALGORITHM, decrypt_bytes, encrypt_bytes, sign_json, verify_json};
+use crate::crypto::{DEFAULT_HASH_ALGORITHM, decrypt_bytes, encrypt_bytes, sign_bytes, verify_bytes};
 use crate::identity::{identity_key_path, parse_address, read_identity_key, resolve_identity};
 use crate::permissions::cli_address_to_wire;
 use crate::lock::{Lock, lock_exclusive, lock_shared};
-use crate::storage::{Body, create_dir_all, exists, is_dir, list_attributes, read, read_attribute, remove_attribute, remove_file, write_atomic_with_metadata, write_atomic_without_metadata, write_attribute};
+use crate::storage::{copy_atomic_with_metadata, create_dir_all, exists, is_dir, list_attributes, read, read_attribute, remove_attribute, remove_file, write_atomic_with_metadata, write_atomic_without_metadata, write_attribute};
 use crate::timestamp;
 use crate::types::{Hash, Key, LocalMetadata, Member, Metadata, Permission, Permissions, Signature};
 use crate::types::Context;
@@ -21,9 +21,8 @@ const LOCAL_ATTRIBUTE_PREFIX: &str = "user.ark_local.";
 const HEADER_PREFIX: &str = "X-Ark-Meta-";
 
 const FIELD_ID: &str = "id";
-const FIELD_CREATED: &str = "created";
-const FIELD_MODIFIED: &str = "modified";
-const FIELD_MODIFIED_BY: &str = "modified_by";
+const FIELD_AUTHOR: &str = "author";
+const FIELD_AUTHOR_DATE: &str = "author_date";
 const FIELD_PARENT_VERSION: &str = "parent_version";
 const FIELD_ENCRYPTION_ALGORITHM: &str = "encryption_algorithm";
 const FIELD_MEMBER_PREFIX: &str = "member_";
@@ -39,7 +38,7 @@ const FIELD_SIGNATURE_VALUE: &str = "signature_value";
 const LOCAL_FIELD_ENCRYPTED: &str = "encrypted";
 const LOCAL_FIELD_SYNC_BODY_HASH_ALGORITHM: &str = "sync_body_hash_algorithm";
 const LOCAL_FIELD_SYNC_BODY_HASH_VALUE: &str = "sync_body_hash_value";
-const LOCAL_FIELD_SYNC_MODIFIED: &str = "sync_modified";
+const LOCAL_FIELD_SYNC_AUTHOR_DATE: &str = "sync_author_date";
 
 pub fn members_changed(old: &[Member], new: &[Member]) -> bool {
     if old.len() != new.len() { return true; }
@@ -55,9 +54,8 @@ pub fn create_metadata(owner_address: &str, encryption_algorithm: Option<&str>) 
 
     Metadata {
         id: Uuid::new_v4(),
-        created: now,
-        modified: now,
-        modified_by: owner_address.to_string(),
+        author: owner_address.to_string(),
+        author_date: now,
         parent_version: None,
         encryption_algorithm: encryption_algorithm.map(|s| s.to_string()),
         members: vec![Member {
@@ -131,90 +129,87 @@ fn read_metadata_attributes_unlocked(ctx: &Context, path: &str) -> io::Result<Me
 }
 
 /// Replace the metadata `path` carries with `metadata`, and the local metadata
-/// it carries with `local_metadata` where that is given.
+/// it carries with `local_metadata` where that is given, as a single visible
+/// change.
 ///
-/// Both go on as one change, so a reader never catches a new record beside the
-/// local one that belonged to the record before it.
-///
-/// The fields are separate attributes and cannot be written as a set. For a
-/// directory, which takes them where it stands, the replacement is serialised
-/// by a lock and the records being replaced are set aside first, so an update
-/// interrupted part-way is put back by the next read rather than left to be
-/// read short.
-pub fn write_metadata_attributes(ctx: &Context, path: &str, metadata: &Metadata, local_metadata: Option<&LocalMetadata>) -> io::Result<()> {
-    let lock = lock_directory_exclusive(ctx, path)?;
+/// A reader sees either the previous records or the whole new ones, never a
+/// new record beside the local one that belonged to the record before it. An
+/// update to a directory interrupted part-way is put back by the next read
+/// rather than left to be read short.
+pub fn write_metadata_attributes_atomic(ctx: &Context, path: &str, metadata: &Metadata, local_metadata: Option<&LocalMetadata>) -> io::Result<()> {
+    if !is_dir(ctx, path) {
+        let local_metadata = local_metadata.cloned().or_else(|| read_local_metadata_attributes(ctx, path).ok());
 
-    // A file is replaced by a rename and cannot be caught part-way, so only a
-    // directory sets aside what it carries while the new records go on. That
-    // happens before the attributes are touched and is removed after the last
-    // of them lands, so its presence is what marks the rewrite as still under
-    // way.
-    if lock.is_some() {
-        restore_previous_metadata_unlocked(ctx, path)?;
-
-        let previous = read_metadata_attributes_unlocked(ctx, path).ok();
-        let previous_local = read_local_metadata_attributes_unlocked(ctx, path)?;
-        save_previous_metadata(ctx, path, previous.as_ref(), &previous_local)?;
+        return copy_atomic_with_metadata(ctx, path, path, metadata, local_metadata.as_ref());
     }
 
-    write_metadata_attributes_unlocked(ctx, path, metadata)?;
-    if let Some(local_metadata) = local_metadata {
-        write_local_metadata_attributes_unlocked(ctx, path, local_metadata)?;
-    }
+    let _lock = lock_exclusive(ctx, path)?;
 
-    if lock.is_some() {
-        remove_file(ctx, &version_path_for(ctx, path, PREVIOUS_VERSION)?)?;
-    }
+    // A directory takes its attributes where it stands, so it sets aside what
+    // it carries while the new records go on. That happens before the
+    // attributes are touched and is removed after the last of them lands, so
+    // its presence is what marks the rewrite as still under way.
+    restore_previous_metadata_unlocked(ctx, path)?;
 
-    Ok(())
+    let previous_metadata = read_metadata_attributes_unlocked(ctx, path).ok();
+    let previous_local_metadata = read_local_metadata_attributes_unlocked(ctx, path)?;
+    save_previous_metadata(ctx, path, previous_metadata.as_ref(), &previous_local_metadata)?;
+
+    write_metadata_attributes(ctx, path, metadata, local_metadata)?;
+
+    remove_file(ctx, &version_path_for(ctx, path, PREVIOUS_VERSION)?)
 }
 
-fn write_metadata_attributes_unlocked(ctx: &Context, path: &str, metadata: &Metadata) -> io::Result<()> {
-    remove_metadata_attributes_unlocked(ctx, path)?;
+/// Replace the metadata `path` carries with `metadata`, and the local metadata
+/// it carries with `local_metadata` where that is given, where `path` stands.
+///
+/// The fields are separate attributes written one at a time, so a reader can
+/// catch the records part-way. For an entry no reader can reach yet, such as
+/// one built under a temporary name; otherwise use
+/// [`write_metadata_attributes_atomic`].
+pub fn write_metadata_attributes(ctx: &Context, path: &str, metadata: &Metadata, local_metadata: Option<&LocalMetadata>) -> io::Result<()> {
+    let mut attributes: Vec<(String, Vec<u8>)> = Vec::new();
 
-    write_attribute(ctx, path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_ID), metadata.id.hyphenated().to_string().as_bytes())?;
-    write_attribute(ctx, path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_CREATED), timestamp::format(metadata.created).as_bytes())?;
-    write_attribute(ctx, path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_MODIFIED), timestamp::format(metadata.modified).as_bytes())?;
-    write_attribute(ctx, path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_MODIFIED_BY), metadata.modified_by.as_bytes())?;
+    attributes.push((format!("{}{}", ATTRIBUTE_PREFIX, FIELD_ID), metadata.id.hyphenated().to_string().into_bytes()));
+    attributes.push((format!("{}{}", ATTRIBUTE_PREFIX, FIELD_AUTHOR), metadata.author.clone().into_bytes()));
+    attributes.push((format!("{}{}", ATTRIBUTE_PREFIX, FIELD_AUTHOR_DATE), timestamp::format(metadata.author_date).into_bytes()));
     if let Some(parent_version) = &metadata.parent_version {
-        write_attribute(ctx, path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_PARENT_VERSION), parent_version.as_bytes())?;
+        attributes.push((format!("{}{}", ATTRIBUTE_PREFIX, FIELD_PARENT_VERSION), parent_version.clone().into_bytes()));
     }
     if let Some(alg) = &metadata.encryption_algorithm {
-        write_attribute(ctx, path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_ENCRYPTION_ALGORITHM), alg.as_bytes())?;
+        attributes.push((format!("{}{}", ATTRIBUTE_PREFIX, FIELD_ENCRYPTION_ALGORITHM), alg.clone().into_bytes()));
     }
     if let Some(body_hash) = &metadata.body_hash {
-        write_attribute(ctx, path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_BODY_HASH_ALGORITHM), body_hash.algorithm.as_bytes())?;
-        write_attribute(ctx, path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_BODY_HASH_VALUE), encode_base64url(&body_hash.value).as_bytes())?;
+        attributes.push((format!("{}{}", ATTRIBUTE_PREFIX, FIELD_BODY_HASH_ALGORITHM), body_hash.algorithm.clone().into_bytes()));
+        attributes.push((format!("{}{}", ATTRIBUTE_PREFIX, FIELD_BODY_HASH_VALUE), encode_base64url(&body_hash.value).into_bytes()));
     }
-    write_attribute(ctx, path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_SIGNATURE_ALGORITHM), metadata.signature.algorithm.as_bytes())?;
-    write_attribute(ctx, path, &format!("{}{}", ATTRIBUTE_PREFIX, FIELD_SIGNATURE_VALUE), encode_base64url(&metadata.signature.value).as_bytes())?;
+    attributes.push((format!("{}{}", ATTRIBUTE_PREFIX, FIELD_SIGNATURE_ALGORITHM), metadata.signature.algorithm.clone().into_bytes()));
+    attributes.push((format!("{}{}", ATTRIBUTE_PREFIX, FIELD_SIGNATURE_VALUE), encode_base64url(&metadata.signature.value).into_bytes()));
 
     for (index, member) in metadata.members.iter().enumerate() {
-        write_attribute(ctx, path, &format!("{}member_{}_address", ATTRIBUTE_PREFIX, index), member.address.as_bytes())?;
-        write_attribute(ctx, path, &format!("{}member_{}_permission", ATTRIBUTE_PREFIX, index), member.permission.as_str().as_bytes())?;
+        attributes.push((format!("{}member_{}_address", ATTRIBUTE_PREFIX, index), member.address.clone().into_bytes()));
+        attributes.push((format!("{}member_{}_permission", ATTRIBUTE_PREFIX, index), member.permission.as_str().as_bytes().to_vec()));
         if let Some(key) = &member.key {
-            write_attribute(ctx, path, &format!("{}member_{}_key_algorithm", ATTRIBUTE_PREFIX, index), key.algorithm.as_bytes())?;
-            write_attribute(ctx, path, &format!("{}member_{}_key_value", ATTRIBUTE_PREFIX, index), encode_base64url(&key.value).as_bytes())?;
+            attributes.push((format!("{}member_{}_key_algorithm", ATTRIBUTE_PREFIX, index), key.algorithm.clone().into_bytes()));
+            attributes.push((format!("{}member_{}_key_value", ATTRIBUTE_PREFIX, index), encode_base64url(&key.value).into_bytes()));
         }
+    }
+
+    write_attributes(ctx, path, ATTRIBUTE_PREFIX, &attributes)?;
+
+    if let Some(local_metadata) = local_metadata {
+        write_local_metadata_attributes(ctx, path, local_metadata)?;
     }
 
     Ok(())
 }
 
+/// Remove the metadata `path` carries, where `path` stands.
+///
+/// The fields are separate attributes removed one at a time, so a reader can
+/// catch the record part-way.
 pub fn remove_metadata_attributes(ctx: &Context, path: &str) -> io::Result<()> {
-    let _lock = lock_directory_exclusive(ctx, path)?;
-
-    remove_metadata_attributes_unlocked(ctx, path)
-}
-
-fn remove_metadata_attributes_unlocked(ctx: &Context, path: &str) -> io::Result<()> {
-    for name in list_attributes(ctx, path)? {
-        if name.starts_with(ATTRIBUTE_PREFIX) {
-            remove_attribute(ctx, path, &name)?;
-        }
-    }
-
-    Ok(())
+    write_attributes(ctx, path, ATTRIBUTE_PREFIX, &[])
 }
 
 pub fn read_local_metadata_attributes(ctx: &Context, path: &str) -> io::Result<LocalMetadata> {
@@ -256,8 +251,8 @@ fn read_local_metadata_attributes_unlocked(ctx: &Context, path: &str) -> io::Res
                 sync_body_hash_value = Some(decode_base64url(value)
                     .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "sync_body_hash_value is not base64url encoded"))?);
             }
-            LOCAL_FIELD_SYNC_MODIFIED => {
-                local.sync_modified = Some(timestamp::parse(&value)?);
+            LOCAL_FIELD_SYNC_AUTHOR_DATE => {
+                local.sync_author_date = Some(timestamp::parse(&value)?);
             }
             _ => {}
         }
@@ -271,32 +266,32 @@ fn read_local_metadata_attributes_unlocked(ctx: &Context, path: &str) -> io::Res
     Ok(local)
 }
 
-fn write_local_metadata_attributes_unlocked(ctx: &Context, path: &str, local: &LocalMetadata) -> io::Result<()> {
-    remove_local_metadata_attributes_unlocked(ctx, path)?;
+fn write_local_metadata_attributes(ctx: &Context, path: &str, local: &LocalMetadata) -> io::Result<()> {
+    let mut attributes: Vec<(String, Vec<u8>)> = Vec::new();
 
     if let Some(encrypted) = local.encrypted {
-        write_attribute(ctx, path, &format!("{}{}", LOCAL_ATTRIBUTE_PREFIX, LOCAL_FIELD_ENCRYPTED), if encrypted { b"true" } else { b"false" })?;
+        attributes.push((format!("{}{}", LOCAL_ATTRIBUTE_PREFIX, LOCAL_FIELD_ENCRYPTED), if encrypted { b"true".to_vec() } else { b"false".to_vec() }));
     }
     if let Some(sync_body_hash) = &local.sync_body_hash {
-        write_attribute(ctx, path, &format!("{}{}", LOCAL_ATTRIBUTE_PREFIX, LOCAL_FIELD_SYNC_BODY_HASH_ALGORITHM), sync_body_hash.algorithm.as_bytes())?;
-        write_attribute(ctx, path, &format!("{}{}", LOCAL_ATTRIBUTE_PREFIX, LOCAL_FIELD_SYNC_BODY_HASH_VALUE), encode_base64url(&sync_body_hash.value).as_bytes())?;
+        attributes.push((format!("{}{}", LOCAL_ATTRIBUTE_PREFIX, LOCAL_FIELD_SYNC_BODY_HASH_ALGORITHM), sync_body_hash.algorithm.clone().into_bytes()));
+        attributes.push((format!("{}{}", LOCAL_ATTRIBUTE_PREFIX, LOCAL_FIELD_SYNC_BODY_HASH_VALUE), encode_base64url(&sync_body_hash.value).into_bytes()));
     }
-    if let Some(sync_modified) = &local.sync_modified {
-        write_attribute(ctx, path, &format!("{}{}", LOCAL_ATTRIBUTE_PREFIX, LOCAL_FIELD_SYNC_MODIFIED), timestamp::format(*sync_modified).as_bytes())?;
+    if let Some(sync_author_date) = &local.sync_author_date {
+        attributes.push((format!("{}{}", LOCAL_ATTRIBUTE_PREFIX, LOCAL_FIELD_SYNC_AUTHOR_DATE), timestamp::format(*sync_author_date).into_bytes()));
     }
 
-    Ok(())
+    write_attributes(ctx, path, LOCAL_ATTRIBUTE_PREFIX, &attributes)
 }
 
-pub fn remove_local_metadata_attributes(ctx: &Context, path: &str) -> io::Result<()> {
-    let _lock = lock_directory_exclusive(ctx, path)?;
+// Every attribute goes on before any left over from the record being replaced
+// comes off, so `path` is never left carrying no record at all part-way.
+fn write_attributes(ctx: &Context, path: &str, prefix: &str, attributes: &[(String, Vec<u8>)]) -> io::Result<()> {
+    for (name, value) in attributes {
+        write_attribute(ctx, path, name, value)?;
+    }
 
-    remove_local_metadata_attributes_unlocked(ctx, path)
-}
-
-fn remove_local_metadata_attributes_unlocked(ctx: &Context, path: &str) -> io::Result<()> {
     for name in list_attributes(ctx, path)? {
-        if name.starts_with(LOCAL_ATTRIBUTE_PREFIX) {
+        if name.starts_with(prefix) && !attributes.iter().any(|(written, _)| *written == name) {
             remove_attribute(ctx, path, &name)?;
         }
     }
@@ -327,9 +322,8 @@ pub fn write_metadata_headers(metadata: &Metadata) -> Vec<(String, String)> {
     let mut out = Vec::new();
 
     out.push((format!("{}Id", HEADER_PREFIX), metadata.id.hyphenated().to_string()));
-    out.push((format!("{}Created", HEADER_PREFIX), timestamp::format(metadata.created)));
-    out.push((format!("{}Modified", HEADER_PREFIX), timestamp::format(metadata.modified)));
-    out.push((format!("{}Modified-By", HEADER_PREFIX), metadata.modified_by.clone()));
+    out.push((format!("{}Author", HEADER_PREFIX), metadata.author.clone()));
+    out.push((format!("{}Author-Date", HEADER_PREFIX), timestamp::format(metadata.author_date)));
     if let Some(parent_version) = &metadata.parent_version {
         out.push((format!("{}Parent-Version", HEADER_PREFIX), parent_version.clone()));
     }
@@ -511,16 +505,26 @@ pub fn sign_metadata(secret_key: &Key, metadata: &mut Metadata, body: Option<&[u
         });
     }
 
-    let json = serde_json::to_value(metadata_for_signing(metadata)).expect("serialize metadata");
-    metadata.signature = sign_json(secret_key, &json)?;
+    metadata.signature = sign_bytes(secret_key, &to_canonical_metadata_bytes(metadata))?;
 
     Ok(())
 }
 
 pub fn verify_metadata_signature(public_key: &Key, metadata: &Metadata) -> io::Result<()> {
-    let json = serde_json::to_value(metadata_for_signing(metadata)).expect("serialize metadata");
-    verify_json(public_key, &metadata.signature, &json)
+    verify_bytes(public_key, &metadata.signature, &to_canonical_metadata_bytes(metadata))
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "metadata signature verification failed"))
+}
+
+/// The bytes the signature on `metadata` covers: every other field of the
+/// record, in JCS-canonical form.
+///
+/// The same for every holder of the record, whatever it was signed with.
+pub fn to_canonical_metadata_bytes(metadata: &Metadata) -> Vec<u8> {
+    let mut clone = metadata.clone();
+    clone.signature.algorithm = String::new();
+    clone.signature.value = Vec::new();
+
+    serde_jcs::to_vec(&clone).expect("serialize metadata")
 }
 
 pub fn verify_metadata(public_key: &Key, metadata: &Metadata, body: Option<&[u8]>) -> io::Result<()> {
@@ -542,13 +546,6 @@ pub fn verify_metadata(public_key: &Key, metadata: &Metadata, body: Option<&[u8]
     }
 
     Ok(())
-}
-
-fn metadata_for_signing(metadata: &Metadata) -> Metadata {
-    let mut clone = metadata.clone();
-    clone.signature.algorithm = String::new();
-    clone.signature.value = Vec::new();
-    clone
 }
 
 fn apply_permission(
@@ -594,21 +591,14 @@ fn lock_directory_shared(ctx: &Context, path: &str) -> io::Result<Option<Lock>> 
     }
 }
 
-fn lock_directory_exclusive(ctx: &Context, path: &str) -> io::Result<Option<Lock>> {
-    match is_dir(ctx, path) {
-        true => Ok(Some(lock_exclusive(ctx, path)?)),
-        false => Ok(None),
-    }
-}
-
 fn save_previous_metadata(ctx: &Context, path: &str, metadata: Option<&Metadata>, local: &LocalMetadata) -> io::Result<()> {
     create_dir_all(ctx, &version_dir_for(ctx, path)?)?;
 
     let previous_path = version_path_for(ctx, path, PREVIOUS_VERSION)?;
 
     match metadata {
-        Some(metadata) => write_atomic_with_metadata(ctx, &previous_path, Body::Bytes(&[]), metadata, Some(local)),
-        None => write_atomic_without_metadata(ctx, &previous_path, Body::Bytes(&[])),
+        Some(metadata) => write_atomic_with_metadata(ctx, &previous_path, &[], metadata, Some(local)),
+        None => write_atomic_without_metadata(ctx, &previous_path, &[]),
     }
 }
 
@@ -631,13 +621,13 @@ fn restore_previous_metadata_unlocked(ctx: &Context, path: &str) -> io::Result<(
     }
 
     match read_metadata_attributes_unlocked(ctx, &previous_path) {
-        Ok(previous) => write_metadata_attributes_unlocked(ctx, path, &previous)?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => remove_metadata_attributes_unlocked(ctx, path)?,
+        Ok(previous) => write_metadata_attributes(ctx, path, &previous, None)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => remove_metadata_attributes(ctx, path)?,
         Err(error) => return Err(error),
     }
 
     let previous_local = read_local_metadata_attributes_unlocked(ctx, &previous_path)?;
-    write_local_metadata_attributes_unlocked(ctx, path, &previous_local)?;
+    write_local_metadata_attributes(ctx, path, &previous_local)?;
 
     remove_file(ctx, &previous_path)
 }
@@ -645,9 +635,8 @@ fn restore_previous_metadata_unlocked(ctx: &Context, path: &str) -> io::Result<(
 #[derive(Default)]
 struct PartialMetadata {
     id: Option<Uuid>,
-    modified_by: Option<String>,
-    created: Option<String>,
-    modified: Option<String>,
+    author: Option<String>,
+    author_date: Option<String>,
     parent_version: Option<String>,
     encryption_algorithm: Option<String>,
     members: Vec<PartialMember>,
@@ -668,9 +657,8 @@ struct PartialMember {
 fn metadata_from_partial(partial: PartialMetadata) -> io::Result<Metadata> {
     Ok(Metadata {
         id: partial.id.unwrap(),
-        created: timestamp::parse(&partial.created.unwrap())?,
-        modified: timestamp::parse(&partial.modified.unwrap())?,
-        modified_by: partial.modified_by.unwrap(),
+        author: partial.author.unwrap(),
+        author_date: timestamp::parse(&partial.author_date.unwrap())?,
         parent_version: partial.parent_version,
         encryption_algorithm: partial.encryption_algorithm,
         members: partial.members.into_iter().map(|member| Member {
@@ -700,9 +688,8 @@ fn apply_field(metadata: &mut PartialMetadata, key: &str, value: &str) -> io::Re
 
     match metadata_key.as_str() {
         FIELD_ID => metadata.id = Some(parse_uuid(value)?),
-        FIELD_CREATED => metadata.created = Some(value.to_string()),
-        FIELD_MODIFIED => metadata.modified = Some(value.to_string()),
-        FIELD_MODIFIED_BY => metadata.modified_by = Some(value.to_string()),
+        FIELD_AUTHOR => metadata.author = Some(value.to_string()),
+        FIELD_AUTHOR_DATE => metadata.author_date = Some(value.to_string()),
         FIELD_PARENT_VERSION => metadata.parent_version = Some(value.to_string()),
         FIELD_ENCRYPTION_ALGORITHM => metadata.encryption_algorithm = Some(value.to_string()),
         FIELD_BODY_HASH_ALGORITHM => metadata.body_hash_algorithm = Some(value.to_string()),
@@ -736,9 +723,8 @@ fn apply_field(metadata: &mut PartialMetadata, key: &str, value: &str) -> io::Re
 
 fn validate_partial_metadata(metadata: &PartialMetadata) -> io::Result<()> {
     if metadata.id.is_none() { return Err(io::Error::new(io::ErrorKind::InvalidData, "missing id field")); }
-    if metadata.created.is_none() { return Err(io::Error::new(io::ErrorKind::InvalidData, "missing created field")); }
-    if metadata.modified.is_none() { return Err(io::Error::new(io::ErrorKind::InvalidData, "missing modified field")); }
-    if metadata.modified_by.is_none() { return Err(io::Error::new(io::ErrorKind::InvalidData, "missing modified_by field")); }
+    if metadata.author.is_none() { return Err(io::Error::new(io::ErrorKind::InvalidData, "missing author field")); }
+    if metadata.author_date.is_none() { return Err(io::Error::new(io::ErrorKind::InvalidData, "missing author_date field")); }
     if metadata.signature_algorithm.is_none() { return Err(io::Error::new(io::ErrorKind::InvalidData, "missing signature_algorithm field")); }
     if metadata.signature_value.is_none() { return Err(io::Error::new(io::ErrorKind::InvalidData, "missing signature field")); }
 
@@ -782,15 +768,14 @@ mod tests {
 
     use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, DEFAULT_HASH_ALGORITHM};
     use crate::identity::create_identity;
-    use crate::storage::{Body, create_dir, write_atomic_with_metadata};
+    use crate::storage::{create_dir, write_atomic_with_metadata};
     use crate::testing::fs::{TEST_ADDRESS, account_context, create_plain_test_metadata, create_test_account, in_test_dir};
 
     // A rewrite stopped part-way, as a process killed mid-write leaves it: the
-    // previous metadata set aside, the attributes wiped, and only some of the
-    // new ones on.
+    // previous metadata set aside, and only some of the new attributes on over
+    // what was there.
     fn interrupt_a_rewrite(context: &Context, path: &str, previous: Option<&Metadata>, attributes_landed: usize) {
         save_previous_metadata(context, path, previous, &LocalMetadata::default()).unwrap();
-        remove_metadata_attributes_unlocked(context, path).unwrap();
 
         for index in 0..attributes_landed {
             write_attribute(context, path, &format!("{}member_{}_address", ATTRIBUTE_PREFIX, index), b"other@example.com").unwrap();
@@ -806,7 +791,7 @@ mod tests {
 
             let mut original = create_metadata(&identity.address, None);
             sign_metadata(&secret_key, &mut original, None).unwrap();
-            write_metadata_attributes(&context, "/dir", &original, None).unwrap();
+            write_metadata_attributes_atomic(&context, "/dir", &original, None).unwrap();
 
             interrupt_a_rewrite(&context, "/dir", Some(&original), 2);
 
@@ -815,26 +800,6 @@ mod tests {
             assert_eq!(read_back.members.len(), 1);
             assert_eq!(read_back.members[0].address, identity.address);
             assert!(!exists(&context, &version_path_for(&context, "/dir", PREVIOUS_VERSION).unwrap()), "the previous metadata outlived being put back");
-        });
-    }
-
-    #[test]
-    fn a_crash_before_any_attribute_lands_is_rolled_back() {
-        in_test_dir("ark_metadata_recovery_test", |temp_dir| {
-            let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
-            let (context, _) = account_context(&account_dir);
-            create_dir(&context, "/dir").unwrap();
-
-            let mut original = create_metadata(&identity.address, None);
-            sign_metadata(&secret_key, &mut original, None).unwrap();
-            write_metadata_attributes(&context, "/dir", &original, None).unwrap();
-
-            // Nothing at all where the wipe landed and the rewrite did not.
-            // Read as "carries no metadata" this would inherit from above.
-            interrupt_a_rewrite(&context, "/dir", Some(&original), 0);
-
-            let read_back = read_metadata_attributes(&context, "/dir").unwrap();
-            assert_eq!(read_back.id, original.id);
         });
     }
 
@@ -854,24 +819,28 @@ mod tests {
                 });
             }
             sign_metadata(&secret_key, &mut original, None).unwrap();
-            write_metadata_attributes(&context, "/dir", &original, None).unwrap();
+            write_metadata_attributes_atomic(&context, "/dir", &original, None).unwrap();
 
-            // Every field of the new record on except the last two members.
-            // Nothing about this is detectable from the attributes alone: the
-            // members left are contiguous from 0, an owner is among them, and
-            // the signature is there — it parses as a whole record with four
-            // members instead of six. Only the metadata set aside gives it
-            // away.
+            // Every field of a record with four members on, and the last two
+            // members of the original not yet taken off. Nothing about this is
+            // detectable from the attributes alone: the members are contiguous
+            // from 0, an owner is among them, and a signature is there — it
+            // parses as a whole record, with six members under the signature
+            // of four. Only the metadata set aside gives it away.
             save_previous_metadata(&context, "/dir", Some(&original), &LocalMetadata::default()).unwrap();
-            remove_metadata_attributes_unlocked(&context, "/dir").unwrap();
             let mut short = original.clone();
             short.members.truncate(4);
-            write_metadata_attributes_unlocked(&context, "/dir", &short).unwrap();
+            sign_metadata(&secret_key, &mut short, None).unwrap();
+            write_metadata_attributes(&context, "/dir", &short, None).unwrap();
+            for index in 4..6 {
+                write_attribute(&context, "/dir", &format!("{}member_{}_address", ATTRIBUTE_PREFIX, index), original.members[index].address.as_bytes()).unwrap();
+                write_attribute(&context, "/dir", &format!("{}member_{}_permission", ATTRIBUTE_PREFIX, index), original.members[index].permission.as_str().as_bytes()).unwrap();
+            }
 
             assert!(read_metadata_attributes_unlocked(&context, "/dir").is_ok(), "the torn state was meant to parse cleanly");
 
             let read_back = read_metadata_attributes(&context, "/dir").unwrap();
-            assert_eq!(read_back.members.len(), 6, "a torn record that parses was served instead of being rolled back");
+            assert_eq!(read_back.signature.value, original.signature.value, "a torn record that parses was served instead of being rolled back");
             assert!(!exists(&context, &version_path_for(&context, "/dir", PREVIOUS_VERSION).unwrap()));
         });
     }
@@ -908,19 +877,20 @@ mod tests {
             let mut original = create_metadata(&identity.address, None);
             sign_metadata(&secret_key, &mut original, None).unwrap();
 
-            // `sync_modified` is what marks a directory as tracked: losing it
+            // `sync_author_date` is what marks a directory as tracked: losing it
             // leaves the directory silently out of every later sync.
-            let local = LocalMetadata { encrypted: None, sync_body_hash: None, sync_modified: Some(original.modified) };
-            write_metadata_attributes(&context, "/dir", &original, Some(&local)).unwrap();
+            let local = LocalMetadata { encrypted: None, sync_body_hash: None, sync_author_date: Some(original.author_date) };
+            write_metadata_attributes_atomic(&context, "/dir", &original, Some(&local)).unwrap();
 
+            // The new records on in full, with the local one dropping
+            // `sync_author_date`, and the metadata set aside not yet removed.
             save_previous_metadata(&context, "/dir", Some(&original), &local).unwrap();
-            remove_metadata_attributes_unlocked(&context, "/dir").unwrap();
-            remove_local_metadata_attributes_unlocked(&context, "/dir").unwrap();
+            write_metadata_attributes(&context, "/dir", &original, Some(&LocalMetadata::default())).unwrap();
 
             read_metadata_attributes(&context, "/dir").unwrap();
 
             let read_back = read_local_metadata_attributes(&context, "/dir").unwrap();
-            assert_eq!(read_back.sync_modified, Some(original.modified), "the directory came back untracked");
+            assert_eq!(read_back.sync_author_date, Some(original.author_date), "the directory came back untracked");
             assert!(!exists(&context, &version_path_for(&context, "/dir", PREVIOUS_VERSION).unwrap()));
         });
     }
@@ -934,7 +904,7 @@ mod tests {
 
             let mut metadata = create_metadata(&identity.address, None);
             sign_metadata(&secret_key, &mut metadata, None).unwrap();
-            write_metadata_attributes(&context, "/dir", &metadata, None).unwrap();
+            write_metadata_attributes_atomic(&context, "/dir", &metadata, None).unwrap();
 
             assert!(!exists(&context, &version_path_for(&context, "/dir", PREVIOUS_VERSION).unwrap()));
         });
@@ -990,7 +960,7 @@ mod tests {
             }
             sign_metadata(&secret_key, &mut large, None).unwrap();
 
-            write_metadata_attributes(&context, "/dir", &small, None).unwrap();
+            write_metadata_attributes_atomic(&context, "/dir", &small, None).unwrap();
 
             let context = Arc::new(context);
             let stop = Arc::new(AtomicBool::new(false));
@@ -1002,7 +972,7 @@ mod tests {
                 move || {
                     for iteration in 0..500 {
                         let metadata = if iteration % 2 == 0 { &small } else { &large };
-                        write_metadata_attributes(&context, "/dir", metadata, None).unwrap();
+                        write_metadata_attributes_atomic(&context, "/dir", metadata, None).unwrap();
                     }
                     stop.store(true, Ordering::Relaxed);
                 }
@@ -1117,7 +1087,7 @@ mod tests {
                 key: Some(Key { algorithm: key_wrap_algorithm, value: wrapped_key_file_key }),
             });
             let key_file_local = LocalMetadata { encrypted: Some(true), ..LocalMetadata::default() };
-            write_atomic_with_metadata(&ctx, "/team.key", Body::Bytes(&key_file_body), &key_file_metadata, Some(&key_file_local)).unwrap();
+            write_atomic_with_metadata(&ctx, "/team.key", &key_file_body, &key_file_metadata, Some(&key_file_local)).unwrap();
 
             let file_key = create_secret_key(DEFAULT_ENCRYPTION_ALGORITHM).unwrap();
             let (wrap_algorithm, wrapped) = encrypt_bytes(&group_identity.public_key, &file_key.value).unwrap();
@@ -1164,9 +1134,8 @@ mod tests {
         sign_metadata(&owner_key, &mut m, Some(b"body")).unwrap();
         let headers = write_metadata_headers(&m);
         assert!(headers.iter().any(|(k, _)| k == "X-Ark-Meta-Id"));
-        assert!(headers.iter().any(|(k, _)| k == "X-Ark-Meta-Created"));
-        assert!(headers.iter().any(|(k, _)| k == "X-Ark-Meta-Modified"));
-        assert!(headers.iter().any(|(k, _)| k == "X-Ark-Meta-Modified-By"));
+        assert!(headers.iter().any(|(k, _)| k == "X-Ark-Meta-Author"));
+        assert!(headers.iter().any(|(k, _)| k == "X-Ark-Meta-Author-Date"));
         assert!(headers.iter().any(|(k, _)| k == "X-Ark-Meta-Encryption-Algorithm"));
         assert!(headers.iter().any(|(k, _)| k == "X-Ark-Meta-Member-0-Address"));
         assert!(headers.iter().any(|(k, _)| k == "X-Ark-Meta-Body-Hash-Algorithm"));
@@ -1187,9 +1156,8 @@ mod tests {
         let headers = write_metadata_headers(&m);
         let back = read_metadata_headers(&headers).unwrap();
         assert_eq!(back.id, m.id);
-        assert_eq!(back.created, m.created);
-        assert_eq!(back.modified, m.modified);
-        assert_eq!(back.modified_by, m.modified_by);
+        assert_eq!(back.author, m.author);
+        assert_eq!(back.author_date, m.author_date);
         assert_eq!(back.encryption_algorithm, m.encryption_algorithm);
         assert_eq!(back.members[0].address, m.members[0].address);
         let (back_hash, m_hash) = (back.body_hash.as_ref().unwrap(), m.body_hash.as_ref().unwrap());
@@ -1204,7 +1172,7 @@ mod tests {
             let (owner, owner_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
             let (ctx, _) = account_context(&account_dir);
             let m = create_plain_test_metadata(&owner, &owner_key, b"x");
-            write_atomic_with_metadata(&ctx, "/file", Body::Bytes(b"x"), &m, None).unwrap();
+            write_atomic_with_metadata(&ctx, "/file", b"x", &m, None).unwrap();
 
             let back = read_metadata_attributes(&ctx, "/file").unwrap();
             assert_eq!(back.id, m.id);
@@ -1218,16 +1186,16 @@ mod tests {
             let (owner, owner_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
             let (ctx, _) = account_context(&account_dir);
             let m = create_plain_test_metadata(&owner, &owner_key, b"x");
-            let sync_modified = timestamp::parse("2026-01-01T00:00:00Z").unwrap();
-            let local = LocalMetadata { encrypted: Some(true), sync_body_hash: Some(Hash { algorithm: DEFAULT_HASH_ALGORITHM.to_string(), value: vec![0xAB, 0xCD] }), sync_modified: Some(sync_modified) };
-            write_atomic_with_metadata(&ctx, "/file", Body::Bytes(b"x"), &m, Some(&local)).unwrap();
+            let sync_author_date = timestamp::parse("2026-01-01T00:00:00Z").unwrap();
+            let local = LocalMetadata { encrypted: Some(true), sync_body_hash: Some(Hash { algorithm: DEFAULT_HASH_ALGORITHM.to_string(), value: vec![0xAB, 0xCD] }), sync_author_date: Some(sync_author_date) };
+            write_atomic_with_metadata(&ctx, "/file", b"x", &m, Some(&local)).unwrap();
 
             let back = read_local_metadata_attributes(&ctx, "/file").unwrap();
             assert_eq!(back.encrypted, Some(true));
             let back_hash = back.sync_body_hash.as_ref().unwrap();
             assert_eq!(back_hash.algorithm, DEFAULT_HASH_ALGORITHM);
             assert_eq!(back_hash.value, vec![0xAB, 0xCD]);
-            assert_eq!(back.sync_modified, Some(sync_modified));
+            assert_eq!(back.sync_author_date, Some(sync_author_date));
         });
     }
 
@@ -1238,8 +1206,8 @@ mod tests {
             let (ctx, _) = account_context(&account_dir);
             let p = account_dir.join("file");
             let m = create_plain_test_metadata(&owner, &owner_key, b"x");
-            let full = LocalMetadata { encrypted: Some(true), sync_body_hash: Some(Hash { algorithm: DEFAULT_HASH_ALGORITHM.to_string(), value: vec![1, 2, 3] }), sync_modified: Some(timestamp::parse("2026-01-01T00:00:00Z").unwrap()) };
-            write_atomic_with_metadata(&ctx, "/file", Body::Bytes(b"x"), &m, Some(&full)).unwrap();
+            let full = LocalMetadata { encrypted: Some(true), sync_body_hash: Some(Hash { algorithm: DEFAULT_HASH_ALGORITHM.to_string(), value: vec![1, 2, 3] }), sync_author_date: Some(timestamp::parse("2026-01-01T00:00:00Z").unwrap()) };
+            write_atomic_with_metadata(&ctx, "/file", b"x", &m, Some(&full)).unwrap();
 
             write_metadata_attributes(&ctx, "/file", &m, Some(&LocalMetadata::default())).unwrap();
 
@@ -1247,7 +1215,7 @@ mod tests {
             assert_eq!(xattr::get(&p, "user.ark_local.encrypted").unwrap(), None);
             assert_eq!(xattr::get(&p, "user.ark_local.sync_body_hash_algorithm").unwrap(), None);
             assert_eq!(xattr::get(&p, "user.ark_local.sync_body_hash_value").unwrap(), None);
-            assert_eq!(xattr::get(&p, "user.ark_local.sync_modified").unwrap(), None);
+            assert_eq!(xattr::get(&p, "user.ark_local.sync_author_date").unwrap(), None);
         });
     }
 
@@ -1272,7 +1240,7 @@ mod tests {
         let (owner, owner_key) = create_identity(TEST_ADDRESS, None).unwrap();
         let body = b"body";
         let mut m = create_plain_test_metadata(&owner, &owner_key, body);
-        m.modified_by = "attacker@evil".to_string();
+        m.author = "attacker@evil".to_string();
         let err = verify_metadata(&owner.public_key, &m, Some(body)).unwrap_err();
         assert!(err.to_string().contains("signature verification failed"));
     }
@@ -1361,7 +1329,7 @@ mod tests {
             let mut two = create_plain_test_metadata(&owner, &owner_key, b"x");
             two.members.push(Member { address: "b@y".to_string(), permission: Permission::Owner, key: None });
             sign_metadata(&owner_key, &mut two, Some(b"x")).unwrap();
-            write_atomic_with_metadata(&ctx, "/file", Body::Bytes(b"x"), &two, None).unwrap();
+            write_atomic_with_metadata(&ctx, "/file", b"x", &two, None).unwrap();
             assert!(xattr::get(&p, "user.ark.member_1_address").unwrap().is_some());
 
             let one = create_plain_test_metadata(&owner, &owner_key, b"x");

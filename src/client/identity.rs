@@ -181,7 +181,7 @@ mod tests {
     use crate::crypto::DEFAULT_ENCRYPTION_ALGORITHM;
     use crate::identity::identity_cache_path;
     use crate::metadata::read_metadata_attributes;
-    use crate::storage::{Body, write_atomic_with_metadata};
+    use crate::storage::write_atomic_with_metadata;
     use crate::testing::fs::{account_context, create_test_account, in_test_dir, init_with_server};
     use crate::testing::http::start_test_server;
     use crate::types::Identity;
@@ -368,7 +368,7 @@ mod tests {
             });
             sign_metadata(ctx.identity_key.as_ref().unwrap(), &mut meta, Some(b"secret")).unwrap();
             let (alice_ctx, shared_account_path) = account_context(&shared_path);
-            write_atomic_with_metadata(&alice_ctx, &shared_account_path, Body::Bytes(b"secret"), &meta, None).unwrap();
+            write_atomic_with_metadata(&alice_ctx, &shared_account_path, b"secret", &meta, None).unwrap();
 
             let (code, body, _) = signed_request(port, &bob_identity, &bob_key, "GET", "/ark/alice/shared.txt", &[]);
             assert_eq!(code, 200);
@@ -407,7 +407,7 @@ mod tests {
             });
             sign_metadata(ctx.identity_key.as_ref().unwrap(), &mut meta, Some(b"secret")).unwrap();
             let (alice_ctx, shared_account_path) = account_context(&shared_path);
-            write_atomic_with_metadata(&alice_ctx, &shared_account_path, Body::Bytes(b"secret"), &meta, None).unwrap();
+            write_atomic_with_metadata(&alice_ctx, &shared_account_path, b"secret", &meta, None).unwrap();
 
             let (code, _, _) = signed_request(port, &charlie_identity, &charlie_key, "GET", "/ark/alice/shared.txt", &[]);
             assert_eq!(code, 403);
@@ -442,7 +442,7 @@ mod tests {
             inner_meta.encryption_algorithm = None;
             inner_meta.members[0].key = None;
             sign_metadata(ctx.identity_key.as_ref().unwrap(), &mut inner_meta, Some(&inner_body)).unwrap();
-            write_atomic_with_metadata(&alice_ctx, &inner_account_path, Body::Bytes(&inner_body), &inner_meta, None).unwrap();
+            write_atomic_with_metadata(&alice_ctx, &inner_account_path, &inner_body, &inner_meta, None).unwrap();
 
             let outer_address = format!("{}/outer.json", alice_address);
             let (outer_identity, _outer_key) =
@@ -455,7 +455,7 @@ mod tests {
             outer_meta.encryption_algorithm = None;
             outer_meta.members[0].key = None;
             sign_metadata(ctx.identity_key.as_ref().unwrap(), &mut outer_meta, Some(&outer_body)).unwrap();
-            write_atomic_with_metadata(&alice_ctx, &outer_account_path, Body::Bytes(&outer_body), &outer_meta, None).unwrap();
+            write_atomic_with_metadata(&alice_ctx, &outer_account_path, &outer_body, &outer_meta, None).unwrap();
 
             let shared_path = temp_dir.join("ark/alice/shared.txt");
             let mut meta = create_plain_test_metadata(&ctx.identity, ctx.identity_key.as_ref().unwrap(), b"secret");
@@ -468,7 +468,7 @@ mod tests {
             });
             sign_metadata(ctx.identity_key.as_ref().unwrap(), &mut meta, Some(b"secret")).unwrap();
             let (alice_ctx, shared_account_path) = account_context(&shared_path);
-            write_atomic_with_metadata(&alice_ctx, &shared_account_path, Body::Bytes(b"secret"), &meta, None).unwrap();
+            write_atomic_with_metadata(&alice_ctx, &shared_account_path, b"secret", &meta, None).unwrap();
 
             let (code, _, _) = signed_request(port, &bob_identity, &bob_key, "GET", "/ark/alice/shared.txt", &[]);
             assert_eq!(code, 403);
@@ -660,7 +660,7 @@ mod tests {
             });
             sign_metadata(ctx.identity_key.as_ref().unwrap(), &mut meta, Some(b"secret")).unwrap();
             let (alice_ctx, shared_account_path) = account_context(&shared_path);
-            write_atomic_with_metadata(&alice_ctx, &shared_account_path, Body::Bytes(b"secret"), &meta, None).unwrap();
+            write_atomic_with_metadata(&alice_ctx, &shared_account_path, b"secret", &meta, None).unwrap();
 
             let (code, body, _) = signed_request(port, &bob_identity, &bob_key, "GET", "/ark/alice/shared.txt", &[]);
             assert_eq!(code, 200);
@@ -704,7 +704,7 @@ mod tests {
             });
             sign_metadata(ctx.identity_key.as_ref().unwrap(), &mut meta, Some(b"secret")).unwrap();
             let (alice_ctx, shared_account_path) = account_context(&shared_path);
-            write_atomic_with_metadata(&alice_ctx, &shared_account_path, Body::Bytes(b"secret"), &meta, None).unwrap();
+            write_atomic_with_metadata(&alice_ctx, &shared_account_path, b"secret", &meta, None).unwrap();
 
             let (code, _, _) = signed_request(port, &bob_identity, &bob_key, "GET", "/ark/alice/shared.txt", &[]);
             assert_eq!(code, 403);

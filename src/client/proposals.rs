@@ -1,23 +1,14 @@
 use std::collections::HashSet;
 use std::io;
-use std::thread::sleep;
-use std::time::Duration;
 
 use super::{delete, get_stream, head, list, request, watch_remote};
 
 use crate::http::check_response_code;
 use crate::identity::parse_address;
 use crate::metadata::{read_metadata_headers, write_metadata_headers};
-use crate::paths::to_url;
+use crate::paths::{to_account_path, to_url};
 use crate::types::{Context, EntryAction, Metadata, Permission, Proposal};
 use crate::util::{parse_request_entry, sha256};
-
-// A log entry's body lands before its metadata does, so a fetch triggered by
-// the create event can arrive too early to verify.
-// TODO: drop the retry once log entries are written temp+rename, the create
-// event then fires on a complete entry
-const ENTRY_FETCH_ATTEMPTS: usize = 5;
-const ENTRY_FETCH_DELAY: Duration = Duration::from_millis(100);
 
 /// List pending share proposals — requests where another account's PUT was
 /// rejected with `403` at a path the current account owns. Returned in
@@ -27,6 +18,7 @@ const ENTRY_FETCH_DELAY: Duration = Duration::from_millis(100);
 /// which sets it up).
 pub fn list_proposals(ctx: &Context) -> io::Result<Vec<Proposal>> {
     let entries = list(ctx, "/.ark/requests/", Some("PUT_403_"))?;
+    let (account_name, _, _) = parse_address(&ctx.identity.address)?;
 
     let mut proposals = Vec::new();
     for entry in entries {
@@ -38,7 +30,7 @@ pub fn list_proposals(ctx: &Context) -> io::Result<Vec<Proposal>> {
             continue;
         }
 
-        if let Some(proposal) = parse_proposal(&entry.name, &entry_body)? {
+        if let Some(proposal) = parse_proposal(&account_name, &entry.name, &entry_body)? {
             proposals.push(proposal);
         }
     }
@@ -63,7 +55,7 @@ where
     F: FnMut(Proposal) -> bool,
     G: Fn(io::Error) -> bool,
 {
-    let target_prefix = to_url(ctx, path)?.path().trim_end_matches('/').to_string();
+    let path_prefix = to_account_path(ctx, path)?.trim_end_matches('/').to_string();
     let requests_url = to_url(ctx, "/.ark/requests/")?;
 
     let mut reported: HashSet<String> = HashSet::new();
@@ -89,9 +81,9 @@ where
 
         reported.insert(id);
 
-        let under_target = proposal.target == target_prefix
-            || proposal.target.starts_with(&format!("{}/", target_prefix));
-        if !under_target { return false; }
+        let under_path = proposal.path == path_prefix
+            || proposal.path.starts_with(&format!("{}/", path_prefix));
+        if !under_path { return false; }
 
         on_proposal(proposal)
     }, &on_error)
@@ -100,7 +92,7 @@ where
 /// Accept a share proposal. `index_or_id`: 1-based index (from
 /// [`list_proposals`]) or a log entry filename.
 ///
-/// Pulls the current file/dir from the modifier's server, checks it has not
+/// Pulls the current file/dir from the author's server, checks it has not
 /// been maliciously altered since the proposal (id unchanged, no unauthorised
 /// member additions/upgrades, current account not downgraded), and applies it
 /// to the target path on the current account. The log entry is removed on
@@ -113,28 +105,25 @@ pub fn accept_proposal(ctx: &Context, index_or_id: &str, force: bool) -> io::Res
     let entry_path = format!("/.ark/requests/{}", id);
     let mut entry_body: Vec<u8> = Vec::new();
     get_stream(ctx, &entry_path, &mut entry_body, false, None, None)?;
-    let proposal = parse_proposal(&id, &entry_body)?
+    let (account_name, _, _) = parse_address(&ctx.identity.address)?;
+    let proposal = parse_proposal(&account_name, &id, &entry_body)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "entry is not a valid proposal"))?;
 
-    let (account_name, _, _) = parse_address(&ctx.identity.address)?;
-    let prefix = format!("/ark/{}/", account_name);
-    let relative_path = proposal.target.strip_prefix(&prefix)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "target path is not within this account"))?
-        .to_string();
+    let relative_path = proposal.path.trim_start_matches('/');
 
     let target_is_dir = proposal.metadata.body_hash.is_none();
-    let modifier_path = if target_is_dir {
-        format!("{}/{}/", proposal.metadata.modified_by, relative_path.trim_end_matches('/'))
+    let author_path = if target_is_dir {
+        format!("{}/{}/", proposal.metadata.author, relative_path.trim_end_matches('/'))
     } else {
-        format!("{}/{}", proposal.metadata.modified_by, relative_path)
+        format!("{}/{}", proposal.metadata.author, relative_path)
     };
 
     let (current_metadata, body) = if target_is_dir {
-        let (_, metadata) = head(ctx, &modifier_path)?;
+        let (_, metadata) = head(ctx, &author_path)?;
         (metadata, Vec::new())
     } else {
         let mut buf: Vec<u8> = Vec::new();
-        let (metadata, _) = get_stream(ctx, &modifier_path, &mut buf, false, None, None)?;
+        let (metadata, _) = get_stream(ctx, &author_path, &mut buf, false, None, None)?;
         let expected_hash = metadata.body_hash.as_ref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "file metadata missing body_hash"))?;
         if sha256(&buf) != expected_hash.value {
@@ -167,7 +156,7 @@ pub fn accept_proposal(ctx: &Context, index_or_id: &str, force: bool) -> io::Res
 
 /// Reject a share proposal by deleting its log entry. `index_or_id` may be a
 /// 1-based index (as returned by [`list_proposals`]) or a log entry filename.
-/// The current file/dir on the modifier's server is untouched; any future
+/// The current file/dir on the author's server is untouched; any future
 /// attempt by the same account will simply produce a new log entry.
 pub fn reject_proposal(ctx: &Context, index_or_id: &str) -> io::Result<()> {
     let id = resolve_id(ctx, index_or_id)?;
@@ -192,33 +181,31 @@ fn resolve_id(ctx: &Context, index_or_id: &str) -> io::Result<String> {
 fn fetch_proposal(ctx: &Context, id: &str) -> io::Result<Option<Proposal>> {
     let entry_path = format!("/.ark/requests/{}", id);
 
-    let mut last_error = None;
-    for attempt in 0..ENTRY_FETCH_ATTEMPTS {
-        if attempt > 0 { sleep(ENTRY_FETCH_DELAY); }
+    let mut entry_body: Vec<u8> = Vec::new();
+    get_stream(ctx, &entry_path, &mut entry_body, false, None, None)?;
 
-        let mut entry_body: Vec<u8> = Vec::new();
-        match get_stream(ctx, &entry_path, &mut entry_body, false, None, None) {
-            Ok(_) => return parse_proposal(id, &entry_body),
-            Err(e) => last_error = Some(e),
-        }
-    }
-
-    Err(last_error.expect("at least one attempt"))
+    let (account_name, _, _) = parse_address(&ctx.identity.address)?;
+    parse_proposal(&account_name, id, &entry_body)
 }
 
-fn parse_proposal(filename: &str, entry_bytes: &[u8]) -> io::Result<Option<Proposal>> {
+fn parse_proposal(account_name: &str, filename: &str, entry_bytes: &[u8]) -> io::Result<Option<Proposal>> {
     let entry = parse_request_entry(entry_bytes)?;
 
     if entry.method != "PUT" { return Ok(None); }
     if entry.status != 403 { return Ok(None); }
 
-    let metadata = read_metadata_headers(&entry.request_headers)?;
+    let server_path = entry.target.split_once('?').map(|(path, _)| path).unwrap_or(&entry.target);
+    let path = match server_path.strip_prefix(&format!("/ark/{}", account_name)) {
+        Some("") | Some("/") => "/".to_string(),
+        Some(rest) if rest.starts_with('/') => rest.trim_end_matches('/').to_string(),
+        _ => return Ok(None),
+    };
 
-    let target = entry.target.split_once('?').map(|(p, _)| p.to_string()).unwrap_or(entry.target);
+    let metadata = read_metadata_headers(&entry.request_headers)?;
 
     Ok(Some(Proposal {
         id: filename.to_string(),
-        target,
+        path,
         metadata,
     }))
 }
@@ -249,9 +236,9 @@ fn check_member_changes(proposal: &Metadata, current: &Metadata, self_address: &
         }
     }
 
-    let modifier_is_owner = proposal.members.iter().find(|m| m.address == current.modified_by)
+    let author_is_owner = proposal.members.iter().find(|m| m.address == current.author)
         .map(|m| m.permission) == Some(Permission::Owner);
-    if modifier_is_owner {
+    if author_is_owner {
         return None;
     }
 
@@ -326,8 +313,8 @@ mod tests {
             let proposals = list_proposals(&alice_ctx).unwrap();
 
             assert_eq!(proposals.len(), 1);
-            assert_eq!(proposals[0].metadata.modified_by, bob_ctx.identity.address);
-            assert_eq!(proposals[0].target, "/ark/alice/apps/notes/foo.md");
+            assert_eq!(proposals[0].metadata.author, bob_ctx.identity.address);
+            assert_eq!(proposals[0].path, "/apps/notes/foo.md");
         });
     }
 
@@ -413,8 +400,8 @@ mod tests {
             let _ = put(&bob_ctx, &target, &Permissions::default(), Some("none"), false);
 
             let proposal = rx.recv_timeout(Duration::from_secs(10)).expect("expected a proposal");
-            assert_eq!(proposal.target, "/ark/alice/apps/notes/foo.md");
-            assert_eq!(proposal.metadata.modified_by, bob_ctx.identity.address);
+            assert_eq!(proposal.path, "/apps/notes/foo.md");
+            assert_eq!(proposal.metadata.author, bob_ctx.identity.address);
         });
     }
 
@@ -425,9 +412,8 @@ mod tests {
             "Host: h\r\n",
             "Authorization: ArkIdentity address=\"ark@h\", timestamp=\"123\", signature=\"sig\"\r\n",
             "X-Ark-Meta-Id: 0f3e1c62-9a4b-4d7e-8c11-2b5a6d9e4f30\r\n",
-            "X-Ark-Meta-Created: 2026-01-01T00:00:00.000Z\r\n",
-            "X-Ark-Meta-Modified: 2026-01-02T00:00:00.000Z\r\n",
-            "X-Ark-Meta-Modified-By: bob@h\r\n",
+            "X-Ark-Meta-Author: bob@h\r\n",
+            "X-Ark-Meta-Author-Date: 2026-01-02T00:00:00.000Z\r\n",
             "X-Ark-Meta-Member-0-Address: bob@h\r\n",
             "X-Ark-Meta-Member-0-Permission: owner\r\n",
             "X-Ark-Meta-Signature-Algorithm: ed25519\r\n",
@@ -437,9 +423,10 @@ mod tests {
             "Content-Length: 0\r\n",
             "\r\n",
         );
-        let p = parse_proposal("entry.http", entry.as_bytes()).unwrap().expect("proposal");
-        assert_eq!(p.metadata.modified_by, "bob@h");
-        assert_eq!(p.target, "/ark/alice/foo");
+        let p = parse_proposal("alice", "entry.http", entry.as_bytes()).unwrap().expect("proposal");
+        assert_eq!(p.metadata.author, "bob@h");
+        assert_eq!(p.path, "/foo");
+        assert!(parse_proposal("alicebob", "entry.http", entry.as_bytes()).unwrap().is_none(), "a PUT to another account is no proposal for this one");
     }
 
     #[test]
@@ -450,7 +437,7 @@ mod tests {
             "HTTP/1.1 201 Created\r\n",
             "\r\n",
         );
-        assert!(parse_proposal("entry.http", entry.as_bytes()).unwrap().is_none());
+        assert!(parse_proposal("alice", "entry.http", entry.as_bytes()).unwrap().is_none());
     }
 
     #[test]
@@ -461,6 +448,6 @@ mod tests {
             "HTTP/1.1 403 Forbidden\r\n",
             "\r\n",
         );
-        assert!(parse_proposal("entry.http", entry.as_bytes()).unwrap().is_none());
+        assert!(parse_proposal("alice", "entry.http", entry.as_bytes()).unwrap().is_none());
     }
 }

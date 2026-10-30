@@ -11,9 +11,52 @@ about code that is there but incomplete.
 `serve_stream` (`src/server/stream.rs`) watches the directory it was asked for
 and reports every write beneath it, so a sync of the account root hears about
 `/.ark/` as well. One put from a peer reports several events, among them the
-log entry that recorded it. `pull_watch` pulls these like any other change, so
-a watching client takes copies of log entries it should not hold at all.
-Skipping every path under `/.ark/` would close it.
+log entry that recorded it and the version the server kept. `pull_watch` now
+drops these, so no client acts on them, but every watcher is still sent them.
+Skipping every path under `/.ark/` in the stream itself would close it.
+
+## Paths last written before every write was versioned lack their current version
+
+Every write is now kept as a version as it lands, so what a path holds is its
+newest version. A path last written before that holds an entry that is in no
+history, and stays so until its next write. A delete then drops it for good.
+Nothing migrates these.
+
+## A version of a directory cannot be fetched under a file, nor the reverse
+
+A path deleted and written again keeps one history, which can hold a file's
+versions and a directory's. `validate_version` refuses a version whose kind is
+not the kind of the copy held, so those are listed but cannot be fetched by a
+client holding the other kind.
+
+## Nothing prunes a client's version store
+
+A client keeps every version it uploads or downloads, as copies, under
+`/.ark/versions/`. Nothing drops them, so the store grows with the account's
+whole history of changes the client has seen. A server keeps its history by
+design; a client's is a cache, and could drop anything the server also has.
+
+## A purge leaves other devices' version stores
+
+`ark versions --purge` drops the server's history of a path and the store of
+the device that ran it. Every other device of the account keeps the copies
+in its own store, so the history is recoverable from any of them until each
+drops it.
+
+## A copy written before clients kept versions has no base in the store
+
+A metadata-only put, and a merge base, read the version a copy's record names
+from the client's own store. A copy last written before clients kept versions
+has none there, so it is fetched from the server on demand — which needs the
+server, and that version to still be readable there.
+
+## Two concurrent creates of one identity can mix their files
+
+`init` and `create_client_identity` refuse a path whose identity or key is
+already there, but check before writing rather than as they write. Two creates
+racing on one path both pass the check, and each file then holds whichever
+write landed last, so the identity and its key may come from different
+creates.
 
 ## Nothing prunes the request log
 

@@ -38,32 +38,6 @@ pub fn read_to_string_raw(root: &Path, path: &str) -> io::Result<String> {
     fs::read_to_string(to_fs_path_raw(root, path)?)
 }
 
-/// Write `body` to `path` as a new entry no other user can read, for a secret
-/// a reader would be able to act as the account with.
-///
-/// Errors with `AlreadyExists` where `path` is already there rather than
-/// writing over it, so a secret that cannot be recovered is never lost to a
-/// second write. On a platform without unix permissions the body is readable
-/// as any other entry's is.
-pub fn write_private(ctx: &Context, path: &str, body: &[u8]) -> io::Result<()> {
-    write_private_raw(&ctx.root, path, body)
-}
-
-/// As [`write_private`], for a caller holding only the account root — one
-/// running before its [`Context`] can be built.
-pub fn write_private_raw(root: &Path, path: &str, body: &[u8]) -> io::Result<()> {
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-
-    // The mode goes on as the entry is created rather than after it, so the
-    // body never sits in an entry anyone else can open — a descriptor taken in
-    // that gap would keep its read on the secret whatever the mode became.
-    #[cfg(unix)]
-    options.mode(0o600);
-
-    options.open(to_fs_path_raw(root, path)?)?.write_all(body)
-}
-
 /// Move `from` to `to`, as [`std::fs::rename`] does.
 ///
 /// The entry keeps the metadata it carries, and arrives whole, so a reader
@@ -81,14 +55,24 @@ pub fn link(ctx: &Context, original: &str, link: &str) -> io::Result<()> {
     fs::hard_link(to_fs_path(ctx, original)?, to_fs_path(ctx, link)?)
 }
 
-/// Copy the body of `from` to `to`, as [`std::fs::copy`] does, and give back
-/// the number of bytes copied.
+/// Make `path` another name for the entry at `original`, as a single visible
+/// change, replacing whatever `path` already holds.
 ///
-/// Only the body is copied — `to` keeps the metadata it already carries, and
-/// gets none where it is new. To copy a body and land metadata with it, use
-/// [`write_atomic_with_metadata`] with [`Body::CopyOf`].
-pub fn copy(ctx: &Context, from: &str, to: &str) -> io::Result<u64> {
-    fs::copy(to_fs_path(ctx, from)?, to_fs_path(ctx, to)?)
+/// As [`link`], the metadata is the entry's own. Where `path` is already there
+/// a reader sees either it or the linked entry, never neither.
+///
+/// `path`'s parent must exist, as it must for [`std::fs::write`].
+pub fn link_atomic(ctx: &Context, original: &str, path: &str) -> io::Result<()> {
+    let target = to_fs_path(ctx, path)?;
+    let temp = to_fs_path(ctx, &temp_path_for(path))?;
+
+    let result = fs::hard_link(to_fs_path(ctx, original)?, &temp).and_then(|_| fs::rename(&temp, &target));
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+
+    result
 }
 
 /// The names of the extended attributes of `path`, as [`xattr::list`] gives
@@ -105,9 +89,9 @@ pub fn read_attribute(ctx: &Context, path: &str, name: &str) -> io::Result<Optio
 /// Set the `name` attribute of `path`, as [`xattr::set`] does.
 ///
 /// Written where the entry stands rather than as a single visible change, so
-/// a reader can see it land on its own. Where that matters, and for a body
-/// and the attributes that belong with it, use [`write_atomic_with_metadata`]
-/// — or, for a directory, [`crate::metadata::write_metadata_attributes`].
+/// a reader can see it land on its own. Where that matters, use
+/// [`crate::metadata::write_metadata_attributes_atomic`] — or, for a body and
+/// the attributes that belong with it, [`write_atomic_with_metadata`].
 pub fn write_attribute(ctx: &Context, path: &str, name: &str, value: &[u8]) -> io::Result<()> {
     xattr::set(to_fs_path(ctx, path)?, name, value)
 }
@@ -115,9 +99,9 @@ pub fn write_attribute(ctx: &Context, path: &str, name: &str, value: &[u8]) -> i
 /// Remove the `name` attribute of `path`, as [`xattr::remove`] does.
 ///
 /// Removed where the entry stands rather than as a single visible change, so
-/// a reader can see it go on its own. Where that matters, and for a body and
-/// the attributes that belong with it, use [`write_atomic_with_metadata`]
-/// — or, for a directory, [`crate::metadata::write_metadata_attributes`].
+/// a reader can see it go on its own. Where that matters, use
+/// [`crate::metadata::write_metadata_attributes_atomic`] — or, for a body and
+/// the attributes that belong with it, [`write_atomic_with_metadata`].
 pub fn remove_attribute(ctx: &Context, path: &str, name: &str) -> io::Result<()> {
     xattr::remove(to_fs_path(ctx, path)?, name)
 }
@@ -233,15 +217,7 @@ pub fn size(ctx: &Context, path: &str) -> io::Result<u64> {
     Ok(fs::metadata(to_fs_path(ctx, path)?)?.len())
 }
 
-/// The body a [`write_atomic`] lands with.
-pub enum Body<'a> {
-    Bytes(&'a [u8]),
-    /// The body of an existing entry, for a change that alters only the
-    /// metadata. Copied rather than read, so the size does not matter.
-    CopyOf(&'a str),
-}
-
-/// Write `body` to `path` as a single visible change, keeping the metadata
+/// Write `contents` to `path` as a single visible change, keeping the metadata
 /// `path` already carries.
 ///
 /// The file is built complete under a temporary sibling name and moved into
@@ -250,37 +226,27 @@ pub enum Body<'a> {
 /// attributes and cannot be replaced atomically where it sits.
 ///
 /// `path`'s parent must exist, as it must for [`std::fs::write`].
-pub fn write_atomic(ctx: &Context, path: &str, body: Body) -> io::Result<()> {
+pub fn write_atomic(ctx: &Context, path: &str, contents: &[u8]) -> io::Result<()> {
     let metadata = read_metadata_attributes(ctx, path).ok();
     let local_metadata = read_local_metadata_attributes(ctx, path).ok();
 
-    write_atomic_inner(ctx, path, body, metadata.as_ref(), local_metadata.as_ref())
+    write_atomic_inner(ctx, path, contents, metadata.as_ref(), local_metadata.as_ref())
 }
 
-/// Write `body` to `path` along with `metadata`, as a single visible change,
+/// Write `contents` to `path` along with `metadata`, as a single visible change,
 /// replacing the metadata `path` already carries.
 ///
-/// The file is built complete under a temporary sibling name and moved into
-/// place, so a reader sees either the previous file or the whole new one,
-/// never a partial write — including the metadata, which is a dozen separate
-/// attributes and cannot be replaced atomically where it sits.
-///
-/// `path`'s parent must exist, as it must for [`std::fs::write`].
-pub fn write_atomic_with_metadata(ctx: &Context, path: &str, body: Body, metadata: &Metadata, local_metadata: Option<&LocalMetadata>) -> io::Result<()> {
-    write_atomic_inner(ctx, path, body, Some(metadata), local_metadata)
+/// Otherwise as [`write_atomic`].
+pub fn write_atomic_with_metadata(ctx: &Context, path: &str, contents: &[u8], metadata: &Metadata, local_metadata: Option<&LocalMetadata>) -> io::Result<()> {
+    write_atomic_inner(ctx, path, contents, Some(metadata), local_metadata)
 }
 
-/// Write `body` to `path` as a single visible change, dropping the metadata
+/// Write `contents` to `path` as a single visible change, dropping the metadata
 /// `path` already carries.
 ///
-/// The file is built complete under a temporary sibling name and moved into
-/// place, so a reader sees either the previous file or the whole new one,
-/// never a partial write — including the metadata, which is a dozen separate
-/// attributes and cannot be replaced atomically where it sits.
-///
-/// `path`'s parent must exist, as it must for [`std::fs::write`].
-pub fn write_atomic_without_metadata(ctx: &Context, path: &str, body: Body) -> io::Result<()> {
-    write_atomic_inner(ctx, path, body, None, None)
+/// Otherwise as [`write_atomic`].
+pub fn write_atomic_without_metadata(ctx: &Context, path: &str, contents: &[u8]) -> io::Result<()> {
+    write_atomic_inner(ctx, path, contents, None, None)
 }
 
 /// As [`write_atomic_without_metadata`], for a caller holding only the account
@@ -289,11 +255,11 @@ pub fn write_atomic_without_metadata(ctx: &Context, path: &str, body: Body) -> i
 /// There is no raw form that lands metadata: the metadata at rest is written
 /// through a [`Context`] (see [`write_metadata_attributes`]), so a caller
 /// with a root alone can only write a body.
-pub fn write_atomic_without_metadata_raw(root: &Path, path: &str, body: &[u8]) -> io::Result<()> {
+pub fn write_atomic_without_metadata_raw(root: &Path, path: &str, contents: &[u8]) -> io::Result<()> {
     let target = to_fs_path_raw(root, path)?;
     let temp = to_fs_path_raw(root, &temp_path_for(path))?;
 
-    let result = fs::write(&temp, body).and_then(|_| fs::rename(&temp, &target));
+    let result = fs::write(&temp, contents).and_then(|_| fs::rename(&temp, &target));
 
     if result.is_err() {
         let _ = fs::remove_file(&temp);
@@ -302,22 +268,171 @@ pub fn write_atomic_without_metadata_raw(root: &Path, path: &str, body: &[u8]) -
     result
 }
 
-fn write_atomic_inner(ctx: &Context, path: &str, body: Body, metadata: Option<&Metadata>, local_metadata: Option<&LocalMetadata>) -> io::Result<()> {
-    let target = to_fs_path(ctx, path)?;
+fn write_atomic_inner(ctx: &Context, path: &str, contents: &[u8], metadata: Option<&Metadata>, local_metadata: Option<&LocalMetadata>) -> io::Result<()> {
     let temp_path = temp_path_for(path);
     let temp = to_fs_path(ctx, &temp_path)?;
 
     let result = (|| {
-        match body {
-            Body::Bytes(bytes) => fs::write(&temp, bytes)?,
-            Body::CopyOf(source) => { fs::copy(to_fs_path(ctx, source)?, &temp)?; }
-        }
+        fs::write(&temp, contents)?;
 
         if let Some(metadata) = metadata {
             write_metadata_attributes(ctx, &temp_path, metadata, local_metadata)?;
         }
 
-        fs::rename(&temp, &target)
+        fs::rename(&temp, to_fs_path(ctx, path)?)
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+
+    result
+}
+
+/// Write `body` to `path` as an entry no other user can read, as a single
+/// visible change, keeping the metadata `path` already carries — for a secret
+/// a reader would be able to act as the account with.
+///
+/// On a platform without unix permissions the body is readable as any other
+/// entry's is.
+///
+/// Otherwise as [`write_atomic`].
+pub fn write_private_atomic(ctx: &Context, path: &str, body: &[u8]) -> io::Result<()> {
+    let metadata = read_metadata_attributes(ctx, path).ok();
+    let local_metadata = read_local_metadata_attributes(ctx, path).ok();
+
+    write_private_atomic_inner(ctx, path, body, metadata.as_ref(), local_metadata.as_ref())
+}
+
+/// Write `body` to `path` along with `metadata`, as a single visible change,
+/// replacing the metadata `path` already carries.
+///
+/// Otherwise as [`write_private_atomic`].
+pub fn write_private_atomic_with_metadata(ctx: &Context, path: &str, body: &[u8], metadata: &Metadata, local_metadata: Option<&LocalMetadata>) -> io::Result<()> {
+    write_private_atomic_inner(ctx, path, body, Some(metadata), local_metadata)
+}
+
+/// Write `body` to `path` as a single visible change, dropping the metadata
+/// `path` already carries.
+///
+/// Otherwise as [`write_private_atomic`].
+pub fn write_private_atomic_without_metadata(ctx: &Context, path: &str, body: &[u8]) -> io::Result<()> {
+    write_private_atomic_inner(ctx, path, body, None, None)
+}
+
+/// As [`write_private_atomic_without_metadata`], for a caller holding only the
+/// account root — one running before its [`Context`] can be built.
+///
+/// There is no raw form that lands metadata, as for
+/// [`write_atomic_without_metadata_raw`].
+pub fn write_private_atomic_without_metadata_raw(root: &Path, path: &str, body: &[u8]) -> io::Result<()> {
+    let target = to_fs_path_raw(root, path)?;
+    let temp = to_fs_path_raw(root, &temp_path_for(path))?;
+
+    let result = create_private(&temp, body).and_then(|_| fs::rename(&temp, &target));
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+
+    result
+}
+
+fn write_private_atomic_inner(ctx: &Context, path: &str, body: &[u8], metadata: Option<&Metadata>, local_metadata: Option<&LocalMetadata>) -> io::Result<()> {
+    let temp_path = temp_path_for(path);
+    let temp = to_fs_path(ctx, &temp_path)?;
+
+    let result = (|| {
+        create_private(&temp, body)?;
+
+        if let Some(metadata) = metadata {
+            write_metadata_attributes(ctx, &temp_path, metadata, local_metadata)?;
+        }
+
+        fs::rename(&temp, to_fs_path(ctx, path)?)
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+
+    result
+}
+
+fn create_private(path: &Path, body: &[u8]) -> io::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+
+    // The mode goes on as the entry is created rather than after it, so the
+    // body never sits in an entry anyone else can open — a descriptor taken in
+    // that gap would keep its read on the secret whatever the mode became.
+    #[cfg(unix)]
+    options.mode(0o600);
+
+    options.open(path)?.write_all(body)
+}
+
+/// Copy the body of `from` to `to` as a single visible change, keeping the
+/// metadata `to` already carries.
+///
+/// The body is copied rather than read, so its size does not matter. For a
+/// change that alters only the metadata, `from` and `to` are the same path.
+///
+/// Otherwise as [`write_atomic`].
+pub fn copy_atomic(ctx: &Context, from: &str, to: &str) -> io::Result<()> {
+    let metadata = read_metadata_attributes(ctx, to).ok();
+    let local_metadata = read_local_metadata_attributes(ctx, to).ok();
+
+    copy_atomic_inner(ctx, from, to, metadata.as_ref(), local_metadata.as_ref())
+}
+
+/// Copy the body of `from` to `to` along with `metadata`, as a single visible
+/// change, replacing the metadata `to` already carries.
+///
+/// Otherwise as [`copy_atomic`].
+pub fn copy_atomic_with_metadata(ctx: &Context, from: &str, to: &str, metadata: &Metadata, local_metadata: Option<&LocalMetadata>) -> io::Result<()> {
+    copy_atomic_inner(ctx, from, to, Some(metadata), local_metadata)
+}
+
+/// Copy the body of `from` to `to` as a single visible change, dropping the
+/// metadata `to` already carries.
+///
+/// Otherwise as [`copy_atomic`].
+pub fn copy_atomic_without_metadata(ctx: &Context, from: &str, to: &str) -> io::Result<()> {
+    copy_atomic_inner(ctx, from, to, None, None)
+}
+
+/// As [`copy_atomic_without_metadata`], for a caller holding only the account
+/// root — one running before its [`Context`] can be built.
+///
+/// There is no raw form that lands metadata, as for
+/// [`write_atomic_without_metadata_raw`].
+pub fn copy_atomic_without_metadata_raw(root: &Path, from: &str, to: &str) -> io::Result<()> {
+    let source = to_fs_path_raw(root, from)?;
+    let target = to_fs_path_raw(root, to)?;
+    let temp = to_fs_path_raw(root, &temp_path_for(to))?;
+
+    let result = fs::copy(&source, &temp).and_then(|_| fs::rename(&temp, &target));
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+
+    result
+}
+
+fn copy_atomic_inner(ctx: &Context, from: &str, to: &str, metadata: Option<&Metadata>, local_metadata: Option<&LocalMetadata>) -> io::Result<()> {
+    let temp_path = temp_path_for(to);
+    let temp = to_fs_path(ctx, &temp_path)?;
+
+    let result = (|| {
+        fs::copy(to_fs_path(ctx, from)?, &temp)?;
+
+        if let Some(metadata) = metadata {
+            write_metadata_attributes(ctx, &temp_path, metadata, local_metadata)?;
+        }
+
+        fs::rename(&temp, to_fs_path(ctx, to)?)
     })();
 
     if result.is_err() {
@@ -363,21 +478,38 @@ mod tests {
     }
 
     #[test]
-    fn rename_carries_the_metadata_and_copy_does_not() {
+    fn rename_carries_the_metadata() {
         in_test_dir("ark_storage_test", |temp_dir| {
             let (context, identity, secret_key) = account(temp_dir);
             write_plain_test_file(&context.root.join("a.txt"), &identity, &secret_key, b"account");
             let before = read_metadata_attributes(&context, "/a.txt").unwrap();
 
-            assert_eq!(copy(&context, "/a.txt", "/copy.txt").unwrap(), b"account".len() as u64);
             rename(&context, "/a.txt", "/moved.txt").unwrap();
-
-            assert_eq!(read(&context, "/copy.txt").unwrap(), b"account");
-            assert!(read_metadata_attributes(&context, "/copy.txt").is_err(), "a copy carries no metadata");
 
             assert_eq!(read(&context, "/moved.txt").unwrap(), b"account");
             assert_eq!(read_metadata_attributes(&context, "/moved.txt").unwrap().id, before.id);
             assert!(!exists(&context, "/a.txt"));
+        });
+    }
+
+    #[test]
+    fn write_private_atomic_with_metadata_lands_whole_and_private_over_a_readable_entry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        in_test_dir("ark_storage_test", |context_dir| {
+            let (context, identity, secret_key) = account(context_dir);
+            let metadata = create_plain_test_metadata(&identity, &secret_key, b"secret");
+            fs::write(context.root.join("a.key"), b"before").unwrap();
+            fs::set_permissions(context.root.join("a.key"), fs::Permissions::from_mode(0o644)).unwrap();
+
+            write_private_atomic_with_metadata(&context, "/a.key", b"secret", &metadata, None).unwrap();
+
+            assert_eq!(read(&context, "/a.key").unwrap(), b"secret");
+            assert_eq!(read_metadata_attributes(&context, "/a.key").unwrap().id, metadata.id);
+            assert_eq!(fs::metadata(context.root.join("a.key")).unwrap().permissions().mode() & 0o777, 0o600);
+
+            let names: Vec<String> = fs::read_dir(&context.root).unwrap().map(|entry| entry.unwrap().file_name().into_string().unwrap()).collect();
+            assert!(!names.iter().any(|name| is_temp_path(name)), "a temporary entry was left behind");
         });
     }
 
@@ -403,7 +535,7 @@ mod tests {
             write_plain_test_file(&context.root.join("a.txt"), &identity, &secret_key, b"before");
             let before = read_metadata_attributes(&context, "/a.txt").unwrap();
 
-            write_atomic(&context, "/a.txt", Body::Bytes(b"after")).unwrap();
+            write_atomic(&context, "/a.txt", b"after").unwrap();
 
             assert_eq!(read(&context, "/a.txt").unwrap(), b"after");
             assert_eq!(read_metadata_attributes(&context, "/a.txt").unwrap().id, before.id,
@@ -423,7 +555,7 @@ mod tests {
 
             // write_atomic replaces the name, not the entry the link also
             // reaches, so what was linked stays what it was.
-            write_atomic_with_metadata(&context, "/a.txt", Body::Bytes(b"after"), &before, None).unwrap();
+            write_atomic_with_metadata(&context, "/a.txt", b"after", &before, None).unwrap();
 
             assert_eq!(read(&context, "/a.txt").unwrap(), b"after");
             assert_eq!(read(&context, "/kept.txt").unwrap(), b"before");
@@ -442,13 +574,12 @@ mod tests {
     }
 
     #[test]
-    fn both_ends_of_a_rename_or_copy_are_checked_against_the_account_root() {
+    fn both_ends_of_a_rename_are_checked_against_the_account_root() {
         in_test_dir("ark_storage_test", |temp_dir| {
             let (context, identity, secret_key) = account(temp_dir);
             write_plain_test_file(&context.root.join("a.txt"), &identity, &secret_key, b"account");
 
             assert_eq!(rename(&context, "/a.txt", "/../outside.txt").unwrap_err().kind(), ErrorKind::InvalidInput);
-            assert_eq!(copy(&context, "/a.txt", "/../outside.txt").unwrap_err().kind(), ErrorKind::InvalidInput);
 
             assert!(exists(&context, "/a.txt"), "a rejected move leaves the entry alone");
             assert!(!context.root.parent().unwrap().join("outside.txt").exists());
@@ -497,7 +628,7 @@ mod tests {
             write_plain_test_file(&path, &identity, &secret_key, b"first");
 
             let metadata = create_plain_test_metadata(&identity, &secret_key, b"second");
-            write_atomic_with_metadata(&context, "/notes.txt", Body::Bytes(b"second"), &metadata, None).unwrap();
+            write_atomic_with_metadata(&context, "/notes.txt", b"second", &metadata, None).unwrap();
 
             assert_eq!(fs::read(&path).unwrap(), b"second");
             assert_eq!(read_metadata_attributes(&context, "/notes.txt").unwrap().id, metadata.id);
@@ -513,7 +644,7 @@ mod tests {
             write_plain_test_file(&path, &identity, &secret_key, b"first");
             let before = read_metadata_attributes(&context, "/notes.txt").unwrap();
 
-            write_atomic(&context, "/notes.txt", Body::Bytes(b"second")).unwrap();
+            write_atomic(&context, "/notes.txt", b"second").unwrap();
 
             assert_eq!(fs::read(&path).unwrap(), b"second");
             assert_eq!(read_metadata_attributes(&context, "/notes.txt").unwrap().id, before.id);
@@ -526,14 +657,14 @@ mod tests {
             let (context, identity, secret_key) = account(temp_dir);
             write_plain_test_file(&context.root.join("notes.txt"), &identity, &secret_key, b"first");
 
-            write_atomic_without_metadata(&context, "/notes.txt", Body::Bytes(b"second")).unwrap();
+            write_atomic_without_metadata(&context, "/notes.txt", b"second").unwrap();
 
             assert!(read_metadata_attributes(&context, "/notes.txt").is_err());
         });
     }
 
     #[test]
-    fn write_atomic_keeps_body_when_copying() {
+    fn copy_atomic_with_metadata_onto_itself_keeps_the_body() {
         in_test_dir("ark_write_atomic_test", |temp_dir| {
             let (context, identity, secret_key) = account(temp_dir);
             let path = context.root.join("notes.txt");
@@ -541,7 +672,7 @@ mod tests {
             let before = read_metadata_attributes(&context, "/notes.txt").unwrap();
 
             let metadata = create_plain_test_metadata(&identity, &secret_key, b"body");
-            write_atomic_with_metadata(&context, "/notes.txt", Body::CopyOf("/notes.txt"), &metadata, None).unwrap();
+            copy_atomic_with_metadata(&context, "/notes.txt", "/notes.txt", &metadata, None).unwrap();
 
             assert_eq!(fs::read(&path).unwrap(), b"body");
             assert_ne!(read_metadata_attributes(&context, "/notes.txt").unwrap().id, before.id);
@@ -549,11 +680,53 @@ mod tests {
     }
 
     #[test]
-    fn write_atomic_leaves_nothing_behind_when_it_fails() {
+    fn copy_atomic_keeps_the_metadata_already_on_the_destination() {
+        in_test_dir("ark_write_atomic_test", |temp_dir| {
+            let (context, identity, secret_key) = account(temp_dir);
+            let path = context.root.join("notes.txt");
+            write_plain_test_file(&context.root.join("source.txt"), &identity, &secret_key, b"second");
+            write_plain_test_file(&path, &identity, &secret_key, b"first");
+            let before = read_metadata_attributes(&context, "/notes.txt").unwrap();
+
+            copy_atomic(&context, "/source.txt", "/notes.txt").unwrap();
+
+            assert_eq!(fs::read(&path).unwrap(), b"second");
+            assert_eq!(read_metadata_attributes(&context, "/notes.txt").unwrap().id, before.id);
+        });
+    }
+
+    #[test]
+    fn copy_atomic_without_metadata_drops_what_was_there() {
+        in_test_dir("ark_write_atomic_test", |temp_dir| {
+            let (context, identity, secret_key) = account(temp_dir);
+            write_plain_test_file(&context.root.join("notes.txt"), &identity, &secret_key, b"first");
+
+            copy_atomic_without_metadata(&context, "/notes.txt", "/notes.txt").unwrap();
+
+            assert_eq!(read(&context, "/notes.txt").unwrap(), b"first");
+            assert!(read_metadata_attributes(&context, "/notes.txt").is_err());
+        });
+    }
+
+    #[test]
+    fn copy_atomic_without_metadata_raw_lands_whole_and_carries_nothing_over() {
+        in_test_dir("ark_write_atomic_test", |temp_dir| {
+            let (context, identity, secret_key) = account(temp_dir);
+            write_plain_test_file(&context.root.join("a.txt"), &identity, &secret_key, b"before");
+
+            copy_atomic_without_metadata_raw(&context.root, "/a.txt", "/b.txt").unwrap();
+
+            assert_eq!(read(&context, "/b.txt").unwrap(), b"before");
+            assert!(read_metadata_attributes(&context, "/b.txt").is_err());
+        });
+    }
+
+    #[test]
+    fn copy_atomic_leaves_nothing_behind_when_it_fails() {
         in_test_dir("ark_write_atomic_test", |temp_dir| {
             let (context, _, _) = account(temp_dir);
 
-            assert!(write_atomic(&context, "/notes.txt", Body::CopyOf("/missing")).is_err());
+            assert!(copy_atomic(&context, "/missing", "/notes.txt").is_err());
 
             assert!(!context.root.join("notes.txt").exists());
             assert_eq!(fs::read_dir(&context.root).unwrap().count(), 1, "nothing but .ark");

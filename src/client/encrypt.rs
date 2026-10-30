@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 
 use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, DEFAULT_HASH_ALGORITHM, create_secret_key, encrypt_bytes};
 use crate::metadata::{apply_key_to_metadata, create_metadata, has_metadata_attributes, read_local_metadata_attributes, read_metadata_attributes, resolve_key_from_members};
-use crate::storage::{Body, read, write_atomic_with_metadata};
+use crate::storage::{read, write_atomic_with_metadata};
 use crate::types::{Context, Hash, Key, LocalMetadata, Metadata};
 use crate::util::sha256;
 
@@ -51,10 +51,10 @@ pub fn encrypt(ctx: &Context, path: &str, encryption_algorithm: Option<&str>) ->
     let local_metadata = LocalMetadata {
         encrypted: Some(true),
         sync_body_hash: Some(Hash { algorithm: DEFAULT_HASH_ALGORITHM.to_string(), value: sha256(&plaintext_bytes) }),
-        sync_modified: Some(metadata.modified),
+        sync_author_date: Some(metadata.author_date),
     };
 
-    write_atomic_with_metadata(ctx, path, Body::Bytes(&ciphertext_bytes), &metadata, Some(&local_metadata))
+    write_atomic_with_metadata(ctx, path, &ciphertext_bytes, &metadata, Some(&local_metadata))
 }
 
 /// Encrypt `plaintext` to `ciphertext` using the file key wrapped in
@@ -208,7 +208,7 @@ mod tests {
             let p = acc.join("in.bin");
             write_plain_test_file(&p, &identity, &secret_key, b"x");
             let (account_ctx, account_path) = account_context(&p);
-            let local = LocalMetadata { encrypted: Some(true), sync_body_hash: None, sync_modified: None };
+            let local = LocalMetadata { encrypted: Some(true), sync_body_hash: None, sync_author_date: None };
             let metadata = read_metadata_attributes(&account_ctx, &account_path).unwrap();
             write_metadata_attributes(&account_ctx, &account_path, &metadata, Some(&local)).unwrap();
             set_current_dir(&acc).unwrap();

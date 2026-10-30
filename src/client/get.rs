@@ -6,12 +6,12 @@ use super::{decrypt_stream, request};
 use crate::crypto::DEFAULT_HASH_ALGORITHM;
 use crate::http::check_response_code;
 use crate::identity::resolve_identity;
-use crate::metadata::{has_metadata_headers, read_metadata_attributes, read_metadata_headers, write_metadata_attributes};
+use crate::metadata::{has_metadata_headers, read_metadata_attributes, read_metadata_headers, write_metadata_attributes_atomic};
 use crate::paths::{parent_path, to_url};
-use crate::storage::{Body, create_dir_all, write_atomic_with_metadata};
+use crate::storage::{create_dir_all, write_atomic_with_metadata};
 use crate::types::{Context, Hash, LocalMetadata, Metadata};
 use crate::util::{sha256, validate_update, validate_version};
-use crate::versions::to_version;
+use crate::versions::{is_versioned, to_version, write_version};
 
 /// Download the body of a file at `path` (decrypting when encrypted).
 ///
@@ -30,7 +30,7 @@ pub fn get_content(ctx: &Context, path: &str) -> io::Result<()> {
 /// `path`; for address form the address selects the download source while the
 /// local file is still written under the account root.
 ///
-/// Verifies the metadata against the modifier's identity, and against the
+/// Verifies the metadata against the author's identity, and against the
 /// account's own copy where it has one — the download must continue that copy
 /// rather than replace it with an unrelated or older file. When `decrypt` is
 /// true, unwraps the file key using `ctx.identity_key` and decrypts the body
@@ -49,13 +49,13 @@ pub fn get(ctx: &Context, path: &str, decrypt: bool) -> io::Result<()> {
 
     if metadata.body_hash.is_none() {
         create_dir_all(ctx, path)?;
-        write_metadata_attributes(ctx, path, &metadata, Some(&local_metadata))?;
+        write_metadata_attributes_atomic(ctx, path, &metadata, Some(&local_metadata))?;
     } else {
         if let Some(parent) = parent_path(path) {
             create_dir_all(ctx, parent)?;
         }
 
-        write_atomic_with_metadata(ctx, path, Body::Bytes(&buf), &metadata, Some(&local_metadata))?;
+        write_atomic_with_metadata(ctx, path, &buf, &metadata, Some(&local_metadata))?;
     }
 
     Ok(())
@@ -67,20 +67,26 @@ pub fn get(ctx: &Context, path: &str, decrypt: bool) -> io::Result<()> {
 /// `path` accepts relative, absolute account (leading `/`), or address form
 /// (`<name>@<host>/...`). Writes the body to `output`.
 ///
-/// Verifies the metadata signature against the modifier's identity. When
+/// Verifies the metadata signature against the author's identity. When
 /// `decrypt` is true, unwraps the file key using `ctx.identity_key` and
 /// decrypts the body before writing.
 ///
 /// `existing_metadata`: the metadata of the copy this download replaces, when
 /// it replaces one. The download is then also checked to continue that copy
 /// rather than replace it with an unrelated or older file. With `version`, it
-/// is checked to be a version of that copy — the same file — but may be older.
+/// is checked to be a version of that path — a file where the copy is a file —
+/// but may be older, and may be of a file the path held before a removal.
 ///
 /// `version`: the id of a past version of `path` to download in place of what
 /// it holds now (see [`list_versions`](super::list_versions)). What came back is checked
 /// to be the version asked for — the id travels outside what the request
 /// signature covers, so a server answering with a different version, or with
 /// the current file, is refused here.
+///
+/// What arrives is kept as a version in the account's own version store, as
+/// the server sent it, so it can be read back without the server (see
+/// [`get_version`](super::get_version)). Entries of the version store and of
+/// the request log are not kept.
 ///
 /// The returned [`LocalMetadata`] reflects whether the written body is
 /// ciphertext (`encrypted=Some(true)`) or plaintext, and includes a
@@ -107,22 +113,26 @@ pub fn get_stream(
 
     let metadata = read_metadata_headers(&headers)?;
 
-    // An unresolvable modifier is a verification failure, not a missing
+    // An unresolvable author is a verification failure, not a missing
     // target, and must not read as one to callers matching on the kind.
-    let modifier_identity = resolve_identity(ctx, &metadata.modified_by)
-        .map_err(|e| io::Error::other(format!("modifier {}: {}", metadata.modified_by, e)))?;
+    let author_identity = resolve_identity(ctx, &metadata.author)
+        .map_err(|e| io::Error::other(format!("author {}: {}", metadata.author, e)))?;
     let is_dir = metadata.body_hash.is_none();
     let update_body = if is_dir { None } else { Some(body.as_slice()) };
 
     match version {
-        Some(_) => validate_version(&modifier_identity.public_key, &metadata, existing_metadata, update_body)?,
-        None => validate_update(&modifier_identity.public_key, &metadata, existing_metadata, update_body)?,
+        Some(_) => validate_version(&author_identity.public_key, &metadata, existing_metadata, update_body)?,
+        None => validate_update(&author_identity.public_key, &metadata, existing_metadata, update_body)?,
     }
 
     if let Some(id) = version {
         if to_version(&metadata) != id {
             return Err(io::Error::new(io::ErrorKind::InvalidData, format!("served version is not {}", id)));
         }
+    }
+
+    if is_versioned(ctx, path)? {
+        write_version(ctx, path, if is_dir { &[] } else { &body }, &metadata)?;
     }
 
     let final_body = if decrypt && metadata.encryption_algorithm.is_some() {
@@ -140,7 +150,7 @@ pub fn get_stream(
         } else {
             None
         },
-        sync_modified: Some(metadata.modified),
+        sync_author_date: Some(metadata.author_date),
     };
 
     output.write_all(&final_body)?;
@@ -224,7 +234,7 @@ mod tests {
             assert_eq!(read_metadata_attributes(&ctx, "shared").unwrap().id, m.id);
 
             let local = read_local_metadata_attributes(&ctx, "shared").unwrap();
-            assert_eq!(local.sync_modified, Some(m.modified));
+            assert_eq!(local.sync_author_date, Some(m.author_date));
             assert!(local.sync_body_hash.is_none(), "a dir holds no body to hash");
         });
     }
@@ -317,7 +327,7 @@ mod tests {
             });
             sign_metadata(ctx.identity_key.as_ref().unwrap(), &mut m, Some(&ct)).unwrap();
             let (server_ctx, server_account_file) = account_context(&server_file);
-            write_atomic_with_metadata(&server_ctx, &server_account_file, Body::Bytes(&ct), &m, None).unwrap();
+            write_atomic_with_metadata(&server_ctx, &server_account_file, &ct, &m, None).unwrap();
 
             let out = temp_dir.join("secret");
             get(&ctx, "secret", true).unwrap();
@@ -379,12 +389,12 @@ mod tests {
             let server_path = temp_dir.join("ark/gyan/notes.txt");
             let (server_ctx, server_account_path) = account_context(&server_path);
             let mut rolled_back = read_metadata_attributes(&server_ctx, &server_account_path).unwrap();
-            rolled_back.modified -= Duration::hours(1);
+            rolled_back.author_date -= Duration::hours(1);
             sign_metadata(ctx.identity_key.as_ref().unwrap(), &mut rolled_back, Some(b"old")).unwrap();
-            write_atomic_with_metadata(&server_ctx, &server_account_path, Body::Bytes(b"old"), &rolled_back, None).unwrap();
+            write_atomic_with_metadata(&server_ctx, &server_account_path, b"old", &rolled_back, None).unwrap();
 
             let err = get(&ctx, "notes.txt", false).unwrap_err();
-            assert!(err.to_string().contains("modified is older than existing"), "msg was {}", err);
+            assert!(err.to_string().contains("author_date is older than existing"), "msg was {}", err);
             assert_eq!(fs::read(&local_path).unwrap(), b"current");
         });
     }

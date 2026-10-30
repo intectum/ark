@@ -79,7 +79,7 @@ pub fn authorize(
     server_ctx: &Context,
     target_ctx: &Context,
     requestor_identity: &Identity,
-    modifier_identity: Option<&Identity>,
+    author_identity: Option<&Identity>,
     existing_members: Option<&[Member]>,
 ) -> io::Result<Permission> {
     if requestor_identity.address == target_ctx.identity.address {
@@ -92,7 +92,7 @@ pub fn authorize(
     };
 
     let requestor_permission = resolve_member_permission(server_ctx, members, &requestor_identity.address)?;
-    let modifier_permission = match modifier_identity {
+    let author_permission = match author_identity {
         Some(m) => resolve_member_permission(server_ctx, members, &m.address)?,
         None => None,
     };
@@ -101,7 +101,7 @@ pub fn authorize(
         .find(|member| member.address == "*")
         .map(|member| member.permission);
 
-    [requestor_permission, modifier_permission, public_permission]
+    [requestor_permission, author_permission, public_permission]
         .into_iter()
         .flatten()
         .max_by_key(|permission| permission.rank())

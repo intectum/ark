@@ -54,7 +54,7 @@ ark::create_dir_all(&ctx, app_root)?;
 
 `create_client_context` locates the account root by walking up from the current directory looking for `.ark/`. Cache the returned `Context` and pass it to every client call — it carries the identity keypair and account root.
 
-**Paths are account paths, not filesystem paths.** `"/apps/notes"` is account-absolute; `"notes.md"` is taken against the working directory; `"bob@host/apps/notes"` names another account's tree. Every client function takes all three, and so do the storage functions — the filesystem reached the same way. Reach for `ark::read`, `ark::write`, `ark::read_dir` and the rest rather than `std::fs` and `ctx.root.join(...)`: they refuse anything outside the account root, and the path you read a file at is the same string you `put` it at.
+**Paths are account paths, not filesystem paths.** `"/apps/notes"` is account-absolute; `"notes.md"` is taken against the working directory; `"bob@host/apps/notes"` names another account's tree. Every client function takes all three, and so do the storage functions — the filesystem reached the same way. Reach for `ark::read`, `ark::write_atomic`, `ark::read_dir` and the rest rather than `std::fs` and `ctx.root.join(...)`: they refuse anything outside the account root, and the path you read a file at is the same string you `put` it at.
 
 **Pick your subtree once, then always work relative to it.** Everything below assumes you have `ctx` and an `app_root` under `apps/<app>/`.
 
@@ -178,9 +178,9 @@ When someone adds you as a member of a file or directory, their server relays th
 
 ```rust
 for p in ark::list_proposals(&ctx)? {
-    // p.target is the relative path the sender tried to write to.
-    // p.metadata.modified_by is the sender's address.
-    if p.target.starts_with("apps/notes/") {
+    // p.path is the account path the sender tried to write to.
+    // p.metadata.author is the sender's address.
+    if p.path.starts_with("/apps/notes/") {
         ark::accept_proposal(&ctx, &p.id, /*force=*/ false)?;
         // On accept: your client fetches, verifies, and PUTs the file locally.
     }
@@ -191,16 +191,14 @@ for p in ark::list_proposals(&ctx)? {
 
 ### Group by directory
 
-When someone shares a directory with N pre-existing files, you get N proposals — one per file. Group them by their target directory before showing the user, so they see "Bob shared *team-brainstorm*" rather than N separate line items.
+When someone shares a directory with N pre-existing files, you get N proposals — one per file. Group them by their directory before showing the user, so they see "Bob shared *team-brainstorm*" rather than N separate line items.
 
 ```rust
 use std::collections::BTreeMap;
 
-let marker = "/apps/notes/";
 let mut by_dir: BTreeMap<String, Vec<String>> = BTreeMap::new();
 for p in ark::list_proposals(&ctx)? {
-    let Some(i) = p.target.find(marker) else { continue };
-    let after = &p.target[i + marker.len()..];
+    let Some(after) = p.path.strip_prefix("/apps/notes/") else { continue };
     let dir = after.split('/').next().unwrap_or("").to_string();
     if !dir.is_empty() {
         by_dir.entry(dir).or_default().push(p.id);
@@ -251,33 +249,36 @@ for path in ark::read_dir(&ctx, dir)? {
     if !ark::has_metadata_attributes(&ctx, &path)? { continue; }
     let meta = ark::read_metadata_attributes(&ctx, &path)?;
     let body = ark::read(&ctx, &path)?;
-    // meta.modified_by = author, meta.modified = timestamp, meta.members = ACL
+    // meta.author = signer's address, meta.author_date = when signed, meta.members = ACL
 }
 ```
 
 `read_dir` hands back account paths, not bare names, so each one feeds straight into the next call. It also skips half-written temporaries, which a raw `std::fs::read_dir` would surface mid-write.
 
-`has_metadata_attributes` is your filter: local files with no ark xattrs are untracked (drafts, editor swap files, sidecars) and should be skipped.
+`has_metadata_attributes` is your filter: local files with no ark xattrs are untracked (drafts, editor swap files) and should be skipped. Sidecars — `<name>.remote-*`, `<name>.base-*` (§10) and `<name>.version-*` — do carry metadata, the record of the copy each holds, so skip those by name.
 
-For one-off reads without touching the filesystem, `get_stream(ctx, path, &mut buf, /*decrypt=*/ true, /*existing_metadata=*/ None)` returns the metadata plus writes the body into `buf`. Pass the metadata of the copy you already hold in that last argument, rather than `None`, and the download is also checked to continue that copy instead of replacing it with an older or unrelated file.
+For one-off reads without touching the filesystem, `get_stream(ctx, path, &mut buf, /*decrypt=*/ true, /*existing_metadata=*/ None, /*version=*/ None)` returns the metadata plus writes the body into `buf`. Pass the metadata of the copy you already hold as `existing_metadata`, rather than `None`, and the download is also checked to continue that copy instead of replacing it with an older or unrelated file. Pass a version id as `version` to read that past version instead; `ark::get_version` does the same from the account's own version store, fetching only what it lacks.
 
 ---
 
 ## 10. Conflicts
 
-When `sync` sees divergence — the local and remote body both changed since last sync — it does not merge and it does not lose data. It leaves the local copy untouched and writes the remote copy alongside as `<name>.conflict-<iso>`, carrying both the remote body and its metadata. The sidecar is not itself sync-tracked.
+When `sync` sees divergence — the local and remote body both changed since last sync — it does not merge and it does not lose data. It leaves the local copy untouched and records the conflict with `ark::write_conflict`: the remote copy goes alongside as `<name>.remote-<iso>`, carrying both the remote body and its metadata, and beside it `<name>.base-<id>`, the newest version both sides descend from, where they share one — what a three-way merge works against. Neither sidecar is itself sync-tracked.
 
 Detecting a conflict from an app is a filename check:
 
 ```rust
 for path in ark::read_dir(&ctx, dir)? {
     let name = ark::file_name(&path);
-    if let Some(dot) = name.rfind(".conflict-") {
-        let original = &name[..dot];
-        // Surface both copies to the user; delete the sidecar once resolved.
+    if let Some(dot) = name.rfind(".remote-") {
+        let original_path = ark::join_path(dir, &name[..dot]);
+        // Surface both copies to the user, merge into the local copy, then
+        // ark::resolve_conflict(&ctx, &original_path)?;
     }
 }
 ```
+
+Once the merge is in the local copy, `ark::resolve_conflict` publishes it as a change to what the server holds now — the history records the merge — and removes both sidecars.
 
 Structure your data model so conflicts are *unlikely*, not impossible: append-only items (messages, log entries) each go in their own file with a unique timestamped name, so two authors never write to the same file. Mutable state (a shared document, a title) needs merge or a designated writer.
 

@@ -174,6 +174,14 @@ pub fn is_temp_path(path: &str) -> bool {
     }
 }
 
+/// Whether the account path `path`, with or without its leading `/`, lies
+/// under `/.ark/`, where protocol state is kept.
+pub fn is_protocol_path(path: &str) -> bool {
+    let path = path.trim_start_matches('/');
+
+    path == ".ark" || path.starts_with(".ark/")
+}
+
 /// Expand a CLI/library path argument into a fully-qualified address string
 /// (`name@host[:port][/path]`).
 ///
@@ -350,13 +358,13 @@ mod tests {
         assert!(!is_temp_path(path));
         assert!(!is_temp_path("/notes/.todo.txt.tmp-notauuid"));
         assert!(!is_temp_path("/notes/todo.txt.tmp-1e2b34d0-0000-4000-8000-000000000000"));
-        assert!(!is_temp_path("/notes/todo.txt.conflict-2026-08-10T00-00-00Z"));
+        assert!(!is_temp_path("/notes/todo.txt.remote-2026-08-10T00-00-00Z"));
     }
 
     #[test]
     fn a_sidecar_sits_beside_what_it_refers_to() {
         assert_eq!(sidecar_path_for("/notes/a.txt", "version-1"), "/notes/a.txt.version-1");
-        assert_eq!(sidecar_path_for("a.txt", "conflict-2"), "a.txt.conflict-2");
+        assert_eq!(sidecar_path_for("a.txt", "remote-2"), "a.txt.remote-2");
     }
 
     #[test]

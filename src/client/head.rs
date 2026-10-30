@@ -8,7 +8,7 @@ use crate::paths::to_url;
 use crate::types::{Context, Metadata};
 
 /// Fetch response headers and signed metadata for `path` without downloading
-/// the body. Verifies the metadata signature against the modifier's identity.
+/// the body. Verifies the metadata signature against the author's identity.
 ///
 /// `path` accepts relative, absolute account, or address form. See the
 /// [module documentation](../index.html) for path resolution details.
@@ -23,11 +23,11 @@ pub fn head(ctx: &Context, path: &str) -> io::Result<(Vec<(String, String)>, Met
 
     let metadata = read_metadata_headers(&headers)?;
 
-    // An unresolvable modifier is a verification failure, not a missing
+    // An unresolvable author is a verification failure, not a missing
     // target, and must not read as one to callers matching on the kind.
-    let modifier_identity = resolve_identity(ctx, &metadata.modified_by)
-        .map_err(|e| io::Error::other(format!("modifier {}: {}", metadata.modified_by, e)))?;
-    verify_metadata_signature(&modifier_identity.public_key, &metadata)?;
+    let author_identity = resolve_identity(ctx, &metadata.author)
+        .map_err(|e| io::Error::other(format!("author {}: {}", metadata.author, e)))?;
+    verify_metadata_signature(&author_identity.public_key, &metadata)?;
 
     Ok((headers, metadata))
 }

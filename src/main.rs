@@ -4,7 +4,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::process::exit;
 
-use ark::{accept_proposal, create_client_context, create_client_identity, decrypt, delete, encrypt, format as format_timestamp, get, get_stream, get_version, head, change_identity_members, init, list, list_proposals, list_versions, parse_address, put, reject_proposal, restore_version, start_server, sync, to_url, watch_local, watch_remote, Context, DirEntryKind, EntryEvent, Permissions};
+use ark::{accept_proposal, create_client_context, create_client_identity, create_dir_all, decrypt, delete, encrypt, format as format_timestamp, get, get_stream, get_version, head, change_identity_members, init, list, list_proposals, list_versions, parent_path, purge_versions, put, read_metadata_attributes, reject_proposal, resolve_conflict, restore_version, sidecar_path_for, start_server, sync, to_url, watch_local, watch_remote, write_atomic_with_metadata, Context, DirEntryKind, EntryEvent, LocalMetadata, Permissions};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -189,7 +189,7 @@ enum Cmd {
     ///
     /// Per tracked file, pure local edits push; pure remote changes pull;
     /// concurrent changes on both sides write the remote copy to a
-    /// `<name>.conflict-<iso>` sidecar and leave the local copy untouched.
+    /// `<name>.remote-<iso>` sidecar and leave the local copy untouched.
     /// Untracked local files and symlinks are left alone. With --watch, keeps
     /// syncing continuously.
     Sync {
@@ -237,8 +237,16 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ProposalsCmd,
     },
-    /// List what a file or directory held before the writes that replaced it.
+    /// List everything a file or directory has held, what it holds now
+    /// included.
+    ///
+    /// History outlives a delete, so a path written again after one lists the
+    /// versions of the file it held before too, under a file ID of their own.
     Versions {
+        /// Drop the history of a deleted path, and of everything beneath it,
+        /// instead of listing it.
+        #[arg(long)]
+        purge: bool,
         /// Ark URL or path.
         path: String,
     },
@@ -252,6 +260,15 @@ enum Cmd {
         path: String,
         /// Version to restore, as `ark versions` lists it.
         id: String,
+    },
+    /// Publish the local copy as the resolution of a conflict `ark sync`
+    /// reported, and remove its conflict and base sidecars.
+    ///
+    /// Merge into the local copy first. It is put as a change to what the
+    /// server holds now, so the history records the merge.
+    Resolve {
+        /// Ark URL or path.
+        path: String,
     },
     /// Encrypt a plaintext file in place.
     ///
@@ -282,7 +299,7 @@ fn main() {
         Cmd::Head { path } => create_client_context().and_then(|c| head_cli(&c, &path)),
         Cmd::Delete { path } => create_client_context().and_then(|c| delete(&c, &path)),
         Cmd::Get { decrypt, version, path } => create_client_context().and_then(|c| match version {
-            Some(id) => get_version(&c, &path, &id, decrypt),
+            Some(id) => get_version_cli(&c, &path, &id, decrypt),
             None => get(&c, &path, decrypt),
         }),
         Cmd::Cat { version, path } => create_client_context().and_then(|c| cat_cli(&c, &path, version.as_deref())),
@@ -307,8 +324,12 @@ fn main() {
         },
         Cmd::Decrypt { path } => create_client_context().and_then(|c| decrypt(&c, &path)),
         Cmd::Encrypt { encryption_algorithm, path } => create_client_context().and_then(|c| encrypt(&c, &path, encryption_algorithm.as_deref())),
-        Cmd::Versions { path } => create_client_context().and_then(|c| list_versions_cli(&c, &path)),
+        Cmd::Versions { purge, path } => create_client_context().and_then(|c| match purge {
+            true => purge_versions(&c, &path),
+            false => list_versions_cli(&c, &path),
+        }),
         Cmd::Restore { path, id } => create_client_context().and_then(|c| restore_version(&c, &path, &id)),
+        Cmd::Resolve { path } => create_client_context().and_then(|c| resolve_conflict(&c, &path)),
     };
     if let Err(e) = result {
         eprintln!("error: {}", e);
@@ -321,6 +342,19 @@ fn cat_cli(ctx: &Context, path: &str, version: Option<&str>) -> io::Result<()> {
     get_stream(ctx, path, &mut stdout, true, None, version)?;
 
     Ok(())
+}
+
+fn get_version_cli(ctx: &Context, path: &str, id: &str, decrypt: bool) -> io::Result<()> {
+    let existing_metadata = read_metadata_attributes(ctx, path).ok();
+    let (body, metadata) = get_version(ctx, path, id, decrypt, existing_metadata.as_ref())?;
+
+    let sidecar_path = sidecar_path_for(path, &format!("version-{}", id));
+    if let Some(parent) = parent_path(&sidecar_path) {
+        create_dir_all(ctx, parent)?;
+    }
+
+    let local_metadata = LocalMetadata { encrypted: Some(!decrypt), ..LocalMetadata::default() };
+    write_atomic_with_metadata(ctx, &sidecar_path, &body, &metadata, Some(&local_metadata))
 }
 
 fn head_cli(ctx: &Context, path: &str) -> io::Result<()> {
@@ -355,17 +389,9 @@ fn list_proposals_cli(ctx: &Context) -> io::Result<()> {
         return Ok(());
     }
 
-    let (account_name, _, _) = parse_address(&ctx.identity.address)?;
-    let account_prefix = format!("/ark/{}", account_name);
-
     for (index, proposal) in proposals.iter().enumerate() {
         let kind = proposal.metadata.body_hash.as_ref().map(|_| "file").unwrap_or("dir");
-        let display_target = match proposal.target.strip_prefix(&account_prefix) {
-            Some("") => "/",
-            Some(rest) => rest,
-            None => &proposal.target,
-        };
-        println!("{:>3}  {}  {}  {}  ({})", index + 1, proposal.metadata.modified_by, kind, display_target, proposal.id);
+        println!("{:>3}  {}  {}  {}  ({})", index + 1, proposal.metadata.author, kind, proposal.path, proposal.id);
         for member in &proposal.metadata.members {
             println!("       {} = {}", member.address, member.permission.as_str());
         }
@@ -383,7 +409,7 @@ fn list_versions_cli(ctx: &Context, path: &str) -> io::Result<()> {
 
     let mut stdout = io::stdout().lock();
     for entry in &entries {
-        writeln!(stdout, "{}  {:>10}  {}  ({})", format_timestamp(entry.modified), entry.size, entry.modified_by, entry.id)?;
+        writeln!(stdout, "{}  {:>10}  {}  {}  ({})", format_timestamp(entry.author_date), entry.size, entry.author, entry.entry_id, entry.id)?;
     }
 
     Ok(())

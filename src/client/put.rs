@@ -1,18 +1,18 @@
 use std::io;
 use std::io::Read;
 
-use super::encrypt_stream;
+use super::{encrypt_stream, get_version};
 
 use crate::client::request;
 use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, DEFAULT_HASH_ALGORITHM, create_secret_key};
 use crate::http::check_response_code;
-use crate::metadata::{apply_key_to_metadata, apply_permissions, create_metadata, has_metadata_attributes, read_local_metadata_attributes, read_metadata_attributes, resolve_key_from_members, sign_metadata, write_metadata_attributes, write_metadata_headers};
+use crate::metadata::{apply_key_to_metadata, apply_permissions, create_metadata, has_metadata_attributes, read_local_metadata_attributes, read_metadata_attributes, resolve_key_from_members, sign_metadata, write_metadata_attributes_atomic, write_metadata_headers};
 use crate::paths::to_url;
-use crate::storage::{Body, is_dir, read, write_atomic_with_metadata};
+use crate::storage::{is_dir, read};
 use crate::timestamp;
 use crate::types::{Context, Hash, LocalMetadata, Metadata, Permissions};
 use crate::util::sha256;
-use crate::versions::to_version;
+use crate::versions::{to_version, write_version};
 
 /// Upload the body of a local file (or create a directory) at `path`.
 ///
@@ -68,6 +68,8 @@ pub fn put_permissions(ctx: &Context, path: &str, permissions: &Permissions) -> 
 /// The signed metadata is written back to the local copy as `user.ark.*`
 /// xattrs, plus local metadata as `user.ark_local.*` xattrs.
 ///
+/// What is uploaded is kept as a version in the account's own version store.
+///
 /// Missing intermediate parent directories on `path` are created on the
 /// server automatically. Writes are relayed to co-members.
 pub fn put(ctx: &Context, path: &str, permissions: &Permissions, encryption_algorithm: Option<&str>, metadata_only: bool) -> io::Result<()> {
@@ -91,11 +93,7 @@ pub fn put(ctx: &Context, path: &str, permissions: &Permissions, encryption_algo
 
     let (metadata, local_metadata) = put_stream(ctx, path, body, permissions, encryption_algorithm, existing_metadata, Some(existing_local_metadata), metadata_only)?;
 
-    if is_dir {
-        write_metadata_attributes(ctx, path, &metadata, Some(&local_metadata))?;
-    } else {
-        write_atomic_with_metadata(ctx, path, Body::CopyOf(path), &metadata, Some(&local_metadata))?;
-    }
+    write_metadata_attributes_atomic(ctx, path, &metadata, Some(&local_metadata))?;
 
     Ok(())
 }
@@ -120,9 +118,13 @@ pub fn put(ctx: &Context, path: &str, permissions: &Permissions, encryption_algo
 /// `existing_metadata` / `existing_local_metadata`: when present, update in
 /// place rather than minting fresh metadata.
 ///
-/// With `metadata_only = true`, `body` is ignored; only metadata is sent to
-/// the server. Requires `existing_metadata`. Rejects any
-/// `encryption_algorithm`.
+/// With `metadata_only = true`, `body` is ignored and the body stays the one
+/// `existing_metadata` was signed over. Requires `existing_metadata`. Rejects
+/// any `encryption_algorithm`.
+///
+/// What is uploaded is kept as a version in the account's own version store.
+/// A metadata-only version keeps the body of the version `existing_metadata`
+/// names, fetched where the store does not hold it.
 ///
 /// Missing intermediate parent directories on `path` are created on the
 /// server automatically. Writes are relayed to co-members.
@@ -183,8 +185,11 @@ pub fn put_stream(
 
     let mut local_metadata = existing_local_metadata.unwrap_or_default();
 
-    let final_body = if is_dir || metadata_only {
+    let final_body = if is_dir {
         Vec::new()
+    } else if metadata_only {
+        let existing_version = existing_version.as_deref().expect("metadata-only put checked for existing metadata");
+        get_version(ctx, path, existing_version, false, None)?.0
     } else {
         let body_bytes = if let Some(r) = body {
             let mut buf = Vec::new();
@@ -222,18 +227,20 @@ pub fn put_stream(
     };
 
     metadata.parent_version = existing_version;
-    metadata.modified = timestamp::now();
-    metadata.modified_by = ctx.identity.address.clone();
+    metadata.author = ctx.identity.address.clone();
+    metadata.author_date = timestamp::now();
 
     let sign_body = if is_dir || metadata_only { None } else { Some(final_body.as_slice()) };
     sign_metadata(ctx.identity_key.as_ref().expect("client context missing identity_key"), &mut metadata, sign_body)?;
 
-    local_metadata.sync_modified = Some(metadata.modified);
+    write_version(ctx, path, &final_body, &metadata)?;
+
+    local_metadata.sync_author_date = Some(metadata.author_date);
 
     let metadata_headers = write_metadata_headers(&metadata);
     let headers: Vec<(&str, &str)> = metadata_headers.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
 
-    let (response_code, _, response_body) = request(Some(ctx), "PUT", &url, &headers, &final_body)?;
+    let (response_code, _, response_body) = request(Some(ctx), "PUT", &url, &headers, if metadata_only { &[] } else { &final_body })?;
     check_response_code(response_code, &response_body)?;
 
     Ok((metadata, local_metadata))
@@ -249,7 +256,7 @@ mod tests {
     use super::*;
 
     use crate::context::create_client_context;
-    use crate::metadata::read_metadata_attributes;
+    use crate::metadata::{read_metadata_attributes, write_metadata_attributes};
     use crate::paths::to_fs_path;
     use crate::storage::{create_dir_all, write_atomic_without_metadata};
     use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, decrypt_bytes, encrypt_bytes};
@@ -259,6 +266,7 @@ mod tests {
     use crate::testing::fs::{account_context, in_test_dir, init_with_server, write_plain_test_file};
     use crate::testing::http::start_test_server;
     use crate::types::{Context, Identity, Key, Permission};
+    use crate::versions::version_path_for;
 
     fn cache_identity(ctx: &Context, identity: &Identity) {
         create_dir_all(ctx, "/.ark/identities").unwrap();
@@ -293,7 +301,7 @@ mod tests {
         if let Some(parent) = local_path.parent() {
             fs::create_dir_all(parent).unwrap();
         }
-        write_atomic_without_metadata(&ctx, arg, Body::Bytes(plaintext)).unwrap();
+        write_atomic_without_metadata(&ctx, arg, plaintext).unwrap();
 
         put(&ctx, arg, &Permissions::default(), None, false).unwrap();
         local_path
@@ -484,7 +492,7 @@ mod tests {
             let mut m = create_metadata(&ctx.identity.address, Some(DEFAULT_ENCRYPTION_ALGORITHM));
             apply_key_to_metadata(&ctx, &mut m, &file_key).unwrap();
             sign_metadata(ctx.identity_key.as_ref().unwrap(), &mut m, Some(&ciphertext)).unwrap();
-            let local = LocalMetadata { encrypted: Some(true), sync_body_hash: None, sync_modified: None };
+            let local = LocalMetadata { encrypted: Some(true), sync_body_hash: None, sync_author_date: None };
             write_metadata_attributes(&ctx, "/file.bin", &m, Some(&local)).unwrap();
 
             put(&ctx, "file.bin", &Permissions::default(), None, false).unwrap();
@@ -552,7 +560,7 @@ mod tests {
             assert!(dir.is_dir());
             let (server_ctx, server_dir) = account_context(&dir);
             let meta = read_metadata_attributes(&server_ctx, &server_dir).unwrap();
-            assert_eq!(meta.modified_by, address);
+            assert_eq!(meta.author, address);
             assert_eq!(meta.encryption_algorithm, None);
             assert!(meta.members[0].key.is_none());
         });
@@ -788,6 +796,48 @@ mod tests {
             let m = read_metadata_attributes(&ctx, "doc.txt").unwrap();
             let body = fs::read(&path).unwrap();
             verify_metadata(&ctx.identity.public_key, &m, Some(&body)).unwrap();
+        });
+    }
+
+    // The account's copy on the server, reached without going over the wire.
+    fn server(ctx: &Context, temp_dir: &Path) -> Context {
+        Context { root: temp_dir.join("ark/gyan"), identity: ctx.identity.clone(), identity_key: ctx.identity_key.clone() }
+    }
+
+    #[test]
+    fn a_put_keeps_the_very_version_the_server_takes() {
+        in_test_dir("ark_put_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let ctx = init_with_server(temp_dir, &format!("gyan@127.0.0.1:{}", port));
+
+            put_encrypted(&ctx, temp_dir, "notes.txt", b"secret");
+
+            let id = to_version(&read_metadata_attributes(&ctx, "notes.txt").unwrap());
+            let server_ctx = server(&ctx, temp_dir);
+            let kept_body = read(&ctx, &version_path_for(&ctx, "notes.txt", &id).unwrap()).unwrap();
+            let server_body = read(&server_ctx, &version_path_for(&server_ctx, "/notes.txt", &id).unwrap()).unwrap();
+            assert_eq!(kept_body, server_body, "the same ciphertext under the same id");
+            assert_ne!(kept_body, b"secret", "kept as it was sent, not as the copy holds it");
+        });
+    }
+
+    #[test]
+    fn a_metadata_only_put_keeps_the_body_it_was_signed_over() {
+        in_test_dir("ark_put_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let ctx = init_with_server(temp_dir, &format!("gyan@127.0.0.1:{}", port));
+            let other = create_identity("other@example.com", None).unwrap().0;
+            cache_identity(&ctx, &other);
+
+            put_encrypted(&ctx, temp_dir, "notes.txt", b"secret");
+            let before = read_metadata_attributes(&ctx, "notes.txt").unwrap();
+            put_permissions(&ctx, "notes.txt", &reader(other.address.clone())).unwrap();
+
+            let after = read_metadata_attributes(&ctx, "notes.txt").unwrap();
+            let before_body = read(&ctx, &version_path_for(&ctx, "notes.txt", &to_version(&before)).unwrap()).unwrap();
+            let after_body = read(&ctx, &version_path_for(&ctx, "notes.txt", &to_version(&after)).unwrap()).unwrap();
+            assert_eq!(after_body, before_body);
+            verify_metadata(&ctx.identity.public_key, &after, Some(&after_body)).unwrap();
         });
     }
 }

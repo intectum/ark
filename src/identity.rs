@@ -7,8 +7,8 @@ use crate::client::request;
 use crate::crypto::{DEFAULT_SIGNING_ALGORITHM, create_secret_key, sign_json, to_public_key, verify_json};
 use crate::http::check_response_code;
 use crate::paths::{join_path, to_path_segment, to_url};
-use crate::storage::{Body, create_dir_all, exists, exists_raw, read_to_string, read_to_string_raw, write_atomic, write_atomic_without_metadata, write_atomic_without_metadata_raw, write_private, write_private_raw};
-use crate::types::{Context, Identity, Key, Signature};
+use crate::storage::{create_dir_all, exists, exists_raw, read_to_string, read_to_string_raw, write_atomic, write_atomic_without_metadata, write_atomic_without_metadata_raw, write_private_atomic, write_private_atomic_with_metadata, write_private_atomic_without_metadata_raw};
+use crate::types::{Context, Identity, Key, Metadata, Signature};
 use crate::util::{decode_base64url, encode_base64url};
 
 pub const IDENTITY_CACHE_DIR: &str = "/.ark/identities";
@@ -101,7 +101,7 @@ pub fn resolve_identity(ctx: &Context, address: &str) -> io::Result<Identity> {
     validate_identity(&identity)?;
 
     create_dir_all(ctx, IDENTITY_CACHE_DIR)?;
-    write_atomic_without_metadata(ctx, &cache_path, Body::Bytes(&body))?;
+    write_atomic_without_metadata(ctx, &cache_path, &body)?;
 
     Ok(identity)
 }
@@ -109,7 +109,7 @@ pub fn resolve_identity(ctx: &Context, address: &str) -> io::Result<Identity> {
 /// Write `identity` to `path`, keeping the ark metadata `path` already
 /// carries so a later put continues the same file.
 pub fn write_identity(ctx: &Context, path: &str, identity: &Identity) -> io::Result<()> {
-    write_atomic(ctx, path, Body::Bytes(&serialize_identity(identity)?))
+    write_atomic(ctx, path, &serialize_identity(identity)?)
 }
 
 /// As [`write_identity`], for a caller holding only the account root — one
@@ -181,17 +181,22 @@ pub fn read_identity_key(ctx: &Context, path: &str) -> io::Result<Vec<u8>> {
     Ok(key)
 }
 
-/// Write `key` to `path`, base64url encoded, as [`write_private`] does — so
-/// the key is private to the current user, and never goes over one that is
-/// already there.
+/// Write `key` to `path`, base64url encoded, as [`write_private_atomic`] does
+/// — so the key is private to the current user and lands whole.
 pub fn write_identity_key(ctx: &Context, path: &str, key: &[u8]) -> io::Result<()> {
-    write_private(ctx, path, encode_base64url(key).as_bytes())
+    write_private_atomic(ctx, path, encode_base64url(key).as_bytes())
+}
+
+/// As [`write_identity_key`], along with `metadata`, as
+/// [`write_private_atomic_with_metadata`] does — so the key never lands without it.
+pub fn write_identity_key_with_metadata(ctx: &Context, path: &str, key: &[u8], metadata: &Metadata) -> io::Result<()> {
+    write_private_atomic_with_metadata(ctx, path, encode_base64url(key).as_bytes(), metadata, None)
 }
 
 /// As [`write_identity_key`], for a caller holding only the account root —
 /// one running before its [`Context`] can be built.
 pub fn write_identity_key_raw(root: &Path, path: &str, key: &[u8]) -> io::Result<()> {
-    write_private_raw(root, path, encode_base64url(key).as_bytes())
+    write_private_atomic_without_metadata_raw(root, path, encode_base64url(key).as_bytes())
 }
 
 fn parse_identity(content: &str) -> io::Result<Identity> {

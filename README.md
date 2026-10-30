@@ -85,7 +85,7 @@ ark cat note.txt                # print it instead, without writing it
 
 # Look at what a write replaced
 echo 'goodbye' > note.txt && ark put note.txt
-ark versions note.txt           # one line per version, newest first
+ark versions note.txt           # one line per version, newest first, the current one included
 ark cat note.txt --version <ID> # prints 'hello'
 ark restore note.txt <ID>       # put it back into the local copy
 ark put note.txt                # publish it, as a new version
@@ -119,9 +119,10 @@ Every command takes `-h` for details. Paths accept three forms:
 | `ark head <PATH>` | Fetch response headers only. |
 | `ark list <PATH>` | List entries of a directory. |
 | `ark delete <PATH>` | Delete a file or directory (recursive). |
-| `ark versions <PATH>` | List what PATH held before the writes that replaced it, newest first. |
+| `ark versions <PATH>` | List everything PATH has held, newest first, what it holds now included. History outlives a delete. `--purge` drops the history of a deleted PATH instead, on the server and in this device's own store. |
 | `ark restore <PATH> <ID>` | Put a version's body back into the local copy of PATH. `ark put` publishes it, as for any local change. |
-| `ark sync [PATH]` | Reconcile local and remote state under PATH — the working directory by default — in one pass. `-w` watches continuously. Prints one line per reconciled entry. |
+| `ark sync [PATH]` | Reconcile local and remote state under PATH — the working directory by default — in one pass. `-w` watches continuously. Prints one line per reconciled entry. Where both sides changed, writes `<name>.remote-<time>` (the server's copy) and `<name>.base-<ID>` (what both started from) beside the file. |
+| `ark resolve <PATH>` | Publish the local copy of PATH as the merge of a conflict `ark sync` reported, and remove its sidecars. The history records the merge. |
 | `ark watch local <PATH>` / `ark watch remote <PATH>` | Print events for local FS changes or the server's SSE stream at PATH. |
 | `ark proposals list` | Show pending share proposals — unauthorized PUTs from other accounts, recorded in `.ark/requests/`. |
 | `ark proposals accept <ID>` | Fetch, verify, and PUT the shared file/dir. `-f` bypasses metadata-change checks. |
@@ -189,16 +190,16 @@ ark::watch_remote(&ctx, &url,
 
 // Streaming form when you don't want to touch the filesystem
 let mut buf = Vec::new();
-let (metadata, _) = ark::get_stream(&ctx, "note.txt", &mut buf, true, /*existing_metadata=*/ None)?;
+let (metadata, _) = ark::get_stream(&ctx, "note.txt", &mut buf, true, /*existing_metadata=*/ None, /*version=*/ None)?;
 ```
 
-Every CLI command has a corresponding library function. `get`, `put`, `encrypt`, and `decrypt` all take a single path and act on the account's own copy of it, mirroring the server. For those four, a `_stream` variant (`encrypt_stream`, `decrypt_stream`, `get_stream`, `put_stream`) exposes the same operation over `Read`/`Write` streams and returns values instead of touching the filesystem — `ark cat` is `get_stream` to stdout.
+Every CLI command has a corresponding library function. `get`, `put`, `encrypt`, and `decrypt` all take a single path and act on the account's own copy of it, mirroring the server. For those four, a `_stream` variant (`encrypt_stream`, `decrypt_stream`, `get_stream`, `put_stream`) exposes the same operation over `Read`/`Write` streams and returns values instead of touching the filesystem — `ark cat` is `get_stream` to stdout. `get_version` returns a past version's body and record, from the account's own version store or fetched into it; `ark get --version` writes that beside the file as `<name>.version-<ID>`.
 
 `put` also has two focused wrappers: `put_content(ctx, path)` uploads the body at `path` with default permissions, and `put_permissions(ctx, path, &permissions)` sends a metadata-only PUT to add or drop members without re-uploading the body. Both delegate to `put`, which remains the full form (`permissions`, `encryption_algorithm`, `metadata_only`). Build a `Permissions` explicitly, or use `ark::owner`, `ark::writer`, `ark::reader`, and `ark::drop` (and plural `ark::owners`/`ark::writers`/`ark::readers`/`ark::drops`) for the common cases.
 
-`get` has a matching wrapper: `get_content(ctx, path)` downloads the body at `path` and writes it under the account root, decrypting when encrypted. `get` remains the full form (`decrypt`). `get_stream` takes one argument the others don't: `existing_metadata`, the metadata of the copy the download replaces when it replaces one. Pass it and the download is also checked to continue that copy — same `id`, `modified` no older — so a server cannot serve back an older version or an unrelated file at the path. `None` when there is no copy to continue.
+`get` has a matching wrapper: `get_content(ctx, path)` downloads the body at `path` and writes it under the account root, decrypting when encrypted. `get` remains the full form (`decrypt`). `get_stream` takes one argument the others don't: `existing_metadata`, the metadata of the copy the download replaces when it replaces one. Pass it and the download is also checked to continue that copy — same `id`, `author_date` no older — so a server cannot serve back an older version or an unrelated file at the path. `None` when there is no copy to continue.
 
-Paths in the library are account paths, not filesystem paths. Every client function takes the same three forms the CLI does — relative, account-absolute, or address — the storage functions are the filesystem reached the same way: `ark::read`, `ark::write`, `ark::read_dir`, `ark::create_dir_all`, `ark::rename`, and the `user.ark.*` attribute operations, each the `std::fs` equivalent with an account path in place of a filesystem one, refusing anything outside the account root. Use them rather than `std::fs` and `ctx.root.join(...)`, and app paths stay the same strings you hand to `put` and `get`. `ark::to_account_path(ctx, path)` and `ark::to_fs_path(ctx, path)` convert between the two when you need to hand an entry to something that only speaks filesystem paths.
+Paths in the library are account paths, not filesystem paths. Every client function takes the same three forms the CLI does — relative, account-absolute, or address — the storage functions are the filesystem reached the same way: `ark::read`, `ark::write_atomic`, `ark::read_dir`, `ark::create_dir_all`, `ark::rename`, and the `user.ark.*` attribute operations, each the `std::fs` equivalent with an account path in place of a filesystem one, refusing anything outside the account root. Use them rather than `std::fs` and `ctx.root.join(...)`, and app paths stay the same strings you hand to `put` and `get`. `ark::to_account_path(ctx, path)` and `ark::to_fs_path(ctx, path)` convert between the two when you need to hand an entry to something that only speaks filesystem paths.
 
 ---
 
@@ -212,8 +213,8 @@ Paths in the library are account paths, not filesystem paths. Every client funct
 | Directories | First-class. Recursive delete. Permissions inherit. |
 | Public files | Supported for plaintext only (any browser can fetch). |
 | Federation | On write, the server relays to co-members' servers. |
-| Versions | A write keeps what it replaced. List, read, and restore past versions of any path. |
-| Sync | One-shot or watch mode; reconciles divergence with a conflict sidecar. |
+| Versions | Every write is kept, through deletes too. List, read, and restore past versions of any path. |
+| Sync | One-shot or watch mode; reconciles divergence with conflict and merge-base sidecars. |
 | Transport | Server binds plain HTTP. Client URLs default to `https://` (put a reverse proxy in front for TLS); prefix an address with `http://` to override for dev. |
 | Authentication | `ArkIdentity` signed requests. No tokens, no sessions. |
 

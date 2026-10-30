@@ -20,20 +20,21 @@ use std::sync::Arc;
 use std::thread;
 
 use self::auth::{authenticate, authorize, inherited_members};
-use self::delete::serve_delete;
+use self::delete::{serve_delete, serve_delete_versions};
 use self::get::serve_get;
 use self::log::{LoggingStream, try_log_request};
 use self::put::{serve_put, serve_put_init};
 use self::relay::relay;
 use self::stream::serve_stream;
-use self::versions::{serve_version, serve_version_list};
+use self::versions::serve_version_list;
 
 use crate::context::{create_server_context, create_target_context};
 use crate::http::{read_request, write_text};
 use crate::identity::resolve_identity;
 use crate::metadata::{read_metadata_attributes, read_metadata_headers};
 use crate::paths::parse_request_target;
-use crate::storage::{is_file, is_symlink};
+use crate::storage::{exists, is_file, is_symlink};
+use crate::versions::version_path_for;
 use crate::types::{Context, Permission, RelayMode};
 
 pub const MAX_CLOCK_SKEW_MS: u64 = 300_000;
@@ -166,6 +167,42 @@ fn handle_parsed_inner(
         Err(e) => return Err(e),
     };
 
+    let prefix: Option<String> = url.query_pairs()
+        .find(|(k, _)| k == "prefix")
+        .map(|(_, v)| v.into_owned());
+
+    let list_versions = url.query_pairs().any(|(k, _)| k == "versions");
+    let version: Option<String> = url.query_pairs()
+        .find(|(k, _)| k == "version")
+        .map(|(_, v)| v.into_owned());
+
+    let wants_stream = headers.iter().any(|(n, v)|
+        n.eq_ignore_ascii_case("accept") && v.contains("text/event-stream"));
+
+    let target_path = match version.as_deref() {
+        Some(id) => {
+            if (method != "GET" && method != "HEAD") || wants_stream {
+                return write_text(stream, 405, b"a version can only be read");
+            }
+
+            if id.is_empty() || id.contains('/') || id.starts_with('.') {
+                return write_text(stream, 400, b"bad version id");
+            }
+
+            let version_path = match version_path_for(&target_ctx, &target_path, id) {
+                Ok(path) => path,
+                Err(e) => return write_text(stream, 400, e.to_string().as_bytes()),
+            };
+
+            if !exists(&target_ctx, &version_path) {
+                return write_text(stream, 404, b"no such version");
+            }
+
+            version_path
+        }
+        None => target_path,
+    };
+
     if is_symlink(&target_ctx, &target_path) {
         return write_text(stream, 403, b"symlinks not allowed");
     }
@@ -197,23 +234,22 @@ fn handle_parsed_inner(
         .as_deref()
         .and_then(|members| members.iter().find(|member| member.address == "*"));
 
-    let prefix: Option<String> = url.query_pairs()
-        .find(|(k, _)| k == "prefix")
-        .map(|(_, v)| v.into_owned());
+    let reads_versions = list_versions && (method == "GET" || method == "HEAD");
 
-    let list_versions = url.query_pairs().any(|(k, _)| k == "versions");
-    let version: Option<String> = url.query_pairs()
-        .find(|(k, _)| k == "version")
-        .map(|(_, v)| v.into_owned());
-
-    if public_member.is_some() && (method == "GET" || method == "HEAD") {
-        return serve_read(&target_ctx, &target_path, stream, method == "GET", prefix.as_deref(), list_versions, version.as_deref());
+    if public_member.is_some() && (method == "GET" || method == "HEAD") && !reads_versions {
+        return serve_get(&target_ctx, &target_path, stream, method == "GET", prefix.as_deref());
     }
 
     let requestor_identity = match authenticate(server_ctx, &url, method, headers, body) {
         Ok(i) => i,
         Err(e) => return write_text(stream, 401, e.to_string().as_bytes())
     };
+
+    // Each version answers to its own record's members, so the listing is
+    // gated entry by entry rather than by the path's.
+    if reads_versions {
+        return serve_version_list(server_ctx, &target_ctx, &target_path, stream, method == "GET", &requestor_identity);
+    }
 
     let metadata = if method == "PUT" {
         match read_metadata_headers(headers) {
@@ -224,8 +260,8 @@ fn handle_parsed_inner(
         None
     };
 
-    let modifier_identity = if let Some(m) = metadata.as_ref() {
-        match resolve_identity(server_ctx, &m.modified_by) {
+    let author_identity = if let Some(m) = metadata.as_ref() {
+        match resolve_identity(server_ctx, &m.author) {
             Ok(i) => Some(i),
             Err(e) => return write_text(stream, 403, e.to_string().as_bytes())
         }
@@ -233,7 +269,7 @@ fn handle_parsed_inner(
         None
     };
 
-    let permission = match authorize(server_ctx, &target_ctx, &requestor_identity, modifier_identity.as_ref(), effective_members.as_deref()) {
+    let permission = match authorize(server_ctx, &target_ctx, &requestor_identity, author_identity.as_ref(), effective_members.as_deref()) {
         Ok(p) => p,
         Err(e) => return write_text(stream, 403, e.to_string().as_bytes())
     };
@@ -247,17 +283,15 @@ fn handle_parsed_inner(
 
     match method {
         "GET" | "HEAD" => {
-            let wants_stream = headers.iter().any(|(n, v)|
-                n.eq_ignore_ascii_case("accept") && v.contains("text/event-stream"));
             if method == "GET" && wants_stream {
                 return serve_stream(&target_ctx, &target_path, stream, verbose);
             }
 
-            serve_read(&target_ctx, &target_path, stream, method == "GET", prefix.as_deref(), list_versions, version.as_deref())
+            serve_get(&target_ctx, &target_path, stream, method == "GET", prefix.as_deref())
         },
         "PUT" => {
             let metadata = metadata.as_ref().expect("metadata presence checked above");
-            let modifier = modifier_identity.as_ref().expect("modifier presence checked above");
+            let author = author_identity.as_ref().expect("author presence checked above");
 
             let mut relay_mode: Option<RelayMode> = None;
             let mut metadata_only = false;
@@ -269,7 +303,7 @@ fn handle_parsed_inner(
                 }
             }
 
-            serve_put(&target_ctx, &target_path, stream, body, metadata, modifier, existing_metadata.as_ref(), permission, metadata_only)?;
+            serve_put(&target_ctx, &target_path, stream, body, metadata, author, existing_metadata.as_ref(), permission, metadata_only)?;
 
             if let Some(mode) = relay_mode {
                 let server_ctx = Arc::clone(server_ctx);
@@ -289,21 +323,16 @@ fn handle_parsed_inner(
 
             Ok(())
         }
+        "DELETE" if list_versions => {
+            if requestor_identity.address != target_ctx.identity.address {
+                return write_text(stream, 403, b"only the account can delete versions");
+            }
+
+            serve_delete_versions(&target_ctx, &target_path, stream)
+        },
         "DELETE" => serve_delete(&target_ctx, &target_path, stream),
         _ => write_text(stream, 405, b"method not allowed"),
     }
-}
-
-fn serve_read(ctx: &Context, path: &str, stream: &mut dyn Write, send_body: bool, prefix: Option<&str>, list_versions: bool, version: Option<&str>) -> io::Result<()> {
-    if list_versions {
-        return serve_version_list(ctx, path, stream, send_body);
-    }
-
-    if let Some(id) = version {
-        return serve_version(ctx, path, stream, send_body, id);
-    }
-
-    serve_get(ctx, path, stream, send_body, prefix)
 }
 
 #[cfg(test)]

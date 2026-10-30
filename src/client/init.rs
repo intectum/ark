@@ -7,8 +7,8 @@ use super::{decrypt_stream, put, request};
 use crate::context::create_client_context;
 use crate::crypto::{DEFAULT_PASSWORD_ALGORITHM, create_secret_key_from_password, restore_secret_key_from_password, to_public_key};
 use crate::http::check_response_code;
-use crate::identity::{create_identity, parse_address, sign_identity, validate_identity, write_identity, write_identity_key, write_identity_key_raw, write_identity_raw};
-use crate::metadata::{read_metadata_headers, write_metadata_attributes};
+use crate::identity::{create_identity, parse_address, sign_identity, validate_identity, write_identity, write_identity_key_raw, write_identity_key_with_metadata, write_identity_raw};
+use crate::metadata::read_metadata_headers;
 use crate::paths::{to_fs_path_raw, to_url, to_url_raw};
 use crate::permissions::{reader, writer};
 use crate::storage::{create_dir_all, create_dir_all_raw, exists_raw};
@@ -142,8 +142,7 @@ fn pull_secret_key_with_password(
     let secret_key = decode_base64url(identity_key_b64.trim())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "identity.key plaintext not base64url"))?;
 
-    write_identity_key(&ctx, "/.ark/identity.key", &secret_key)?;
-    write_metadata_attributes(&ctx, "/.ark/identity.key", &identity_key_metadata, None)?;
+    write_identity_key_with_metadata(&ctx, "/.ark/identity.key", &secret_key, &identity_key_metadata)?;
 
     Ok(())
 }

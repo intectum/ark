@@ -4,7 +4,7 @@ use std::str::from_utf8;
 use crate::context::create_target_context;
 use crate::metadata::{create_metadata, read_metadata_attributes, sign_metadata};
 use crate::paths::join_path;
-use crate::storage::{Body, exists, is_dir, write_atomic_with_metadata};
+use crate::storage::{exists, is_dir, write_atomic_with_metadata};
 use crate::timestamp;
 use crate::types::{Context, Member, Permission};
 
@@ -118,7 +118,7 @@ pub fn try_log_request(
     let secret_key = server_ctx.identity_key.as_ref()
         .ok_or_else(|| io::Error::other("server context missing identity_key"))?;
     sign_metadata(secret_key, &mut metadata, Some(&entry))?;
-    write_atomic_with_metadata(&target_ctx, &entry_path, Body::Bytes(&entry), &metadata, None)?;
+    write_atomic_with_metadata(&target_ctx, &entry_path, &entry, &metadata, None)?;
 
     Ok(())
 }
@@ -338,7 +338,7 @@ mod tests {
             assert!(!entries.is_empty());
             let (alice_ctx, entry_path) = account_context(&entries[0]);
             let meta = read_metadata_attributes(&alice_ctx, &entry_path).unwrap();
-            assert_eq!(meta.modified_by, ark.address);
+            assert_eq!(meta.author, ark.address);
             assert!(meta.members.iter().any(|m| m.address == identity.address && m.permission == Permission::Owner));
             assert!(meta.members.iter().any(|m| m.address == ark.address && m.permission == Permission::Writer));
         });

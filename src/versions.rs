@@ -1,39 +1,43 @@
-//! What a path held before the writes that replaced it.
+//! Everything a path has held, what it holds now included.
 //!
 //! A version is an ordinary ark entry at rest — the body bytes and the signed
 //! record its author published, unchanged — so it is read back through the
 //! same operations as anything else. Versions of one path live together in a
 //! directory of their own under [`VERSIONS_DIR`], keyed by the path they
-//! belong to.
+//! belong to rather than the entry, so they outlive a removal of the path and
+//! a path recreated after one carries on the same history.
 //!
-//! See `spec.md` §4.3 and the decision behind the design in `versions.md`.
+//! See `spec.md` §4.3.
 
 use std::io;
 
-use crate::metadata::read_metadata_attributes;
+use crate::metadata::{read_metadata_attributes, to_canonical_metadata_bytes};
 use crate::paths::{file_name, join_path, to_account_path, to_path_segment};
-use crate::storage::{Body, create_dir_all, exists, is_dir, link, read_dir, remove_dir_all, size, write_atomic_with_metadata};
+use crate::storage::{copy_atomic_with_metadata, create_dir_all, exists, link_atomic, read_dir, remove_dir_all, size, write_atomic_with_metadata};
 use crate::timestamp;
 use crate::types::{Context, Metadata, VersionEntry};
-use crate::util::encode_base64url;
+use crate::util::{encode_base64url, sha256};
 
 pub const VERSIONS_DIR: &str = "/.ark/versions";
 
-const ID_SIGNATURE_LENGTH: usize = 8;
+const REQUESTS_DIR: &str = "/.ark/requests";
+
+const ID_HASH_LENGTH: usize = 8;
 
 /// The id naming the version `metadata` describes.
 ///
-/// Derived from the record itself, so every host holding that version names it
-/// the same — which is what lets two histories that drifted apart be compared.
-/// Two records that differ in any field, including a member list moved without
-/// touching the body, get ids of their own.
+/// Derived from what the record says, so every host holding that version names
+/// it the same — which is what lets two histories that drifted apart be
+/// compared. Two records that differ in any field, including a member list
+/// moved without touching the body, get ids of their own. How the record was
+/// signed plays no part.
 pub fn to_version(metadata: &Metadata) -> String {
-    let signature: String = encode_base64url(&metadata.signature.value)
+    let hash: String = encode_base64url(sha256(&to_canonical_metadata_bytes(metadata)))
         .chars()
-        .take(ID_SIGNATURE_LENGTH)
+        .take(ID_HASH_LENGTH)
         .collect();
 
-    format!("{}_{}", timestamp::format_fs_safe(metadata.modified), signature)
+    format!("{}_{}", timestamp::format_fs_safe(metadata.author_date), hash)
 }
 
 /// Where the versions of `path` are kept.
@@ -46,39 +50,98 @@ pub fn version_path_for(ctx: &Context, path: &str, id: &str) -> io::Result<Strin
     Ok(join_path(&version_dir_for(ctx, path)?, id))
 }
 
-/// Keep what `path` holds under `metadata` as a version of it.
+/// Write `contents` to the file `path` along with `metadata`, as a single
+/// visible change, keeping it as a version of `path` as it lands.
 ///
-/// Call this before replacing an entry, with the record that entry carries.
-/// Keeping the same record twice leaves one version, so a write that stopped
-/// before replacing anything costs nothing on the next attempt.
+/// The version is the very entry `path` then names — no copy — and is there
+/// before `path` changes, so what `path` holds is always among its versions.
+/// A write that stopped part-way can leave a version `path` never held;
+/// writing the same record again leaves one version and finishes the job.
 ///
 /// Nothing is dropped again: a path keeps a version per write it has taken,
-/// for as long as it exists. Only [`remove_versions`] clears them.
-pub fn save_version(ctx: &Context, path: &str, metadata: &Metadata) -> io::Result<()> {
-    let account_path = to_account_path(ctx, path)?;
-    if account_path == VERSIONS_DIR || account_path.starts_with(&format!("{}/", VERSIONS_DIR)) {
-        return Ok(());
+/// through removals of it too. Only [`remove_versions`] clears them.
+///
+/// `metadata` must be the record signed for `contents`: a version is named by
+/// its record, so new contents under a record already kept would take that
+/// version's name and replace it.
+///
+/// `path`'s parent must exist, as it must for [`std::fs::write`].
+pub fn write_versioned_with_metadata(ctx: &Context, path: &str, contents: &[u8], metadata: &Metadata) -> io::Result<()> {
+    if !is_versioned(ctx, path)? {
+        return write_atomic_with_metadata(ctx, path, contents, metadata, None);
     }
 
+    let version_path = write_version(ctx, path, contents, metadata)?;
+    link_atomic(ctx, &version_path, path)
+}
+
+/// Keep `contents` and `metadata` as a version of `path`, leaving `path`
+/// itself alone, and give back where the version is kept.
+///
+/// For a version made before `path` takes it — or that `path` never takes
+/// where it stands, as on a client, whose own copy is edited in place. Keeping
+/// the same record twice leaves one version.
+///
+/// `metadata` must be the record signed for `contents`, as for
+/// [`write_versioned_with_metadata`]. A directory's version has no contents.
+pub fn write_version(ctx: &Context, path: &str, contents: &[u8], metadata: &Metadata) -> io::Result<String> {
     let version_dir = version_dir_for(ctx, path)?;
     create_dir_all(ctx, &version_dir)?;
 
     let version_path = join_path(&version_dir, &to_version(metadata));
+    write_atomic_with_metadata(ctx, &version_path, contents, metadata, None)?;
 
-    if is_dir(ctx, path) {
-        write_atomic_with_metadata(ctx, &version_path, Body::Bytes(&[]), metadata, None)?;
-    } else {
-        match link(ctx, path, &version_path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
-        }
-    }
-
-    Ok(())
+    Ok(version_path)
 }
 
-/// The versions of `path`, newest first. Empty where it has none.
+/// Copy the body of `from` to the file `to` along with `metadata`, as a
+/// single visible change, keeping it as a version of `to` as it lands.
+///
+/// For a change that alters only the metadata, `from` and `to` are the same
+/// path. Otherwise as [`write_versioned_with_metadata`].
+pub fn copy_versioned_with_metadata(ctx: &Context, from: &str, to: &str, metadata: &Metadata) -> io::Result<()> {
+    if !is_versioned(ctx, to)? {
+        return copy_atomic_with_metadata(ctx, from, to, metadata, None);
+    }
+
+    let version_dir = version_dir_for(ctx, to)?;
+    create_dir_all(ctx, &version_dir)?;
+
+    let version_path = join_path(&version_dir, &to_version(metadata));
+    copy_atomic_with_metadata(ctx, from, &version_path, metadata, None)?;
+
+    link_atomic(ctx, &version_path, to)
+}
+
+/// Keep `metadata` as a version of the directory `path`. Call this before
+/// `path` takes that record, so what `path` carries is always among its
+/// versions.
+///
+/// As for [`write_versioned_with_metadata`], keeping the same record twice leaves one
+/// version, and versions are kept through removals of `path`.
+pub fn create_dir_version(ctx: &Context, path: &str, metadata: &Metadata) -> io::Result<()> {
+    if !is_versioned(ctx, path)? {
+        return Ok(());
+    }
+
+    write_version(ctx, path, &[], metadata).map(|_| ())
+}
+
+/// Whether writes to `path` are kept as versions of it.
+///
+/// They are everywhere but in the version store itself, and the request log,
+/// whose entries a server writes once and never replaces.
+pub fn is_versioned(ctx: &Context, path: &str) -> io::Result<bool> {
+    let account_path = to_account_path(ctx, path)?;
+
+    Ok(![VERSIONS_DIR, REQUESTS_DIR].iter().any(|dir| account_path == *dir || account_path.starts_with(&format!("{}/", dir))))
+}
+
+/// The versions of `path`, newest first, what it holds now included. Empty
+/// where it has none.
+///
+/// A path removed and written again keeps the versions it had before, so the
+/// versions may be of more than one entry — told apart by `entry_id`.
 pub fn read_versions(ctx: &Context, path: &str) -> io::Result<Vec<VersionEntry>> {
     let version_dir = version_dir_for(ctx, path)?;
     if !exists(ctx, &version_dir) {
@@ -93,8 +156,9 @@ pub fn read_versions(ctx: &Context, path: &str) -> io::Result<Vec<VersionEntry>>
 
         entries.push(VersionEntry {
             id: file_name(&version_path).to_string(),
-            modified: metadata.modified,
-            modified_by: metadata.modified_by,
+            entry_id: metadata.id,
+            author: metadata.author,
+            author_date: metadata.author_date,
             body_hash: metadata.body_hash,
             size: size(ctx, &version_path)?,
         });
@@ -106,8 +170,9 @@ pub fn read_versions(ctx: &Context, path: &str) -> io::Result<Vec<VersionEntry>>
 }
 
 /// Drop every version of `path` and of the paths beneath it, along with
-/// anything else kept beside them — including metadata a directory set aside
-/// for a rewrite still under way, so call this only once `path` is gone.
+/// anything else kept beside them — including what `path` holds now and the
+/// metadata a directory sets aside for a rewrite still under way, so call
+/// this only once `path` is gone.
 pub fn remove_versions(ctx: &Context, path: &str) -> io::Result<()> {
     if !exists(ctx, VERSIONS_DIR) {
         return Ok(());
@@ -129,15 +194,19 @@ pub fn remove_versions(ctx: &Context, path: &str) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::os::unix::fs::MetadataExt;
     use std::path::Path;
+    use std::thread;
+    use std::time::Duration;
 
     use super::*;
 
     use crate::crypto::create_secret_key;
     use crate::identity::create_identity;
     use crate::metadata::{apply_key_to_metadata, create_metadata, sign_metadata, write_metadata_attributes};
-    use crate::storage::{read, write_atomic_with_metadata, write_atomic_without_metadata};
-    use crate::testing::fs::{TEST_ADDRESS, create_test_account, in_test_dir, write_plain_test_file};
+    use crate::storage::{read, remove_file, write_atomic_without_metadata};
+    use crate::testing::fs::{TEST_ADDRESS, create_plain_test_metadata, create_test_account, in_test_dir};
     use crate::types::{Identity, Key, Member, Permission};
 
     fn account(temp_dir: &Path) -> (Context, Identity, Key) {
@@ -152,8 +221,13 @@ mod tests {
     }
 
     fn write(ctx: &Context, identity: &Identity, secret_key: &Key, path: &str, body: &[u8]) -> Metadata {
-        write_plain_test_file(&ctx.root.join(path.trim_start_matches('/')), identity, secret_key, body);
-        read_metadata_attributes(ctx, path).unwrap()
+        // Versions are ordered by the millisecond they were written in, so
+        // each write gets one of its own.
+        thread::sleep(Duration::from_millis(2));
+
+        let metadata = create_plain_test_metadata(identity, secret_key, body);
+        write_versioned_with_metadata(ctx, path, body, &metadata).unwrap();
+        metadata
     }
 
     #[test]
@@ -172,33 +246,81 @@ mod tests {
         sign_metadata(&secret_key, &mut changed, Some(b"body")).unwrap();
 
         assert_ne!(to_version(&changed), id, "a record that differs names a version of its own");
+
+        let mut signed_otherwise = metadata.clone();
+        signed_otherwise.signature.value = vec![0; signed_otherwise.signature.value.len()];
+
+        assert_eq!(to_version(&signed_otherwise), id, "the signature plays no part");
     }
 
     #[test]
-    fn keeping_what_a_path_holds_costs_no_copy_and_keeps_the_record() {
+    fn a_version_kept_aside_leaves_the_path_alone_and_reads_back_whole() {
         in_test_dir("ark_versions_test", |temp_dir| {
             let (context, identity, secret_key) = account(temp_dir);
-            let before = write(&context, &identity, &secret_key, "/a.txt", b"before");
+            let metadata = create_plain_test_metadata(&identity, &secret_key, b"kept");
 
-            save_version(&context, "/a.txt", &before).unwrap();
-            write_atomic_with_metadata(&context, "/a.txt", Body::Bytes(b"after"), &before, None).unwrap();
+            write_version(&context, "/a.txt", b"kept", &metadata).unwrap();
 
-            let version_path = version_path_for(&context, "/a.txt", &to_version(&before)).unwrap();
-            assert_eq!(read(&context, &version_path).unwrap(), b"before");
-            assert_eq!(read_metadata_attributes(&context, &version_path).unwrap().id, before.id);
+            assert!(!exists(&context, "/a.txt"), "only the store is written");
+            let version_path = version_path_for(&context, "/a.txt", &to_version(&metadata)).unwrap();
+            assert_eq!(read(&context, &version_path).unwrap(), b"kept");
+            assert_eq!(to_version(&read_metadata_attributes(&context, &version_path).unwrap()), to_version(&metadata));
         });
     }
 
     #[test]
-    fn keeping_the_same_record_twice_leaves_one_version() {
+    fn what_a_path_holds_is_its_newest_version_and_costs_no_copy() {
         in_test_dir("ark_versions_test", |temp_dir| {
             let (context, identity, secret_key) = account(temp_dir);
             let before = write(&context, &identity, &secret_key, "/a.txt", b"before");
+            let after = write(&context, &identity, &secret_key, "/a.txt", b"after");
 
-            save_version(&context, "/a.txt", &before).unwrap();
-            save_version(&context, "/a.txt", &before).unwrap();
+            let versions = read_versions(&context, "/a.txt").unwrap();
+            assert_eq!(versions.len(), 2);
+            assert_eq!(versions[0].id, to_version(&after));
+
+            let before_path = version_path_for(&context, "/a.txt", &to_version(&before)).unwrap();
+            assert_eq!(read(&context, &before_path).unwrap(), b"before");
+            assert_eq!(read_metadata_attributes(&context, &before_path).unwrap().signature.value, before.signature.value);
+
+            let after_path = version_path_for(&context, "/a.txt", &to_version(&after)).unwrap();
+            let live_inode = fs::metadata(context.root.join("a.txt")).unwrap().ino();
+            let version_inode = fs::metadata(context.root.join(after_path.trim_start_matches('/'))).unwrap().ino();
+            assert_eq!(live_inode, version_inode, "the newest version is the live entry itself");
+        });
+    }
+
+    #[test]
+    fn writing_the_same_record_twice_leaves_one_version() {
+        in_test_dir("ark_versions_test", |temp_dir| {
+            let (context, identity, secret_key) = account(temp_dir);
+            let metadata = write(&context, &identity, &secret_key, "/a.txt", b"body");
+
+            write_versioned_with_metadata(&context, "/a.txt", b"body", &metadata).unwrap();
 
             assert_eq!(read_versions(&context, "/a.txt").unwrap().len(), 1);
+            assert_eq!(read(&context, "/a.txt").unwrap(), b"body");
+        });
+    }
+
+    #[test]
+    fn versions_outlive_a_removal_and_carry_on_under_the_entry_written_after_it() {
+        in_test_dir("ark_versions_test", |temp_dir| {
+            let (context, identity, secret_key) = account(temp_dir);
+            let removed = write(&context, &identity, &secret_key, "/a.txt", b"removed");
+            remove_file(&context, "/a.txt").unwrap();
+
+            assert_eq!(read_versions(&context, "/a.txt").unwrap().len(), 1, "a removal keeps the versions");
+
+            let recreated = write(&context, &identity, &secret_key, "/a.txt", b"recreated");
+
+            let versions = read_versions(&context, "/a.txt").unwrap();
+            assert_eq!(versions.len(), 2);
+            assert_eq!(versions[0].entry_id, recreated.id);
+            assert_eq!(versions[1].entry_id, removed.id, "the entry removed is still in the history");
+
+            let removed_path = version_path_for(&context, "/a.txt", &versions[1].id).unwrap();
+            assert_eq!(read(&context, &removed_path).unwrap(), b"removed");
         });
     }
 
@@ -209,9 +331,9 @@ mod tests {
             create_dir_all(&context, "/notes").unwrap();
             let mut metadata = create_metadata(&identity.address, None);
             sign_metadata(&secret_key, &mut metadata, None).unwrap();
-            write_metadata_attributes(&context, "/notes", &metadata, None).unwrap();
+            create_dir_version(&context, "/notes", &metadata).unwrap();
 
-            save_version(&context, "/notes", &metadata).unwrap();
+            write_metadata_attributes(&context, "/notes", &metadata, None).unwrap();
 
             let versions = read_versions(&context, "/notes").unwrap();
             assert_eq!(versions.len(), 1);
@@ -229,7 +351,6 @@ mod tests {
             for index in 0..25 {
                 let metadata = write(&context, &identity, &secret_key, "/a.txt", format!("body {}", index).as_bytes());
                 ids.push(to_version(&metadata));
-                save_version(&context, "/a.txt", &metadata).unwrap();
             }
 
             let versions = read_versions(&context, "/a.txt").unwrap();
@@ -244,12 +365,11 @@ mod tests {
         in_test_dir("ark_versions_test", |temp_dir| {
             let (context, identity, secret_key) = account(temp_dir);
             let metadata = write(&context, &identity, &secret_key, "/a.txt", b"body");
-            save_version(&context, "/a.txt", &metadata).unwrap();
 
             // What a stopped rewrite leaves beside the versions: an entry
             // carrying no record, which a version could never be.
             let marker = join_path(&version_dir_for(&context, "/a.txt").unwrap(), ".previous");
-            write_atomic_without_metadata(&context, &marker, Body::Bytes(&[])).unwrap();
+            write_atomic_without_metadata(&context, &marker, &[]).unwrap();
 
             let versions = read_versions(&context, "/a.txt").unwrap();
             assert_eq!(versions.len(), 1);
@@ -264,10 +384,8 @@ mod tests {
             create_dir_all(&context, "/notes").unwrap();
             create_dir_all(&context, "/notebook").unwrap();
 
-            let inside = write(&context, &identity, &secret_key, "/notes/a.txt", b"inside");
-            let beside = write(&context, &identity, &secret_key, "/notebook/b.txt", b"beside");
-            save_version(&context, "/notes/a.txt", &inside).unwrap();
-            save_version(&context, "/notebook/b.txt", &beside).unwrap();
+            write(&context, &identity, &secret_key, "/notes/a.txt", b"inside");
+            write(&context, &identity, &secret_key, "/notebook/b.txt", b"beside");
 
             remove_versions(&context, "/notes").unwrap();
 
@@ -283,10 +401,9 @@ mod tests {
         in_test_dir("ark_versions_test", |temp_dir| {
             let (context, identity, secret_key) = account(temp_dir);
             create_dir_all(&context, VERSIONS_DIR).unwrap();
-            let metadata = write(&context, &identity, &secret_key, "/.ark/versions/planted", b"planted");
+            write(&context, &identity, &secret_key, "/.ark/versions/planted", b"planted");
 
-            save_version(&context, "/.ark/versions/planted", &metadata).unwrap();
-
+            assert_eq!(read(&context, "/.ark/versions/planted").unwrap(), b"planted");
             assert!(read_versions(&context, "/.ark/versions/planted").unwrap().is_empty());
         });
     }
@@ -300,9 +417,7 @@ mod tests {
             let file_key = create_secret_key("aes-256-gcm").unwrap();
             apply_key_to_metadata(&context, &mut metadata, &file_key).unwrap();
             sign_metadata(&secret_key, &mut metadata, Some(b"cipher")).unwrap();
-            write_atomic_with_metadata(&context, "/a.txt", Body::Bytes(b"cipher"), &metadata, None).unwrap();
-
-            save_version(&context, "/a.txt", &metadata).unwrap();
+            write_versioned_with_metadata(&context, "/a.txt", b"cipher", &metadata).unwrap();
 
             let version_path = version_path_for(&context, "/a.txt", &to_version(&metadata)).unwrap();
             let kept = read_metadata_attributes(&context, &version_path).unwrap();

@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 
 use crate::crypto::{DEFAULT_HASH_ALGORITHM, decrypt_bytes};
 use crate::metadata::{has_metadata_attributes, read_local_metadata_attributes, read_metadata_attributes, resolve_key_from_members};
-use crate::storage::{Body, read, write_atomic_with_metadata};
+use crate::storage::{read, write_atomic_with_metadata};
 use crate::types::{Context, Hash, Key, LocalMetadata, Metadata};
 use crate::util::sha256;
 
@@ -35,10 +35,10 @@ pub fn decrypt(ctx: &Context, path: &str) -> io::Result<()> {
     let local_metadata = LocalMetadata {
         encrypted: Some(false),
         sync_body_hash: Some(Hash { algorithm: DEFAULT_HASH_ALGORITHM.to_string(), value: sha256(&plaintext_bytes) }),
-        sync_modified: Some(metadata.modified),
+        sync_author_date: Some(metadata.author_date),
     };
 
-    write_atomic_with_metadata(ctx, path, Body::Bytes(&plaintext_bytes), &metadata, Some(&local_metadata))
+    write_atomic_with_metadata(ctx, path, &plaintext_bytes, &metadata, Some(&local_metadata))
 }
 
 /// Decrypt `ciphertext` to `plaintext` using the file key wrapped in
@@ -174,7 +174,7 @@ mod tests {
             let (wrap_alg, wrapped) = encrypt_bytes(&identity.public_key, &[0u8; 32]).unwrap();
             m.members[0].key = Some(Key { algorithm: wrap_alg, value: wrapped });
             sign_metadata(&secret_key, &mut m, Some(&body)).unwrap();
-            let local = LocalMetadata { encrypted: Some(true), sync_body_hash: None, sync_modified: None };
+            let local = LocalMetadata { encrypted: Some(true), sync_body_hash: None, sync_author_date: None };
             let (account_ctx, account_path) = account_context(&p);
             write_metadata_attributes(&account_ctx, &account_path, &m, Some(&local)).unwrap();
             set_current_dir(&acc).unwrap();

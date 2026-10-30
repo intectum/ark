@@ -11,7 +11,7 @@ use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, create_secret_key, encrypt_byt
 use crate::identity::{parse_address, read_identity_key, read_identity_raw, write_identity_raw};
 use crate::metadata::{create_metadata, sign_metadata, write_metadata_attributes};
 use crate::paths::join_path;
-use crate::storage::{Body, write_atomic_with_metadata};
+use crate::storage::write_atomic_with_metadata;
 use crate::types::{Context, Identity, Key, Member, Metadata, Permission};
 
 static CWD_LOCK: Mutex<()> = Mutex::new(());
@@ -108,7 +108,7 @@ pub fn write_plain_test_file(path: &Path, owner: &Identity, owner_key: &Key, bod
     let metadata = create_plain_test_metadata(owner, owner_key, body);
 
     let (context, account_path) = account_context(path);
-    write_atomic_with_metadata(&context, &account_path, Body::Bytes(body), &metadata, None).unwrap();
+    write_atomic_with_metadata(&context, &account_path, body, &metadata, None).unwrap();
 }
 
 pub fn create_encrypted_test_metadata(owner: &Identity, owner_key: &Key, plaintext: &[u8]) -> (Metadata, Vec<u8>) {
@@ -125,5 +125,5 @@ pub fn write_encrypted_test_file(path: &Path, owner: &Identity, owner_key: &Key,
     let (metadata, ciphertext) = create_encrypted_test_metadata(owner, owner_key, plaintext);
 
     let (context, account_path) = account_context(path);
-    write_atomic_with_metadata(&context, &account_path, Body::Bytes(&ciphertext), &metadata, None).unwrap();
+    write_atomic_with_metadata(&context, &account_path, &ciphertext, &metadata, None).unwrap();
 }

@@ -115,9 +115,9 @@ pub struct LocalMetadata {
     pub encrypted: Option<bool>,
     /// Hash of the last-synced plaintext body. Absent = do not sync.
     pub sync_body_hash: Option<Hash>,
-    /// `Metadata.modified` at the last successful sync. Baseline for detecting
-    /// local metadata drift (e.g. `chmod` since last sync).
-    pub sync_modified: Option<OffsetDateTime>,
+    /// `Metadata.author_date` at the last successful sync. Baseline for
+    /// detecting local metadata drift (e.g. `chmod` since last sync).
+    pub sync_author_date: Option<OffsetDateTime>,
 }
 
 /// A member entry in a file or directory's metadata: address, permission,
@@ -137,11 +137,9 @@ pub struct Member {
 pub struct Metadata {
     #[serde(with = "hyphenated_uuid")]
     pub id: Uuid,
+    pub author: String,
     #[serde(with = "timestamp")]
-    pub created: OffsetDateTime,
-    #[serde(with = "timestamp")]
-    pub modified: OffsetDateTime,
-    pub modified_by: String,
+    pub author_date: OffsetDateTime,
     /// The version this write was made against, where it was made against
     /// one. Absent on a file's first write.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -205,9 +203,14 @@ pub struct Permissions {
     pub drops: Vec<String>,
 }
 
+/// A share proposal: another account's PUT the server rejected and logged,
+/// pending consent to receive what it carried.
 pub struct Proposal {
+    /// The log entry's filename, which accepting or rejecting it takes.
     pub id: String,
-    pub target: String,
+    /// The account path the PUT was made to.
+    pub path: String,
+    /// The metadata the PUT carried.
     pub metadata: Metadata,
 }
 
@@ -263,9 +266,11 @@ pub struct StreamEvent {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VersionEntry {
     pub id: String,
+    #[serde(with = "hyphenated_uuid")]
+    pub entry_id: Uuid,
+    pub author: String,
     #[serde(with = "timestamp")]
-    pub modified: OffsetDateTime,
-    pub modified_by: String,
+    pub author_date: OffsetDateTime,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body_hash: Option<Hash>,
     pub size: u64,
