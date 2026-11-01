@@ -121,7 +121,7 @@ Every command takes `-h` for details. Paths accept three forms:
 | `ark delete <PATH>` | Delete a file or directory (recursive). |
 | `ark versions <PATH>` | List everything PATH has held, newest first, what it holds now included. History outlives a delete. `--purge` drops the history of a deleted PATH instead, on the server and in this device's own store. |
 | `ark restore <PATH> <ID>` | Put a version's body back into the local copy of PATH. `ark put` publishes it, as for any local change. |
-| `ark sync [PATH]` | Reconcile local and remote state under PATH — the working directory by default — in one pass. `-w` watches continuously. Prints one line per reconciled entry. Where both sides changed, writes `<name>.remote-<time>` (the server's copy) and `<name>.base-<ID>` (what both started from) beside the file. |
+| `ark sync [PATH]` | Reconcile local and remote state under PATH — the working directory by default — in one pass. `-w` watches continuously. Prints one line per reconciled entry. Removes what co-members deleted, unless it changed locally. Where both sides changed, writes `<name>.remote-<time>` (the server's copy) and `<name>.base-<ID>` (what both started from) beside the file. |
 | `ark resolve <PATH>` | Publish the local copy of PATH as the merge of a conflict `ark sync` reported, and remove its sidecars. The history records the merge. |
 | `ark watch local <PATH>` / `ark watch remote <PATH>` | Print events for local FS changes or the server's SSE stream at PATH. |
 | `ark proposals list` | Show pending share proposals — unauthorized PUTs from other accounts, recorded in `.ark/requests/`. |
@@ -212,7 +212,7 @@ Paths in the library are account paths, not filesystem paths. Every client funct
 | Sharing | `owner` / `writer` / `reader` per file. Add or drop members with `put`. |
 | Directories | First-class. Recursive delete. Permissions inherit. |
 | Public files | Supported for plaintext only (any browser can fetch). |
-| Federation | On write, the server relays to co-members' servers. |
+| Federation | On write or delete, the server relays to co-members' servers. |
 | Versions | Every write is kept, through deletes too. List, read, and restore past versions of any path. |
 | Sync | One-shot or watch mode; reconciles divergence with conflict and merge-base sidecars. |
 | Transport | Server binds plain HTTP. Client URLs default to `https://` (put a reverse proxy in front for TLS); prefix an address with `http://` to override for dev. |

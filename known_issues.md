@@ -36,6 +36,15 @@ A client keeps every version it uploads or downloads, as copies, under
 whole history of changes the client has seen. A server keeps its history by
 design; a client's is a cache, and could drop anything the server also has.
 
+## A late write can bring back a deleted path
+
+A delete is checked against the record a path holds, but the record of the
+delete is not kept: `serve_delete` (`src/server/delete.rs`) removes the path
+and nothing remembers it went. A write older than the delete that arrives
+after it — a relay delayed in transit — finds no record to lose to, and
+recreates the path. Keeping the delete's record in the path's history, and
+checking a write against it, would close this.
+
 ## A purge leaves other devices' version stores
 
 `ark versions --purge` drops the server's history of a path and the store of

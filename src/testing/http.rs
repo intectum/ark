@@ -265,6 +265,12 @@ pub fn seed_shared_dir(
     dir
 }
 
+pub fn signed_delete_metadata(port: u16, signer: &Identity, signer_key: &Key, target: &str, metadata: &Metadata) -> u16 {
+    let headers = write_metadata_headers(metadata);
+    let all: Vec<(&str, &str)> = headers.iter().map(|(key, value)| (key.as_str(), value.as_str())).collect();
+    signed_request_with_headers(port, signer, signer_key, "DELETE", target, &[], &all).0
+}
+
 pub fn signed_put_metadata(
     port: u16,
     signer: &Identity,

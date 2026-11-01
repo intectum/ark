@@ -9,10 +9,12 @@ use crate::client::init_local;
 use crate::context::create_client_context;
 use crate::crypto::{DEFAULT_ENCRYPTION_ALGORITHM, create_secret_key, encrypt_bytes};
 use crate::identity::{parse_address, read_identity_key, read_identity_raw, write_identity_raw};
-use crate::metadata::{create_metadata, sign_metadata, write_metadata_attributes};
+use crate::metadata::{create_metadata, read_metadata_attributes, sign_metadata, write_metadata_attributes};
 use crate::paths::join_path;
 use crate::storage::write_atomic_with_metadata;
+use crate::timestamp;
 use crate::types::{Context, Identity, Key, Member, Metadata, Permission};
+use crate::versions::to_version;
 
 static CWD_LOCK: Mutex<()> = Mutex::new(());
 pub const TEST_ADDRESS: &str = "test@example.com";
@@ -101,6 +103,23 @@ fn publish_identity(account_dir: &Path, identity: &Identity, secret_key: &Key) {
 pub fn create_plain_test_metadata(owner: &Identity, owner_key: &Key, body: &[u8]) -> Metadata {
     let mut metadata = create_metadata(&owner.address, None);
     sign_metadata(owner_key, &mut metadata, Some(body)).unwrap();
+    metadata
+}
+
+pub fn create_delete_test_metadata(path: &Path, signer: &Identity, signer_key: &Key) -> Metadata {
+    let (context, account_path) = account_context(path);
+    let mut metadata = match read_metadata_attributes(&context, &account_path) {
+        Ok(existing_metadata) => {
+            let mut metadata = existing_metadata.clone();
+            metadata.parent_version = Some(to_version(&existing_metadata));
+            metadata
+        }
+        Err(_) => create_metadata(&signer.address, None),
+    };
+    metadata.author = signer.address.clone();
+    metadata.author_date = timestamp::now();
+    metadata.deleted = true;
+    sign_metadata(signer_key, &mut metadata, None).unwrap();
     metadata
 }
 

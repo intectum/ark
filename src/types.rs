@@ -144,6 +144,9 @@ pub struct Metadata {
     /// one. Absent on a file's first write.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_version: Option<String>,
+    /// Marks the record of a delete rather than of a write.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deleted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption_algorithm: Option<String>,
     pub members: Vec<Member>,

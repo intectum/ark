@@ -6,9 +6,9 @@ use std::thread;
 use super::{get, get_stream, head, list, put_content, watch_local, watch_remote, write_conflict};
 
 use crate::identity::parse_address;
-use crate::metadata::{has_metadata_attributes, read_local_metadata_attributes, read_metadata_attributes, read_metadata_headers, write_metadata_attributes_atomic};
+use crate::metadata::{has_metadata_attributes, has_metadata_headers, read_local_metadata_attributes, read_metadata_attributes, read_metadata_headers, write_metadata_attributes_atomic};
 use crate::paths::{is_protocol_path, join_path, parent_path, to_account_path, to_fs_path, to_path_segment, to_url};
-use crate::storage::{create_dir_all, exists, is_dir, is_file, is_symlink, read, read_dir, read_to_string, remove_file, write_atomic_without_metadata};
+use crate::storage::{create_dir_all, exists, is_dir, is_file, is_symlink, read, read_dir, read_to_string, remove_dir, remove_file, write_atomic_without_metadata};
 use crate::types::{Context, DirEntryKind, EntryAction, EntryEvent, Metadata};
 use crate::util::{parse_request_entry, sha256};
 
@@ -17,6 +17,7 @@ struct SyncEntry {
     modified_local_body: bool,
     modified_remote_body: bool,
     modified_remote_metadata: bool,
+    deleted_remote: bool,
 }
 
 /// Reconcile local and remote state under the directory `path` in a single
@@ -25,7 +26,9 @@ struct SyncEntry {
 /// Per tracked file/dir: push if only local changed; pull if only remote
 /// changed; pull metadata alone when only remote permissions/members changed;
 /// record a conflict with [`write_conflict`] when both sides diverged, leaving
-/// the local copy untouched.
+/// the local copy untouched. Remove what another account deleted unless it
+/// changed locally, in which case it is pushed again; a directory is removed
+/// only once nothing is left in it.
 ///
 /// Only items with sync markers (seeded via a previous [`put`](super::put))
 /// are considered. Symlinks, untracked local files, and
@@ -137,6 +140,7 @@ where
                     modified_local_body: false,
                     modified_remote_body: !is_dir && !matches!(event.action, EntryAction::Metadata),
                     modified_remote_metadata: true,
+                    deleted_remote: false,
                 };
                 match sync_entry(ctx, &entry, decrypt, on_event) {
                     Ok(true) => return true,
@@ -146,19 +150,23 @@ where
             }
             EntryAction::Deleted => {
                 let local_path = join_path("/", &relative_path);
-                if exists(ctx, &local_path) && !is_dir {
-                    match remove_file(ctx, &local_path) {
-                        Ok(()) => if on_event(EntryEvent {
-                            action: EntryAction::Deleted,
-                            kind: Some(DirEntryKind::File),
-                            path: PathBuf::from(&relative_path),
-                            conflict: false,
-                        }) { return true; },
-                        Err(e) => { on_error(io::Error::other(format!("pull delete {}: {}", relative_path, e))); }
+                if !exists(ctx, &local_path) { return false; }
+
+                match check_entry(ctx, &local_path) {
+                    Ok(Some(mut entry)) => {
+                        entry.deleted_remote = true;
+                        match sync_entry(ctx, &entry, decrypt, on_event) {
+                            Ok(true) => return true,
+                            Ok(false) => {}
+                            Err(e) => { on_error(io::Error::other(format!("pull delete {}: {}", relative_path, e))); }
+                        }
                     }
+                    Ok(None) => {}
+                    Err(e) => { on_error(io::Error::other(format!("check {}: {}", local_path, e))); }
                 }
             }
         }
+
         false
     }, on_error)
 }
@@ -174,17 +182,17 @@ where
             _ => return false,
         }
 
-        let absolute = join_path(path, &event.path.to_string_lossy());
-        if !is_file(ctx, &absolute) { return false; }
+        let entry_path = join_path(path, &event.path.to_string_lossy());
+        if !is_file(ctx, &entry_path) { return false; }
 
-        match check_entry(ctx, &absolute) {
+        match check_entry(ctx, &entry_path) {
             Ok(Some(entry)) => match sync_entry(ctx, &entry, false, on_event) {
                 Ok(true) => return true,
                 Ok(false) => {}
-                Err(e) => { on_error(io::Error::other(format!("push failed for {}: {}", absolute, e))); }
+                Err(e) => { on_error(io::Error::other(format!("push failed for {}: {}", entry_path, e))); }
             },
             Ok(None) => {}
-            Err(e) => { on_error(io::Error::other(format!("check {}: {}", absolute, e))); }
+            Err(e) => { on_error(io::Error::other(format!("check {}: {}", entry_path, e))); }
         }
 
         false
@@ -201,7 +209,7 @@ where
     check_dir(ctx, path, &mut entries, on_error)?;
 
     for (rel, log) in &log_map {
-        if log.author == ctx.identity.address { continue; }
+        if log.deleted || log.author == ctx.identity.address { continue; }
 
         let is_dir = log.body_hash.is_none();
         let local_path = join_path("/", rel);
@@ -245,12 +253,23 @@ where
                 modified_local_body: false,
                 modified_remote_body: body_changed,
                 modified_remote_metadata: metadata_changed,
+                deleted_remote: false,
             });
     }
 
-    let list = entries.into_values()
-        .filter(|e| e.modified_local_body || e.modified_remote_body || e.modified_remote_metadata)
+    // A path deleted, by itself or with a directory above it, and not written
+    // again since.
+    for entry in entries.values_mut() {
+        if matches!(log_map.get(&entry.relative_path), Some(log) if !log.deleted) { continue; }
+        entry.deleted_remote = log_map.iter()
+            .any(|(rel, log)| log.deleted && log.author != ctx.identity.address && under_prefix(&entry.relative_path, rel));
+    }
+
+    let mut list: Vec<SyncEntry> = entries.into_values()
+        .filter(|e| e.modified_local_body || e.modified_remote_body || e.modified_remote_metadata || e.deleted_remote)
         .collect();
+    // Beneath a directory first, so it is empty by the time it is removed.
+    list.sort_by(|a, b| b.relative_path.cmp(&a.relative_path));
     Ok((list, last_sync_request))
 }
 
@@ -307,6 +326,7 @@ fn check_entry(
         modified_local_body,
         modified_remote_body: false,
         modified_remote_metadata: false,
+        deleted_remote: false,
     }))
 }
 
@@ -326,7 +346,21 @@ where
         })
     };
 
-    if entry.modified_local_body && entry.modified_remote_body {
+    if entry.deleted_remote && !entry.modified_local_body {
+        let target_is_dir = is_dir(ctx, &target);
+        let result = if target_is_dir { remove_dir(ctx, &target) } else { remove_file(ctx, &target) };
+        match result {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::DirectoryNotEmpty => return Ok(false),
+            Err(e) => return Err(e),
+        }
+        return Ok(on_event(EntryEvent {
+            action: EntryAction::Deleted,
+            kind: Some(if target_is_dir { DirEntryKind::Dir } else { DirEntryKind::File }),
+            path: PathBuf::from(&entry.relative_path),
+            conflict: false,
+        }));
+    } else if entry.modified_local_body && entry.modified_remote_body {
         match write_conflict(ctx, &target, decrypt) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
@@ -381,6 +415,7 @@ where
     let rel_prefix = path.trim_start_matches('/');
 
     let mut entries = list(ctx, "/.ark/requests/", Some("PUT_2"))?;
+    entries.extend(list(ctx, "/.ark/requests/", Some("DELETE_204"))?);
     entries.retain(|entry|
         matches!(entry.kind, DirEntryKind::File) && entry.name.ends_with(".http"));
     entries.sort_by(|a, b| stamp_key(&a.name).cmp(stamp_key(&b.name)));
@@ -406,17 +441,25 @@ where
             continue;
         }
 
-        let (relative_path, metadata) = match parse_put(&entry_body, &account_prefix) {
+        let (relative_path, metadata) = match parse_log_entry(&entry_body, &account_prefix) {
             Ok(Some(v)) => v,
             Ok(None) => continue,
             Err(e) => { on_error(io::Error::new(io::ErrorKind::InvalidData, format!("bad log entry: {}", e))); continue; }
         };
 
-        if !under_prefix(&relative_path, rel_prefix) { continue; }
+        // A delete above the synced path takes what is beneath it too.
+        let covers_path = metadata.deleted && under_prefix(rel_prefix, &relative_path);
+        if !under_prefix(&relative_path, rel_prefix) && !covers_path { continue; }
         if is_protocol_path(&relative_path) { continue; }
 
+        if metadata.deleted {
+            map.retain(|rel, _| !under_prefix(rel, &relative_path));
+            map.insert(relative_path, metadata);
+            continue;
+        }
+
         match map.get(&relative_path) {
-            Some(existing) if metadata.author_date < existing.author_date => {}
+            Some(existing_metadata) if metadata.author_date < existing_metadata.author_date => {}
             _ => { map.insert(relative_path, metadata); }
         }
     }
@@ -429,11 +472,15 @@ fn stamp_key(name: &str) -> &str {
     name.splitn(3, '_').nth(2).unwrap_or(name)
 }
 
-fn parse_put(entry_bytes: &[u8], account_prefix: &str) -> io::Result<Option<(String, Metadata)>> {
+fn parse_log_entry(entry_bytes: &[u8], account_prefix: &str) -> io::Result<Option<(String, Metadata)>> {
     let entry = parse_request_entry(entry_bytes)?;
 
-    if entry.method != "PUT" { return Ok(None); }
-    if entry.status != 201 && entry.status != 204 { return Ok(None); }
+    match (entry.method.as_str(), entry.status) {
+        ("PUT", 201 | 204) | ("DELETE", 204) => {}
+        _ => return Ok(None),
+    }
+    // A delete of a path's versions carries no record.
+    if !has_metadata_headers(&entry.request_headers) { return Ok(None); }
 
     let target = entry.target.split_once('?').map(|(p, _)| p).unwrap_or(&entry.target);
     let Some(relative_path) = target.strip_prefix(account_prefix) else { return Ok(None); };
@@ -461,7 +508,7 @@ mod tests {
 
     use super::*;
 
-    use crate::client::{get::get, init, put::{put, put_permissions}, resolve_conflict};
+    use crate::client::{delete, get::get, init, put::{put, put_permissions}, resolve_conflict};
     use crate::metadata::{has_metadata_attributes, read_local_metadata_attributes, read_metadata_attributes};
     use crate::context::create_client_context;
     use crate::permissions::{owner, reader, writer};
@@ -935,6 +982,145 @@ mod tests {
             sync(&alice_ctx, ".", false, false, |_| false, |_| false).unwrap();
 
             assert!(!local.exists(), "own PUTs must not be pulled back");
+        });
+    }
+
+    fn seed_shared_file_with_writer(alice_dir: &Path, alice_ctx: &Context, writer_addr: &str, relative: &str, body: &[u8]) {
+        write_local(alice_dir, relative, body);
+        put(alice_ctx, relative, &Permissions::default(), Some("none"), false).unwrap();
+        put_permissions(alice_ctx, relative, &writer(writer_addr)).unwrap();
+    }
+
+    #[test]
+    fn sync_removes_files_other_accounts_deleted() {
+        in_test_dir("ark_sync_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let (alice_ctx, bob_ctx) = init_two_accounts(temp_dir, port);
+
+            let alice_dir = temp_dir.join("alice_client");
+            let bob_dir = temp_dir.join("bob_client");
+
+            set_current_dir(&alice_dir).unwrap();
+            seed_shared_dir_with_writer(&alice_dir, &alice_ctx, &bob_ctx.identity.address);
+            seed_shared_file_with_writer(&alice_dir, &alice_ctx, &bob_ctx.identity.address, "shared/foo.txt", b"hello");
+
+            set_current_dir(&bob_dir).unwrap();
+            let target = format!("alice@127.0.0.1:{}/shared/foo.txt", port);
+            get(&bob_ctx, &target, false).unwrap();
+            delete(&bob_ctx, &target).unwrap();
+
+            set_current_dir(&alice_dir).unwrap();
+            let alice_ctx = create_client_context().unwrap();
+            sync(&alice_ctx, ".", false, false, |_| false, |_| false).unwrap();
+
+            assert!(!alice_dir.join("shared/foo.txt").exists());
+        });
+    }
+
+    #[test]
+    fn sync_pushes_a_file_changed_locally_after_another_account_deleted_it() {
+        in_test_dir("ark_sync_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let (alice_ctx, bob_ctx) = init_two_accounts(temp_dir, port);
+
+            let alice_dir = temp_dir.join("alice_client");
+            let bob_dir = temp_dir.join("bob_client");
+
+            set_current_dir(&alice_dir).unwrap();
+            seed_shared_dir_with_writer(&alice_dir, &alice_ctx, &bob_ctx.identity.address);
+            seed_shared_file_with_writer(&alice_dir, &alice_ctx, &bob_ctx.identity.address, "shared/foo.txt", b"hello");
+
+            set_current_dir(&bob_dir).unwrap();
+            let target = format!("alice@127.0.0.1:{}/shared/foo.txt", port);
+            get(&bob_ctx, &target, false).unwrap();
+            delete(&bob_ctx, &target).unwrap();
+
+            set_current_dir(&alice_dir).unwrap();
+            fs::write(alice_dir.join("shared/foo.txt"), b"edited").unwrap();
+            let alice_ctx = create_client_context().unwrap();
+            sync(&alice_ctx, ".", false, false, |_| false, |_| false).unwrap();
+
+            assert_eq!(fs::read(alice_dir.join("shared/foo.txt")).unwrap(), b"edited");
+            assert_eq!(fs::read(temp_dir.join("ark/alice/shared/foo.txt")).unwrap(), b"edited", "an edit outlives a delete");
+        });
+    }
+
+    #[test]
+    fn sync_removes_a_deleted_directory_only_once_it_is_empty() {
+        in_test_dir("ark_sync_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let (alice_ctx, bob_ctx) = init_two_accounts(temp_dir, port);
+
+            let alice_dir = temp_dir.join("alice_client");
+            let bob_dir = temp_dir.join("bob_client");
+
+            set_current_dir(&alice_dir).unwrap();
+            seed_shared_dir_with_writer(&alice_dir, &alice_ctx, &bob_ctx.identity.address);
+            fs::create_dir(alice_dir.join("shared/sub")).unwrap();
+            put(&alice_ctx, "shared/sub/", &writer(&bob_ctx.identity.address), None, false).unwrap();
+            write_local(&alice_dir, "shared/sub/a.txt", b"tracked");
+            put(&alice_ctx, "shared/sub/a.txt", &writer(&bob_ctx.identity.address), Some("none"), false).unwrap();
+            write_local(&alice_dir, "shared/scratch.txt", b"untracked");
+
+            set_current_dir(&bob_dir).unwrap();
+            let target = format!("alice@127.0.0.1:{}/shared", port);
+            get(&bob_ctx, &target, false).unwrap();
+            delete(&bob_ctx, &target).unwrap();
+
+            set_current_dir(&alice_dir).unwrap();
+            let alice_ctx = create_client_context().unwrap();
+            sync(&alice_ctx, ".", false, false, |_| false, |_| false).unwrap();
+
+            assert!(!alice_dir.join("shared/sub").exists(), "a tracked directory left empty goes");
+            assert!(alice_dir.join("shared/scratch.txt").exists(), "an untracked file stays");
+        });
+    }
+
+    #[test]
+    fn sync_of_a_subdir_removes_what_a_delete_above_it_took() {
+        in_test_dir("ark_sync_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let (alice_ctx, bob_ctx) = init_two_accounts(temp_dir, port);
+
+            let alice_dir = temp_dir.join("alice_client");
+            let bob_dir = temp_dir.join("bob_client");
+
+            set_current_dir(&alice_dir).unwrap();
+            seed_shared_dir_with_writer(&alice_dir, &alice_ctx, &bob_ctx.identity.address);
+            write_local(&alice_dir, "shared/sub/a.txt", b"tracked");
+            put(&alice_ctx, "shared/sub/a.txt", &writer(&bob_ctx.identity.address), Some("none"), false).unwrap();
+
+            set_current_dir(&bob_dir).unwrap();
+            let target = format!("alice@127.0.0.1:{}/shared", port);
+            get(&bob_ctx, &target, false).unwrap();
+            delete(&bob_ctx, &target).unwrap();
+
+            set_current_dir(&alice_dir).unwrap();
+            let alice_ctx = create_client_context().unwrap();
+            sync(&alice_ctx, "shared/sub", false, false, |_| false, |_| false).unwrap();
+
+            assert!(!alice_dir.join("shared/sub/a.txt").exists());
+        });
+    }
+
+    #[test]
+    fn sync_ignores_own_deletes_in_log() {
+        in_test_dir("ark_sync_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let alice_dir = temp_dir.join("alice_client");
+            fs::create_dir_all(&alice_dir).unwrap();
+            set_current_dir(&alice_dir).unwrap();
+            init(&current_dir().unwrap(), &format!("alice@127.0.0.1:{}", port), None, false).unwrap();
+            let alice_ctx = create_client_context().unwrap();
+
+            let local = alice_dir.join("notes.txt");
+            fs::write(&local, b"self body").unwrap();
+            put(&alice_ctx, "notes.txt", &Permissions::default(), Some("none"), false).unwrap();
+            delete(&alice_ctx, "notes.txt").unwrap();
+
+            sync(&alice_ctx, ".", false, false, |_| false, |_| false).unwrap();
+
+            assert!(local.exists(), "own deletes leave the local copy to the caller");
         });
     }
 

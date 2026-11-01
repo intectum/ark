@@ -1,14 +1,16 @@
 use std::collections::HashSet;
 use std::io;
 
-use super::{delete, get_stream, head, list, request, watch_remote};
+use super::{get_stream, head, list, request, watch_remote};
 
 use crate::http::check_response_code;
 use crate::identity::parse_address;
-use crate::metadata::{read_metadata_headers, write_metadata_headers};
+use crate::metadata::{read_metadata_headers, sign_metadata, write_metadata_headers};
 use crate::paths::{to_account_path, to_url};
+use crate::timestamp;
 use crate::types::{Context, EntryAction, Metadata, Permission, Proposal};
 use crate::util::{parse_request_entry, sha256};
+use crate::versions::to_version;
 
 /// List pending share proposals — requests where another account's PUT was
 /// rejected with `403` at a path the current account owns. Returned in
@@ -104,7 +106,7 @@ pub fn accept_proposal(ctx: &Context, index_or_id: &str, force: bool) -> io::Res
     let id = resolve_id(ctx, index_or_id)?;
     let entry_path = format!("/.ark/requests/{}", id);
     let mut entry_body: Vec<u8> = Vec::new();
-    get_stream(ctx, &entry_path, &mut entry_body, false, None, None)?;
+    let (entry_metadata, _) = get_stream(ctx, &entry_path, &mut entry_body, false, None, None)?;
     let (account_name, _, _) = parse_address(&ctx.identity.address)?;
     let proposal = parse_proposal(&account_name, &id, &entry_body)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "entry is not a valid proposal"))?;
@@ -149,7 +151,7 @@ pub fn accept_proposal(ctx: &Context, index_or_id: &str, force: bool) -> io::Res
     let (code, _, resp_body) = request(Some(ctx), "PUT", &own_url, &header_refs, &body)?;
     check_response_code(code, &resp_body)?;
 
-    delete(ctx, &entry_path)?;
+    delete_entry(ctx, &entry_path, &entry_metadata)?;
 
     Ok(())
 }
@@ -161,9 +163,26 @@ pub fn accept_proposal(ctx: &Context, index_or_id: &str, force: bool) -> io::Res
 pub fn reject_proposal(ctx: &Context, index_or_id: &str) -> io::Result<()> {
     let id = resolve_id(ctx, index_or_id)?;
     let entry_path = format!("/.ark/requests/{}", id);
-    delete(ctx, &entry_path)?;
+    let (_, entry_metadata) = head(ctx, &entry_path)?;
+    delete_entry(ctx, &entry_path, &entry_metadata)?;
 
     Ok(())
+}
+
+fn delete_entry(ctx: &Context, entry_path: &str, entry_metadata: &Metadata) -> io::Result<()> {
+    let mut metadata = entry_metadata.clone();
+    metadata.parent_version = Some(to_version(entry_metadata));
+    metadata.author = ctx.identity.address.clone();
+    metadata.author_date = timestamp::now();
+    metadata.deleted = true;
+
+    sign_metadata(ctx.identity_key.as_ref().expect("client context missing identity_key"), &mut metadata, None)?;
+
+    let headers = write_metadata_headers(&metadata);
+    let header_refs: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
+    let (code, _, body) = request(Some(ctx), "DELETE", &to_url(ctx, entry_path)?, &header_refs, &[])?;
+    check_response_code(code, &body)
 }
 
 fn resolve_id(ctx: &Context, index_or_id: &str) -> io::Result<String> {

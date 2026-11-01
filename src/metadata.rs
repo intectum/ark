@@ -24,6 +24,7 @@ const FIELD_ID: &str = "id";
 const FIELD_AUTHOR: &str = "author";
 const FIELD_AUTHOR_DATE: &str = "author_date";
 const FIELD_PARENT_VERSION: &str = "parent_version";
+const FIELD_DELETED: &str = "deleted";
 const FIELD_ENCRYPTION_ALGORITHM: &str = "encryption_algorithm";
 const FIELD_MEMBER_PREFIX: &str = "member_";
 const FIELD_MEMBER_ADDRESS: &str = "address";
@@ -57,6 +58,7 @@ pub fn create_metadata(owner_address: &str, encryption_algorithm: Option<&str>) 
         author: owner_address.to_string(),
         author_date: now,
         parent_version: None,
+        deleted: false,
         encryption_algorithm: encryption_algorithm.map(|s| s.to_string()),
         members: vec![Member {
             address: owner_address.to_string(),
@@ -175,6 +177,9 @@ pub fn write_metadata_attributes(ctx: &Context, path: &str, metadata: &Metadata,
     attributes.push((format!("{}{}", ATTRIBUTE_PREFIX, FIELD_AUTHOR_DATE), timestamp::format(metadata.author_date).into_bytes()));
     if let Some(parent_version) = &metadata.parent_version {
         attributes.push((format!("{}{}", ATTRIBUTE_PREFIX, FIELD_PARENT_VERSION), parent_version.clone().into_bytes()));
+    }
+    if metadata.deleted {
+        attributes.push((format!("{}{}", ATTRIBUTE_PREFIX, FIELD_DELETED), b"true".to_vec()));
     }
     if let Some(alg) = &metadata.encryption_algorithm {
         attributes.push((format!("{}{}", ATTRIBUTE_PREFIX, FIELD_ENCRYPTION_ALGORITHM), alg.clone().into_bytes()));
@@ -326,6 +331,9 @@ pub fn write_metadata_headers(metadata: &Metadata) -> Vec<(String, String)> {
     out.push((format!("{}Author-Date", HEADER_PREFIX), timestamp::format(metadata.author_date)));
     if let Some(parent_version) = &metadata.parent_version {
         out.push((format!("{}Parent-Version", HEADER_PREFIX), parent_version.clone()));
+    }
+    if metadata.deleted {
+        out.push((format!("{}Deleted", HEADER_PREFIX), "true".to_string()));
     }
     if let Some(alg) = &metadata.encryption_algorithm {
         out.push((format!("{}Encryption-Algorithm", HEADER_PREFIX), alg.clone()));
@@ -638,6 +646,7 @@ struct PartialMetadata {
     author: Option<String>,
     author_date: Option<String>,
     parent_version: Option<String>,
+    deleted: bool,
     encryption_algorithm: Option<String>,
     members: Vec<PartialMember>,
     body_hash_algorithm: Option<String>,
@@ -660,6 +669,7 @@ fn metadata_from_partial(partial: PartialMetadata) -> io::Result<Metadata> {
         author: partial.author.unwrap(),
         author_date: timestamp::parse(&partial.author_date.unwrap())?,
         parent_version: partial.parent_version,
+        deleted: partial.deleted,
         encryption_algorithm: partial.encryption_algorithm,
         members: partial.members.into_iter().map(|member| Member {
             address: member.address.unwrap(),
@@ -691,6 +701,11 @@ fn apply_field(metadata: &mut PartialMetadata, key: &str, value: &str) -> io::Re
         FIELD_AUTHOR => metadata.author = Some(value.to_string()),
         FIELD_AUTHOR_DATE => metadata.author_date = Some(value.to_string()),
         FIELD_PARENT_VERSION => metadata.parent_version = Some(value.to_string()),
+        FIELD_DELETED => metadata.deleted = match value {
+            "true" => true,
+            "false" => false,
+            _ => return Err(io::Error::new(io::ErrorKind::InvalidData, format!("deleted is not a boolean: {}", value))),
+        },
         FIELD_ENCRYPTION_ALGORITHM => metadata.encryption_algorithm = Some(value.to_string()),
         FIELD_BODY_HASH_ALGORITHM => metadata.body_hash_algorithm = Some(value.to_string()),
         FIELD_BODY_HASH_VALUE => metadata.body_hash_value = Some(decode_base64url(value)

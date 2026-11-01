@@ -1,13 +1,64 @@
 use std::io::{self, Write};
 
-use crate::http::write_text;
-use crate::storage::{exists, is_dir, remove_dir_all, remove_file};
-use crate::types::Context;
+use super::auth::authorize;
+
+use crate::http::{error_response_code, write_text};
+use crate::metadata::read_metadata_attributes;
+use crate::storage::{exists, is_dir, is_symlink, read_dir, remove_dir_all, remove_file};
+use crate::types::{Context, Identity, Metadata, Permission};
+use crate::util::validate_update;
 use crate::versions::remove_versions;
 
-pub fn serve_delete(ctx: &Context, path: &str, stream: &mut dyn Write) -> io::Result<()> {
-    if !exists(ctx, path) {
-        return write_text(stream, 404, b"not found");
+pub fn serve_delete(
+    server_ctx: &Context,
+    ctx: &Context,
+    path: &str,
+    stream: &mut dyn Write,
+    metadata: &Metadata,
+    requestor_identity: &Identity,
+    author_identity: &Identity,
+    existing_metadata: Option<&Metadata>,
+) -> io::Result<bool> {
+    let Some(existing_metadata) = existing_metadata else {
+        write_text(stream, 404, b"not found")?;
+        return Ok(false);
+    };
+
+    if !metadata.deleted {
+        write_text(stream, 400, b"a delete must carry a delete record")?;
+        return Ok(false);
+    }
+
+    if let Err(error) = validate_update(&author_identity.public_key, metadata, Some(existing_metadata), None) {
+        write_text(stream, error_response_code(&error), error.to_string().as_bytes())?;
+        return Ok(false);
+    }
+
+    if is_dir(ctx, path) {
+        let mut pending = read_dir(ctx, path)?;
+        while let Some(entry) = pending.pop() {
+            if is_symlink(ctx, &entry) { continue; }
+            if is_dir(ctx, &entry) {
+                pending.extend(read_dir(ctx, &entry)?);
+            }
+
+            let entry_metadata = match read_metadata_attributes(ctx, &entry) {
+                Ok(m) => m,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    write_text(stream, 500, e.to_string().as_bytes())?;
+                    return Ok(false);
+                }
+            };
+
+            match authorize(server_ctx, ctx, requestor_identity, Some(author_identity), Some(&entry_metadata.members)) {
+                Ok(permission) if permission != Permission::Reader => {}
+                _ => {
+                    write_text(stream, 403, format!("writer permission required on {}", entry).as_bytes())?;
+                    return Ok(false);
+                }
+            }
+        }
     }
 
     let result = if is_dir(ctx, path) {
@@ -17,9 +68,14 @@ pub fn serve_delete(ctx: &Context, path: &str, stream: &mut dyn Write) -> io::Re
     };
 
     match result {
-        Ok(_) => write_text(stream, 204, &[]),
-        Err(e) => write_text(stream, 500, e.to_string().as_bytes()),
+        Ok(_) => write_text(stream, 204, &[])?,
+        Err(e) => {
+            write_text(stream, 500, e.to_string().as_bytes())?;
+            return Ok(false);
+        }
     }
+
+    Ok(true)
 }
 
 pub fn serve_delete_versions(ctx: &Context, path: &str, stream: &mut dyn Write) -> io::Result<()> {
@@ -38,7 +94,10 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::symlink;
 
-    use crate::testing::fs::{TEST_ADDRESS, account_context, create_test_account, in_test_dir, write_plain_test_file};
+    use time::Duration;
+
+    use crate::metadata::{read_metadata_attributes, sign_metadata};
+    use crate::testing::fs::{TEST_ADDRESS, account_context, create_delete_test_metadata, create_test_account, in_test_dir, write_plain_test_file};
     use crate::testing::http::*;
     use crate::testing::http::start_test_server;
     use crate::types::{Member, Permission};
@@ -48,11 +107,13 @@ mod tests {
     fn deleting_a_path_keeps_what_it_held() {
         in_test_dir("ark_server_test", |temp_dir| {
             let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
+            seed_shared_dir(temp_dir, &identity, &secret_key, "ark/test/notes", vec![]);
             let port = start_test_server(temp_dir.to_path_buf());
             let (code, _, _) = signed_put_with_default_metadata(port, &identity, &secret_key, "/ark/test/notes/a.txt", b"inside");
             assert_eq!(code, 201);
 
-            let (code, _, _) = signed_request(port, &identity, &secret_key, "DELETE", "/ark/test/notes", &[]);
+            let metadata = create_delete_test_metadata(&account_dir.join("notes"), &identity, &secret_key);
+            let code = signed_delete_metadata(port, &identity, &secret_key, "/ark/test/notes", &metadata);
             assert_eq!(code, 204);
 
             let (account_ctx, _) = account_context(&account_dir.join(".ark"));
@@ -65,13 +126,15 @@ mod tests {
     fn the_account_drops_the_versions_of_a_deleted_path_and_those_beneath_it() {
         in_test_dir("ark_server_test", |temp_dir| {
             let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
+            seed_shared_dir(temp_dir, &identity, &secret_key, "ark/test/notes", vec![]);
             let port = start_test_server(temp_dir.to_path_buf());
             signed_put_with_default_metadata(port, &identity, &secret_key, "/ark/test/notes/a.txt", b"inside");
 
             let (code, _, _) = signed_request(port, &identity, &secret_key, "DELETE", "/ark/test/notes?versions", &[]);
             assert_eq!(code, 409, "versions go only once the path itself has");
 
-            signed_request(port, &identity, &secret_key, "DELETE", "/ark/test/notes", &[]);
+            let metadata = create_delete_test_metadata(&account_dir.join("notes"), &identity, &secret_key);
+            signed_delete_metadata(port, &identity, &secret_key, "/ark/test/notes", &metadata);
             let (code, _, _) = signed_request(port, &identity, &secret_key, "DELETE", "/ark/test/notes?versions", &[]);
             assert_eq!(code, 204);
 
@@ -92,7 +155,8 @@ mod tests {
 
             let port = start_test_server(temp_dir.to_path_buf());
             signed_put_with_default_metadata(port, &owner_identity, &owner_key, "/ark/owner/shared/a.txt", b"kept");
-            signed_request(port, &owner_identity, &owner_key, "DELETE", "/ark/owner/shared/a.txt", &[]);
+            let metadata = create_delete_test_metadata(&owner_dir.join("shared/a.txt"), &owner_identity, &owner_key);
+            signed_delete_metadata(port, &owner_identity, &owner_key, "/ark/owner/shared/a.txt", &metadata);
 
             let (code, _, _) = signed_request(port, &co_owner_identity, &co_owner_key, "DELETE", "/ark/owner/shared/a.txt?versions", &[]);
             assert_eq!(code, 403);
@@ -109,7 +173,8 @@ mod tests {
             let p = account_dir.join("d.txt");
             write_plain_test_file(&p, &identity, &secret_key, b"bye");
             let port = start_test_server(temp_dir.to_path_buf());
-            let (code, _, _) = signed_request(port, &identity, &secret_key, "DELETE", "/ark/test/d.txt", &[]);
+            let metadata = create_delete_test_metadata(&p, &identity, &secret_key);
+            let code = signed_delete_metadata(port, &identity, &secret_key, "/ark/test/d.txt", &metadata);
             assert_eq!(code, 204);
             assert!(!p.exists());
         });
@@ -118,23 +183,38 @@ mod tests {
     #[test]
     fn delete_dir_recursively_removes_and_returns_204() {
         in_test_dir("ark_server_test", |temp_dir| {
-            let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
-            let d = account_dir.join("sub");
-            fs::create_dir(&d).unwrap();
+            let (identity, secret_key, _) = create_test_account(temp_dir, TEST_ADDRESS);
+            let d = seed_shared_dir(temp_dir, &identity, &secret_key, "ark/test/sub", vec![]);
             fs::write(d.join("inner"), b"x").unwrap();
             let port = start_test_server(temp_dir.to_path_buf());
-            let (code, _, _) = signed_request(port, &identity, &secret_key, "DELETE", "/ark/test/sub", &[]);
+            let metadata = create_delete_test_metadata(&d, &identity, &secret_key);
+            let code = signed_delete_metadata(port, &identity, &secret_key, "/ark/test/sub", &metadata);
             assert_eq!(code, 204);
             assert!(!d.exists());
         });
     }
 
     #[test]
+    fn delete_dir_holding_no_record_404() {
+        in_test_dir("ark_server_test", |temp_dir| {
+            let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
+            let d = account_dir.join("sub");
+            fs::create_dir(&d).unwrap();
+            let port = start_test_server(temp_dir.to_path_buf());
+            let metadata = create_delete_test_metadata(&d, &identity, &secret_key);
+            let code = signed_delete_metadata(port, &identity, &secret_key, "/ark/test/sub", &metadata);
+            assert_eq!(code, 404, "nothing was put there");
+            assert!(d.exists());
+        });
+    }
+
+    #[test]
     fn delete_missing_404() {
         in_test_dir("ark_server_test", |temp_dir| {
-            let (identity, secret_key, _) = create_test_account(temp_dir, TEST_ADDRESS);
+            let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
             let port = start_test_server(temp_dir.to_path_buf());
-            let (code, _, _) = signed_request(port, &identity, &secret_key, "DELETE", "/ark/test/nope", &[]);
+            let metadata = create_delete_test_metadata(&account_dir.join("nope"), &identity, &secret_key);
+            let code = signed_delete_metadata(port, &identity, &secret_key, "/ark/test/nope", &metadata);
             assert_eq!(code, 404);
         });
     }
@@ -149,7 +229,8 @@ mod tests {
             let link = account_dir.join("link");
             symlink(&target, &link).unwrap();
             let port = start_test_server(temp_dir.to_path_buf());
-            let (code, _, _) = signed_request(port, &identity, &secret_key, "DELETE", "/ark/test/link", &[]);
+            let metadata = create_delete_test_metadata(&link, &identity, &secret_key);
+            let code = signed_delete_metadata(port, &identity, &secret_key, "/ark/test/link", &metadata);
             assert_eq!(code, 403);
             assert!(link.exists());
             assert!(target.exists());
@@ -159,9 +240,10 @@ mod tests {
     #[test]
     fn delete_at_ark_root_405() {
         in_test_dir("ark_server_test", |temp_dir| {
-            let (identity, secret_key, _) = create_test_account(temp_dir, TEST_ADDRESS);
+            let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
             let port = start_test_server(temp_dir.to_path_buf());
-            let (code, _, _) = signed_request(port, &identity, &secret_key, "DELETE", "/ark/test", &[]);
+            let metadata = create_delete_test_metadata(&account_dir, &identity, &secret_key);
+            let code = signed_delete_metadata(port, &identity, &secret_key, "/ark/test", &metadata);
             assert_eq!(code, 405);
             assert!(temp_dir.join("ark/test").exists());
         });
@@ -178,9 +260,71 @@ mod tests {
             ]);
 
             let port = start_test_server(temp_dir.to_path_buf());
-            let (code, _, _) = signed_request(port, &writer_identity, &writer_key, "DELETE", "/ark/owner/file.txt", &[]);
+            let metadata = create_delete_test_metadata(&file, &writer_identity, &writer_key);
+            let code = signed_delete_metadata(port, &writer_identity, &writer_key, "/ark/owner/file.txt", &metadata);
             assert_eq!(code, 204);
             assert!(!file.exists());
+        });
+    }
+
+    #[test]
+    fn delete_without_a_delete_record_400() {
+        in_test_dir("ark_server_test", |temp_dir| {
+            let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
+            let file = account_dir.join("d.txt");
+            write_plain_test_file(&file, &identity, &secret_key, b"kept");
+            let (account_ctx, account_path) = account_context(&file);
+            let mut metadata = read_metadata_attributes(&account_ctx, &account_path).unwrap();
+            let port = start_test_server(temp_dir.to_path_buf());
+
+            let (code, _, _) = signed_request(port, &identity, &secret_key, "DELETE", "/ark/test/d.txt", &[]);
+            assert_eq!(code, 400, "no record at all");
+
+            metadata.author_date += Duration::seconds(1);
+            sign_metadata(&secret_key, &mut metadata, None).unwrap();
+            let code = signed_delete_metadata(port, &identity, &secret_key, "/ark/test/d.txt", &metadata);
+            assert_eq!(code, 400, "a record of a write, not of a delete");
+
+            assert!(file.exists());
+        });
+    }
+
+    #[test]
+    fn delete_older_than_the_copy_held_409() {
+        in_test_dir("ark_server_test", |temp_dir| {
+            let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
+            let file = account_dir.join("d.txt");
+            write_plain_test_file(&file, &identity, &secret_key, b"kept");
+            let (account_ctx, account_path) = account_context(&file);
+            let mut metadata = read_metadata_attributes(&account_ctx, &account_path).unwrap();
+            let port = start_test_server(temp_dir.to_path_buf());
+
+            metadata.author_date -=Duration::seconds(1);
+            metadata.deleted = true;
+            sign_metadata(&secret_key, &mut metadata, None).unwrap();
+            let code = signed_delete_metadata(port, &identity, &secret_key, "/ark/test/d.txt", &metadata);
+            assert_eq!(code, 409, "a write newer than the delete wins");
+            assert!(file.exists());
+        });
+    }
+
+    #[test]
+    fn delete_dir_holding_what_the_deleter_cannot_write_403() {
+        in_test_dir("ark_server_test", |temp_dir| {
+            let (owner_identity, owner_key, _) = create_test_account(temp_dir, "owner@example.com");
+            let (writer_identity, writer_key, _) = create_test_account(temp_dir, "writer@example.com");
+
+            let dir = seed_shared_dir(temp_dir, &owner_identity, &owner_key, "ark/owner/shared", vec![
+                Member { address: writer_identity.address.clone(), permission: Permission::Writer, key: None },
+            ]);
+            let private = seed_shared_file(temp_dir, &owner_identity, &owner_key, "ark/owner/shared/inner/private.txt", b"mine", vec![]);
+
+            let port = start_test_server(temp_dir.to_path_buf());
+            let metadata = create_delete_test_metadata(&dir, &writer_identity, &writer_key);
+            let code = signed_delete_metadata(port, &writer_identity, &writer_key, "/ark/owner/shared", &metadata);
+            assert_eq!(code, 403);
+            assert!(dir.exists());
+            assert!(private.exists());
         });
     }
 
@@ -195,7 +339,8 @@ mod tests {
             ]);
 
             let port = start_test_server(temp_dir.to_path_buf());
-            let (code, _, _) = signed_request(port, &reader_identity, &reader_key, "DELETE", "/ark/owner/file.txt", &[]);
+            let metadata = create_delete_test_metadata(&file, &reader_identity, &reader_key);
+            let code = signed_delete_metadata(port, &reader_identity, &reader_key, "/ark/owner/file.txt", &metadata);
             assert_eq!(code, 403);
             assert!(file.exists());
         });

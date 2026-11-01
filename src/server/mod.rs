@@ -167,14 +167,21 @@ fn handle_parsed_inner(
         Err(e) => return Err(e),
     };
 
-    let prefix: Option<String> = url.query_pairs()
-        .find(|(k, _)| k == "prefix")
-        .map(|(_, v)| v.into_owned());
-
-    let list_versions = url.query_pairs().any(|(k, _)| k == "versions");
-    let version: Option<String> = url.query_pairs()
-        .find(|(k, _)| k == "version")
-        .map(|(_, v)| v.into_owned());
+    let mut prefix: Option<String> = None;
+    let mut list_versions = false;
+    let mut version: Option<String> = None;
+    let mut relay_mode: Option<RelayMode> = None;
+    let mut metadata_only = false;
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "prefix" => prefix = Some(value.into_owned()),
+            "versions" => list_versions = true,
+            "version" => version = Some(value.into_owned()),
+            "relay" => relay_mode = RelayMode::parse(value.as_ref()),
+            "metadata" => metadata_only = true,
+            _ => {}
+        }
+    }
 
     let wants_stream = headers.iter().any(|(n, v)|
         n.eq_ignore_ascii_case("accept") && v.contains("text/event-stream"));
@@ -251,7 +258,7 @@ fn handle_parsed_inner(
         return serve_version_list(server_ctx, &target_ctx, &target_path, stream, method == "GET", &requestor_identity);
     }
 
-    let metadata = if method == "PUT" {
+    let metadata = if method == "PUT" || (method == "DELETE" && !list_versions) {
         match read_metadata_headers(headers) {
             Ok(m) => Some(m),
             Err(e) => return write_text(stream, 400, e.to_string().as_bytes()),
@@ -281,58 +288,52 @@ fn handle_parsed_inner(
         }
     }
 
-    match method {
+    let applied = match method {
         "GET" | "HEAD" => {
             if method == "GET" && wants_stream {
                 return serve_stream(&target_ctx, &target_path, stream, verbose);
             }
 
-            serve_get(&target_ctx, &target_path, stream, method == "GET", prefix.as_deref())
+            return serve_get(&target_ctx, &target_path, stream, method == "GET", prefix.as_deref());
         },
         "PUT" => {
             let metadata = metadata.as_ref().expect("metadata presence checked above");
             let author = author_identity.as_ref().expect("author presence checked above");
 
-            let mut relay_mode: Option<RelayMode> = None;
-            let mut metadata_only = false;
-            for (key, value) in url.query_pairs() {
-                match key.as_ref() {
-                    "relay" => relay_mode = RelayMode::parse(value.as_ref()),
-                    "metadata" => metadata_only = true,
-                    _ => {}
-                }
-            }
-
-            serve_put(&target_ctx, &target_path, stream, body, metadata, author, existing_metadata.as_ref(), permission, metadata_only)?;
-
-            if let Some(mode) = relay_mode {
-                let server_ctx = Arc::clone(server_ctx);
-                let method = method.to_string();
-                let url = url.clone();
-                let headers = headers.to_vec();
-                let body = body.to_vec();
-                let metadata = metadata.clone();
-                thread::spawn(move || {
-                    if let Err(e) = relay(&server_ctx, &method, &url, &headers, &body, &metadata, mode, metadata_only, verbose) {
-                        if verbose {
-                            eprintln!("ERROR(relay) {}", e);
-                        }
-                    }
-                });
-            }
-
-            Ok(())
+            serve_put(&target_ctx, &target_path, stream, body, metadata, author, existing_metadata.as_ref(), permission, metadata_only)?
         }
         "DELETE" if list_versions => {
             if requestor_identity.address != target_ctx.identity.address {
                 return write_text(stream, 403, b"only the account can delete versions");
             }
 
-            serve_delete_versions(&target_ctx, &target_path, stream)
+            return serve_delete_versions(&target_ctx, &target_path, stream);
         },
-        "DELETE" => serve_delete(&target_ctx, &target_path, stream),
-        _ => write_text(stream, 405, b"method not allowed"),
+        "DELETE" => {
+            let metadata = metadata.as_ref().expect("metadata presence checked above");
+            let author = author_identity.as_ref().expect("author presence checked above");
+
+            serve_delete(server_ctx, &target_ctx, &target_path, stream, metadata, &requestor_identity, author, existing_metadata.as_ref())?
+        },
+        _ => return write_text(stream, 405, b"method not allowed"),
+    };
+
+    if let (true, Some(mode), Some(metadata)) = (applied, relay_mode, metadata) {
+        let server_ctx = Arc::clone(server_ctx);
+        let method = method.to_string();
+        let url = url.clone();
+        let headers = headers.to_vec();
+        let body = body.to_vec();
+        thread::spawn(move || {
+            if let Err(e) = relay(&server_ctx, &method, &url, &headers, &body, &metadata, mode, metadata_only, verbose) {
+                if verbose {
+                    eprintln!("ERROR(relay) {}", e);
+                }
+            }
+        });
     }
+
+    Ok(())
 }
 
 #[cfg(test)]

@@ -40,6 +40,11 @@ pub fn serve_put_init(
 pub fn serve_put(ctx: &Context, path: &str, stream: &mut dyn Write, body: &[u8], metadata: &Metadata, author_identity: &Identity, existing_metadata: Option<&Metadata>, permission: Permission, metadata_only: bool) -> io::Result<bool> {
     let is_dir = metadata.body_hash.is_none();
 
+    if metadata.deleted {
+        write_text(stream, 400, b"a delete record is sent with DELETE")?;
+        return Ok(false);
+    }
+
     if is_dir && !body.is_empty() {
         write_text(stream, 400, b"dir put must have empty body")?;
         return Ok(false);
@@ -122,6 +127,20 @@ mod tests {
             let code = signed_put_metadata(port, &identity, &secret_key, "/ark/test/x", b"new content", &new_meta);
             assert_eq!(code, 204);
             assert_eq!(fs::read(temp_dir.join("ark/test/x")).unwrap(), b"new content");
+        });
+    }
+
+    #[test]
+    fn put_of_a_delete_record_returns_400() {
+        in_test_dir("ark_server_test", |temp_dir| {
+            let (identity, secret_key, _) = create_test_account(temp_dir, TEST_ADDRESS);
+            let mut metadata = create_plain_test_metadata(&identity, &secret_key, b"payload");
+            metadata.deleted = true;
+            sign_metadata(&secret_key, &mut metadata, Some(b"payload")).unwrap();
+            let port = start_test_server(temp_dir.to_path_buf());
+            let code = signed_put_metadata(port, &identity, &secret_key, "/ark/test/new.txt", b"payload", &metadata);
+            assert_eq!(code, 400);
+            assert!(!temp_dir.join("ark/test/new.txt").exists());
         });
     }
 

@@ -159,15 +159,23 @@ Creates or updates a file or directory. **Dir vs file is determined by whether t
 
 **Parent directories.** Missing intermediate directories on the path are created automatically. They are created without metadata, so they inherit member checks from the nearest metadata-bearing ancestor (§7.3).
 
-**Response codes.** `201 Created` (new path), `204 No Content` (existing path updated), `400` (missing/bad metadata, body-vs-dir mismatch, or metadata-only body_hash mismatch), `401` (bad signature), `403` (not authorized, or member change without owner), `409` (id mismatch on overwrite, older `author_date` than existing, or metadata-only PUT on nonexistent file).
+**Response codes.** `201 Created` (new path), `204 No Content` (existing path updated), `400` (missing/bad metadata, body-vs-dir mismatch, metadata-only body_hash mismatch, or a record with `deleted` set — that goes with DELETE, §4.6), `401` (bad signature), `403` (not authorized, or member change without owner), `409` (id mismatch on overwrite, older `author_date` than existing, or metadata-only PUT on nonexistent file).
 
 **Bootstrap: `PUT /ark/<account>/.ark/identity.json`.** If no identity exists at that path, the request is unauthenticated and the body is the new account's `Identity` JSON. The request metadata must still be signed by the new account's key. This is how an account is created.
 
 ### 4.6 `DELETE`
 
-Removes a file, or recursively removes a directory and its contents. **The versions (§4.3) of the path and of everything beneath it are kept**, each still readable by the members its own record lists. Membership is enforced. Returns `204 No Content` on success, `404` if the path does not exist, `403` for insufficient permission or a symlinked target.
+Removes a file, or recursively removes a directory and its contents. **The versions (§4.3) of the path and of everything beneath it are kept**, each still readable by the members its own record lists.
 
-**Optional query param: `versions`.** Drops the versions of the path and of everything beneath it instead, which is what leaves nothing to recover. Only the account may: `403` for anyone else, whatever their permission. The path must already be deleted, so that what it holds now is never dropped from its own history: `409` while it exists. `204 No Content` on success, whether or not there were versions to drop.
+**Required request headers.** Full `X-Ark-Meta-*` set: the path's record with `deleted` set, made like any change against the version the client last saw (`parent_version`, §7), and signed by its `author`. It is checked as a metadata-only PUT would be: the same `id`, an `author_date` no older than the record held, the same kind of entry, and a valid signature. A path must hold a record of its own to be deleted: that is what ties the delete's record to it, so a directory created only as a side effect of a nested PUT (§4.5) is deleted with an ancestor, or given a record first. The record is not stored; it is what lets every server a delete is relayed to check it (§9).
+
+**Membership** is enforced against the record's `author` and the requester, as for PUT. Deleting a directory needs `writer` on everything it removes: every entry beneath it carrying a record of its own must grant it too.
+
+**Response codes.** `204 No Content` on success, `400` for a missing or malformed record or one without `deleted`, `403` for insufficient permission (on the path or anything beneath it) or a symlinked target, `404` if the path does not exist or holds no record of its own, `409` for an `id` mismatch or an older `author_date` — a write newer than the delete wins.
+
+**Optional query param: `relay`.** As for PUT (§4.5): fans the delete out to the members its record lists (§9).
+
+**Optional query param: `versions`.** Drops the versions of the path and of everything beneath it instead, which is what leaves nothing to recover. Takes no record. Only the account may: `403` for anyone else, whatever their permission. The path must already be deleted, so that what it holds now is never dropped from its own history: `409` while it exists. `204 No Content` on success, whether or not there were versions to drop.
 
 ### 4.7 Response codes
 
@@ -297,6 +305,7 @@ Every Ark file and directory has a `Metadata` record (Appendix A.2). Fields:
 | `author` | ✓ | ✓ | Address of the identity that signed this metadata. |
 | `author_date` | ✓ | ✓ | When `author` signed this metadata. RFC 3339 timestamp, millisecond precision, `Z`-terminated (e.g. `2026-07-24T10:00:00.000Z`). Used for last-write-wins on relay. |
 | `parent_version` | optional | optional | The id of the version (§4.3) this write was made against. Omitted on a first write, and where the writer does not track it. Two writes carrying the same `parent_version` forked from one state. A server records it and does not act on it: conflict resolution stays last-write-wins (§9), and the field is there so a fork can be seen at all. Acting on it — refusing a write whose parent is not current — is **Status: not yet implemented**. |
+| `deleted` | optional | optional | `true` on the record of a delete (§4.6), omitted otherwise. Signed with the rest, so a record of a write cannot be passed off as a delete. |
 | `encryption_algorithm` | optional (omit for unencrypted; default per Appendix B.2) | must be omitted | See §8. |
 | `members` | ✓ (at least one `owner`) | ✓ (at least one `owner`) | Member list. |
 | `body_hash` | ✓ (hash algorithm per Appendix B) | must be omitted | Hash of `body_bytes_as_stored` under the named hash algorithm. |
@@ -419,13 +428,15 @@ Ark makes federation a server responsibility. A client publishes once; the serve
 
 **Client responsibility.** For any shared file or directory, the client sends **one** PUT — to its own account's server, at the shared path, with `?relay=full`.
 
-**Server responsibility.** On a PUT that carries `?relay=full`, after storing locally the server iterates the metadata's members and, for each member whose address is on a **different host**, sends the same PUT to `/ark/<member-account>/<same-path>` on that host — once per unique host. The outbound PUT carries `?relay=internal` so the receiving server does not fan out further. Members on the **same host** are handled in-process, once, and skip the origin account itself. Members whose address is not parseable, `*`, or `groups:…` are skipped. A `?metadata` flag on the incoming PUT is carried through to every relayed request.
+**Server responsibility.** On a PUT that carries `?relay=full`, after storing locally the server iterates the metadata's members and, for each member whose address is on a **different host**, sends the same PUT to `/ark/<member-account>/<same-path>` on that host — once per unique host. The outbound PUT carries `?relay=internal` so the receiving server does not fan out further. Members on the **same host** are handled in-process, once, and skip the origin account itself. Members whose address is not parseable, `*`, or `groups:…` are skipped. A `?metadata` flag on the incoming PUT is carried through to every relayed request. A DELETE carrying `?relay=full` is relayed the same way, to the members its record lists (§4.6). Only a change the server applied itself is relayed.
 
-**Cross-server signing.** Outbound requests are signed by the relaying server's own `ark@<host>` account (see §10). The receiving server verifies that signature against `ark@<host>`'s identity document and then applies its normal member checks against the target account.
+**Cross-server signing.** Outbound requests are signed by the relaying server's own `ark@<host>` account (see §10). The receiving server verifies that signature against `ark@<host>`'s identity document and then applies its normal member checks against the target account, for the `author` of the record the request carries. The author signed that record, so a relaying server can pass on a change but never make one.
 
-**Conflict resolution.** Last-write-wins by `author_date` timestamp. A PUT whose `author_date` is older than the existing file returns `409`. A PUT whose `id` differs from the existing `id` returns `409`.
+**Conflict resolution.** Last-write-wins by `author_date` timestamp, deletes included. A PUT or DELETE whose `author_date` is older than the existing file returns `409`. A PUT or DELETE whose `id` differs from the existing `id` returns `409`.
 
 **Merging (client).** Where a sync finds both the copy and the server changed, it keeps the copy and writes the server's version beside it as a remote copy. It then walks both histories back along `parent_version` — the copy's from its own store, the server's through `?version=`, keeping each — to the newest version both share, and writes that beside it too, as the base to merge against. Publishing the merge puts it as a change to the server's version, so its `parent_version` names that version and the history records where the two lines met.
+
+**Deleting (client).** Where a sync finds in the request log (§10) that another account deleted a path the client tracks, it removes the copy, unless the copy changed since it last synced, in which case it puts the copy again. A directory is removed only once nothing is left in it, so anything the client never synced stays.
 
 **Failure.** Relay is fire-and-forget in v0. If the destination is unreachable, the write is dropped. Delivery retries, backoff, and bounces are **Status: not yet implemented**.
 
@@ -607,6 +618,7 @@ Types below define the JSON shapes that ride in bodies and the field set that ri
   "author": "alice@example.com",
   "author_date": "2026-07-24T10:00:00.000Z",
   "parent_version": "2026-07-24T09-12-33.418Z_p7Qk2-Xd",
+  "deleted": true,
   "encryption_algorithm": "aes-256-gcm",
   "members": [Member],
   "body_hash": Hash,

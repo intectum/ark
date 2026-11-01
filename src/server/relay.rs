@@ -134,8 +134,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::metadata::{read_metadata_attributes, sign_metadata};
-    use crate::testing::fs::{account_context, create_plain_test_metadata, create_test_account, in_test_dir};
-    use crate::testing::http::{seed_shared_dir, signed_put_metadata_with_headers};
+    use crate::testing::fs::{account_context, create_delete_test_metadata, create_plain_test_metadata, create_test_account, in_test_dir};
+    use crate::testing::http::{seed_shared_dir, signed_delete_metadata, signed_put_metadata_with_headers};
     use crate::testing::http::start_test_server;
     use crate::types::{Member, Permission};
 
@@ -262,6 +262,36 @@ mod tests {
     }
 
     #[test]
+    fn relay_deletes_from_same_server_member_at_matching_path() {
+        in_test_dir("ark_server_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let (alice_id, alice_key, _) = create_test_account(temp_dir, &format!("alice@127.0.0.1:{}", port));
+            let (bob_id, bob_key, _) = create_test_account(temp_dir, &format!("bob@127.0.0.1:{}", port));
+
+            seed_shared_dir(temp_dir, &bob_id, &bob_key, "ark/bob/shared", vec![
+                Member { address: alice_id.address.clone(), permission: Permission::Writer, key: None },
+            ]);
+
+            let mut m = create_plain_test_metadata(&alice_id, &alice_key, b"todo body");
+            m.encryption_algorithm = None;
+            m.members[0].key = None;
+            m.members.push(Member { address: bob_id.address.clone(), permission: Permission::Writer, key: None });
+            sign_metadata(&alice_key, &mut m, Some(b"todo body")).unwrap();
+
+            signed_put_metadata_with_headers(port, &alice_id, &alice_key, "/ark/alice/shared/todo.txt?relay=full", b"todo body", &m, &[]);
+            let bob_path = temp_dir.join("ark/bob/shared/todo.txt");
+            wait_for(|| bob_path.exists());
+
+            let metadata = create_delete_test_metadata(&temp_dir.join("ark/alice/shared/todo.txt"), &alice_id, &alice_key);
+            let code = signed_delete_metadata(port, &alice_id, &alice_key, "/ark/alice/shared/todo.txt?relay=full", &metadata);
+            assert_eq!(code, 204);
+
+            assert!(!temp_dir.join("ark/alice/shared/todo.txt").exists());
+            wait_for(|| !bob_path.exists());
+        });
+    }
+
+    #[test]
     fn relay_skips_member_not_authorized_in_dest_account() {
         in_test_dir("ark_server_test", |temp_dir| {
             let port = start_test_server(temp_dir.to_path_buf());
@@ -371,6 +401,44 @@ mod tests {
             wait_for(|| bob_path.exists() && carol_path.exists());
             assert_eq!(fs::read(&bob_path).unwrap(), b"hello");
             assert_eq!(fs::read(&carol_path).unwrap(), b"hello");
+        });
+    }
+
+    #[test]
+    fn relay_full_deletes_from_remote_server() {
+        in_test_dir("ark_server_test", |temp_dir| {
+            let server_a_root = temp_dir.join("server_a");
+            let server_b_root = temp_dir.join("server_b");
+            fs::create_dir_all(&server_a_root).unwrap();
+            fs::create_dir_all(&server_b_root).unwrap();
+
+            let port_b = start_test_server(server_b_root.clone());
+            let bob_address = format!("bob@127.0.0.1:{}", port_b);
+            let (bob_id, bob_key, _) = create_test_account(&server_b_root, &bob_address);
+
+            let port_a = start_test_server(server_a_root.clone());
+            let alice_address = format!("alice@127.0.0.1:{}", port_a);
+            let (alice_id, alice_key, _) = create_test_account(&server_a_root, &alice_address);
+
+            seed_shared_dir(&server_b_root, &bob_id, &bob_key, "ark/bob/shared", vec![
+                Member { address: alice_id.address.clone(), permission: Permission::Writer, key: None },
+            ]);
+
+            let mut m = create_plain_test_metadata(&alice_id, &alice_key, b"hello");
+            m.encryption_algorithm = None;
+            m.members[0].key = None;
+            m.members.push(Member { address: bob_id.address.clone(), permission: Permission::Writer, key: None });
+            sign_metadata(&alice_key, &mut m, Some(b"hello")).unwrap();
+
+            signed_put_metadata_with_headers(port_a, &alice_id, &alice_key, "/ark/alice/shared/todo.txt?relay=full", b"hello", &m, &[]);
+            let bob_path = server_b_root.join("ark/bob/shared/todo.txt");
+            wait_for(|| bob_path.exists());
+
+            let metadata = create_delete_test_metadata(&server_a_root.join("ark/alice/shared/todo.txt"), &alice_id, &alice_key);
+            let code = signed_delete_metadata(port_a, &alice_id, &alice_key, "/ark/alice/shared/todo.txt?relay=full", &metadata);
+            assert_eq!(code, 204);
+
+            wait_for(|| !bob_path.exists());
         });
     }
 
