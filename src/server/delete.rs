@@ -7,7 +7,7 @@ use crate::metadata::read_metadata_attributes;
 use crate::storage::{exists, is_dir, is_symlink, read_dir, remove_dir_all, remove_file};
 use crate::types::{Context, Identity, Metadata, Permission};
 use crate::util::validate_update;
-use crate::versions::remove_versions;
+use crate::versions::{is_versioned, remove_versions, write_version};
 
 pub fn serve_delete(
     server_ctx: &Context,
@@ -25,7 +25,7 @@ pub fn serve_delete(
     };
 
     if !metadata.deleted {
-        write_text(stream, 400, b"a delete must carry a delete record")?;
+        write_text(stream, 400, b"a delete must carry delete metadata")?;
         return Ok(false);
     }
 
@@ -59,6 +59,10 @@ pub fn serve_delete(
                 }
             }
         }
+    }
+
+    if is_versioned(ctx, path)? {
+        write_version(ctx, path, &[], metadata)?;
     }
 
     let result = if is_dir(ctx, path) {
@@ -101,7 +105,7 @@ mod tests {
     use crate::testing::http::*;
     use crate::testing::http::start_test_server;
     use crate::types::{Member, Permission};
-    use crate::versions::read_versions;
+    use crate::versions::{read_versions, to_version};
 
     #[test]
     fn deleting_a_path_keeps_what_it_held() {
@@ -119,6 +123,11 @@ mod tests {
             let (account_ctx, _) = account_context(&account_dir.join(".ark"));
             let versions = read_versions(&account_ctx, "/notes/a.txt").unwrap();
             assert_eq!(versions.len(), 1, "a path beneath a deleted directory keeps its versions too");
+            assert!(!versions[0].deleted, "only the path deleted keeps the delete");
+
+            let versions = read_versions(&account_ctx, "/notes").unwrap();
+            assert!(versions[0].deleted, "the delete is the newest version of the path");
+            assert_eq!(versions[0].id, to_version(&metadata));
         });
     }
 
@@ -162,7 +171,7 @@ mod tests {
             assert_eq!(code, 403);
 
             let (account_ctx, _) = account_context(&owner_dir.join(".ark"));
-            assert_eq!(read_versions(&account_ctx, "/shared/a.txt").unwrap().len(), 1);
+            assert_eq!(read_versions(&account_ctx, "/shared/a.txt").unwrap().len(), 2);
         });
     }
 
@@ -195,7 +204,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_dir_holding_no_record_404() {
+    fn delete_dir_carrying_no_metadata_404() {
         in_test_dir("ark_server_test", |temp_dir| {
             let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
             let d = account_dir.join("sub");
@@ -268,7 +277,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_without_a_delete_record_400() {
+    fn delete_without_delete_metadata_400() {
         in_test_dir("ark_server_test", |temp_dir| {
             let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
             let file = account_dir.join("d.txt");
@@ -278,12 +287,12 @@ mod tests {
             let port = start_test_server(temp_dir.to_path_buf());
 
             let (code, _, _) = signed_request(port, &identity, &secret_key, "DELETE", "/ark/test/d.txt", &[]);
-            assert_eq!(code, 400, "no record at all");
+            assert_eq!(code, 400, "no metadata at all");
 
             metadata.author_date += Duration::seconds(1);
             sign_metadata(&secret_key, &mut metadata, None).unwrap();
             let code = signed_delete_metadata(port, &identity, &secret_key, "/ark/test/d.txt", &metadata);
-            assert_eq!(code, 400, "a record of a write, not of a delete");
+            assert_eq!(code, 400, "write metadata, not delete metadata");
 
             assert!(file.exists());
         });

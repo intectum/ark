@@ -255,7 +255,7 @@ for path in ark::read_dir(&ctx, dir)? {
 
 `read_dir` hands back account paths, not bare names, so each one feeds straight into the next call. It also skips half-written temporaries, which a raw `std::fs::read_dir` would surface mid-write.
 
-`has_metadata_attributes` is your filter: local files with no ark xattrs are untracked (drafts, editor swap files) and should be skipped. Sidecars — `<name>.remote-*`, `<name>.base-*` (§10) and `<name>.version-*` — do carry metadata, the record of the copy each holds, so skip those by name.
+`has_metadata_attributes` is your filter: local files with no ark xattrs are untracked (drafts, editor swap files) and should be skipped. Sidecars — `<name>.remote-*`, `<name>.base-*` (§10) and `<name>.version-*` — do carry metadata, that of the copy each holds, so skip those by name.
 
 For one-off reads without touching the filesystem, `get_stream(ctx, path, &mut buf, /*decrypt=*/ true, /*existing_metadata=*/ None, /*version=*/ None)` returns the metadata plus writes the body into `buf`. Pass the metadata of the copy you already hold as `existing_metadata`, rather than `None`, and the download is also checked to continue that copy instead of replacing it with an older or unrelated file. Pass a version id as `version` to read that past version instead; `ark::get_version` does the same from the account's own version store, fetching only what it lacks.
 

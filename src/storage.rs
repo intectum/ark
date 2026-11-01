@@ -529,7 +529,7 @@ mod tests {
     }
 
     #[test]
-    fn write_atomic_keeps_the_record_so_a_replaced_body_stays_the_same_file() {
+    fn write_atomic_keeps_the_metadata_so_a_replaced_body_stays_the_same_file() {
         in_test_dir("ark_storage_test", |context_dir| {
             let (context, identity, secret_key) = account(context_dir);
             write_plain_test_file(&context.root.join("a.txt"), &identity, &secret_key, b"before");

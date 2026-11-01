@@ -8,7 +8,7 @@ use crate::paths::parent_path;
 use crate::storage::{create_dir_all, exists};
 use crate::types::{Context, Identity, Metadata, Permission};
 use crate::util::validate_update;
-use crate::versions::{copy_versioned_with_metadata, create_dir_version, write_versioned_with_metadata};
+use crate::versions::{copy_versioned_with_metadata, create_dir_version, read_versions, write_versioned_with_metadata};
 
 pub fn serve_put_init(
     target_root: &Path,
@@ -41,7 +41,7 @@ pub fn serve_put(ctx: &Context, path: &str, stream: &mut dyn Write, body: &[u8],
     let is_dir = metadata.body_hash.is_none();
 
     if metadata.deleted {
-        write_text(stream, 400, b"a delete record is sent with DELETE")?;
+        write_text(stream, 400, b"delete metadata is sent with DELETE")?;
         return Ok(false);
     }
 
@@ -54,6 +54,16 @@ pub fn serve_put(ctx: &Context, path: &str, stream: &mut dyn Write, body: &[u8],
     if let Err(error) = validate_update(&author_identity.public_key, metadata, existing_metadata, update_body) {
         write_text(stream, error_response_code(&error), error.to_string().as_bytes())?;
         return Ok(false);
+    }
+
+    let mut current = Some(path);
+    while let Some(current_path) = current {
+        if read_versions(ctx, current_path)?.iter().any(|version| version.deleted && metadata.author_date < version.author_date) {
+            write_text(stream, 409, b"author_date is older than a delete of the path")?;
+            return Ok(false);
+        }
+
+        current = parent_path(current_path);
     }
 
     if let Some(old) = existing_metadata {
@@ -91,7 +101,7 @@ mod tests {
 
     use crate::crypto::DEFAULT_ENCRYPTION_ALGORITHM;
     use crate::metadata::{create_metadata, read_metadata_attributes, sign_metadata, write_metadata_headers};
-    use crate::testing::fs::{TEST_ADDRESS, account_context, create_encrypted_test_metadata, create_plain_test_metadata, create_test_account, in_test_dir, write_plain_test_file};
+    use crate::testing::fs::{TEST_ADDRESS, account_context, create_delete_test_metadata, create_encrypted_test_metadata, create_plain_test_metadata, create_test_account, in_test_dir, write_plain_test_file};
     use crate::testing::http::*;
     use crate::testing::http::start_test_server;
     use time::Duration;
@@ -131,7 +141,7 @@ mod tests {
     }
 
     #[test]
-    fn put_of_a_delete_record_returns_400() {
+    fn put_of_delete_metadata_returns_400() {
         in_test_dir("ark_server_test", |temp_dir| {
             let (identity, secret_key, _) = create_test_account(temp_dir, TEST_ADDRESS);
             let mut metadata = create_plain_test_metadata(&identity, &secret_key, b"payload");
@@ -141,6 +151,47 @@ mod tests {
             let code = signed_put_metadata(port, &identity, &secret_key, "/ark/test/new.txt", b"payload", &metadata);
             assert_eq!(code, 400);
             assert!(!temp_dir.join("ark/test/new.txt").exists());
+        });
+    }
+
+    #[test]
+    fn put_older_than_a_delete_of_the_path_409_and_newer_201() {
+        in_test_dir("ark_server_test", |temp_dir| {
+            let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
+            let file = account_dir.join("x");
+            write_plain_test_file(&file, &identity, &secret_key, b"old");
+            let port = start_test_server(temp_dir.to_path_buf());
+            let delete_metadata = create_delete_test_metadata(&file, &identity, &secret_key);
+            assert_eq!(signed_delete_metadata(port, &identity, &secret_key, "/ark/test/x", &delete_metadata), 204);
+
+            let mut late = create_plain_test_metadata(&identity, &secret_key, b"late");
+            late.author_date = delete_metadata.author_date - Duration::seconds(1);
+            sign_metadata(&secret_key, &mut late, Some(b"late")).unwrap();
+            let code = signed_put_metadata(port, &identity, &secret_key, "/ark/test/x", b"late", &late);
+            assert_eq!(code, 409, "a write that lost to the delete does not bring the path back");
+            assert!(!file.exists());
+
+            let recreated = create_plain_test_metadata(&identity, &secret_key, b"recreated");
+            let code = signed_put_metadata(port, &identity, &secret_key, "/ark/test/x", b"recreated", &recreated);
+            assert_eq!(code, 201, "a file of its own, newer than the delete");
+        });
+    }
+
+    #[test]
+    fn put_older_than_a_delete_of_a_directory_above_409() {
+        in_test_dir("ark_server_test", |temp_dir| {
+            let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
+            seed_shared_dir(temp_dir, &identity, &secret_key, "ark/test/notes", vec![]);
+            let port = start_test_server(temp_dir.to_path_buf());
+            let delete_metadata = create_delete_test_metadata(&account_dir.join("notes"), &identity, &secret_key);
+            assert_eq!(signed_delete_metadata(port, &identity, &secret_key, "/ark/test/notes", &delete_metadata), 204);
+
+            let mut late = create_plain_test_metadata(&identity, &secret_key, b"late");
+            late.author_date = delete_metadata.author_date - Duration::seconds(1);
+            sign_metadata(&secret_key, &mut late, Some(b"late")).unwrap();
+            let code = signed_put_metadata(port, &identity, &secret_key, "/ark/test/notes/a.txt", b"late", &late);
+            assert_eq!(code, 409);
+            assert!(!account_dir.join("notes").exists());
         });
     }
 
@@ -526,8 +577,8 @@ mod tests {
             let existing = read_metadata_attributes(&account_ctx, &account_path).unwrap();
 
             // A parent naming a version this server never held. The write is
-            // a fork, and the server applies it anyway — the record of it is
-            // what the owner reads back, not a rule the server enforces.
+            // a fork, and the server applies it anyway — its `parent_version`
+            // is what the owner reads back, not a rule the server enforces.
             let mut forked = create_plain_test_metadata(&identity, &secret_key, b"forked");
             forked.id = existing.id;
             forked.parent_version = Some("2020-01-01T00-00-00.000Z_AAAAAAAA".to_string());

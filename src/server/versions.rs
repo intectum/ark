@@ -69,7 +69,7 @@ mod tests {
     }
 
     #[test]
-    fn a_version_answers_to_the_members_its_own_record_lists() {
+    fn a_version_answers_to_the_members_its_own_metadata_lists() {
         in_test_dir("ark_server_test", |temp_dir| {
             let (owner_identity, owner_key, _) = create_test_account(temp_dir, "owner@example.com");
             let (reader_identity, reader_key, _) = create_test_account(temp_dir, "reader@example.com");
@@ -92,7 +92,7 @@ mod tests {
 
             let target = format!("/ark/owner/file.txt?version={}", to_version(&removed));
             let (code, body, _) = signed_request(port, &reader_identity, &reader_key, "GET", &target, &[]);
-            assert_eq!(code, 200, "the version's own record lists the reader");
+            assert_eq!(code, 200, "the version's own metadata lists the reader");
             assert_eq!(body, b"removed");
 
             let target = format!("/ark/owner/file.txt?version={}", to_version(&recreated));
@@ -168,12 +168,12 @@ mod tests {
 
             let target = format!("/ark/owner/shared/private.txt?version={}", to_version(&private));
             let (code, _, _) = signed_request(port, &reader_identity, &reader_key, "GET", &target, &[]);
-            assert_eq!(code, 403, "the version's own record governs it, not the directory's");
+            assert_eq!(code, 403, "the version's own metadata governs it, not the directory's");
         });
     }
 
     #[test]
-    fn a_version_is_listed_and_served_with_the_record_its_author_signed() {
+    fn a_version_is_listed_and_served_with_the_metadata_its_author_signed() {
         in_test_dir("ark_server_test", |temp_dir| {
             let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
             let file = account_dir.join("x.txt");
@@ -215,7 +215,7 @@ mod tests {
             let (reader_identity, reader_key, _) = create_test_account(temp_dir, "reader@example.com");
 
             // The version is written while the reader is a member, so its own
-            // record lists them.
+            // metadata lists them.
             let file = seed_shared_file(temp_dir, &owner_identity, &owner_key, "ark/owner/file.txt", b"secret", vec![
                 Member { address: reader_identity.address.clone(), permission: Permission::Reader, key: None },
             ]);
@@ -227,7 +227,7 @@ mod tests {
             let port = start_test_server(temp_dir.to_path_buf());
             let target = format!("/ark/owner/file.txt?version={}", id);
             let (code, body, _) = signed_request(port, &reader_identity, &reader_key, "GET", &target, &[]);
-            assert_eq!(code, 200, "the version's own record still lists them");
+            assert_eq!(code, 200, "the version's own metadata still lists them");
             assert_eq!(body, b"secret");
 
             let listed = list(port, &reader_identity, &reader_key, "/ark/owner/file.txt?versions");

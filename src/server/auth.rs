@@ -199,12 +199,12 @@ mod tests {
         in_test_dir("ark_auth_test", |temp_dir| {
             let context = tree(temp_dir);
 
-            // Part of a record and nothing set aside to put it back, as an update
+            // Part of its metadata and nothing set aside to put it back, as an update
             // interrupted before any of this existed would have left it.
             write_attribute(&context, "/top/mid", "user.ark.member_0_address", b"someone@example.com").unwrap();
 
             // Carrying on to `/top` would hand out the public read that the
-            // unreadable record sits between.
+            // unreadable metadata sits between.
             match inherited_members(&context, "/top/mid/leaf") {
                 Ok(members) => panic!("walked past an unreadable directory and found {:?}", members.map(|m| m.len())),
                 Err(error) => assert_eq!(error.kind(), io::ErrorKind::InvalidData),

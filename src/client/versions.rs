@@ -132,7 +132,10 @@ pub fn restore_version(ctx: &Context, path: &str, id: &str) -> io::Result<()> {
     let current_metadata = read_metadata_attributes(ctx, path)?;
     let current_local_metadata = read_local_metadata_attributes(ctx, path)?;
 
-    let (buf, _) = get_version(ctx, path, id, true, Some(&current_metadata))?;
+    let (buf, metadata) = get_version(ctx, path, id, true, Some(&current_metadata))?;
+    if metadata.deleted {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "a delete holds nothing to restore"));
+    }
 
     let local_metadata = LocalMetadata { encrypted: Some(false), ..current_local_metadata };
     write_atomic_with_metadata(ctx, path, &buf, &current_metadata, Some(&local_metadata))?;
@@ -272,13 +275,22 @@ mod tests {
             put(&ctx, "notes.txt", &Permissions::default(), Some("none"), false).unwrap();
 
             let listed = list_versions(&ctx, "notes.txt").unwrap();
-            assert_eq!(listed.len(), 2);
-            assert_ne!(listed[0].entry_id, listed[1].entry_id);
+            assert_eq!(listed.len(), 3);
+            assert!(listed[1].deleted, "the delete is kept between the two files");
+            assert_eq!(listed[1].entry_id, listed[2].entry_id);
+            assert_ne!(listed[0].entry_id, listed[2].entry_id);
 
-            let (body, _) = get_version(&ctx, "notes.txt", &listed[1].id, true, None).unwrap();
+            let (body, _) = get_version(&ctx, "notes.txt", &listed[2].id, true, None).unwrap();
             assert_eq!(body, b"removed");
 
-            restore_version(&ctx, "notes.txt", &listed[1].id).unwrap();
+            // Fetched from the server, the delete verifies though it has no body.
+            remove_dir_all(&ctx, &version_dir_for(&ctx, "notes.txt").unwrap()).unwrap();
+            let (body, metadata) = get_version(&ctx, "notes.txt", &listed[1].id, true, None).unwrap();
+            assert!(body.is_empty() && metadata.deleted);
+            let err = restore_version(&ctx, "notes.txt", &listed[1].id).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+            restore_version(&ctx, "notes.txt", &listed[2].id).unwrap();
             assert_eq!(fs::read(temp_dir.join("notes.txt")).unwrap(), b"removed");
             assert_eq!(read_metadata_attributes(&ctx, "notes.txt").unwrap().id, listed[0].entry_id,
                 "the copy stays the file the path holds now");
@@ -312,7 +324,7 @@ mod tests {
             fs::write(temp_dir.join("notes.txt"), b"one").unwrap();
             put(&ctx, "notes.txt", &Permissions::default(), Some("none"), false).unwrap();
             delete(&ctx, "notes.txt").unwrap();
-            assert_eq!(list_versions(&ctx, "notes.txt").unwrap().len(), 1);
+            assert_eq!(list_versions(&ctx, "notes.txt").unwrap().len(), 2);
             assert!(exists(&ctx, &version_dir_for(&ctx, "notes.txt").unwrap()), "the account keeps its own store of the history");
 
             purge_versions(&ctx, "notes.txt").unwrap();

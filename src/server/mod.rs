@@ -216,7 +216,7 @@ fn handle_parsed_inner(
 
     // Metadata that is there but cannot be read is not the same as none at
     // all: falling through to the members of an ancestor would hand out the
-    // access the unreadable record was there to withhold.
+    // access the unreadable metadata was there to withhold.
     let existing_metadata = match read_metadata_attributes(&target_ctx, &target_path) {
         Ok(metadata) => Some(metadata),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
@@ -252,7 +252,7 @@ fn handle_parsed_inner(
         Err(e) => return write_text(stream, 401, e.to_string().as_bytes())
     };
 
-    // Each version answers to its own record's members, so the listing is
+    // Each version answers to the members its own metadata lists, so the listing is
     // gated entry by entry rather than by the path's.
     if reads_versions {
         return serve_version_list(server_ctx, &target_ctx, &target_path, stream, method == "GET", &requestor_identity);
@@ -370,7 +370,7 @@ mod tests {
             sign_metadata(&owner_key, &mut private, None).unwrap();
             write_metadata_attributes(&context, "/private", &private, None).unwrap();
 
-            // Leave it carrying part of a record and nothing set aside to put back,
+            // Leave it carrying part of its metadata and nothing set aside to put back,
             // as a write interrupted before this change would have.
             remove_metadata_attributes(&context, "/private").unwrap();
             write_attribute(&context, "/private", "user.ark.member_0_address", owner_identity.address.as_bytes()).unwrap();

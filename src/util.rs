@@ -109,7 +109,8 @@ pub fn sha256(data: &[u8]) -> Vec<u8> {
 /// `body` is what arrived with the metadata. `None` on a directory, which has
 /// no body; `None` on a file means the change keeps the body the existing copy
 /// already has, so only the signature is checked and `existing_metadata` is
-/// required.
+/// required. Delete metadata has no body, whatever `body` holds: only its
+/// signature is checked.
 ///
 /// `Err` carries the kind the rejection corresponds to, as
 /// [`crate::http::error_response_code`] maps it: `InvalidData` where the
@@ -156,7 +157,9 @@ pub fn validate_version(
 ) -> io::Result<()> {
     let is_dir = metadata.body_hash.is_none();
 
-    if body.is_none() && !is_dir {
+    if metadata.deleted {
+        verify_metadata_signature(author_public_key, metadata)?;
+    } else if body.is_none() && !is_dir {
         let existing_metadata = match existing_metadata {
             Some(m) => m,
             None => return Err(io::Error::new(io::ErrorKind::NotFound, "metadata-only update requires existing file")),

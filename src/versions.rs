@@ -1,11 +1,14 @@
 //! Everything a path has held, what it holds now included.
 //!
 //! A version is an ordinary ark entry at rest — the body bytes and the signed
-//! record its author published, unchanged — so it is read back through the
+//! metadata its author published, unchanged — so it is read back through the
 //! same operations as anything else. Versions of one path live together in a
 //! directory of their own under [`VERSIONS_DIR`], keyed by the path they
 //! belong to rather than the entry, so they outlive a removal of the path and
 //! a path recreated after one carries on the same history.
+//!
+//! A delete is kept as a version too: the delete metadata, with no contents.
+//! It marks where a history stops, and what a later write must be newer than.
 //!
 //! See `spec.md` §4.3.
 
@@ -26,11 +29,11 @@ const ID_HASH_LENGTH: usize = 8;
 
 /// The id naming the version `metadata` describes.
 ///
-/// Derived from what the record says, so every host holding that version names
-/// it the same — which is what lets two histories that drifted apart be
-/// compared. Two records that differ in any field, including a member list
-/// moved without touching the body, get ids of their own. How the record was
-/// signed plays no part.
+/// Derived from what the metadata says, so every host holding that version
+/// names it the same — which is what lets two histories that drifted apart be
+/// compared. Metadata that differs in any field, including a member list
+/// moved without touching the body, gets an id of its own. How the metadata
+/// was signed plays no part.
 pub fn to_version(metadata: &Metadata) -> String {
     let hash: String = encode_base64url(sha256(&to_canonical_metadata_bytes(metadata)))
         .chars()
@@ -56,13 +59,13 @@ pub fn version_path_for(ctx: &Context, path: &str, id: &str) -> io::Result<Strin
 /// The version is the very entry `path` then names — no copy — and is there
 /// before `path` changes, so what `path` holds is always among its versions.
 /// A write that stopped part-way can leave a version `path` never held;
-/// writing the same record again leaves one version and finishes the job.
+/// writing the same metadata again leaves one version and finishes the job.
 ///
 /// Nothing is dropped again: a path keeps a version per write it has taken,
 /// through removals of it too. Only [`remove_versions`] clears them.
 ///
-/// `metadata` must be the record signed for `contents`: a version is named by
-/// its record, so new contents under a record already kept would take that
+/// `metadata` must be the metadata signed for `contents`: a version is named by
+/// its metadata, so new contents under metadata already kept would take that
 /// version's name and replace it.
 ///
 /// `path`'s parent must exist, as it must for [`std::fs::write`].
@@ -80,10 +83,11 @@ pub fn write_versioned_with_metadata(ctx: &Context, path: &str, contents: &[u8],
 ///
 /// For a version made before `path` takes it — or that `path` never takes
 /// where it stands, as on a client, whose own copy is edited in place. Keeping
-/// the same record twice leaves one version.
+/// the same metadata twice leaves one version.
 ///
-/// `metadata` must be the record signed for `contents`, as for
-/// [`write_versioned_with_metadata`]. A directory's version has no contents.
+/// `metadata` must be the metadata signed for `contents`, as for
+/// [`write_versioned_with_metadata`]. A directory's version has no contents,
+/// nor does a delete's.
 pub fn write_version(ctx: &Context, path: &str, contents: &[u8], metadata: &Metadata) -> io::Result<String> {
     let version_dir = version_dir_for(ctx, path)?;
     create_dir_all(ctx, &version_dir)?;
@@ -114,10 +118,10 @@ pub fn copy_versioned_with_metadata(ctx: &Context, from: &str, to: &str, metadat
 }
 
 /// Keep `metadata` as a version of the directory `path`. Call this before
-/// `path` takes that record, so what `path` carries is always among its
+/// `path` takes that metadata, so what `path` carries is always among its
 /// versions.
 ///
-/// As for [`write_versioned_with_metadata`], keeping the same record twice leaves one
+/// As for [`write_versioned_with_metadata`], keeping the same metadata twice leaves one
 /// version, and versions are kept through removals of `path`.
 pub fn create_dir_version(ctx: &Context, path: &str, metadata: &Metadata) -> io::Result<()> {
     if !is_versioned(ctx, path)? {
@@ -141,7 +145,8 @@ pub fn is_versioned(ctx: &Context, path: &str) -> io::Result<bool> {
 /// where it has none.
 ///
 /// A path removed and written again keeps the versions it had before, so the
-/// versions may be of more than one entry — told apart by `entry_id`.
+/// versions may be of more than one entry — told apart by `entry_id`. A delete
+/// kept as a version is marked `deleted`.
 pub fn read_versions(ctx: &Context, path: &str) -> io::Result<Vec<VersionEntry>> {
     let version_dir = version_dir_for(ctx, path)?;
     if !exists(ctx, &version_dir) {
@@ -161,6 +166,7 @@ pub fn read_versions(ctx: &Context, path: &str) -> io::Result<Vec<VersionEntry>>
             author_date: metadata.author_date,
             body_hash: metadata.body_hash,
             size: size(ctx, &version_path)?,
+            deleted: metadata.deleted,
         });
     }
 
@@ -231,21 +237,21 @@ mod tests {
     }
 
     #[test]
-    fn an_id_names_one_record_and_no_other() {
+    fn an_id_names_one_metadata_and_no_other() {
         let (identity, secret_key) = create_identity(TEST_ADDRESS, None).unwrap();
 
         let mut metadata = create_metadata(&identity.address, None);
         sign_metadata(&secret_key, &mut metadata, Some(b"body")).unwrap();
         let id = to_version(&metadata);
 
-        assert_eq!(to_version(&metadata), id, "the same record names the same version");
+        assert_eq!(to_version(&metadata), id, "the same metadata names the same version");
 
         // A member change leaves the body, and so the body hash, alone.
         let mut changed = metadata.clone();
         changed.members.push(Member { address: "other@example.com".to_string(), permission: Permission::Reader, key: None });
         sign_metadata(&secret_key, &mut changed, Some(b"body")).unwrap();
 
-        assert_ne!(to_version(&changed), id, "a record that differs names a version of its own");
+        assert_ne!(to_version(&changed), id, "metadata that differs names a version of its own");
 
         let mut signed_otherwise = metadata.clone();
         signed_otherwise.signature.value = vec![0; signed_otherwise.signature.value.len()];
@@ -291,7 +297,7 @@ mod tests {
     }
 
     #[test]
-    fn writing_the_same_record_twice_leaves_one_version() {
+    fn writing_the_same_metadata_twice_leaves_one_version() {
         in_test_dir("ark_versions_test", |temp_dir| {
             let (context, identity, secret_key) = account(temp_dir);
             let metadata = write(&context, &identity, &secret_key, "/a.txt", b"body");
@@ -325,7 +331,7 @@ mod tests {
     }
 
     #[test]
-    fn a_directory_is_kept_as_its_record_alone() {
+    fn a_directory_is_kept_as_its_metadata_alone() {
         in_test_dir("ark_versions_test", |temp_dir| {
             let (context, identity, secret_key) = account(temp_dir);
             create_dir_all(&context, "/notes").unwrap();
@@ -337,7 +343,7 @@ mod tests {
 
             let versions = read_versions(&context, "/notes").unwrap();
             assert_eq!(versions.len(), 1);
-            assert_eq!(versions[0].size, 0, "a directory version holds the record and no body");
+            assert_eq!(versions[0].size, 0, "a directory version holds the metadata and no body");
             assert!(versions[0].body_hash.is_none());
         });
     }
@@ -367,7 +373,7 @@ mod tests {
             let metadata = write(&context, &identity, &secret_key, "/a.txt", b"body");
 
             // What a stopped rewrite leaves beside the versions: an entry
-            // carrying no record, which a version could never be.
+            // carrying no metadata, which a version could never be.
             let marker = join_path(&version_dir_for(&context, "/a.txt").unwrap(), ".previous");
             write_atomic_without_metadata(&context, &marker, &[]).unwrap();
 

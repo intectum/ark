@@ -83,7 +83,7 @@ pub fn has_metadata_attributes(ctx: &Context, path: &str) -> io::Result<bool> {
 /// The metadata `path` carries.
 ///
 /// Errors with `NotFound` where `path` carries none at all, and `InvalidData`
-/// where what it carries cannot be read as a whole record. A caller deciding
+/// where what it carries cannot be read whole. A caller deciding
 /// access must tell the two apart: only the first means "inherits from above".
 ///
 /// Reading a directory first puts back the metadata an update that did not
@@ -134,8 +134,8 @@ fn read_metadata_attributes_unlocked(ctx: &Context, path: &str) -> io::Result<Me
 /// it carries with `local_metadata` where that is given, as a single visible
 /// change.
 ///
-/// A reader sees either the previous records or the whole new ones, never a
-/// new record beside the local one that belonged to the record before it. An
+/// A reader sees either the previous metadata or the whole new metadata, never
+/// new metadata beside the local metadata that belonged to what came before. An
 /// update to a directory interrupted part-way is put back by the next read
 /// rather than left to be read short.
 pub fn write_metadata_attributes_atomic(ctx: &Context, path: &str, metadata: &Metadata, local_metadata: Option<&LocalMetadata>) -> io::Result<()> {
@@ -148,7 +148,7 @@ pub fn write_metadata_attributes_atomic(ctx: &Context, path: &str, metadata: &Me
     let _lock = lock_exclusive(ctx, path)?;
 
     // A directory takes its attributes where it stands, so it sets aside what
-    // it carries while the new records go on. That happens before the
+    // it carries while the new metadata goes on. That happens before the
     // attributes are touched and is removed after the last of them lands, so
     // its presence is what marks the rewrite as still under way.
     restore_previous_metadata_unlocked(ctx, path)?;
@@ -166,7 +166,7 @@ pub fn write_metadata_attributes_atomic(ctx: &Context, path: &str, metadata: &Me
 /// it carries with `local_metadata` where that is given, where `path` stands.
 ///
 /// The fields are separate attributes written one at a time, so a reader can
-/// catch the records part-way. For an entry no reader can reach yet, such as
+/// catch the metadata part-way. For an entry no reader can reach yet, such as
 /// one built under a temporary name; otherwise use
 /// [`write_metadata_attributes_atomic`].
 pub fn write_metadata_attributes(ctx: &Context, path: &str, metadata: &Metadata, local_metadata: Option<&LocalMetadata>) -> io::Result<()> {
@@ -212,7 +212,7 @@ pub fn write_metadata_attributes(ctx: &Context, path: &str, metadata: &Metadata,
 /// Remove the metadata `path` carries, where `path` stands.
 ///
 /// The fields are separate attributes removed one at a time, so a reader can
-/// catch the record part-way.
+/// catch the metadata part-way.
 pub fn remove_metadata_attributes(ctx: &Context, path: &str) -> io::Result<()> {
     write_attributes(ctx, path, ATTRIBUTE_PREFIX, &[])
 }
@@ -288,8 +288,8 @@ fn write_local_metadata_attributes(ctx: &Context, path: &str, local: &LocalMetad
     write_attributes(ctx, path, LOCAL_ATTRIBUTE_PREFIX, &attributes)
 }
 
-// Every attribute goes on before any left over from the record being replaced
-// comes off, so `path` is never left carrying no record at all part-way.
+// Every attribute goes on before any left over from the metadata being replaced
+// comes off, so `path` is never left carrying no metadata at all part-way.
 fn write_attributes(ctx: &Context, path: &str, prefix: &str, attributes: &[(String, Vec<u8>)]) -> io::Result<()> {
     for (name, value) in attributes {
         write_attribute(ctx, path, name, value)?;
@@ -523,10 +523,10 @@ pub fn verify_metadata_signature(public_key: &Key, metadata: &Metadata) -> io::R
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "metadata signature verification failed"))
 }
 
-/// The bytes the signature on `metadata` covers: every other field of the
-/// record, in JCS-canonical form.
+/// The bytes the signature on `metadata` covers: every other field of it, in
+/// JCS-canonical form.
 ///
-/// The same for every holder of the record, whatever it was signed with.
+/// The same for every holder of `metadata`, whatever it was signed with.
 pub fn to_canonical_metadata_bytes(metadata: &Metadata) -> Vec<u8> {
     let mut clone = metadata.clone();
     clone.signature.algorithm = String::new();
@@ -819,7 +819,7 @@ mod tests {
     }
 
     #[test]
-    fn an_interrupted_write_that_reads_as_a_whole_record_is_still_rolled_back() {
+    fn an_interrupted_write_that_reads_as_whole_metadata_is_still_rolled_back() {
         in_test_dir("ark_metadata_recovery_test", |temp_dir| {
             let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
             let (context, _) = account_context(&account_dir);
@@ -836,11 +836,11 @@ mod tests {
             sign_metadata(&secret_key, &mut original, None).unwrap();
             write_metadata_attributes_atomic(&context, "/dir", &original, None).unwrap();
 
-            // Every field of a record with four members on, and the last two
+            // Every field of metadata with four members on, and the last two
             // members of the original not yet taken off. Nothing about this is
             // detectable from the attributes alone: the members are contiguous
             // from 0, an owner is among them, and a signature is there — it
-            // parses as a whole record, with six members under the signature
+            // parses as whole metadata, with six members under the signature
             // of four. Only the metadata set aside gives it away.
             save_previous_metadata(&context, "/dir", Some(&original), &LocalMetadata::default()).unwrap();
             let mut short = original.clone();
@@ -855,7 +855,7 @@ mod tests {
             assert!(read_metadata_attributes_unlocked(&context, "/dir").is_ok(), "the torn state was meant to parse cleanly");
 
             let read_back = read_metadata_attributes(&context, "/dir").unwrap();
-            assert_eq!(read_back.signature.value, original.signature.value, "a torn record that parses was served instead of being rolled back");
+            assert_eq!(read_back.signature.value, original.signature.value, "torn metadata that parses was served instead of being rolled back");
             assert!(!exists(&context, &version_path_for(&context, "/dir", PREVIOUS_VERSION).unwrap()));
         });
     }
@@ -897,7 +897,7 @@ mod tests {
             let local = LocalMetadata { encrypted: None, sync_body_hash: None, sync_author_date: Some(original.author_date) };
             write_metadata_attributes_atomic(&context, "/dir", &original, Some(&local)).unwrap();
 
-            // The new records on in full, with the local one dropping
+            // The new metadata on in full, with the local metadata dropping
             // `sync_author_date`, and the metadata set aside not yet removed.
             save_previous_metadata(&context, "/dir", Some(&original), &local).unwrap();
             write_metadata_attributes(&context, "/dir", &original, Some(&LocalMetadata::default())).unwrap();
@@ -940,7 +940,7 @@ mod tests {
     }
 
     #[test]
-    fn a_path_carrying_part_of_a_record_reads_as_invalid() {
+    fn a_path_carrying_part_of_its_metadata_reads_as_invalid() {
         in_test_dir("ark_metadata_recovery_test", |temp_dir| {
             let (_, _, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
             let (context, _) = account_context(&account_dir);
@@ -1003,7 +1003,7 @@ mod tests {
                         let metadata = read_metadata_attributes(&context, "/dir").expect("read a partial attribute set");
                         let whole = (metadata.id == small_id && metadata.members.len() == 1)
                             || (metadata.id == large_id && metadata.members.len() == 6);
-                        assert!(whole, "read mixed two records: id {} with {} members", metadata.id, metadata.members.len());
+                        assert!(whole, "read mixed two metadata sets: id {} with {} members", metadata.id, metadata.members.len());
 
                         reads.fetch_add(1, Ordering::Relaxed);
                     }

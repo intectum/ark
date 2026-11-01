@@ -409,7 +409,8 @@ fn list_versions_cli(ctx: &Context, path: &str) -> io::Result<()> {
 
     let mut stdout = io::stdout().lock();
     for entry in &entries {
-        writeln!(stdout, "{}  {:>10}  {}  {}  ({})", format_timestamp(entry.author_date), entry.size, entry.author, entry.entry_id, entry.id)?;
+        let size = if entry.deleted { "deleted".to_string() } else { entry.size.to_string() };
+        writeln!(stdout, "{}  {:>10}  {}  {}  ({})", format_timestamp(entry.author_date), size, entry.author, entry.entry_id, entry.id)?;
     }
 
     Ok(())

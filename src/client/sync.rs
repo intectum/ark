@@ -479,7 +479,7 @@ fn parse_log_entry(entry_bytes: &[u8], account_prefix: &str) -> io::Result<Optio
         ("PUT", 201 | 204) | ("DELETE", 204) => {}
         _ => return Ok(None),
     }
-    // A delete of a path's versions carries no record.
+    // A delete of a path's versions carries no metadata.
     if !has_metadata_headers(&entry.request_headers) { return Ok(None); }
 
     let target = entry.target.split_once('?').map(|(p, _)| p).unwrap_or(&entry.target);

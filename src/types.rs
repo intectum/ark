@@ -144,7 +144,7 @@ pub struct Metadata {
     /// one. Absent on a file's first write.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_version: Option<String>,
-    /// Marks the record of a delete rather than of a write.
+    /// Marks the metadata of a delete rather than of a write.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub deleted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -277,6 +277,8 @@ pub struct VersionEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body_hash: Option<Hash>,
     pub size: u64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deleted: bool,
 }
 
 mod base64url {
