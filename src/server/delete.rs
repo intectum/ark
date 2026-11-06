@@ -6,7 +6,7 @@ use crate::http::{error_response_code, write_text};
 use crate::metadata::read_metadata_attributes;
 use crate::storage::{exists, is_dir, is_symlink, read_dir, remove_dir_all, remove_file};
 use crate::types::{Context, Identity, Metadata, Permission};
-use crate::util::validate_update;
+use crate::validate::validate_entry;
 use crate::versions::{is_versioned, remove_versions, write_version};
 
 pub fn serve_delete(
@@ -19,17 +19,17 @@ pub fn serve_delete(
     author_identity: &Identity,
     existing_metadata: Option<&Metadata>,
 ) -> io::Result<bool> {
-    let Some(existing_metadata) = existing_metadata else {
+    if existing_metadata.is_none() {
         write_text(stream, 404, b"not found")?;
         return Ok(false);
-    };
+    }
 
     if !metadata.deleted {
         write_text(stream, 400, b"a delete must carry delete metadata")?;
         return Ok(false);
     }
 
-    if let Err(error) = validate_update(&author_identity.public_key, metadata, Some(existing_metadata), None) {
+    if let Err(error) = validate_entry(ctx, path, metadata, None, None, Some(server_ctx)) {
         write_text(stream, error_response_code(&error), error.to_string().as_bytes())?;
         return Ok(false);
     }

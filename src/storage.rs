@@ -233,8 +233,8 @@ pub fn write_atomic(ctx: &Context, path: &str, contents: &[u8]) -> io::Result<()
     write_atomic_inner(ctx, path, contents, metadata.as_ref(), local_metadata.as_ref())
 }
 
-/// Write `contents` to `path` along with `metadata`, as a single visible change,
-/// replacing the metadata `path` already carries.
+/// Write `contents` to `path` along with `metadata`, as a single visible
+/// change, replacing the metadata `path` already carries.
 ///
 /// Otherwise as [`write_atomic`].
 pub fn write_atomic_with_metadata(ctx: &Context, path: &str, contents: &[u8], metadata: &Metadata, local_metadata: Option<&LocalMetadata>) -> io::Result<()> {

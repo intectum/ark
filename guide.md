@@ -170,6 +170,10 @@ let ctx = Arc::new(ctx);
 
 **Proposals are the exception.** Share proposals — unauthorized PUTs recorded in the request log — are *not* on the sync stream; they have their own watcher. See [§7](#7-accepting-share-proposals).
 
+**Nothing is taken on the server's word.** Sync applies each remote change as the version it made, and only once its author checks out against the version before it, back to something the account itself signed or accepted. A change that doesn't check out — one a server wrote into the account on its own, say — reaches the error callback with `PermissionDenied` and is skipped. `get` checks a download the same way, and `ark::validate_entry` checks an entry you hold yourself. The server runs the same check on every write it takes, from what it holds, and refuses with `409` a write not made on what the path holds now: of two edits made on one version, the second has to sync and merge first.
+
+Where a check needs a version the device doesn't hold — as the first time it takes in a path written more than once — it takes in the history that version was made on: each version's metadata back to one it holds, checked and stored in the version store, but no bodies. Later checks then need nothing from the server. One bad version on that chain refuses the path. A past version's body is fetched the first time `get_version` (or a restore or merge) wants it, and stored from then on.
+
 ---
 
 ## 7. Accepting share proposals
@@ -188,6 +192,8 @@ for p in ark::list_proposals(&ctx)? {
 ```
 
 `list_proposals` returns proposals for every path. Filter by prefix to keep your app looking only at its own subtree.
+
+Accepting signs a grant for the version you took, under `/.ark/grants/`. Another account wrote the file, so the grant is what lets each of your devices trust it, and what came after it, when they sync. Deleting the grant withdraws that.
 
 ### Group by directory
 
@@ -257,15 +263,17 @@ for path in ark::read_dir(&ctx, dir)? {
 
 `has_metadata_attributes` is your filter: local files with no ark xattrs are untracked (drafts, editor swap files) and should be skipped. Sidecars — `<name>.remote-*`, `<name>.base-*` (§10) and `<name>.version-*` — do carry metadata, that of the copy each holds, so skip those by name.
 
-For one-off reads without touching the filesystem, `get_stream(ctx, path, &mut buf, /*decrypt=*/ true, /*existing_metadata=*/ None, /*version=*/ None)` returns the metadata plus writes the body into `buf`. Pass the metadata of the copy you already hold as `existing_metadata`, rather than `None`, and the download is also checked to continue that copy instead of replacing it with an older or unrelated file. Pass a version id as `version` to read that past version instead; `ark::get_version` does the same from the account's own version store, fetching only what it lacks.
+For one-off reads without touching the filesystem, `get_stream(ctx, path, &mut buf, /*decrypt=*/ true, /*version=*/ None)` returns the metadata plus writes the body into `buf`. Where the account holds its own copy of `path`, the download is also checked to continue that copy instead of replacing it with an older or unrelated file. Pass a version id as `version` to read that past version instead; `ark::get_version` does the same from the account's own version store, fetching only the body where the store holds just the metadata.
 
 ---
 
 ## 10. Conflicts
 
-When `sync` sees divergence — the local and remote body both changed since last sync — it does not merge and it does not lose data. It leaves the local copy untouched and records the conflict with `ark::write_conflict`: the remote copy goes alongside as `<name>.remote-<iso>`, carrying both the remote body and its metadata, and beside it `<name>.base-<id>`, the newest version both sides descend from, where they share one — what a three-way merge works against. Neither sidecar is itself sync-tracked.
+When `sync` sees divergence — the local and remote body both changed since last sync — it does not merge and it does not lose data. It leaves the local copy untouched and records the conflict with `ark::write_conflict`: the remote copy goes alongside as `<name>.remote-<iso>`, carrying both the remote body and its metadata, and beside it `<name>.base-<id>`, the newest version both sides descend from, where they share one — what a three-way merge works against. Neither sidecar is itself sync-tracked, and a later conflict on the same file replaces them, so they always hold the newest remote side.
 
-Detecting a conflict from an app is a filename check:
+Where another account deleted a file the local copy changed, `sync` records it the same way with `ark::write_delete_conflict`: the `<name>.remote-<iso>` sidecar is empty and carries the delete metadata. While a conflict stands, `sync` does not push the local copy, so neither side is overwritten.
+
+Detecting a conflict from an app is a filename check, or `ark::has_conflict` for a known path:
 
 ```rust
 for path in ark::read_dir(&ctx, dir)? {
@@ -278,7 +286,7 @@ for path in ark::read_dir(&ctx, dir)? {
 }
 ```
 
-Once the merge is in the local copy, `ark::resolve_conflict` publishes it as a change to what the server holds now — the history records the merge — and removes both sidecars.
+Once the merge is in the local copy, `ark::resolve_conflict` publishes it as a change to what the server holds now — the history records the merge — and removes both sidecars. For a delete, it puts the local copy again; to take the delete instead, remove the local copy and its sidecar.
 
 Structure your data model so conflicts are *unlikely*, not impossible: append-only items (messages, log entries) each go in their own file with a unique timestamped name, so two authors never write to the same file. Mutable state (a shared document, a title) needs merge or a designated writer.
 

@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use crate::identity::parse_address;
 use crate::types::Context;
-use crate::util::{is_loopback_host, parse_uuid};
+use crate::util::{encode_base64url, is_loopback_host, parse_uuid};
 
 const TEMP_INFIX: &str = ".tmp-";
 
@@ -135,6 +135,13 @@ pub fn to_path_segment(name: &str) -> String {
     utf8_percent_encode(name, SEGMENT_ENCODE_SET).to_string()
 }
 
+/// Where the account keeps the grant it signs on accepting the account path
+/// `path` from another account.
+pub fn grant_path_for(path: &str) -> String {
+    // Named so it travels in a URL as it is.
+    join_path("/.ark/grants", &encode_base64url(path.trim_end_matches('/').as_bytes()))
+}
+
 /// A unique sibling name for a temporary version of `path`.
 ///
 /// Named `.<name>.tmp-<uuid>`. The leading dot marks it internal.
@@ -161,6 +168,23 @@ pub fn sidecar_path_for(path: &str, suffix: &str) -> String {
     }
 }
 
+/// Whether the account path `path`, with or without its leading `/`, lies
+/// under `/.ark/`, where protocol state is stored.
+pub fn is_protocol_path(path: &str) -> bool {
+    let path = path.trim_start_matches('/');
+
+    path == ".ark" || path.starts_with(".ark/")
+}
+
+/// Whether the account path `path`, with or without its leading `/`, lies
+/// under `/.ark/requests/`, the request log, whose entries the server writes
+/// and signs itself.
+pub fn is_request_log_path(path: &str) -> bool {
+    let path = path.trim_start_matches('/');
+
+    path == ".ark/requests" || path.starts_with(".ark/requests/")
+}
+
 /// Whether `path` names a temporary version of a file.
 pub fn is_temp_path(path: &str) -> bool {
     let stem = match file_name(path).strip_prefix('.') {
@@ -172,14 +196,6 @@ pub fn is_temp_path(path: &str) -> bool {
         Some(infix) => parse_uuid(&stem[infix + TEMP_INFIX.len()..]).is_ok(),
         None => false,
     }
-}
-
-/// Whether the account path `path`, with or without its leading `/`, lies
-/// under `/.ark/`, where protocol state is kept.
-pub fn is_protocol_path(path: &str) -> bool {
-    let path = path.trim_start_matches('/');
-
-    path == ".ark" || path.starts_with(".ark/")
 }
 
 /// Expand a CLI/library path argument into a fully-qualified address string

@@ -1,14 +1,14 @@
 use std::collections::HashSet;
 use std::io;
 
-use super::{get_stream, head, list, request, watch_remote};
+use super::{get_stream, head, list, put_stream, request, watch_remote};
 
 use crate::http::check_response_code;
 use crate::identity::parse_address;
 use crate::metadata::{read_metadata_headers, sign_metadata, write_metadata_headers};
-use crate::paths::{to_account_path, to_url};
+use crate::paths::{grant_path_for, to_account_path, to_url};
 use crate::timestamp;
-use crate::types::{Context, EntryAction, Metadata, Permission, Proposal};
+use crate::types::{Context, EntryAction, Metadata, Permission, Permissions, Proposal};
 use crate::util::{parse_request_entry, sha256};
 use crate::versions::to_version;
 
@@ -28,7 +28,7 @@ pub fn list_proposals(ctx: &Context) -> io::Result<Vec<Proposal>> {
 
         let entry_path = format!("/.ark/requests/{}", entry.name);
         let mut entry_body: Vec<u8> = Vec::new();
-        if get_stream(ctx, &entry_path, &mut entry_body, false, None, None).is_err() {
+        if get_stream(ctx, &entry_path, &mut entry_body, false, None).is_err() {
             continue;
         }
 
@@ -97,8 +97,10 @@ where
 /// Pulls the current file/dir from the author's server, checks it has not
 /// been maliciously altered since the proposal (id unchanged, no unauthorised
 /// member additions/upgrades, current account not downgraded), and applies it
-/// to the target path on the current account. The log entry is removed on
-/// success.
+/// to the target path on the current account. The account signs a grant for
+/// the version it accepted, under `/.ark/grants/`, which is what lets its
+/// devices trust a path another account wrote; deleting the grant withdraws
+/// that. The log entry is removed on success.
 ///
 /// With `force=true`, accepts the current metadata as-is even if members were
 /// added or the current account was downgraded since the proposal.
@@ -106,7 +108,7 @@ pub fn accept_proposal(ctx: &Context, index_or_id: &str, force: bool) -> io::Res
     let id = resolve_id(ctx, index_or_id)?;
     let entry_path = format!("/.ark/requests/{}", id);
     let mut entry_body: Vec<u8> = Vec::new();
-    let (entry_metadata, _) = get_stream(ctx, &entry_path, &mut entry_body, false, None, None)?;
+    let (entry_metadata, _) = get_stream(ctx, &entry_path, &mut entry_body, false, None)?;
     let (account_name, _, _) = parse_address(&ctx.identity.address)?;
     let proposal = parse_proposal(&account_name, &id, &entry_body)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "entry is not a valid proposal"))?;
@@ -120,12 +122,12 @@ pub fn accept_proposal(ctx: &Context, index_or_id: &str, force: bool) -> io::Res
         format!("{}/{}", proposal.metadata.author, relative_path)
     };
 
-    let (current_metadata, body) = if target_is_dir {
+    let (metadata, body) = if target_is_dir {
         let (_, metadata) = head(ctx, &author_path)?;
         (metadata, Vec::new())
     } else {
         let mut buf: Vec<u8> = Vec::new();
-        let (metadata, _) = get_stream(ctx, &author_path, &mut buf, false, None, None)?;
+        let (metadata, _) = get_stream(ctx, &author_path, &mut buf, false, None)?;
         let expected_hash = metadata.body_hash.as_ref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "file metadata missing body_hash"))?;
         if sha256(&buf) != expected_hash.value {
@@ -135,20 +137,29 @@ pub fn accept_proposal(ctx: &Context, index_or_id: &str, force: bool) -> io::Res
     };
 
     if !force {
-        verify_metadata_changes(&proposal.metadata, &current_metadata, &ctx.identity.address)?;
+        validate_metadata_changes(&proposal.metadata, &metadata, &ctx.identity.address)?;
     }
 
-    let own_path = if target_is_dir {
+    let version = to_version(&metadata);
+    let path = if target_is_dir {
         format!("/{}/", relative_path.trim_end_matches('/'))
     } else {
         format!("/{}", relative_path)
     };
-    let own_url = to_url(ctx, &own_path)?;
 
-    let headers = write_metadata_headers(&current_metadata);
+    let grant_path = grant_path_for(&path);
+    let existing_grant_metadata = match head(ctx, &grant_path) {
+        Ok((_, grant_metadata)) => Some(grant_metadata),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
+    put_stream(ctx, &grant_path, Some(&mut version.as_bytes()), &Permissions::default(), Some("none"), existing_grant_metadata, None, false)?;
+
+    let url = to_url(ctx, &path)?;
+    let headers = write_metadata_headers(&metadata);
     let header_refs: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
-    let (code, _, resp_body) = request(Some(ctx), "PUT", &own_url, &header_refs, &body)?;
+    let (code, _, resp_body) = request(Some(ctx), "PUT", &url, &header_refs, &body)?;
     check_response_code(code, &resp_body)?;
 
     delete_entry(ctx, &entry_path, &entry_metadata)?;
@@ -201,7 +212,7 @@ fn fetch_proposal(ctx: &Context, id: &str) -> io::Result<Option<Proposal>> {
     let entry_path = format!("/.ark/requests/{}", id);
 
     let mut entry_body: Vec<u8> = Vec::new();
-    get_stream(ctx, &entry_path, &mut entry_body, false, None, None)?;
+    get_stream(ctx, &entry_path, &mut entry_body, false, None)?;
 
     let (account_name, _, _) = parse_address(&ctx.identity.address)?;
     parse_proposal(&account_name, id, &entry_body)
@@ -229,7 +240,7 @@ fn parse_proposal(account_name: &str, filename: &str, entry_bytes: &[u8]) -> io:
     }))
 }
 
-fn verify_metadata_changes(proposal: &Metadata, current: &Metadata, self_address: &str) -> io::Result<()> {
+fn validate_metadata_changes(proposal: &Metadata, current: &Metadata, self_address: &str) -> io::Result<()> {
     if current.id != proposal.id {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "id is wrong"));
     }
@@ -285,12 +296,11 @@ mod tests {
 
     use super::*;
 
-    use crate::client::{init, put};
+    use crate::client::{get, init, put};
     use crate::context::create_client_context;
     use crate::permissions::reader;
-    use crate::testing::fs::in_test_dir;
+    use crate::testing::fs::{in_test_dir, write_plain_test_file};
     use crate::testing::http::start_test_server;
-    use crate::types::Permissions;
 
     fn setup(temp_dir: &Path, port: u16) -> (Context, Context) {
         let alice_dir = temp_dir.join("alice_client");
@@ -390,6 +400,46 @@ mod tests {
             assert_eq!(fs::read(&alice_file).unwrap(), b"hello alice");
 
             assert_eq!(list_proposals(&alice_ctx).unwrap().len(), 0, "log entry should be deleted");
+
+            // Bob wrote it, but the account's grant vouches for it on a device
+            // holding nothing of it yet.
+            fs::remove_dir_all(temp_dir.join("alice_client/.ark/versions")).unwrap();
+            get(&alice_ctx, "/apps/notes/foo.md", false).unwrap();
+            assert_eq!(fs::read(temp_dir.join("alice_client/apps/notes/foo.md")).unwrap(), b"hello alice");
+        });
+    }
+
+    #[test]
+    fn a_grant_the_account_did_not_sign_is_ignored() {
+        in_test_dir("ark_proposals_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let (_alice_ctx, bob_ctx) = setup(temp_dir, port);
+
+            set_current_dir(temp_dir.join("bob_client")).unwrap();
+            write_payload(&temp_dir.join("bob_client"), "apps/notes/foo.md", b"hello alice");
+            put(&bob_ctx, "apps/notes/foo.md", &Permissions::default(), Some("none"), false).unwrap();
+            let alice_addr = format!("alice@127.0.0.1:{}", port);
+            put(&bob_ctx, "apps/notes/foo.md", &reader(alice_addr.clone()), Some("none"), false).unwrap();
+
+            set_current_dir(temp_dir.join("alice_client")).unwrap();
+            let alice_ctx = create_client_context().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let proposals = loop {
+                let p = list_proposals(&alice_ctx).unwrap();
+                if !p.is_empty() || Instant::now() >= deadline { break p; }
+                sleep(Duration::from_millis(20));
+            };
+            accept_proposal(&alice_ctx, &proposals[0].id, false).unwrap();
+
+            // The same grant, signed by Bob rather than the account.
+            let grant_file = temp_dir.join("ark/alice").join(grant_path_for("/apps/notes/foo.md").trim_start_matches('/'));
+            let grant = fs::read(&grant_file).unwrap();
+            write_plain_test_file(&grant_file, &bob_ctx.identity, bob_ctx.identity_key.as_ref().unwrap(), &grant);
+
+            // A device holding nothing of it yet.
+            fs::remove_dir_all(temp_dir.join("alice_client/.ark/versions")).unwrap();
+            let err = get(&alice_ctx, "/apps/notes/foo.md", false).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{}", err);
         });
     }
 

@@ -188,10 +188,10 @@ enum Cmd {
     /// Reconcile local and remote state in one pass.
     ///
     /// Per tracked file, pure local edits push; pure remote changes pull;
-    /// concurrent changes on both sides write the remote copy to a
-    /// `<name>.remote-<iso>` sidecar and leave the local copy untouched.
-    /// Untracked local files and symlinks are left alone. With --watch, keeps
-    /// syncing continuously.
+    /// concurrent changes on both sides, a remote delete included, write the
+    /// remote copy to a `<name>.remote-<iso>` sidecar and leave the local copy
+    /// untouched and unpushed until resolved. Untracked local files and
+    /// symlinks are left alone. With --watch, keeps syncing continuously.
     Sync {
         /// Watch for changes and re-sync continuously.
         #[arg(short, long)]
@@ -339,7 +339,7 @@ fn main() {
 
 fn cat_cli(ctx: &Context, path: &str, version: Option<&str>) -> io::Result<()> {
     let mut stdout = io::stdout().lock();
-    get_stream(ctx, path, &mut stdout, true, None, version)?;
+    get_stream(ctx, path, &mut stdout, true, version)?;
 
     Ok(())
 }

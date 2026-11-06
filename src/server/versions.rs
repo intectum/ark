@@ -4,10 +4,14 @@ use super::auth::authorize;
 
 use crate::http::{write_response, write_text};
 use crate::metadata::read_metadata_attributes;
-use crate::types::{Context, Identity};
+use crate::types::{Context, Identity, Member};
 use crate::versions::{read_versions, version_path_for};
 
-pub fn serve_version_list(server_ctx: &Context, ctx: &Context, path: &str, stream: &mut dyn Write, send_body: bool, requestor_identity: &Identity) -> io::Result<()> {
+// Every version of `path` to anyone `path_members` lets read it; to anyone
+// else only the versions whose own members let them.
+pub fn serve_version_list(server_ctx: &Context, ctx: &Context, path: &str, stream: &mut dyn Write, send_body: bool, requestor_identity: &Identity, path_members: Option<&[Member]>) -> io::Result<()> {
+    let reads_path = authorize(server_ctx, ctx, requestor_identity, None, path_members).is_ok();
+
     let versions = match read_versions(ctx, path) {
         Ok(v) => v,
         Err(e) => return write_text(stream, 500, e.to_string().as_bytes()),
@@ -25,7 +29,7 @@ pub fn serve_version_list(server_ctx: &Context, ctx: &Context, path: &str, strea
             Err(e) => return write_text(stream, 500, e.to_string().as_bytes()),
         };
 
-        if authorize(server_ctx, ctx, requestor_identity, None, Some(&metadata.members)).is_ok() {
+        if reads_path || authorize(server_ctx, ctx, requestor_identity, None, Some(&metadata.members)).is_ok() {
             readable_versions.push(version);
         }
     }
@@ -53,9 +57,9 @@ mod tests {
     use crate::types::{Identity, Key, Member, Metadata, Permission, VersionEntry};
     use crate::versions::{copy_versioned_with_metadata, to_version};
 
-    // Keeps what `file` holds as a version, as the server would have had it
+    // Stores what `file` holds as a version, as the server would have had it
     // come through a put.
-    fn keep(file: &Path) -> Metadata {
+    fn store(file: &Path) -> Metadata {
         let (account_ctx, account_path) = account_context(file);
         let metadata = read_metadata_attributes(&account_ctx, &account_path).unwrap();
         copy_versioned_with_metadata(&account_ctx, &account_path, &account_path, &metadata).unwrap();
@@ -77,12 +81,13 @@ mod tests {
             let file = seed_shared_file(temp_dir, &owner_identity, &owner_key, "ark/owner/file.txt", b"removed", vec![
                 Member { address: reader_identity.address.clone(), permission: Permission::Reader, key: None },
             ]);
-            let removed = keep(&file);
+            let removed = store(&file);
             fs::remove_file(&file).unwrap();
 
-            // Written again as an entry of its own, which leaves the reader out.
+            // Written again as an entry of its own, which leaves the reader
+            // out.
             seed_shared_file(temp_dir, &owner_identity, &owner_key, "ark/owner/file.txt", b"recreated", vec![]);
-            let recreated = keep(&file);
+            let recreated = store(&file);
 
             let port = start_test_server(temp_dir.to_path_buf());
 
@@ -104,12 +109,37 @@ mod tests {
     }
 
     #[test]
+    fn a_member_added_since_sees_the_whole_history_but_not_its_bodies() {
+        in_test_dir("ark_server_test", |temp_dir| {
+            let (owner_identity, owner_key, _) = create_test_account(temp_dir, "owner@example.com");
+            let (reader_identity, reader_key, _) = create_test_account(temp_dir, "reader@example.com");
+
+            let file = seed_shared_file(temp_dir, &owner_identity, &owner_key, "ark/owner/file.txt", b"before", vec![]);
+            let before = store(&file);
+            seed_shared_file(temp_dir, &owner_identity, &owner_key, "ark/owner/file.txt", b"after", vec![
+                Member { address: reader_identity.address.clone(), permission: Permission::Reader, key: None },
+            ]);
+            store(&file);
+
+            let port = start_test_server(temp_dir.to_path_buf());
+
+            assert_eq!(list(port, &reader_identity, &reader_key, "/ark/owner/file.txt?versions").len(), 2);
+
+            let target = format!("/ark/owner/file.txt?version={}", to_version(&before));
+            let (code, _, _) = signed_request(port, &reader_identity, &reader_key, "HEAD", &target, &[]);
+            assert_eq!(code, 200, "the metadata is the path's to show");
+            let (code, _, _) = signed_request(port, &reader_identity, &reader_key, "GET", &target, &[]);
+            assert_eq!(code, 403, "the body is the version's own members' alone");
+        });
+    }
+
+    #[test]
     fn a_version_can_only_be_read_and_only_by_an_id_of_its_own() {
         in_test_dir("ark_server_test", |temp_dir| {
             let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
             let file = account_dir.join("x.txt");
             write_plain_test_file(&file, &identity, &secret_key, b"kept");
-            let target = format!("/ark/test/x.txt?version={}", to_version(&keep(&file)));
+            let target = format!("/ark/test/x.txt?version={}", to_version(&store(&file)));
 
             let port = start_test_server(temp_dir.to_path_buf());
 
@@ -119,7 +149,8 @@ mod tests {
             assert_eq!(code, 405);
             assert_eq!(list(port, &identity, &secret_key, "/ark/test/x.txt?versions").len(), 1, "the version is untouched");
 
-            // Neither a name set aside beside the versions, nor a way out of them.
+            // Neither a name set aside beside the versions, nor a way out of
+            // them.
             let (code, _, _) = signed_request(port, &identity, &secret_key, "GET", "/ark/test/x.txt?version=.previous", &[]);
             assert_eq!(code, 400);
             let (code, _, _) = signed_request(port, &identity, &secret_key, "GET", "/ark/test/x.txt?version=..%2F..%2F..%2Fx.txt", &[]);
@@ -135,7 +166,7 @@ mod tests {
             let file = seed_shared_file(temp_dir, &owner_identity, &owner_key, "ark/owner/public.txt", b"open", vec![
                 Member { address: "*".to_string(), permission: Permission::Reader, key: None },
             ]);
-            let target = format!("/ark/owner/public.txt?version={}", to_version(&keep(&file)));
+            let target = format!("/ark/owner/public.txt?version={}", to_version(&store(&file)));
 
             let port = start_test_server(temp_dir.to_path_buf());
 
@@ -157,9 +188,10 @@ mod tests {
             seed_shared_dir(temp_dir, &owner_identity, &owner_key, "ark/owner/shared", vec![
                 Member { address: reader_identity.address.clone(), permission: Permission::Reader, key: None },
             ]);
-            // A file of the owner's alone, inside a directory the reader can read.
+            // A file of the owner's alone, inside a directory the reader can
+            // read.
             let file = seed_shared_file(temp_dir, &owner_identity, &owner_key, "ark/owner/shared/private.txt", b"private", vec![]);
-            let private = keep(&file);
+            let private = store(&file);
             fs::remove_file(&file).unwrap();
 
             let port = start_test_server(temp_dir.to_path_buf());
@@ -169,6 +201,8 @@ mod tests {
             let target = format!("/ark/owner/shared/private.txt?version={}", to_version(&private));
             let (code, _, _) = signed_request(port, &reader_identity, &reader_key, "GET", &target, &[]);
             assert_eq!(code, 403, "the version's own metadata governs it, not the directory's");
+            let (code, _, _) = signed_request(port, &reader_identity, &reader_key, "HEAD", &target, &[]);
+            assert_eq!(code, 403, "a removed path is read as its newest version left it");
         });
     }
 
@@ -178,7 +212,7 @@ mod tests {
             let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
             let file = account_dir.join("x.txt");
             write_plain_test_file(&file, &identity, &secret_key, b"old");
-            let existing = keep(&file);
+            let existing = store(&file);
             write_plain_test_file(&file, &identity, &secret_key, b"new");
 
             let port = start_test_server(temp_dir.to_path_buf());
@@ -219,7 +253,7 @@ mod tests {
             let file = seed_shared_file(temp_dir, &owner_identity, &owner_key, "ark/owner/file.txt", b"secret", vec![
                 Member { address: reader_identity.address.clone(), permission: Permission::Reader, key: None },
             ]);
-            let id = to_version(&keep(&file));
+            let id = to_version(&store(&file));
 
             // The live path then drops them.
             seed_shared_file(temp_dir, &owner_identity, &owner_key, "ark/owner/file.txt", b"newer", vec![]);

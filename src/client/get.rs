@@ -5,13 +5,13 @@ use super::{decrypt_stream, request};
 
 use crate::crypto::DEFAULT_HASH_ALGORITHM;
 use crate::http::check_response_code;
-use crate::identity::resolve_identity;
-use crate::metadata::{has_metadata_headers, read_metadata_attributes, read_metadata_headers, write_metadata_attributes_atomic};
+use crate::metadata::{has_metadata_headers, read_metadata_headers, write_metadata_attributes_atomic};
 use crate::paths::{parent_path, to_url};
 use crate::storage::{create_dir_all, write_atomic_with_metadata};
 use crate::types::{Context, Hash, LocalMetadata, Metadata};
-use crate::util::{sha256, validate_update, validate_version};
-use crate::versions::{is_versioned, to_version, write_version};
+use crate::util::sha256;
+use crate::validate::validate_entry;
+use crate::versions::{is_versioned, write_version};
 
 /// Download the body of a file at `path` (decrypting when encrypted).
 ///
@@ -32,9 +32,10 @@ pub fn get_content(ctx: &Context, path: &str) -> io::Result<()> {
 ///
 /// Verifies the metadata against the author's identity, and against the
 /// account's own copy where it has one — the download must continue that copy
-/// rather than replace it with an unrelated or older file. When `decrypt` is
-/// true, unwraps the file key using `ctx.identity_key` and decrypts the body
-/// before writing.
+/// rather than replace it with an unrelated or older file. Its author must
+/// also have been allowed to make it (see [`validate_entry`]). When `decrypt`
+/// is true, unwraps the file key using `ctx.identity_key` and decrypts the
+/// body before writing.
 ///
 /// A directory is created where it is missing and takes the metadata alone;
 /// its listing is the server's view of it, not a body the local copy holds.
@@ -42,10 +43,8 @@ pub fn get_content(ctx: &Context, path: &str) -> io::Result<()> {
 /// Stores signed metadata as `user.ark.*` xattrs plus local metadata as
 /// `user.ark_local.*` xattrs on the written file.
 pub fn get(ctx: &Context, path: &str, decrypt: bool) -> io::Result<()> {
-    let existing_metadata = read_metadata_attributes(ctx, path).ok();
-
     let mut buf: Vec<u8> = Vec::new();
-    let (metadata, local_metadata) = get_stream(ctx, path, &mut buf, decrypt, existing_metadata.as_ref(), None)?;
+    let (metadata, local_metadata) = get_stream(ctx, path, &mut buf, decrypt, None)?;
 
     if metadata.body_hash.is_none() {
         create_dir_all(ctx, path)?;
@@ -67,26 +66,17 @@ pub fn get(ctx: &Context, path: &str, decrypt: bool) -> io::Result<()> {
 /// `path` accepts relative, absolute account (leading `/`), or address form
 /// (`<name>@<host>/...`). Writes the body to `output`.
 ///
-/// Verifies the metadata signature against the author's identity. When
-/// `decrypt` is true, unwraps the file key using `ctx.identity_key` and
-/// decrypts the body before writing.
-///
-/// `existing_metadata`: the metadata of the copy this download replaces, when
-/// it replaces one. The download is then also checked to continue that copy
-/// rather than replace it with an unrelated or older file. With `version`, it
-/// is checked to be a version of that path — a file where the copy is a file —
-/// but may be older, and may be of a file the path held before a removal.
+/// What arrives is checked by [`validate_entry`]. When `decrypt` is true,
+/// unwraps the file key using `ctx.identity_key` and decrypts the body before
+/// writing.
 ///
 /// `version`: the id of a past version of `path` to download in place of what
-/// it holds now (see [`list_versions`](super::list_versions)). What came back is checked
-/// to be the version asked for — the id travels outside what the request
-/// signature covers, so a server answering with a different version, or with
-/// the current file, is refused here.
+/// it holds now (see [`list_versions`](super::list_versions)).
 ///
-/// What arrives is kept as a version in the account's own version store, as
+/// What arrives is stored as a version in the account's own version store, as
 /// the server sent it, so it can be read back without the server (see
 /// [`get_version`](super::get_version)). Entries of the version store and of
-/// the request log are not kept.
+/// the request log are not stored.
 ///
 /// The returned [`LocalMetadata`] reflects whether the written body is
 /// ciphertext (`encrypted=Some(true)`) or plaintext, and includes a
@@ -97,7 +87,6 @@ pub fn get_stream(
     path: &str,
     output: &mut dyn Write,
     decrypt: bool,
-    existing_metadata: Option<&Metadata>,
     version: Option<&str>,
 ) -> io::Result<(Metadata, LocalMetadata)> {
     let mut url = to_url(ctx, path)?;
@@ -112,24 +101,9 @@ pub fn get_stream(
     }
 
     let metadata = read_metadata_headers(&headers)?;
-
-    // An unresolvable author is a verification failure, not a missing
-    // target, and must not read as one to callers matching on the kind.
-    let author_identity = resolve_identity(ctx, &metadata.author)
-        .map_err(|e| io::Error::other(format!("author {}: {}", metadata.author, e)))?;
     let is_dir = metadata.body_hash.is_none();
-    let update_body = if is_dir { None } else { Some(body.as_slice()) };
 
-    match version {
-        Some(_) => validate_version(&author_identity.public_key, &metadata, existing_metadata, update_body)?,
-        None => validate_update(&author_identity.public_key, &metadata, existing_metadata, update_body)?,
-    }
-
-    if let Some(id) = version {
-        if to_version(&metadata) != id {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, format!("served version is not {}", id)));
-        }
-    }
+    validate_entry(ctx, path, &metadata, if is_dir { None } else { Some(body.as_slice()) }, version, None)?;
 
     if is_versioned(ctx, path)? {
         write_version(ctx, path, if is_dir { &[] } else { &body }, &metadata)?;
@@ -173,8 +147,9 @@ mod tests {
     use crate::identity::{create_identity, identity_cache_path, write_identity};
     use crate::metadata::{create_metadata, read_local_metadata_attributes, read_metadata_attributes, sign_metadata, write_metadata_attributes};
     use crate::testing::fs::{account_context, in_test_dir, init_with_server, write_encrypted_test_file, write_plain_test_file};
-    use crate::testing::http::start_test_server;
-    use crate::types::{Key, Permissions};
+    use crate::testing::http::{seed_shared_dir, start_test_server};
+    use crate::types::{Key, Member, Permission, Permissions};
+    use crate::versions::{create_dir_version, read_versions, to_version};
 
     #[test]
     fn get_writes_body_to_account_tree() {
@@ -206,7 +181,7 @@ mod tests {
             write_metadata_attributes(&server_ctx, &server_account_dir, &m, None).unwrap();
 
             let mut buf = Vec::new();
-            let (metadata, _) = get_stream(&ctx, "shared", &mut buf, false, None, None).unwrap();
+            let (metadata, _) = get_stream(&ctx, "shared", &mut buf, false, None).unwrap();
             assert!(metadata.body_hash.is_none(), "dir metadata should have no body_hash");
             assert!(!buf.is_empty(), "dir listing body should be returned");
         });
@@ -347,13 +322,110 @@ mod tests {
             let address = format!("gyan@127.0.0.1:{}", port);
             let ctx = init_with_server(temp_dir, &address);
             let (other_identity, other_key) = create_identity("other@example.com", None).unwrap();
-            write_encrypted_test_file(&temp_dir.join("ark/gyan/secret"), &other_identity, &other_key, b"raw");
+
+            // The account lets the author write here, so only the key is
+            // missing.
+            seed_shared_dir(temp_dir, &ctx.identity, ctx.identity_key.as_ref().unwrap(), "ark/gyan/sub", vec![
+                Member { address: other_identity.address.clone(), permission: Permission::Writer, key: None },
+            ]);
+            write_encrypted_test_file(&temp_dir.join("ark/gyan/sub/secret"), &other_identity, &other_key, b"raw");
 
             create_dir_all(&ctx, "/.ark/identities").unwrap();
             write_identity(&ctx, &identity_cache_path("other@example.com"), &other_identity).unwrap();
 
-            let err = get(&ctx, "secret", true).unwrap_err();
+            let err = get(&ctx, "sub/secret", true).unwrap_err();
             assert!(err.to_string().contains("no member entry"), "msg was {}", err);
+        });
+    }
+
+    #[test]
+    fn get_takes_a_file_its_author_wrote_before_being_removed_from_the_directory() {
+        in_test_dir("ark_get_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let address = format!("gyan@127.0.0.1:{}", port);
+            let ctx = init_with_server(temp_dir, &address);
+            let (other_identity, other_key) = create_identity("other@example.com", None).unwrap();
+            create_dir_all(&ctx, "/.ark/identities").unwrap();
+            write_identity(&ctx, &identity_cache_path("other@example.com"), &other_identity).unwrap();
+
+            let dir = seed_shared_dir(temp_dir, &ctx.identity, ctx.identity_key.as_ref().unwrap(), "ark/gyan/shared", vec![
+                Member { address: other_identity.address.clone(), permission: Permission::Writer, key: None },
+            ]);
+            write_plain_test_file(&temp_dir.join("ark/gyan/shared/notes.txt"), &other_identity, &other_key, b"by other");
+
+            // Removed from the directory after writing the file.
+            let (server_ctx, server_path) = account_context(&dir);
+            let written = read_metadata_attributes(&server_ctx, "/shared/notes.txt").unwrap();
+            let mut removed = read_metadata_attributes(&server_ctx, &server_path).unwrap();
+            removed.parent_version = Some(to_version(&removed));
+            removed.author_date = written.author_date + Duration::seconds(1);
+            removed.members.retain(|member| member.address != other_identity.address);
+            sign_metadata(ctx.identity_key.as_ref().unwrap(), &mut removed, None).unwrap();
+            create_dir_version(&server_ctx, &server_path, &removed).unwrap();
+            write_metadata_attributes(&server_ctx, &server_path, &removed, None).unwrap();
+
+            // Holding the directory as it is now does not change who could
+            // write there then.
+            get(&ctx, "shared/", false).unwrap();
+            get(&ctx, "shared/notes.txt", false).unwrap();
+            assert_eq!(fs::read(temp_dir.join("shared/notes.txt")).unwrap(), b"by other");
+        });
+    }
+
+    #[test]
+    fn get_refuses_a_file_the_account_never_let_its_author_write() {
+        in_test_dir("ark_get_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let address = format!("gyan@127.0.0.1:{}", port);
+            let ctx = init_with_server(temp_dir, &address);
+
+            // Signed by its author, but written straight into the account by
+            // the server rather than through anything the account allowed.
+            let (other_identity, other_key) = create_identity("other@example.com", None).unwrap();
+            write_plain_test_file(&temp_dir.join("ark/gyan/planted.txt"), &other_identity, &other_key, b"planted");
+            create_dir_all(&ctx, "/.ark/identities").unwrap();
+            write_identity(&ctx, &identity_cache_path("other@example.com"), &other_identity).unwrap();
+
+            let err = get(&ctx, "planted.txt", false).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "msg was {}", err);
+            assert!(!temp_dir.join("planted.txt").exists());
+        });
+    }
+
+    #[test]
+    fn get_refuses_a_version_the_account_never_allowed_made_on_a_history_it_does_not_hold() {
+        in_test_dir("ark_get_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let address = format!("gyan@127.0.0.1:{}", port);
+            let ctx = init_with_server(temp_dir, &address);
+            for body in [b"one", b"two"] {
+                fs::write(temp_dir.join("notes.txt"), body).unwrap();
+                put(&ctx, "notes.txt", &Permissions::default(), Some("none"), false).unwrap();
+            }
+
+            // As a device that holds nothing of it yet.
+            fs::remove_file(temp_dir.join("notes.txt")).unwrap();
+            fs::remove_dir_all(temp_dir.join(".ark/versions")).unwrap();
+
+            // Written by the server on top of what the account wrote, signed by
+            // someone the account never allowed.
+            let (other_identity, other_key) = create_identity("other@example.com", None).unwrap();
+            let (server_ctx, _) = account_context(&temp_dir.join("ark/gyan/notes.txt"));
+            let two = read_metadata_attributes(&server_ctx, "/notes.txt").unwrap();
+            let mut planted = two.clone();
+            planted.author = other_identity.address.clone();
+            planted.author_date = two.author_date + Duration::seconds(1);
+            planted.parent_version = Some(to_version(&two));
+            sign_metadata(&other_key, &mut planted, Some(b"planted")).unwrap();
+            write_atomic_with_metadata(&server_ctx, "/notes.txt", b"planted", &planted, None).unwrap();
+            create_dir_all(&ctx, "/.ark/identities").unwrap();
+            write_identity(&ctx, &identity_cache_path("other@example.com"), &other_identity).unwrap();
+
+            let err = get(&ctx, "notes.txt", false).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "msg was {}", err);
+            assert!(!temp_dir.join("notes.txt").exists());
+            // What it was made against is taken in back to the first version.
+            assert_eq!(read_versions(&ctx, "notes.txt").unwrap().len(), 2);
         });
     }
 
@@ -366,7 +438,7 @@ mod tests {
             write_plain_test_file(&temp_dir.join("ark/gyan/piped.txt"), &ctx.identity, ctx.identity_key.as_ref().unwrap(), b"to stdout");
 
             let mut buf = Vec::new();
-            get_stream(&ctx, "piped.txt", &mut buf, false, None, None).unwrap();
+            get_stream(&ctx, "piped.txt", &mut buf, false, None).unwrap();
 
             assert_eq!(buf, b"to stdout");
             assert!(!temp_dir.join("piped.txt").exists());
@@ -394,7 +466,7 @@ mod tests {
             write_atomic_with_metadata(&server_ctx, &server_account_path, b"old", &rolled_back, None).unwrap();
 
             let err = get(&ctx, "notes.txt", false).unwrap_err();
-            assert!(err.to_string().contains("author_date is older than existing"), "msg was {}", err);
+            assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "msg was {}", err);
             assert_eq!(fs::read(&local_path).unwrap(), b"current");
         });
     }
@@ -415,7 +487,7 @@ mod tests {
             write_plain_test_file(&temp_dir.join("ark/gyan/notes.txt"), &ctx.identity, ctx.identity_key.as_ref().unwrap(), b"substitute");
 
             let err = get(&ctx, "notes.txt", false).unwrap_err();
-            assert!(err.to_string().contains("id is wrong"), "msg was {}", err);
+            assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "msg was {}", err);
             assert_eq!(fs::read(&local_path).unwrap(), b"current");
         });
     }

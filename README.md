@@ -190,14 +190,14 @@ ark::watch_remote(&ctx, &url,
 
 // Streaming form when you don't want to touch the filesystem
 let mut buf = Vec::new();
-let (metadata, _) = ark::get_stream(&ctx, "note.txt", &mut buf, true, /*existing_metadata=*/ None, /*version=*/ None)?;
+let (metadata, _) = ark::get_stream(&ctx, "note.txt", &mut buf, true, /*version=*/ None)?;
 ```
 
 Every CLI command has a corresponding library function. `get`, `put`, `encrypt`, and `decrypt` all take a single path and act on the account's own copy of it, mirroring the server. For those four, a `_stream` variant (`encrypt_stream`, `decrypt_stream`, `get_stream`, `put_stream`) exposes the same operation over `Read`/`Write` streams and returns values instead of touching the filesystem — `ark cat` is `get_stream` to stdout. `get_version` returns a past version's body and metadata, from the account's own version store or fetched into it; `ark get --version` writes that beside the file as `<name>.version-<ID>`.
 
 `put` also has two focused wrappers: `put_content(ctx, path)` uploads the body at `path` with default permissions, and `put_permissions(ctx, path, &permissions)` sends a metadata-only PUT to add or drop members without re-uploading the body. Both delegate to `put`, which remains the full form (`permissions`, `encryption_algorithm`, `metadata_only`). Build a `Permissions` explicitly, or use `ark::owner`, `ark::writer`, `ark::reader`, and `ark::drop` (and plural `ark::owners`/`ark::writers`/`ark::readers`/`ark::drops`) for the common cases.
 
-`get` has a matching wrapper: `get_content(ctx, path)` downloads the body at `path` and writes it under the account root, decrypting when encrypted. `get` remains the full form (`decrypt`). `get_stream` takes one argument the others don't: `existing_metadata`, the metadata of the copy the download replaces when it replaces one. Pass it and the download is also checked to continue that copy — same `id`, `author_date` no older — so a server cannot serve back an older version or an unrelated file at the path. `None` when there is no copy to continue.
+`get` has a matching wrapper: `get_content(ctx, path)` downloads the body at `path` and writes it under the account root, decrypting when encrypted. `get` remains the full form (`decrypt`). Where the account holds its own copy of the path, `get_stream` checks the download was made on that copy, or on versions made on it in turn, so a server cannot serve back an older version or an unrelated file at the path.
 
 Paths in the library are account paths, not filesystem paths. Every client function takes the same three forms the CLI does — relative, account-absolute, or address — the storage functions are the filesystem reached the same way: `ark::read`, `ark::write_atomic`, `ark::read_dir`, `ark::create_dir_all`, `ark::rename`, and the `user.ark.*` attribute operations, each the `std::fs` equivalent with an account path in place of a filesystem one, refusing anything outside the account root. Use them rather than `std::fs` and `ctx.root.join(...)`, and app paths stay the same strings you hand to `put` and `get`. `ark::to_account_path(ctx, path)` and `ark::to_fs_path(ctx, path)` convert between the two when you need to hand an entry to something that only speaks filesystem paths.
 
@@ -213,7 +213,7 @@ Paths in the library are account paths, not filesystem paths. Every client funct
 | Directories | First-class. Recursive delete. Permissions inherit. |
 | Public files | Supported for plaintext only (any browser can fetch). |
 | Federation | On write or delete, the server relays to co-members' servers. |
-| Versions | Every write is kept, through deletes too. List, read, and restore past versions of any path. |
+| Versions | Every write is stored, through deletes too. List, read, and restore past versions of any path. |
 | Sync | One-shot or watch mode; reconciles divergence with conflict and merge-base sidecars. |
 | Transport | Server binds plain HTTP. Client URLs default to `https://` (put a reverse proxy in front for TLS); prefix an address with `http://` to override for dev. |
 | Authentication | `ArkIdentity` signed requests. No tokens, no sessions. |

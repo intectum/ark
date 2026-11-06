@@ -68,7 +68,7 @@ pub fn put_permissions(ctx: &Context, path: &str, permissions: &Permissions) -> 
 /// The signed metadata is written back to the local copy as `user.ark.*`
 /// xattrs, plus local metadata as `user.ark_local.*` xattrs.
 ///
-/// What is uploaded is kept as a version in the account's own version store.
+/// What is uploaded is stored as a version in the account's own version store.
 ///
 /// Missing intermediate parent directories on `path` are created on the
 /// server automatically. Writes are relayed to co-members.
@@ -122,7 +122,7 @@ pub fn put(ctx: &Context, path: &str, permissions: &Permissions, encryption_algo
 /// `existing_metadata` was signed over. Requires `existing_metadata`. Rejects
 /// any `encryption_algorithm`.
 ///
-/// What is uploaded is kept as a version in the account's own version store.
+/// What is uploaded is stored as a version in the account's own version store.
 /// A metadata-only version keeps the body of the version `existing_metadata`
 /// names, fetched where the store does not hold it.
 ///
@@ -814,10 +814,10 @@ mod tests {
 
             let id = to_version(&read_metadata_attributes(&ctx, "notes.txt").unwrap());
             let server_ctx = server(&ctx, temp_dir);
-            let kept_body = read(&ctx, &version_path_for(&ctx, "notes.txt", &id).unwrap()).unwrap();
+            let stored_body = read(&ctx, &version_path_for(&ctx, "notes.txt", &id).unwrap()).unwrap();
             let server_body = read(&server_ctx, &version_path_for(&server_ctx, "/notes.txt", &id).unwrap()).unwrap();
-            assert_eq!(kept_body, server_body, "the same ciphertext under the same id");
-            assert_ne!(kept_body, b"secret", "kept as it was sent, not as the copy holds it");
+            assert_eq!(stored_body, server_body, "the same ciphertext under the same id");
+            assert_ne!(stored_body, b"secret", "stored as it was sent, not as the copy holds it");
         });
     }
 

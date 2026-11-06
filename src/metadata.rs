@@ -7,6 +7,7 @@ use crate::crypto::{DEFAULT_HASH_ALGORITHM, decrypt_bytes, encrypt_bytes, sign_b
 use crate::identity::{identity_key_path, parse_address, read_identity_key, resolve_identity};
 use crate::permissions::cli_address_to_wire;
 use crate::lock::{Lock, lock_exclusive, lock_shared};
+use crate::paths::parent_path;
 use crate::storage::{copy_atomic_with_metadata, create_dir_all, exists, is_dir, list_attributes, read, read_attribute, remove_attribute, remove_file, write_atomic_with_metadata, write_atomic_without_metadata, write_attribute};
 use crate::timestamp;
 use crate::types::{Hash, Key, LocalMetadata, Member, Metadata, Permission, Permissions, Signature};
@@ -83,8 +84,8 @@ pub fn has_metadata_attributes(ctx: &Context, path: &str) -> io::Result<bool> {
 /// The metadata `path` carries.
 ///
 /// Errors with `NotFound` where `path` carries none at all, and `InvalidData`
-/// where what it carries cannot be read whole. A caller deciding
-/// access must tell the two apart: only the first means "inherits from above".
+/// where what it carries cannot be read whole. A caller deciding access must
+/// tell the two apart: only the first means "inherits from above".
 ///
 /// Reading a directory first puts back the metadata an update that did not
 /// finish had set aside, so it may take the exclusive lock and write. An
@@ -96,6 +97,28 @@ pub fn read_metadata_attributes(ctx: &Context, path: &str) -> io::Result<Metadat
     let _lock = recover_directory(ctx, path, lock)?;
 
     read_metadata_attributes_unlocked(ctx, path)
+}
+
+/// The metadata `path` inherits: that of the nearest directory above it
+/// carrying metadata, where there is one. The walk ends at the account root.
+///
+/// Errors rather than walking past a directory whose metadata is present but
+/// unreadable — taking the members of something further up would widen access
+/// without saying so.
+pub fn read_inherited_metadata_attributes(ctx: &Context, path: &str) -> io::Result<Option<Metadata>> {
+    let mut current = parent_path(path);
+
+    while let Some(dir) = current {
+        match read_metadata_attributes(ctx, dir) {
+            Ok(metadata) => return Ok(Some(metadata)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+
+        current = parent_path(dir);
+    }
+
+    Ok(None)
 }
 
 fn read_metadata_attributes_unlocked(ctx: &Context, path: &str) -> io::Result<Metadata> {
@@ -427,6 +450,59 @@ pub fn resolve_member_addresses(ctx: &Context, members: &[Member]) -> io::Result
     }
 
     Ok(member_addresses)
+}
+
+/// The permission `members` give `address`, directly or through a group it
+/// belongs to, whichever ranks highest. `None` where they give it none.
+///
+/// Errors with `Unsupported` on a group that has groups among its members.
+pub fn resolve_member_permission(
+    ctx: &Context,
+    members: &[Member],
+    address: &str,
+) -> io::Result<Option<Permission>> {
+    if let Some(member) = members.iter().find(|member| member.address == address) {
+        return Ok(Some(member.permission));
+    }
+
+    let mut best: Option<Permission> = None;
+    for member in members {
+        if member.address == "*" || member.address == address {
+            continue;
+        }
+
+        let member_identity = match resolve_identity(ctx, &member.address) {
+            Ok(i) => i,
+            Err(_) => continue,
+        };
+
+        let group_members = match member_identity.members.as_ref() {
+            Some(m) => m,
+            None => continue,
+        };
+
+        if !group_members.iter().any(|entry| entry == address) {
+            continue;
+        }
+
+        for entry in group_members {
+            let entry_identity = match resolve_identity(ctx, entry) {
+                Ok(i) => i,
+                Err(_) => continue,
+            };
+
+            if entry_identity.members.is_some() {
+                return Err(io::Error::new(io::ErrorKind::Unsupported, "nested groups not supported"));
+            }
+        }
+
+        best = match best {
+            Some(current) if current.rank() >= member.permission.rank() => Some(current),
+            _ => Some(member.permission),
+        };
+    }
+
+    Ok(best)
 }
 
 /// Unwrap the file key wrapped in `members` for the current account, either
@@ -777,6 +853,7 @@ fn split_member_key(key: &str) -> Option<(usize, String)> {
 mod tests {
     use super::*;
 
+    use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::thread;
@@ -785,6 +862,62 @@ mod tests {
     use crate::identity::create_identity;
     use crate::storage::{create_dir, write_atomic_with_metadata};
     use crate::testing::fs::{TEST_ADDRESS, account_context, create_plain_test_metadata, create_test_account, in_test_dir};
+
+    // `/top` carries members, `/top/mid` is what the walk has to get past, and
+    // `/top/mid/leaf` carries nothing of its own.
+    fn tree(temp_dir: &Path) -> Context {
+        let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
+        let (context, _) = account_context(&account_dir);
+
+        create_dir_all(&context, "/top/mid/leaf").unwrap();
+
+        let mut top = create_metadata(&identity.address, None);
+        top.members.push(Member { address: "*".to_string(), permission: Permission::Reader, key: None });
+        sign_metadata(&secret_key, &mut top, None).unwrap();
+        write_metadata_attributes(&context, "/top", &top, None).unwrap();
+
+        context
+    }
+
+    #[test]
+    fn a_directory_carrying_nothing_is_walked_past() {
+        in_test_dir("ark_metadata_test", |temp_dir| {
+            let context = tree(temp_dir);
+
+            let metadata = read_inherited_metadata_attributes(&context, "/top/mid/leaf").unwrap().expect("no metadata found");
+            assert!(metadata.members.iter().any(|member| member.address == "*"));
+        });
+    }
+
+    #[test]
+    fn a_directory_whose_metadata_cannot_be_read_stops_the_walk() {
+        in_test_dir("ark_metadata_test", |temp_dir| {
+            let context = tree(temp_dir);
+
+            // Part of its metadata and nothing set aside to put it back, as an
+            // update interrupted before any of this existed would have left
+            // it.
+            write_attribute(&context, "/top/mid", "user.ark.member_0_address", b"someone@example.com").unwrap();
+
+            // Carrying on to `/top` would hand out the public read that the
+            // unreadable metadata sits between.
+            match read_inherited_metadata_attributes(&context, "/top/mid/leaf") {
+                Ok(metadata) => panic!("walked past an unreadable directory and found {:?}", metadata.map(|metadata| metadata.members.len())),
+                Err(error) => assert_eq!(error.kind(), io::ErrorKind::InvalidData),
+            }
+        });
+    }
+
+    #[test]
+    fn nothing_above_carrying_metadata_is_not_an_error() {
+        in_test_dir("ark_metadata_test", |temp_dir| {
+            let (_, _, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
+            let (context, _) = account_context(&account_dir);
+            create_dir_all(&context, "/top/mid/leaf").unwrap();
+
+            assert!(read_inherited_metadata_attributes(&context, "/top/mid/leaf").unwrap().is_none());
+        });
+    }
 
     // A rewrite stopped part-way, as a process killed mid-write leaves it: the
     // previous metadata set aside, and only some of the new attributes on over
@@ -892,8 +1025,8 @@ mod tests {
             let mut original = create_metadata(&identity.address, None);
             sign_metadata(&secret_key, &mut original, None).unwrap();
 
-            // `sync_author_date` is what marks a directory as tracked: losing it
-            // leaves the directory silently out of every later sync.
+            // `sync_author_date` is what marks a directory as tracked: losing
+            // it leaves the directory silently out of every later sync.
             let local = LocalMetadata { encrypted: None, sync_body_hash: None, sync_author_date: Some(original.author_date) };
             write_metadata_attributes_atomic(&context, "/dir", &original, Some(&local)).unwrap();
 

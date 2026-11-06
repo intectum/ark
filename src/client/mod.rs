@@ -14,7 +14,7 @@ mod sync;
 mod versions;
 mod watch;
 
-pub use conflict::{resolve_conflict, write_conflict};
+pub use conflict::{has_conflict, resolve_conflict, write_conflict, write_delete_conflict};
 pub use decrypt::{decrypt, decrypt_stream};
 pub use delete::delete;
 pub use encrypt::{encrypt, encrypt_stream};

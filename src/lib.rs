@@ -47,6 +47,7 @@ pub mod testing;
 mod timestamp;
 mod types;
 mod util;
+mod validate;
 mod versions;
 
 pub use client::*;
@@ -63,4 +64,5 @@ pub use storage::*;
 pub use timestamp::*;
 pub use types::*;
 pub use util::*;
+pub use validate::*;
 pub use versions::*;

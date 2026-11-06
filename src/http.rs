@@ -8,7 +8,7 @@ use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use rustls::pki_types::ServerName;
 use url::Url;
 
-use crate::types::{ReadWrite, StreamEvent};
+use crate::types::{Headers, ReadWrite, StreamEvent};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const PATH_ENCODE_SET: &AsciiSet = &CONTROLS.add(b' ').add(b'"').add(b'#').add(b'<').add(b'>').add(b'?').add(b'`').add(b'{').add(b'}');
@@ -50,7 +50,7 @@ pub fn connect(url: &Url, read_timeout: Duration) -> io::Result<Box<dyn ReadWrit
     }
 }
 
-pub fn read_request(stream: &mut dyn Read, skip_body: bool) -> io::Result<(String, String, Vec<(String, String)>, Vec<u8>)> {
+pub fn read_request(stream: &mut dyn Read, skip_body: bool) -> io::Result<(String, String, Headers, Vec<u8>)> {
     let (first_line, headers, body) = read_message(stream, skip_body)?;
 
     let request_line_parts: Vec<&str> = first_line.split_whitespace().collect();
@@ -87,7 +87,7 @@ pub fn write_request(stream: &mut dyn Write, url: &Url, method: &str, headers: &
     write_message(stream, &request_line, &final_headers, body)
 }
 
-pub fn read_response(stream: &mut dyn Read, skip_body: bool) -> io::Result<(u16, Vec<(String, String)>, Vec<u8>)> {
+pub fn read_response(stream: &mut dyn Read, skip_body: bool) -> io::Result<(u16, Headers, Vec<u8>)> {
     let (first_line, headers, body) = read_message(stream, skip_body)?;
 
     let code: u16 = first_line
@@ -215,7 +215,7 @@ pub fn error_response_code(error: &io::Error) -> u16 {
     }
 }
 
-fn read_message(stream: &mut dyn Read, skip_body: bool) -> io::Result<(String, Vec<(String, String)>, Vec<u8>)> {
+fn read_message(stream: &mut dyn Read, skip_body: bool) -> io::Result<(String, Headers, Vec<u8>)> {
     let mut reader = BufReader::new(stream);
 
     let mut first_line = String::new();

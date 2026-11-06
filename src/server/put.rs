@@ -3,11 +3,11 @@ use std::path::Path;
 
 use crate::http::{error_response_code, write_text};
 use crate::identity::validate_identity;
-use crate::metadata::{members_changed, write_metadata_attributes_atomic};
+use crate::metadata::write_metadata_attributes_atomic;
 use crate::paths::parent_path;
 use crate::storage::{create_dir_all, exists};
-use crate::types::{Context, Identity, Metadata, Permission};
-use crate::util::validate_update;
+use crate::types::{Context, Identity, Metadata};
+use crate::validate::validate_entry;
 use crate::versions::{copy_versioned_with_metadata, create_dir_version, read_versions, write_versioned_with_metadata};
 
 pub fn serve_put_init(
@@ -32,12 +32,12 @@ pub fn serve_put_init(
         identity_key: None,
     };
 
-    serve_put(&target_ctx, target_path, stream, body, metadata, &body_identity, None, Permission::Owner, false)?;
+    serve_put(&target_ctx, &target_ctx, target_path, stream, body, metadata, false)?;
 
     Ok(())
 }
 
-pub fn serve_put(ctx: &Context, path: &str, stream: &mut dyn Write, body: &[u8], metadata: &Metadata, author_identity: &Identity, existing_metadata: Option<&Metadata>, permission: Permission, metadata_only: bool) -> io::Result<bool> {
+pub fn serve_put(server_ctx: &Context, ctx: &Context, path: &str, stream: &mut dyn Write, body: &[u8], metadata: &Metadata, metadata_only: bool) -> io::Result<bool> {
     let is_dir = metadata.body_hash.is_none();
 
     if metadata.deleted {
@@ -51,7 +51,7 @@ pub fn serve_put(ctx: &Context, path: &str, stream: &mut dyn Write, body: &[u8],
     }
 
     let update_body = if is_dir || metadata_only { None } else { Some(body) };
-    if let Err(error) = validate_update(&author_identity.public_key, metadata, existing_metadata, update_body) {
+    if let Err(error) = validate_entry(ctx, path, metadata, update_body, None, Some(server_ctx)) {
         write_text(stream, error_response_code(&error), error.to_string().as_bytes())?;
         return Ok(false);
     }
@@ -64,13 +64,6 @@ pub fn serve_put(ctx: &Context, path: &str, stream: &mut dyn Write, body: &[u8],
         }
 
         current = parent_path(current_path);
-    }
-
-    if let Some(old) = existing_metadata {
-        if members_changed(&old.members, &metadata.members) && permission != Permission::Owner {
-            write_text(stream, 403, b"owner permission required to change members")?;
-            return Ok(false);
-        }
     }
 
     let status_code = if exists(ctx, path) { 204 } else { 201 };
@@ -129,9 +122,10 @@ mod tests {
             let file = account_dir.join("x");
             write_plain_test_file(&file, &identity, &secret_key, b"old");
             let (account_ctx, account_path) = account_context(&file);
-            let existing_id = read_metadata_attributes(&account_ctx, &account_path).unwrap().id;
+            let existing = read_metadata_attributes(&account_ctx, &account_path).unwrap();
             let mut new_meta = create_plain_test_metadata(&identity, &secret_key, b"new content");
-            new_meta.id = existing_id;
+            new_meta.id = existing.id;
+            new_meta.parent_version = Some(to_version(&existing));
             sign_metadata(&secret_key, &mut new_meta, Some(b"new content")).unwrap();
             let port = start_test_server(temp_dir.to_path_buf());
             let code = signed_put_metadata(port, &identity, &secret_key, "/ark/test/x", b"new content", &new_meta);
@@ -261,9 +255,8 @@ mod tests {
     fn put_stores_metadata_headers_as_xattr() {
         in_test_dir("ark_server_test", |temp_dir| {
             let (identity, secret_key, _) = create_test_account(temp_dir, TEST_ADDRESS);
-            let (alice_identity, alice_key, _) = create_test_account(temp_dir, "alice@example.com");
             let port = start_test_server(temp_dir.to_path_buf());
-            let (m, ciphertext) = create_encrypted_test_metadata(&alice_identity, &alice_key, b"plaintext");
+            let (m, ciphertext) = create_encrypted_test_metadata(&identity, &secret_key, b"plaintext");
             let sent_key = m.members[0].key.as_ref().unwrap().value.clone();
             let headers = write_metadata_headers(&m);
             let extra: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
@@ -277,7 +270,7 @@ mod tests {
             let (account_ctx, account_path) = account_context(&p);
             let loaded = read_metadata_attributes(&account_ctx, &account_path).unwrap();
             assert_eq!(loaded.members.len(), 1);
-            assert_eq!(loaded.members[0].address, alice_identity.address);
+            assert_eq!(loaded.members[0].address, identity.address);
             assert_eq!(loaded.members[0].key.as_ref().unwrap().value, sent_key);
         });
     }
@@ -333,12 +326,13 @@ mod tests {
                 Member { address: writer_identity.address.clone(), permission: Permission::Writer, key: None },
             ]);
             let (account_ctx, account_path) = account_context(&file);
-            let existing_id = read_metadata_attributes(&account_ctx, &account_path).unwrap().id;
+            let existing = read_metadata_attributes(&account_ctx, &account_path).unwrap();
 
             let port = start_test_server(temp_dir.to_path_buf());
 
             let mut new_meta = create_plain_test_metadata(&writer_identity, &writer_key, b"v2");
-            new_meta.id = existing_id;
+            new_meta.id = existing.id;
+            new_meta.parent_version = Some(to_version(&existing));
             new_meta.encryption_algorithm = None;
             new_meta.members = vec![
                 Member { address: owner_identity.address.clone(), permission: Permission::Owner, key: None },
@@ -349,6 +343,36 @@ mod tests {
             let code = signed_put_metadata(port, &writer_identity, &writer_key, "/ark/owner/file.txt", b"v2", &new_meta);
             assert_eq!(code, 204);
             assert_eq!(fs::read(temp_dir.join("ark/owner/file.txt")).unwrap(), b"v2");
+        });
+    }
+
+    #[test]
+    fn put_by_write_member_of_a_change_authored_by_an_outsider_forbidden() {
+        in_test_dir("ark_server_test", |temp_dir| {
+            let (owner_identity, owner_key, _) = create_test_account(temp_dir, "owner@example.com");
+            let (writer_identity, writer_key, _) = create_test_account(temp_dir, "writer@example.com");
+            let (outsider_identity, outsider_key, _) = create_test_account(temp_dir, "outsider@example.com");
+
+            let file = seed_shared_file(temp_dir, &owner_identity, &owner_key, "ark/owner/file.txt", b"v1", vec![
+                Member { address: writer_identity.address.clone(), permission: Permission::Writer, key: None },
+            ]);
+            let (account_ctx, account_path) = account_context(&file);
+            let existing = read_metadata_attributes(&account_ctx, &account_path).unwrap();
+
+            let port = start_test_server(temp_dir.to_path_buf());
+
+            let mut new_meta = create_plain_test_metadata(&outsider_identity, &outsider_key, b"v2");
+            new_meta.id = existing.id;
+            new_meta.parent_version = Some(to_version(&existing));
+            new_meta.encryption_algorithm = None;
+            new_meta.members = existing.members.clone();
+            sign_metadata(&outsider_key, &mut new_meta, Some(b"v2")).unwrap();
+
+            // The writer may write, but the change is the outsider's, who may
+            // not.
+            let code = signed_put_metadata(port, &writer_identity, &writer_key, "/ark/owner/file.txt", b"v2", &new_meta);
+            assert_eq!(code, 403);
+            assert_eq!(fs::read(temp_dir.join("ark/owner/file.txt")).unwrap(), b"v1");
         });
     }
 
@@ -412,12 +436,13 @@ mod tests {
                 Member { address: writer_identity.address.clone(), permission: Permission::Writer, key: None },
             ]);
             let (account_ctx, account_path) = account_context(&file);
-            let existing_id = read_metadata_attributes(&account_ctx, &account_path).unwrap().id;
+            let existing = read_metadata_attributes(&account_ctx, &account_path).unwrap();
 
             let port = start_test_server(temp_dir.to_path_buf());
 
             let mut new_meta = create_plain_test_metadata(&writer_identity, &writer_key, b"v2");
-            new_meta.id = existing_id;
+            new_meta.id = existing.id;
+            new_meta.parent_version = Some(to_version(&existing));
             new_meta.encryption_algorithm = None;
             new_meta.members = vec![
                 Member { address: owner_identity.address.clone(), permission: Permission::Owner, key: None },
@@ -443,12 +468,13 @@ mod tests {
                 Member { address: co_owner_identity.address.clone(), permission: Permission::Owner, key: None },
             ]);
             let (account_ctx, account_path) = account_context(&file);
-            let existing_id = read_metadata_attributes(&account_ctx, &account_path).unwrap().id;
+            let existing = read_metadata_attributes(&account_ctx, &account_path).unwrap();
 
             let port = start_test_server(temp_dir.to_path_buf());
 
             let mut new_meta = create_plain_test_metadata(&co_owner_identity, &co_owner_key, b"v2");
-            new_meta.id = existing_id;
+            new_meta.id = existing.id;
+            new_meta.parent_version = Some(to_version(&existing));
             new_meta.encryption_algorithm = None;
             new_meta.members = vec![
                 Member { address: owner_identity.address.clone(), permission: Permission::Owner, key: None },
@@ -494,6 +520,7 @@ mod tests {
 
             let mut new_meta = create_plain_test_metadata(&identity, &secret_key, b"new");
             new_meta.id = old_meta.id;
+            new_meta.parent_version = Some(to_version(&old_meta));
             new_meta.author_date = old_meta.author_date + Duration::milliseconds(1);
             sign_metadata(&secret_key, &mut new_meta, Some(b"new")).unwrap();
             assert_eq!(signed_put_metadata(port, &identity, &secret_key, "/ark/test/x", b"new", &new_meta), 204);
@@ -507,8 +534,8 @@ mod tests {
             assert_eq!(versions[0].id, to_version(&new_meta), "what the path holds now is a version too");
             assert_eq!(versions[1].id, to_version(&old_meta));
 
-            let kept = version_path_for(&account_ctx, &account_path, &versions[1].id).unwrap();
-            assert_eq!(read(&account_ctx, &kept).unwrap(), b"old");
+            let stored = version_path_for(&account_ctx, &account_path, &versions[1].id).unwrap();
+            assert_eq!(read(&account_ctx, &stored).unwrap(), b"old");
         });
     }
 
@@ -523,6 +550,7 @@ mod tests {
 
             let mut new_meta = create_plain_test_metadata(&identity, &secret_key, b"body");
             new_meta.id = old_meta.id;
+            new_meta.parent_version = Some(to_version(&old_meta));
             new_meta.author_date = old_meta.author_date + Duration::milliseconds(1);
             new_meta.members.push(Member { address: "other@example.com".to_string(), permission: Permission::Reader, key: None });
             sign_metadata(&secret_key, &mut new_meta, Some(b"body")).unwrap();
@@ -533,10 +561,10 @@ mod tests {
             assert_eq!(versions.len(), 2);
             assert_eq!(versions[0].id, to_version(&new_meta));
 
-            let kept = version_path_for(&account_ctx, &account_path, &versions[1].id).unwrap();
-            let kept_metadata = read_metadata_attributes(&account_ctx, &kept).unwrap();
-            assert_eq!(kept_metadata.members.len(), 1, "the version carries the member list it was written with");
-            assert_eq!(read(&account_ctx, &kept).unwrap(), b"body");
+            let stored = version_path_for(&account_ctx, &account_path, &versions[1].id).unwrap();
+            let stored_metadata = read_metadata_attributes(&account_ctx, &stored).unwrap();
+            assert_eq!(stored_metadata.members.len(), 1, "the version carries the member list it was written with");
+            assert_eq!(read(&account_ctx, &stored).unwrap(), b"body");
         });
     }
 
@@ -554,6 +582,7 @@ mod tests {
             assert_eq!(signed_put_metadata(port, &identity, &secret_key, "/ark/test/notes/", b"", &meta), 201);
 
             let mut second = meta.clone();
+            second.parent_version = Some(to_version(&meta));
             second.author_date = meta.author_date + Duration::milliseconds(1);
             second.members.push(Member { address: "other@example.com".to_string(), permission: Permission::Reader, key: None });
             sign_metadata(&secret_key, &mut second, None).unwrap();
@@ -568,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn the_parent_version_a_write_names_is_stored_and_decides_nothing() {
+    fn a_write_not_made_on_what_the_path_holds_409() {
         in_test_dir("ark_server_test", |temp_dir| {
             let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
             let file = account_dir.join("x");
@@ -576,20 +605,75 @@ mod tests {
             let (account_ctx, account_path) = account_context(&file);
             let existing = read_metadata_attributes(&account_ctx, &account_path).unwrap();
 
-            // A parent naming a version this server never held. The write is
-            // a fork, and the server applies it anyway — its `parent_version`
-            // is what the owner reads back, not a rule the server enforces.
+            // A parent naming a version this server never held.
             let mut forked = create_plain_test_metadata(&identity, &secret_key, b"forked");
             forked.id = existing.id;
             forked.parent_version = Some("2020-01-01T00-00-00.000Z_AAAAAAAA".to_string());
             sign_metadata(&secret_key, &mut forked, Some(b"forked")).unwrap();
 
             let port = start_test_server(temp_dir.to_path_buf());
-            assert_eq!(signed_put_metadata(port, &identity, &secret_key, "/ark/test/x", b"forked", &forked), 204);
-            assert_eq!(fs::read(&file).unwrap(), b"forked");
+            assert_eq!(signed_put_metadata(port, &identity, &secret_key, "/ark/test/x", b"forked", &forked), 409);
+            assert_eq!(fs::read(&file).unwrap(), b"old");
+        });
+    }
 
-            let stored = read_metadata_attributes(&account_ctx, &account_path).unwrap();
-            assert_eq!(stored.parent_version.as_deref(), Some("2020-01-01T00-00-00.000Z_AAAAAAAA"));
+    #[test]
+    fn a_second_write_made_on_the_same_version_409() {
+        in_test_dir("ark_server_test", |temp_dir| {
+            let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
+            let file = account_dir.join("x");
+            write_plain_test_file(&file, &identity, &secret_key, b"v1");
+            let (account_ctx, account_path) = account_context(&file);
+            let existing = read_metadata_attributes(&account_ctx, &account_path).unwrap();
+            let port = start_test_server(temp_dir.to_path_buf());
+
+            let made_on_v1 = |body: &[u8], offset: i64| {
+                let mut metadata = create_plain_test_metadata(&identity, &secret_key, body);
+                metadata.id = existing.id;
+                metadata.parent_version = Some(to_version(&existing));
+                metadata.author_date = existing.author_date + Duration::seconds(offset);
+                sign_metadata(&secret_key, &mut metadata, Some(body)).unwrap();
+                metadata
+            };
+
+            assert_eq!(signed_put_metadata(port, &identity, &secret_key, "/ark/test/x", b"first", &made_on_v1(b"first", 1)), 204);
+            assert_eq!(signed_put_metadata(port, &identity, &secret_key, "/ark/test/x", b"second", &made_on_v1(b"second", 2)), 409);
+            assert_eq!(fs::read(&file).unwrap(), b"first");
+        });
+    }
+
+    #[test]
+    fn a_member_removed_since_cannot_write_on_a_version_from_before() {
+        in_test_dir("ark_server_test", |temp_dir| {
+            let (owner_identity, owner_key, _) = create_test_account(temp_dir, "owner@example.com");
+            let (writer_identity, writer_key, _) = create_test_account(temp_dir, "writer@example.com");
+
+            let file = seed_shared_file(temp_dir, &owner_identity, &owner_key, "ark/owner/file.txt", b"v1", vec![
+                Member { address: writer_identity.address.clone(), permission: Permission::Writer, key: None },
+            ]);
+            let (account_ctx, account_path) = account_context(&file);
+            let v1 = read_metadata_attributes(&account_ctx, &account_path).unwrap();
+            let port = start_test_server(temp_dir.to_path_buf());
+
+            // The owner removes the writer.
+            let mut v2 = v1.clone();
+            v2.parent_version = Some(to_version(&v1));
+            v2.author_date = v1.author_date + Duration::seconds(1);
+            v2.members.retain(|member| member.address != writer_identity.address);
+            sign_metadata(&owner_key, &mut v2, Some(b"v1")).unwrap();
+            assert_eq!(signed_put_metadata(port, &owner_identity, &owner_key, "/ark/owner/file.txt", b"v1", &v2), 204);
+
+            // The writer writes on v1, which still let them.
+            let mut forked = create_plain_test_metadata(&writer_identity, &writer_key, b"late");
+            forked.id = v1.id;
+            forked.parent_version = Some(to_version(&v1));
+            forked.encryption_algorithm = None;
+            forked.members = v1.members.clone();
+            forked.author_date = v2.author_date + Duration::seconds(1);
+            sign_metadata(&writer_key, &mut forked, Some(b"late")).unwrap();
+            let code = signed_put_metadata(port, &writer_identity, &writer_key, "/ark/owner/file.txt", b"late", &forked);
+            assert_ne!(code, 204);
+            assert_eq!(fs::read(&file).unwrap(), b"v1");
         });
     }
 
@@ -675,11 +759,12 @@ mod tests {
                 Member { address: writer_identity.address.clone(), permission: Permission::Writer, key: None },
             ]);
             let (account_ctx, account_path) = account_context(&dir);
-            let existing_id = read_metadata_attributes(&account_ctx, &account_path).unwrap().id;
+            let existing = read_metadata_attributes(&account_ctx, &account_path).unwrap();
 
             let port = start_test_server(temp_dir.to_path_buf());
             let mut new_meta = create_plain_test_metadata(&writer_identity, &writer_key, b"");
-            new_meta.id = existing_id;
+            new_meta.id = existing.id;
+            new_meta.parent_version = Some(to_version(&existing));
             new_meta.encryption_algorithm = None;
             new_meta.members = vec![
                 Member { address: owner_identity.address.clone(), permission: Permission::Owner, key: None },
@@ -721,6 +806,7 @@ mod tests {
 
             let mut new_meta = create_plain_test_metadata(&identity, &secret_key, b"body");
             new_meta.id = existing.id;
+            new_meta.parent_version = Some(to_version(&existing));
             sign_metadata(&secret_key, &mut new_meta, Some(b"body")).unwrap();
 
             let port = start_test_server(temp_dir.to_path_buf());

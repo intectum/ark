@@ -7,7 +7,7 @@
 //! belong to rather than the entry, so they outlive a removal of the path and
 //! a path recreated after one carries on the same history.
 //!
-//! A delete is kept as a version too: the delete metadata, with no contents.
+//! A delete is stored as a version too: the delete metadata, with no contents.
 //! It marks where a history stops, and what a later write must be newer than.
 //!
 //! See `spec.md` §4.3.
@@ -43,29 +43,29 @@ pub fn to_version(metadata: &Metadata) -> String {
     format!("{}_{}", timestamp::format_fs_safe(metadata.author_date), hash)
 }
 
-/// Where the versions of `path` are kept.
+/// Where the versions of `path` are stored.
 pub fn version_dir_for(ctx: &Context, path: &str) -> io::Result<String> {
     Ok(join_path(VERSIONS_DIR, &to_path_segment(&to_account_path(ctx, path)?)))
 }
 
-/// Where the version of `path` that `id` names is kept.
+/// Where the version of `path` that `id` names is stored.
 pub fn version_path_for(ctx: &Context, path: &str, id: &str) -> io::Result<String> {
     Ok(join_path(&version_dir_for(ctx, path)?, id))
 }
 
 /// Write `contents` to the file `path` along with `metadata`, as a single
-/// visible change, keeping it as a version of `path` as it lands.
+/// visible change, storing it as a version of `path` as it lands.
 ///
 /// The version is the very entry `path` then names — no copy — and is there
 /// before `path` changes, so what `path` holds is always among its versions.
 /// A write that stopped part-way can leave a version `path` never held;
 /// writing the same metadata again leaves one version and finishes the job.
 ///
-/// Nothing is dropped again: a path keeps a version per write it has taken,
+/// Nothing is dropped again: a version is stored per write a path has taken,
 /// through removals of it too. Only [`remove_versions`] clears them.
 ///
 /// `metadata` must be the metadata signed for `contents`: a version is named by
-/// its metadata, so new contents under metadata already kept would take that
+/// its metadata, so new contents under metadata already stored would take that
 /// version's name and replace it.
 ///
 /// `path`'s parent must exist, as it must for [`std::fs::write`].
@@ -78,8 +78,8 @@ pub fn write_versioned_with_metadata(ctx: &Context, path: &str, contents: &[u8],
     link_atomic(ctx, &version_path, path)
 }
 
-/// Keep `contents` and `metadata` as a version of `path`, leaving `path`
-/// itself alone, and give back where the version is kept.
+/// Store `contents` and `metadata` as a version of `path`, leaving `path`
+/// itself alone, and give back where the version is stored.
 ///
 /// For a version made before `path` takes it — or that `path` never takes
 /// where it stands, as on a client, whose own copy is edited in place. Keeping
@@ -99,7 +99,7 @@ pub fn write_version(ctx: &Context, path: &str, contents: &[u8], metadata: &Meta
 }
 
 /// Copy the body of `from` to the file `to` along with `metadata`, as a
-/// single visible change, keeping it as a version of `to` as it lands.
+/// single visible change, storing it as a version of `to` as it lands.
 ///
 /// For a change that alters only the metadata, `from` and `to` are the same
 /// path. Otherwise as [`write_versioned_with_metadata`].
@@ -117,12 +117,12 @@ pub fn copy_versioned_with_metadata(ctx: &Context, from: &str, to: &str, metadat
     link_atomic(ctx, &version_path, to)
 }
 
-/// Keep `metadata` as a version of the directory `path`. Call this before
+/// Store `metadata` as a version of the directory `path`. Call this before
 /// `path` takes that metadata, so what `path` carries is always among its
 /// versions.
 ///
-/// As for [`write_versioned_with_metadata`], keeping the same metadata twice leaves one
-/// version, and versions are kept through removals of `path`.
+/// As for [`write_versioned_with_metadata`], storing the same metadata twice
+/// leaves one version, and versions stay stored through removals of `path`.
 pub fn create_dir_version(ctx: &Context, path: &str, metadata: &Metadata) -> io::Result<()> {
     if !is_versioned(ctx, path)? {
         return Ok(());
@@ -131,7 +131,7 @@ pub fn create_dir_version(ctx: &Context, path: &str, metadata: &Metadata) -> io:
     write_version(ctx, path, &[], metadata).map(|_| ())
 }
 
-/// Whether writes to `path` are kept as versions of it.
+/// Whether writes to `path` are stored as versions of it.
 ///
 /// They are everywhere but in the version store itself, and the request log,
 /// whose entries a server writes once and never replaces.
@@ -146,7 +146,7 @@ pub fn is_versioned(ctx: &Context, path: &str) -> io::Result<bool> {
 ///
 /// A path removed and written again keeps the versions it had before, so the
 /// versions may be of more than one entry — told apart by `entry_id`. A delete
-/// kept as a version is marked `deleted`.
+/// stored as a version is marked `deleted`.
 pub fn read_versions(ctx: &Context, path: &str) -> io::Result<Vec<VersionEntry>> {
     let version_dir = version_dir_for(ctx, path)?;
     if !exists(ctx, &version_dir) {
@@ -175,8 +175,32 @@ pub fn read_versions(ctx: &Context, path: &str) -> io::Result<Vec<VersionEntry>>
     Ok(entries)
 }
 
+/// The metadata of the version of `path` that `id` names, where `ctx`'s
+/// version store holds it.
+pub fn read_version_metadata_attributes(ctx: &Context, path: &str, id: &str) -> io::Result<Option<Metadata>> {
+    match read_metadata_attributes(ctx, &version_path_for(ctx, path, id)?) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// The ids of `metadata`'s version and of those it was made on, newest first,
+/// as far back as `ctx`'s version store holds them. The version named by the
+/// last one held is listed too, held or not.
+pub fn get_version_chain(ctx: &Context, path: &str, metadata: &Metadata) -> io::Result<Vec<String>> {
+    let mut chain = vec![to_version(metadata)];
+    let mut parent = metadata.parent_version.clone();
+    while let Some(id) = parent {
+        parent = read_version_metadata_attributes(ctx, path, &id)?.and_then(|metadata| metadata.parent_version);
+        chain.push(id);
+    }
+
+    Ok(chain)
+}
+
 /// Drop every version of `path` and of the paths beneath it, along with
-/// anything else kept beside them — including what `path` holds now and the
+/// anything else stored beside them — including what `path` holds now and the
 /// metadata a directory sets aside for a rewrite still under way, so call
 /// this only once `path` is gone.
 pub fn remove_versions(ctx: &Context, path: &str) -> io::Result<()> {
@@ -360,7 +384,7 @@ mod tests {
             }
 
             let versions = read_versions(&context, "/a.txt").unwrap();
-            assert_eq!(versions.len(), ids.len(), "a path keeps a version per write it has taken");
+            assert_eq!(versions.len(), ids.len(), "a version is stored per write a path has taken");
             assert_eq!(versions[0].id, *ids.last().unwrap(), "newest first");
             assert_eq!(versions.last().unwrap().id, ids[0], "oldest last, and still there");
         });
@@ -426,8 +450,8 @@ mod tests {
             write_versioned_with_metadata(&context, "/a.txt", b"cipher", &metadata).unwrap();
 
             let version_path = version_path_for(&context, "/a.txt", &to_version(&metadata)).unwrap();
-            let kept = read_metadata_attributes(&context, &version_path).unwrap();
-            assert_eq!(kept.members[0].key.as_ref().unwrap().value, metadata.members[0].key.as_ref().unwrap().value);
+            let stored = read_metadata_attributes(&context, &version_path).unwrap();
+            assert_eq!(stored.members[0].key.as_ref().unwrap().value, metadata.members[0].key.as_ref().unwrap().value);
         });
     }
 }

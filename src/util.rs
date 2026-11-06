@@ -7,8 +7,7 @@ use uuid::Uuid;
 
 use crate::crypto::sign_bytes;
 use crate::http::{read_request, read_response};
-use crate::metadata::{verify_metadata, verify_metadata_signature};
-use crate::types::{Context, Key, Metadata, RequestEntry};
+use crate::types::{Context, RequestEntry};
 
 pub fn is_loopback_host(host: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1")
@@ -93,96 +92,6 @@ pub fn sha256(data: &[u8]) -> Vec<u8> {
     let mut hash = Sha256::new();
     hash.update(data);
     hash.finalize().to_vec()
-}
-
-/// Validate a change received from another node, against the copy of the file
-/// it replaces.
-///
-/// Checks that the metadata is signed by the account that made the change and
-/// matches the body that arrived with it, and that `existing_metadata` — the
-/// copy being replaced, where there is one — is being continued rather than
-/// overwritten by an unrelated or older file.
-///
-/// Whether the change is a directory is taken from the metadata, which carries
-/// a `body_hash` only for a file. A change may not turn one into the other.
-///
-/// `body` is what arrived with the metadata. `None` on a directory, which has
-/// no body; `None` on a file means the change keeps the body the existing copy
-/// already has, so only the signature is checked and `existing_metadata` is
-/// required. Delete metadata has no body, whatever `body` holds: only its
-/// signature is checked.
-///
-/// `Err` carries the kind the rejection corresponds to, as
-/// [`crate::http::error_response_code`] maps it: `InvalidData` where the
-/// metadata does not verify or is malformed, `NotFound` where the copy it
-/// continues is missing, `AlreadyExists` where it loses to the copy already
-/// held.
-///
-/// Whether the author was allowed to change the members is not covered: that
-/// needs the authoritative member list, which only the account's own server
-/// holds.
-pub fn validate_update(
-    author_public_key: &Key,
-    metadata: &Metadata,
-    existing_metadata: Option<&Metadata>,
-    body: Option<&[u8]>,
-) -> io::Result<()> {
-    validate_version(author_public_key, metadata, existing_metadata, body)?;
-
-    if let Some(existing_metadata) = existing_metadata {
-        if existing_metadata.id != metadata.id {
-            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "id is wrong"));
-        }
-        if metadata.author_date < existing_metadata.author_date {
-            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "author_date is older than existing"));
-        }
-    }
-
-    Ok(())
-}
-
-/// As [`validate_update`], for a past version of the path `existing_metadata`
-/// describes rather than a change to it: everything is checked except that it
-/// is no older, since a version is older by definition, and that it has the
-/// same `id`, since a path removed and written again keeps the versions of the
-/// file it held before.
-///
-/// It must still be a file where `existing_metadata` is one, and a directory
-/// where it is one.
-pub fn validate_version(
-    author_public_key: &Key,
-    metadata: &Metadata,
-    existing_metadata: Option<&Metadata>,
-    body: Option<&[u8]>,
-) -> io::Result<()> {
-    let is_dir = metadata.body_hash.is_none();
-
-    if metadata.deleted {
-        verify_metadata_signature(author_public_key, metadata)?;
-    } else if body.is_none() && !is_dir {
-        let existing_metadata = match existing_metadata {
-            Some(m) => m,
-            None => return Err(io::Error::new(io::ErrorKind::NotFound, "metadata-only update requires existing file")),
-        };
-
-        let new_hash = metadata.body_hash.as_ref().map(|h| &h.value);
-        let old_hash = existing_metadata.body_hash.as_ref().map(|h| &h.value);
-        if new_hash != old_hash {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "metadata-only update must not change body_hash"));
-        }
-
-        verify_metadata_signature(author_public_key, metadata)?;
-    } else {
-        verify_metadata(author_public_key, metadata, body)?;
-    }
-
-    if let Some(existing_metadata) = existing_metadata {
-        if existing_metadata.body_hash.is_none() != is_dir {
-            return Err(io::Error::new(io::ErrorKind::AlreadyExists, if is_dir { "existing is a file" } else { "existing is a dir" }));
-        }
-    }
-
-    Ok(())
 }
 
 /// The UUID `value` spells.

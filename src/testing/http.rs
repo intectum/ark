@@ -5,16 +5,18 @@ use std::path::{Path, PathBuf};
 use std::str::from_utf8;
 use std::time::Duration;
 
+use crate::context::{create_server_context, create_target_context};
 use crate::crypto::{DEFAULT_SIGNING_ALGORITHM, sign_bytes};
 use crate::http::read_response;
-use crate::metadata::{sign_metadata, write_metadata_attributes, write_metadata_headers};
+use crate::metadata::{create_metadata, sign_metadata, write_metadata_attributes, write_metadata_headers};
 pub use crate::server::start_test_server;
 use crate::storage::write_atomic_with_metadata;
 use crate::testing::fs::{account_context, create_plain_test_metadata};
 use crate::timestamp;
-use crate::types::{Identity, Key, Member, Metadata};
+use crate::types::{Identity, Key, Member, Metadata, Permission};
 use crate::util::{encode_base64url, request_to_bytes};
 pub use crate::util::format_authorization_header;
+use crate::versions::{create_dir_version, write_versioned_with_metadata};
 
 pub fn test_host(port: u16) -> String {
     format!("127.0.0.1:{}", port)
@@ -237,7 +239,7 @@ pub fn seed_shared_file(
     sign_metadata(owner_secret_key, &mut metadata, Some(body)).unwrap();
 
     let (context, account_path) = account_context(&file);
-    write_atomic_with_metadata(&context, &account_path, body, &metadata, None).unwrap();
+    write_versioned_with_metadata(&context, &account_path, body, &metadata).unwrap();
 
     file
 }
@@ -253,6 +255,7 @@ pub fn seed_shared_dir(
     fs::create_dir_all(&dir).unwrap();
     let mut metadata = create_plain_test_metadata(owner, owner_secret_key, b"");
     metadata.encryption_algorithm = None;
+    metadata.body_hash = None;
     metadata.members[0].key = None;
     for member in extra_members {
         metadata.members.push(member);
@@ -260,6 +263,7 @@ pub fn seed_shared_dir(
     sign_metadata(owner_secret_key, &mut metadata, None).unwrap();
 
     let (context, account_path) = account_context(&dir);
+    create_dir_version(&context, &account_path, &metadata).unwrap();
     write_metadata_attributes(&context, &account_path, &metadata, None).unwrap();
 
     dir
@@ -295,4 +299,29 @@ pub fn signed_put_metadata_with_headers(
     let mut all: Vec<(&str, &str)> = headers.iter().map(|(key, value)| (key.as_str(), value.as_str())).collect();
     all.extend_from_slice(extra);
     signed_request_with_headers(port, signer, signer_key, "PUT", path, body, &all).0
+}
+
+/// Write `body` and `metadata` into the server's copy of `account_name`'s
+/// `path`, and log it as an accepted PUT, as a server that skips its checks
+/// would. The server must have started and the account must keep a log.
+pub fn plant_logged_put(temp_dir: &Path, account_name: &str, path: &str, body: &[u8], metadata: &Metadata) {
+    let server_ctx = create_server_context(temp_dir, "").unwrap();
+    let account_ctx = create_target_context(temp_dir, account_name).unwrap();
+    write_versioned_with_metadata(&account_ctx, path, body, metadata).unwrap();
+
+    let mut entry: Vec<u8> = Vec::new();
+    write!(entry, "PUT /ark/{}{} HTTP/1.1\r\n", account_name, path).unwrap();
+    for (name, value) in write_metadata_headers(metadata) {
+        write!(entry, "{}: {}\r\n", name, value).unwrap();
+    }
+    entry.extend_from_slice(b"\r\nHTTP/1.1 204 No Content\r\n\r\n");
+
+    let mut entry_metadata = create_metadata(&server_ctx.identity.address, None);
+    entry_metadata.members = vec![
+        Member { address: account_ctx.identity.address.clone(), permission: Permission::Owner, key: None },
+        Member { address: server_ctx.identity.address.clone(), permission: Permission::Writer, key: None },
+    ];
+    sign_metadata(server_ctx.identity_key.as_ref().unwrap(), &mut entry_metadata, Some(&entry)).unwrap();
+    let entry_path = format!("/.ark/requests/PUT_204_{}_000.http", timestamp::format_fs_safe(timestamp::now()));
+    write_atomic_with_metadata(&account_ctx, &entry_path, &entry, &entry_metadata, None).unwrap();
 }

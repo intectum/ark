@@ -19,7 +19,7 @@ use std::str::from_utf8;
 use std::sync::Arc;
 use std::thread;
 
-use self::auth::{authenticate, authorize, inherited_members};
+use self::auth::{authenticate, authorize};
 use self::delete::{serve_delete, serve_delete_versions};
 use self::get::serve_get;
 use self::log::{LoggingStream, try_log_request};
@@ -31,10 +31,10 @@ use self::versions::serve_version_list;
 use crate::context::{create_server_context, create_target_context};
 use crate::http::{read_request, write_text};
 use crate::identity::resolve_identity;
-use crate::metadata::{read_metadata_attributes, read_metadata_headers};
+use crate::metadata::{read_inherited_metadata_attributes, read_metadata_attributes, read_metadata_headers};
 use crate::paths::parse_request_target;
 use crate::storage::{exists, is_file, is_symlink};
-use crate::versions::version_path_for;
+use crate::versions::{read_versions, version_path_for};
 use crate::types::{Context, Permission, RelayMode};
 
 pub const MAX_CLOCK_SKEW_MS: u64 = 300_000;
@@ -143,7 +143,7 @@ fn handle_parsed_inner(
     let server_root = server_ctx.root.parent().unwrap().parent().unwrap();
     let name = segments[1];
 
-    let target_path = match url.path().strip_prefix(&format!("/ark/{}", name)) {
+    let url_path = match url.path().strip_prefix(&format!("/ark/{}", name)) {
         Some("") => "/".to_string(),
         Some(rest) => rest.to_string(),
         None => return write_text(stream, 403, b"forbidden"),
@@ -152,12 +152,12 @@ fn handle_parsed_inner(
     let account_root = server_root.join("ark").join(name);
     let target_identity_path = account_root.join(".ark").join("identity.json");
 
-    if method == "PUT" && target_path == "/.ark/identity.json" && !target_identity_path.exists() {
+    if method == "PUT" && url_path == "/.ark/identity.json" && !target_identity_path.exists() {
         let metadata = match read_metadata_headers(headers) {
             Ok(m) => m,
             Err(e) => return write_text(stream, 400, e.to_string().as_bytes()),
         };
-        return serve_put_init(&account_root, &target_path, stream, body, &metadata);
+        return serve_put_init(&account_root, &url_path, stream, body, &metadata);
     }
 
     let target_ctx = match create_target_context(server_root, name) {
@@ -167,18 +167,18 @@ fn handle_parsed_inner(
         Err(e) => return Err(e),
     };
 
-    let mut prefix: Option<String> = None;
-    let mut list_versions = false;
-    let mut version: Option<String> = None;
-    let mut relay_mode: Option<RelayMode> = None;
     let mut metadata_only = false;
+    let mut prefix: Option<String> = None;
+    let mut relay_mode: Option<RelayMode> = None;
+    let mut version: Option<String> = None;
+    let mut versions = false;
     for (key, value) in url.query_pairs() {
         match key.as_ref() {
-            "prefix" => prefix = Some(value.into_owned()),
-            "versions" => list_versions = true,
-            "version" => version = Some(value.into_owned()),
-            "relay" => relay_mode = RelayMode::parse(value.as_ref()),
             "metadata" => metadata_only = true,
+            "prefix" => prefix = Some(value.into_owned()),
+            "relay" => relay_mode = RelayMode::parse(value.as_ref()),
+            "version" => version = Some(value.into_owned()),
+            "versions" => versions = true,
             _ => {}
         }
     }
@@ -196,7 +196,7 @@ fn handle_parsed_inner(
                 return write_text(stream, 400, b"bad version id");
             }
 
-            let version_path = match version_path_for(&target_ctx, &target_path, id) {
+            let version_path = match version_path_for(&target_ctx, &url_path, id) {
                 Ok(path) => path,
                 Err(e) => return write_text(stream, 400, e.to_string().as_bytes()),
             };
@@ -207,7 +207,7 @@ fn handle_parsed_inner(
 
             version_path
         }
-        None => target_path,
+        None => url_path.clone(),
     };
 
     if is_symlink(&target_ctx, &target_path) {
@@ -227,12 +227,29 @@ fn handle_parsed_inner(
         return write_text(stream, 500, b"file missing metadata");
     }
 
+    let reads_versions = versions && (method == "GET" || method == "HEAD");
+    let reads_history = reads_versions || (version.is_some() && method == "HEAD");
+
+    let members_path = if reads_history { &url_path } else { &target_path };
+    let members_metadata = if reads_history {
+        let newest_metadata = read_versions(&target_ctx, members_path).and_then(|versions| match versions.first() {
+            Some(newest) => read_metadata_attributes(&target_ctx, &version_path_for(&target_ctx, members_path, &newest.id)?).map(Some),
+            None => Ok(None),
+        });
+        match newest_metadata {
+            Ok(metadata) => metadata,
+            Err(error) => return write_text(stream, 500, error.to_string().as_bytes()),
+        }
+    } else {
+        existing_metadata.clone()
+    };
+
     // A path with no metadata of its own — a new file, or a directory created
     // as a side effect of a nested put — inherits from above.
-    let effective_members = match existing_metadata.as_ref() {
-        Some(metadata) => Some(metadata.members.clone()),
-        None => match inherited_members(&target_ctx, &target_path) {
-            Ok(members) => members,
+    let effective_members = match members_metadata {
+        Some(metadata) => Some(metadata.members),
+        None => match read_inherited_metadata_attributes(&target_ctx, members_path) {
+            Ok(metadata) => metadata.map(|metadata| metadata.members),
             Err(error) => return write_text(stream, 500, error.to_string().as_bytes()),
         },
     };
@@ -240,8 +257,6 @@ fn handle_parsed_inner(
     let public_member = effective_members
         .as_deref()
         .and_then(|members| members.iter().find(|member| member.address == "*"));
-
-    let reads_versions = list_versions && (method == "GET" || method == "HEAD");
 
     if public_member.is_some() && (method == "GET" || method == "HEAD") && !reads_versions {
         return serve_get(&target_ctx, &target_path, stream, method == "GET", prefix.as_deref());
@@ -252,13 +267,11 @@ fn handle_parsed_inner(
         Err(e) => return write_text(stream, 401, e.to_string().as_bytes())
     };
 
-    // Each version answers to the members its own metadata lists, so the listing is
-    // gated entry by entry rather than by the path's.
     if reads_versions {
-        return serve_version_list(server_ctx, &target_ctx, &target_path, stream, method == "GET", &requestor_identity);
+        return serve_version_list(server_ctx, &target_ctx, &target_path, stream, method == "GET", &requestor_identity, effective_members.as_deref());
     }
 
-    let metadata = if method == "PUT" || (method == "DELETE" && !list_versions) {
+    let metadata = if method == "PUT" || (method == "DELETE" && !versions) {
         match read_metadata_headers(headers) {
             Ok(m) => Some(m),
             Err(e) => return write_text(stream, 400, e.to_string().as_bytes()),
@@ -298,11 +311,10 @@ fn handle_parsed_inner(
         },
         "PUT" => {
             let metadata = metadata.as_ref().expect("metadata presence checked above");
-            let author = author_identity.as_ref().expect("author presence checked above");
 
-            serve_put(&target_ctx, &target_path, stream, body, metadata, author, existing_metadata.as_ref(), permission, metadata_only)?
+            serve_put(server_ctx, &target_ctx, &target_path, stream, body, metadata, metadata_only)?
         }
-        "DELETE" if list_versions => {
+        "DELETE" if versions => {
             if requestor_identity.address != target_ctx.identity.address {
                 return write_text(stream, 403, b"only the account can delete versions");
             }
@@ -370,8 +382,8 @@ mod tests {
             sign_metadata(&owner_key, &mut private, None).unwrap();
             write_metadata_attributes(&context, "/private", &private, None).unwrap();
 
-            // Leave it carrying part of its metadata and nothing set aside to put back,
-            // as a write interrupted before this change would have.
+            // Leave it carrying part of its metadata and nothing set aside to
+            // put back, as a write interrupted before this change would have.
             remove_metadata_attributes(&context, "/private").unwrap();
             write_attribute(&context, "/private", "user.ark.member_0_address", owner_identity.address.as_bytes()).unwrap();
 

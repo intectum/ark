@@ -188,7 +188,8 @@ pub fn write_identity_key(ctx: &Context, path: &str, key: &[u8]) -> io::Result<(
 }
 
 /// As [`write_identity_key`], along with `metadata`, as
-/// [`write_private_atomic_with_metadata`] does — so the key never lands without it.
+/// [`write_private_atomic_with_metadata`] does — so the key never lands
+/// without it.
 pub fn write_identity_key_with_metadata(ctx: &Context, path: &str, key: &[u8], metadata: &Metadata) -> io::Result<()> {
     write_private_atomic_with_metadata(ctx, path, encode_base64url(key).as_bytes(), metadata, None)
 }
@@ -476,7 +477,7 @@ mod tests {
             fs::create_dir_all(&cache_dir).unwrap();
             fs::write(cache_dir.join("bob@example.com.json"), b"not json").unwrap();
 
-            let err = resolve_identity(&ctx, "bob@example.com").err().expect("expected error");
+            let err = resolve_identity(&ctx, "bob@example.com").unwrap_err();
             assert!(err.to_string().contains("identity.json parse"), "msg was {}", err);
         });
     }

@@ -220,6 +220,9 @@ pub struct Proposal {
 pub trait ReadWrite: Read + Write {}
 impl<T: Read + Write> ReadWrite for T {}
 
+/// HTTP headers as name/value pairs, in the order they were sent.
+pub type Headers = Vec<(String, String)>;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RelayMode {
     Full,
@@ -264,6 +267,7 @@ pub struct StreamEvent {
     pub event: String,
     pub data: String,
 }
+
 
 /// One entry of a path's version history. See `spec.md` §4.3.
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -138,6 +138,7 @@ mod tests {
     use crate::testing::http::{seed_shared_dir, signed_delete_metadata, signed_put_metadata_with_headers};
     use crate::testing::http::start_test_server;
     use crate::types::{Member, Permission};
+    use crate::versions::to_version;
 
     #[test]
     fn same_host_relay_of_a_metadata_only_put_is_authorized() {
@@ -167,6 +168,7 @@ mod tests {
             // The relayed target carries `?metadata`, which must not end up in
             // the signed bytes — verification recomputes them from the path.
             let mut updated = metadata.clone();
+            updated.parent_version = Some(to_version(&metadata));
             updated.author_date = metadata.author_date + time::Duration::seconds(1);
             sign_metadata(&alice_key, &mut updated, Some(b"body")).unwrap();
 
