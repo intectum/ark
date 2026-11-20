@@ -234,7 +234,7 @@ mod tests {
             fs::remove_file(temp_dir.join("notes.txt")).unwrap();
             remove_dir_all(&ctx, &version_dir_for(&ctx, "notes.txt").unwrap()).unwrap();
 
-            get(&ctx, "notes.txt", false).unwrap();
+            get(&ctx, "notes.txt", false, false).unwrap();
 
             let stored = read_versions(&ctx, "notes.txt").unwrap();
             assert_eq!(stored.len(), 3);
@@ -257,7 +257,7 @@ mod tests {
 
             fs::remove_file(temp_dir.join("notes.txt")).unwrap();
             remove_dir_all(&ctx, &version_dir_for(&ctx, "notes.txt").unwrap()).unwrap();
-            get(&ctx, "notes.txt", false).unwrap();
+            get(&ctx, "notes.txt", false, false).unwrap();
 
             let id = list_versions(&ctx, "notes.txt").unwrap()[1].id.clone();
             assert_eq!(get_version(&ctx, "notes.txt", &id, false, None).unwrap().0, b"one");

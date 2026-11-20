@@ -127,10 +127,18 @@ enum Cmd {
         path: String,
     },
     /// Download a file into the account tree.
+    ///
+    /// Where the local copy changed since it was last synced, writes the
+    /// remote copy to a `<name>.remote-<iso>` sidecar and leaves the local copy
+    /// untouched until resolved.
     Get {
         /// Decrypt the body using its metadata key.
         #[arg(short, long)]
         decrypt: bool,
+        /// Overwrite the local copy even where it changed since it was last
+        /// synced, dropping any conflict sidecars beside it.
+        #[arg(short, long)]
+        force: bool,
         /// Download the version ID instead, to a sibling named
         /// <name>.version-<ID>. Leaves the file at PATH alone.
         #[arg(long, value_name = "ID")]
@@ -261,8 +269,8 @@ enum Cmd {
         /// Version to restore, as `ark versions` lists it.
         id: String,
     },
-    /// Publish the local copy as the resolution of a conflict `ark sync`
-    /// reported, and remove its conflict and base sidecars.
+    /// Publish the local copy as the resolution of a conflict `ark sync` or
+    /// `ark get` reported, and remove its conflict and base sidecars.
     ///
     /// Merge into the local copy first. It is put as a change to what the
     /// server holds now, so the history records the merge.
@@ -298,9 +306,9 @@ fn main() {
         Cmd::Init { address, password, local_only } => current_dir().and_then(|c| init(&c, &address, password.as_deref(), local_only)),
         Cmd::Head { path } => create_client_context().and_then(|c| head_cli(&c, &path)),
         Cmd::Delete { path } => create_client_context().and_then(|c| delete(&c, &path)),
-        Cmd::Get { decrypt, version, path } => create_client_context().and_then(|c| match version {
+        Cmd::Get { decrypt, force, version, path } => create_client_context().and_then(|c| match version {
             Some(id) => get_version_cli(&c, &path, &id, decrypt),
-            None => get(&c, &path, decrypt),
+            None => get_cli(&c, &path, decrypt, force),
         }),
         Cmd::Cat { version, path } => create_client_context().and_then(|c| cat_cli(&c, &path, version.as_deref())),
         Cmd::List { prefix, path } => create_client_context().and_then(|c| list_cli(&c, &path, prefix.as_deref())),
@@ -340,6 +348,14 @@ fn main() {
 fn cat_cli(ctx: &Context, path: &str, version: Option<&str>) -> io::Result<()> {
     let mut stdout = io::stdout().lock();
     get_stream(ctx, path, &mut stdout, true, version)?;
+
+    Ok(())
+}
+
+fn get_cli(ctx: &Context, path: &str, decrypt: bool, force: bool) -> io::Result<()> {
+    if get(ctx, path, decrypt, force)? {
+        eprintln!("file modified {} (conflict)", path.trim_start_matches('/'));
+    }
 
     Ok(())
 }

@@ -404,7 +404,7 @@ mod tests {
             // Bob wrote it, but the account's grant vouches for it on a device
             // holding nothing of it yet.
             fs::remove_dir_all(temp_dir.join("alice_client/.ark/versions")).unwrap();
-            get(&alice_ctx, "/apps/notes/foo.md", false).unwrap();
+            get(&alice_ctx, "/apps/notes/foo.md", false, false).unwrap();
             assert_eq!(fs::read(temp_dir.join("alice_client/apps/notes/foo.md")).unwrap(), b"hello alice");
         });
     }
@@ -438,7 +438,7 @@ mod tests {
 
             // A device holding nothing of it yet.
             fs::remove_dir_all(temp_dir.join("alice_client/.ark/versions")).unwrap();
-            let err = get(&alice_ctx, "/apps/notes/foo.md", false).unwrap_err();
+            let err = get(&alice_ctx, "/apps/notes/foo.md", false, false).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{}", err);
         });
     }

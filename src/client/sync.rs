@@ -3,13 +3,13 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::thread;
 
-use super::{get_stream, get_version, has_conflict, list, put_content, watch_local, watch_remote, write_conflict, write_delete_conflict};
+use super::{get_stream, get_version, has_conflict, is_modified, list, put_content, watch_local, watch_remote, write_conflict, write_delete_conflict};
 
 use crate::crypto::DEFAULT_HASH_ALGORITHM;
 use crate::identity::parse_address;
 use crate::metadata::{has_metadata_attributes, has_metadata_headers, read_local_metadata_attributes, read_metadata_attributes, read_metadata_headers, write_metadata_attributes_atomic};
 use crate::paths::{is_protocol_path, join_path, parent_path, to_account_path, to_fs_path, to_path_segment, to_url};
-use crate::storage::{create_dir_all, exists, is_dir, is_file, is_symlink, read, read_dir, read_to_string, remove_dir, remove_file, write_atomic_with_metadata, write_atomic_without_metadata};
+use crate::storage::{create_dir_all, exists, is_dir, is_file, is_symlink, read_dir, read_to_string, remove_dir, remove_file, write_atomic_with_metadata, write_atomic_without_metadata};
 use crate::types::{Context, DirEntryKind, EntryAction, EntryEvent, Hash, LocalMetadata, Metadata};
 use crate::util::{parse_request_entry, sha256};
 use crate::validate::{validate_entry, validate_made_on_copy};
@@ -115,7 +115,7 @@ where
         let entry_path = join_path(path, &event.path.to_string_lossy());
         if !is_file(ctx, &entry_path) { return false; }
 
-        match check_entry(ctx, &entry_path) {
+        match is_modified(ctx,&entry_path) {
             Ok(Some(true)) if !has_conflict(ctx, &entry_path).unwrap_or(false) => match put_content(ctx, &entry_path) {
                 Ok(()) => return emit(ctx, &entry_path, EntryAction::Modified, false, on_event),
                 Err(e) => { on_error(io::Error::other(format!("push failed for {}: {}", entry_path, e))); }
@@ -249,7 +249,7 @@ where
         }
         if !is_file(ctx, &entry) { continue; }
 
-        match check_entry(ctx, &entry) {
+        match is_modified(ctx,&entry) {
             Ok(Some(true)) => {}
             Ok(_) => continue,
             Err(e) => {
@@ -270,20 +270,6 @@ where
     }
 
     Ok(false)
-}
-
-// Whether the body changed since it was last synced; `None` where untracked.
-fn check_entry(ctx: &Context, path: &str) -> io::Result<Option<bool>> {
-    let local_metadata = read_local_metadata_attributes(ctx, path)?;
-
-    if is_dir(ctx, path) {
-        return Ok(local_metadata.sync_author_date.map(|_| false));
-    }
-
-    match &local_metadata.sync_body_hash {
-        Some(h) => Ok(Some(h.value != sha256(&read(ctx, path)?))),
-        None => Ok(None),
-    }
 }
 
 fn apply_remote_put<F>(
@@ -317,12 +303,15 @@ where
 
     let body_changed = !is_dir && local_body_hash.as_ref() != metadata.body_hash.as_ref().map(|h| &h.value);
 
-    if body_changed && local_exists && check_entry(ctx, path)? == Some(true) {
-        match write_conflict(ctx, path, decrypt) {
-            Ok(()) => {}
+    if body_changed && local_exists && is_modified(ctx,path)? == Some(true) {
+        let mut remote_body = Vec::new();
+        let remote_metadata = match get_stream(ctx, path, &mut remote_body, decrypt, None) {
+            Ok((remote_metadata, _)) => remote_metadata,
+            // Deleted on the server since.
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(e) => return Err(e),
-        }
+        };
+        write_conflict(ctx, path, &remote_body, &remote_metadata, decrypt)?;
         return Ok(emit(ctx, path, EntryAction::Modified, true, on_event));
     }
 
@@ -400,7 +389,7 @@ where
         }
     }
 
-    match check_entry(ctx, path)? {
+    match is_modified(ctx,path)? {
         Some(false) => {}
         Some(true) => {
             write_delete_conflict(ctx, path, delete_metadata)?;
@@ -663,7 +652,7 @@ mod tests {
             write_plain_test_file(&server_path, &ctx.identity, ctx.identity_key.as_ref().unwrap(), b"remote body");
             let before = fs::read(&server_path).unwrap();
 
-            get(&ctx, "pulled.txt", false).unwrap();
+            get(&ctx, "pulled.txt", false, false).unwrap();
 
             sync(&ctx, ".", false, false, |_| false, |_| false).unwrap();
 
@@ -748,7 +737,7 @@ mod tests {
             write_encrypted_test_file(&server_path, &ctx.identity, ctx.identity_key.as_ref().unwrap(), b"plaintext");
 
             let local = temp_dir.join("secret");
-            get(&ctx, "secret", false).unwrap();
+            get(&ctx, "secret", false, false).unwrap();
             assert_eq!(xattr::get(&local, "user.ark_local.encrypted").unwrap().as_deref(), Some(b"true".as_slice()));
             assert!(read_local_metadata_attributes(&ctx, "secret").unwrap().sync_body_hash.is_none(), "encrypted-at-rest file should not carry sync_body_hash");
 
@@ -988,7 +977,7 @@ mod tests {
 
             set_current_dir(&bob_dir).unwrap();
             let target = format!("alice@127.0.0.1:{}/shared/foo.txt", port);
-            get(&bob_ctx, &target, false).unwrap();
+            get(&bob_ctx, &target, false, false).unwrap();
             delete(&bob_ctx, &target).unwrap();
 
             set_current_dir(&alice_dir).unwrap();
@@ -1014,7 +1003,7 @@ mod tests {
 
             set_current_dir(&bob_dir).unwrap();
             let target = format!("alice@127.0.0.1:{}/shared/foo.txt", port);
-            get(&bob_ctx, &target, false).unwrap();
+            get(&bob_ctx, &target, false, false).unwrap();
             delete(&bob_ctx, &target).unwrap();
 
             set_current_dir(&alice_dir).unwrap();
@@ -1057,7 +1046,7 @@ mod tests {
 
             set_current_dir(&bob_dir).unwrap();
             let target = format!("alice@127.0.0.1:{}/shared/foo.txt", port);
-            get(&bob_ctx, &target, false).unwrap();
+            get(&bob_ctx, &target, false, false).unwrap();
             delete(&bob_ctx, &target).unwrap();
             write_local(&bob_dir, "shared/foo.txt", b"bob-v2");
             put(&bob_ctx, &target, &Permissions::default(), Some("none"), false).unwrap();
@@ -1104,7 +1093,7 @@ mod tests {
 
             set_current_dir(&bob_dir).unwrap();
             let target = format!("alice@127.0.0.1:{}/shared/sub", port);
-            get(&bob_ctx, &target, false).unwrap();
+            get(&bob_ctx, &target, false, false).unwrap();
             delete(&bob_ctx, &target).unwrap();
 
             set_current_dir(&alice_dir).unwrap();
@@ -1137,7 +1126,7 @@ mod tests {
 
             set_current_dir(&bob_dir).unwrap();
             let target = format!("alice@127.0.0.1:{}/shared", port);
-            get(&bob_ctx, &target, false).unwrap();
+            get(&bob_ctx, &target, false, false).unwrap();
             delete(&bob_ctx, &target).unwrap();
 
             set_current_dir(&alice_dir).unwrap();
@@ -1165,7 +1154,7 @@ mod tests {
 
             set_current_dir(&bob_dir).unwrap();
             let target = format!("alice@127.0.0.1:{}/shared", port);
-            get(&bob_ctx, &target, false).unwrap();
+            get(&bob_ctx, &target, false, false).unwrap();
             delete(&bob_ctx, &target).unwrap();
 
             set_current_dir(&alice_dir).unwrap();
@@ -1195,7 +1184,7 @@ mod tests {
 
             set_current_dir(&bob_dir).unwrap();
             let target = format!("alice@127.0.0.1:{}/shared/sub", port);
-            get(&bob_ctx, &target, false).unwrap();
+            get(&bob_ctx, &target, false, false).unwrap();
             delete(&bob_ctx, &target).unwrap();
             fs::create_dir_all(bob_dir.join("shared/sub")).unwrap();
             put(&bob_ctx, &target, &Permissions::default(), None, false).unwrap();
@@ -1236,13 +1225,13 @@ mod tests {
             // only checks out against the version that added her.
             set_current_dir(&bob_dir).unwrap();
             let target = format!("alice@127.0.0.1:{}/shared/foo.txt", port);
-            get(&bob_ctx, &target, false).unwrap();
+            get(&bob_ctx, &target, false, false).unwrap();
             put_permissions(&bob_ctx, &target, &writer(carol_ctx.identity.address.clone())).unwrap();
 
             // Carol checks Bob's change back through a version she was no
             // member of: its metadata is hers to read, its body is not.
             set_current_dir(&carol_dir).unwrap();
-            get(&carol_ctx, &target, false).unwrap();
+            get(&carol_ctx, &target, false, false).unwrap();
             let before_carol = read_metadata_attributes(&carol_ctx, "/shared/foo.txt").unwrap().parent_version.unwrap();
             let mut body = Vec::new();
             let result = get_stream(&carol_ctx, &target, &mut body, false, Some(&before_carol));
@@ -1278,7 +1267,7 @@ mod tests {
 
             set_current_dir(&bob_dir).unwrap();
             let target = format!("alice@127.0.0.1:{}/shared/foo.txt", port);
-            get(&bob_ctx, &target, false).unwrap();
+            get(&bob_ctx, &target, false, false).unwrap();
             fs::write(bob_dir.join("shared/foo.txt"), b"bob").unwrap();
             put(&bob_ctx, &target, &Permissions::default(), Some("none"), false).unwrap();
             write_local(&bob_dir, "shared/new.txt", b"new");
@@ -1327,12 +1316,12 @@ mod tests {
             // copy Alice holds predates both.
             set_current_dir(&bob_dir).unwrap();
             let target = format!("alice@127.0.0.1:{}/shared/foo.txt", port);
-            get(&bob_ctx, &target, false).unwrap();
+            get(&bob_ctx, &target, false, false).unwrap();
             fs::write(bob_dir.join("shared/foo.txt"), b"bob").unwrap();
             put(&bob_ctx, &target, &writer(carol_ctx.identity.address.clone()), Some("none"), false).unwrap();
 
             set_current_dir(&carol_dir).unwrap();
-            get(&carol_ctx, &target, false).unwrap();
+            get(&carol_ctx, &target, false, false).unwrap();
             fs::write(carol_dir.join("shared/foo.txt"), b"carol").unwrap();
             put(&carol_ctx, &target, &Permissions::default(), Some("none"), false).unwrap();
 
@@ -1436,7 +1425,7 @@ mod tests {
             delete(&bob_ctx, &gone).unwrap();
 
             let kept = format!("alice@127.0.0.1:{}/shared/kept.txt", port);
-            get(&bob_ctx, &kept, false).unwrap();
+            get(&bob_ctx, &kept, false, false).unwrap();
             delete(&bob_ctx, &kept).unwrap();
             write_local(&bob_dir, "shared/kept.txt", b"v2");
             put(&bob_ctx, &kept, &Permissions::default(), Some("none"), false).unwrap();
@@ -1495,7 +1484,7 @@ mod tests {
             set_current_dir(&bob_dir).unwrap();
             let bob_local = bob_dir.join("shared/foo.txt");
             let target = format!("alice@127.0.0.1:{}/shared/foo.txt", port);
-            get(&bob_ctx, &target, false).unwrap();
+            get(&bob_ctx, &target, false, false).unwrap();
             fs::write(&bob_local, b"bob-v2").unwrap();
             put(&bob_ctx, &target, &Permissions::default(), Some("none"), false).unwrap();
 
@@ -1541,7 +1530,7 @@ mod tests {
 
             set_current_dir(&bob_dir).unwrap();
             let target = format!("alice@127.0.0.1:{}/shared/foo.txt", port);
-            get(&bob_ctx, &target, false).unwrap();
+            get(&bob_ctx, &target, false, false).unwrap();
             fs::write(bob_dir.join("shared/foo.txt"), b"bob").unwrap();
             put(&bob_ctx, &target, &Permissions::default(), Some("none"), false).unwrap();
             let bob_id = to_version(&read_metadata_attributes(&bob_ctx, "/shared/foo.txt").unwrap());
@@ -1653,7 +1642,7 @@ mod tests {
             set_current_dir(&bob_dir).unwrap();
             let bob_local = bob_dir.join("shared/foo.txt");
             let target = format!("alice@127.0.0.1:{}/shared/foo.txt", port);
-            get(&bob_ctx, &target, false).unwrap();
+            get(&bob_ctx, &target, false, false).unwrap();
             fs::write(&bob_local, b"bob-v3").unwrap();
             put(&bob_ctx, &target, &Permissions::default(), Some("none"), false).unwrap();
 

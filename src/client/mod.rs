@@ -14,6 +14,7 @@ mod sync;
 mod versions;
 mod watch;
 
+use conflict::{is_modified, remove_sidecars};
 pub use conflict::{has_conflict, resolve_conflict, write_conflict, write_delete_conflict};
 pub use decrypt::{decrypt, decrypt_stream};
 pub use delete::delete;

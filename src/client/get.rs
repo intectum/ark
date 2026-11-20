@@ -1,13 +1,13 @@
 use std::io;
 use std::io::Write;
 
-use super::{decrypt_stream, request};
+use super::{decrypt_stream, is_modified, remove_sidecars, request, write_conflict};
 
 use crate::crypto::DEFAULT_HASH_ALGORITHM;
 use crate::http::check_response_code;
-use crate::metadata::{has_metadata_headers, read_metadata_headers, write_metadata_attributes_atomic};
+use crate::metadata::{has_metadata_headers, read_local_metadata_attributes, read_metadata_attributes, read_metadata_headers, write_metadata_attributes_atomic};
 use crate::paths::{parent_path, to_url};
-use crate::storage::{create_dir_all, write_atomic_with_metadata};
+use crate::storage::{create_dir_all, exists, write_atomic_with_metadata};
 use crate::types::{Context, Hash, LocalMetadata, Metadata};
 use crate::util::sha256;
 use crate::validate::validate_entry;
@@ -19,8 +19,11 @@ use crate::versions::{is_versioned, write_version};
 /// (`<name>@<host>/...`). The local file is written to the account root at
 /// the path portion; for address form the address selects the download source
 /// while the local file is still written under the account root.
-pub fn get_content(ctx: &Context, path: &str) -> io::Result<()> {
-    get(ctx, path, true)
+///
+/// Where the local file changed since it was last synced, records a conflict
+/// rather than overwriting it, as [`get`] does. Returns whether it did.
+pub fn get_content(ctx: &Context, path: &str) -> io::Result<bool> {
+    get(ctx, path, true, false)
 }
 
 /// Download a file body (and metadata) at `path`, with decryption control.
@@ -29,6 +32,14 @@ pub fn get_content(ctx: &Context, path: &str) -> io::Result<()> {
 /// (`<name>@<host>/...`). The body is written to the account's own copy of
 /// `path`; for address form the address selects the download source while the
 /// local file is still written under the account root.
+///
+/// Where the account's own copy of a file changed since it was last synced,
+/// the copy is kept: a conflict is recorded with [`write_conflict`] where the
+/// server's body differs from the one the copy was synced from, and the
+/// metadata alone is taken where it does not. Returns whether a conflict was
+/// recorded. With `force`, the server's copy is written over the account's
+/// own regardless. Writing the server's copy drops the sidecars of any
+/// conflict recorded on `path`.
 ///
 /// Verifies the metadata against the author's identity, and against the
 /// account's own copy where it has one — the download must continue that copy
@@ -42,22 +53,38 @@ pub fn get_content(ctx: &Context, path: &str) -> io::Result<()> {
 ///
 /// Stores signed metadata as `user.ark.*` xattrs plus local metadata as
 /// `user.ark_local.*` xattrs on the written file.
-pub fn get(ctx: &Context, path: &str, decrypt: bool) -> io::Result<()> {
+pub fn get(ctx: &Context, path: &str, decrypt: bool, force: bool) -> io::Result<bool> {
     let mut buf: Vec<u8> = Vec::new();
     let (metadata, local_metadata) = get_stream(ctx, path, &mut buf, decrypt, None)?;
 
     if metadata.body_hash.is_none() {
         create_dir_all(ctx, path)?;
         write_metadata_attributes_atomic(ctx, path, &metadata, Some(&local_metadata))?;
-    } else {
-        if let Some(parent) = parent_path(path) {
-            create_dir_all(ctx, parent)?;
-        }
-
-        write_atomic_with_metadata(ctx, path, &buf, &metadata, Some(&local_metadata))?;
+        return Ok(false);
     }
 
-    Ok(())
+    if !force && exists(ctx, path) && is_modified(ctx, path)? == Some(true) {
+        let existing_metadata = read_metadata_attributes(ctx, path)?;
+        // Only the members changed where the body did not, so the local edit is kept.
+        if existing_metadata.body_hash.as_ref().map(|h| &h.value) == metadata.body_hash.as_ref().map(|h| &h.value) {
+            let local_metadata = LocalMetadata { sync_author_date: Some(metadata.author_date), ..read_local_metadata_attributes(ctx, path)? };
+            write_metadata_attributes_atomic(ctx, path, &metadata, Some(&local_metadata))?;
+            return Ok(false);
+        }
+
+        write_conflict(ctx, path, &buf, &metadata, decrypt)?;
+        return Ok(true);
+    }
+
+    if let Some(parent) = parent_path(path) {
+        create_dir_all(ctx, parent)?;
+    }
+
+    write_atomic_with_metadata(ctx, path, &buf, &metadata, Some(&local_metadata))?;
+
+    remove_sidecars(ctx, path, &[])?;
+
+    Ok(false)
 }
 
 /// Download a file body (and metadata) at `path`, writing the body to
@@ -136,6 +163,7 @@ pub fn get_stream(
 mod tests {
     use std::fs;
     use std::env;
+    use std::path::Path;
 
     use time::Duration;
 
@@ -149,7 +177,7 @@ mod tests {
     use crate::testing::fs::{account_context, in_test_dir, init_with_server, write_encrypted_test_file, write_plain_test_file};
     use crate::testing::http::{seed_shared_dir, start_test_server};
     use crate::types::{Key, Member, Permission, Permissions};
-    use crate::versions::{create_dir_version, read_versions, to_version};
+    use crate::versions::{create_dir_version, read_versions, to_version, write_versioned_with_metadata};
 
     #[test]
     fn get_writes_body_to_account_tree() {
@@ -159,7 +187,7 @@ mod tests {
             let ctx = init_with_server(temp_dir, &address);
             write_plain_test_file(&temp_dir.join("ark/gyan/hello.txt"), &ctx.identity, ctx.identity_key.as_ref().unwrap(), b"hi from server");
 
-            get(&ctx, "hello.txt", false).unwrap();
+            get(&ctx, "hello.txt", false, false).unwrap();
 
             assert_eq!(fs::read(temp_dir.join("hello.txt")).unwrap(), b"hi from server");
         });
@@ -202,7 +230,7 @@ mod tests {
             let (server_ctx, server_account_dir) = account_context(&server_dir);
             write_metadata_attributes(&server_ctx, &server_account_dir, &m, None).unwrap();
 
-            get(&ctx, "shared", false).unwrap();
+            get(&ctx, "shared", false, false).unwrap();
 
             let local_dir = temp_dir.join("shared");
             assert!(local_dir.is_dir(), "get should create the dir locally");
@@ -227,7 +255,7 @@ mod tests {
             let client_notes = temp_dir.join("notes");
             fs::create_dir_all(&client_notes).unwrap();
             env::set_current_dir(&client_notes).unwrap();
-            get(&ctx, "todo.txt", false).unwrap();
+            get(&ctx, "todo.txt", false, false).unwrap();
             assert_eq!(fs::read(client_notes.join("todo.txt")).unwrap(), b"buy milk");
         });
     }
@@ -242,7 +270,7 @@ mod tests {
             fs::create_dir_all(&subdir).unwrap();
             write_plain_test_file(&subdir.join("file.txt"), &ctx.identity, ctx.identity_key.as_ref().unwrap(), b"absolute");
 
-            get(&ctx, "/sub/file.txt", false).unwrap();
+            get(&ctx, "/sub/file.txt", false, false).unwrap();
             assert_eq!(fs::read(temp_dir.join("sub/file.txt")).unwrap(), b"absolute");
         });
     }
@@ -256,7 +284,7 @@ mod tests {
             write_plain_test_file(&temp_dir.join("ark/gyan/explicit.txt"), &ctx.identity, ctx.identity_key.as_ref().unwrap(), b"via address");
 
             let arg = format!("gyan@127.0.0.1:{}/explicit.txt", port);
-            get(&ctx, &arg, false).unwrap();
+            get(&ctx, &arg, false, false).unwrap();
             assert_eq!(fs::read(temp_dir.join("explicit.txt")).unwrap(), b"via address");
         });
     }
@@ -275,7 +303,7 @@ mod tests {
                 .members[0].key.as_ref().unwrap().value.clone();
 
             let out = temp_dir.join("secret");
-            get(&ctx, "secret", false).unwrap();
+            get(&ctx, "secret", false, false).unwrap();
 
             assert_eq!(fs::read(&out).unwrap(), expected_ciphertext);
             let m = read_metadata_attributes(&ctx, "secret").unwrap();
@@ -305,7 +333,7 @@ mod tests {
             write_atomic_with_metadata(&server_ctx, &server_account_file, &ct, &m, None).unwrap();
 
             let out = temp_dir.join("secret");
-            get(&ctx, "secret", true).unwrap();
+            get(&ctx, "secret", true, false).unwrap();
 
             assert_eq!(fs::read(&out).unwrap(), b"clear text");
             assert_eq!(
@@ -333,7 +361,7 @@ mod tests {
             create_dir_all(&ctx, "/.ark/identities").unwrap();
             write_identity(&ctx, &identity_cache_path("other@example.com"), &other_identity).unwrap();
 
-            let err = get(&ctx, "sub/secret", true).unwrap_err();
+            let err = get(&ctx, "sub/secret", true, false).unwrap_err();
             assert!(err.to_string().contains("no member entry"), "msg was {}", err);
         });
     }
@@ -366,8 +394,8 @@ mod tests {
 
             // Holding the directory as it is now does not change who could
             // write there then.
-            get(&ctx, "shared/", false).unwrap();
-            get(&ctx, "shared/notes.txt", false).unwrap();
+            get(&ctx, "shared/", false, false).unwrap();
+            get(&ctx, "shared/notes.txt", false, false).unwrap();
             assert_eq!(fs::read(temp_dir.join("shared/notes.txt")).unwrap(), b"by other");
         });
     }
@@ -386,7 +414,7 @@ mod tests {
             create_dir_all(&ctx, "/.ark/identities").unwrap();
             write_identity(&ctx, &identity_cache_path("other@example.com"), &other_identity).unwrap();
 
-            let err = get(&ctx, "planted.txt", false).unwrap_err();
+            let err = get(&ctx, "planted.txt", false, false).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "msg was {}", err);
             assert!(!temp_dir.join("planted.txt").exists());
         });
@@ -421,7 +449,7 @@ mod tests {
             create_dir_all(&ctx, "/.ark/identities").unwrap();
             write_identity(&ctx, &identity_cache_path("other@example.com"), &other_identity).unwrap();
 
-            let err = get(&ctx, "notes.txt", false).unwrap_err();
+            let err = get(&ctx, "notes.txt", false, false).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "msg was {}", err);
             assert!(!temp_dir.join("notes.txt").exists());
             // What it was made against is taken in back to the first version.
@@ -465,7 +493,7 @@ mod tests {
             sign_metadata(ctx.identity_key.as_ref().unwrap(), &mut rolled_back, Some(b"old")).unwrap();
             write_atomic_with_metadata(&server_ctx, &server_account_path, b"old", &rolled_back, None).unwrap();
 
-            let err = get(&ctx, "notes.txt", false).unwrap_err();
+            let err = get(&ctx, "notes.txt", false, false).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "msg was {}", err);
             assert_eq!(fs::read(&local_path).unwrap(), b"current");
         });
@@ -486,9 +514,97 @@ mod tests {
             // own file was.
             write_plain_test_file(&temp_dir.join("ark/gyan/notes.txt"), &ctx.identity, ctx.identity_key.as_ref().unwrap(), b"substitute");
 
-            let err = get(&ctx, "notes.txt", false).unwrap_err();
+            let err = get(&ctx, "notes.txt", false, false).unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "msg was {}", err);
             assert_eq!(fs::read(&local_path).unwrap(), b"current");
+        });
+    }
+
+    // Stand a version made on the account's copy of `notes.txt` on the
+    // server, as another device of the account would.
+    fn put_newer_server_version(ctx: &Context, temp_dir: &Path, body: &[u8]) -> Metadata {
+        let (server_ctx, server_path) = account_context(&temp_dir.join("ark/gyan/notes.txt"));
+        let mut newer = read_metadata_attributes(&server_ctx, &server_path).unwrap();
+        newer.parent_version = Some(to_version(&newer));
+        newer.author_date += Duration::seconds(1);
+        sign_metadata(ctx.identity_key.as_ref().unwrap(), &mut newer, Some(body)).unwrap();
+        write_versioned_with_metadata(&server_ctx, &server_path, body, &newer).unwrap();
+        newer
+    }
+
+    fn sidecar_names(temp_dir: &Path) -> Vec<String> {
+        fs::read_dir(temp_dir).unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("notes.txt."))
+            .collect()
+    }
+
+    #[test]
+    fn get_records_a_conflict_rather_than_overwrite_a_local_edit() {
+        in_test_dir("ark_get_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let address = format!("gyan@127.0.0.1:{}", port);
+            let ctx = init_with_server(temp_dir, &address);
+
+            let local_path = temp_dir.join("notes.txt");
+            fs::write(&local_path, b"base").unwrap();
+            put(&ctx, "notes.txt", &Permissions::default(), Some("none"), false).unwrap();
+            let base_id = to_version(&read_metadata_attributes(&ctx, "notes.txt").unwrap());
+
+            put_newer_server_version(&ctx, temp_dir, b"remote");
+            fs::write(&local_path, b"local").unwrap();
+
+            assert!(get(&ctx, "notes.txt", false, false).unwrap(), "conflict reported");
+
+            assert_eq!(fs::read(&local_path).unwrap(), b"local", "local edit kept");
+            assert_eq!(fs::read(temp_dir.join(format!("notes.txt.base-{}", base_id))).unwrap(), b"base");
+            let remote_sidecar = sidecar_names(temp_dir).into_iter().find(|name| name.starts_with("notes.txt.remote-")).expect("remote sidecar");
+            assert_eq!(fs::read(temp_dir.join(remote_sidecar)).unwrap(), b"remote");
+        });
+    }
+
+    #[test]
+    fn get_keeps_a_local_edit_when_only_the_metadata_changed() {
+        in_test_dir("ark_get_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let address = format!("gyan@127.0.0.1:{}", port);
+            let ctx = init_with_server(temp_dir, &address);
+
+            let local_path = temp_dir.join("notes.txt");
+            fs::write(&local_path, b"base").unwrap();
+            put(&ctx, "notes.txt", &Permissions::default(), Some("none"), false).unwrap();
+
+            let newer = put_newer_server_version(&ctx, temp_dir, b"base");
+            fs::write(&local_path, b"local").unwrap();
+
+            assert!(!get(&ctx, "notes.txt", false, false).unwrap());
+
+            assert_eq!(fs::read(&local_path).unwrap(), b"local", "local edit kept");
+            assert_eq!(read_metadata_attributes(&ctx, "notes.txt").unwrap().author_date, newer.author_date, "server metadata taken");
+            assert!(sidecar_names(temp_dir).is_empty());
+        });
+    }
+
+    #[test]
+    fn get_with_force_overwrites_a_local_edit_and_drops_its_conflict() {
+        in_test_dir("ark_get_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let address = format!("gyan@127.0.0.1:{}", port);
+            let ctx = init_with_server(temp_dir, &address);
+
+            let local_path = temp_dir.join("notes.txt");
+            fs::write(&local_path, b"base").unwrap();
+            put(&ctx, "notes.txt", &Permissions::default(), Some("none"), false).unwrap();
+
+            put_newer_server_version(&ctx, temp_dir, b"remote");
+            fs::write(&local_path, b"local").unwrap();
+            get(&ctx, "notes.txt", false, false).unwrap();
+
+            assert!(!get(&ctx, "notes.txt", false, true).unwrap());
+
+            assert_eq!(fs::read(&local_path).unwrap(), b"remote");
+            assert!(sidecar_names(temp_dir).is_empty(), "sidecars dropped: {:?}", sidecar_names(temp_dir));
         });
     }
 

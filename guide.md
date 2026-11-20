@@ -271,6 +271,8 @@ For one-off reads without touching the filesystem, `get_stream(ctx, path, &mut b
 
 When `sync` sees divergence — the local and remote body both changed since last sync — it does not merge and it does not lose data. It leaves the local copy untouched and records the conflict with `ark::write_conflict`: the remote copy goes alongside as `<name>.remote-<iso>`, carrying both the remote body and its metadata, and beside it `<name>.base-<id>`, the newest version both sides descend from, where they share one — what a three-way merge works against. Neither sidecar is itself sync-tracked, and a later conflict on the same file replaces them, so they always hold the newest remote side.
 
+`get` does the same where the local copy of the file it downloads changed since it was last synced, and returns `true` when it recorded a conflict. Pass `force` to overwrite the local copy instead, which also drops any sidecars beside it.
+
 Where another account deleted a file the local copy changed, `sync` records it the same way with `ark::write_delete_conflict`: the `<name>.remote-<iso>` sidecar is empty and carries the delete metadata. While a conflict stands, `sync` does not push the local copy, so neither side is overwritten.
 
 Detecting a conflict from an app is a filename check, or `ark::has_conflict` for a known path:

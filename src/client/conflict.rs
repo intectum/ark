@@ -1,12 +1,13 @@
 use std::io;
 
-use super::{get_merge_base_version, get_stream, head, put_content};
+use super::{get_merge_base_version, head, put_content};
 
 use crate::metadata::{read_local_metadata_attributes, read_metadata_attributes, write_metadata_attributes_atomic};
 use crate::paths::{file_name, parent_path, sidecar_path_for};
-use crate::storage::{read_dir, remove_file, write_atomic_with_metadata};
+use crate::storage::{is_dir, read, read_dir, remove_file, write_atomic_with_metadata};
 use crate::timestamp;
 use crate::types::{Context, Metadata};
+use crate::util::sha256;
 use crate::versions::to_version;
 
 const BASE_SIDECAR_PREFIX: &str = "base-";
@@ -15,25 +16,22 @@ const REMOTE_SIDECAR_PREFIX: &str = "remote-";
 /// Record a conflict on the file at `path`, where the account's own copy and
 /// the server's have both changed, leaving the copy untouched.
 ///
-/// `path` accepts relative, absolute account, or address form. Writes a
-/// `<name>.remote-<iso>` sidecar carrying the server's copy (body plus
-/// metadata), and beside it a `<name>.base-<id>` sidecar carrying the newest
-/// version both sides descend from, where they share one, to merge against.
-/// Neither sidecar is sync-tracked itself, and they replace any an earlier
-/// conflict on `path` left. `decrypt` controls whether the sidecar bodies are
-/// decrypted. [`resolve_conflict`] publishes the merge.
-///
-/// Errors with `NotFound` where the server no longer holds `path`.
-pub fn write_conflict(ctx: &Context, path: &str, decrypt: bool) -> io::Result<()> {
-    let mut body: Vec<u8> = Vec::new();
-    let (metadata, _) = get_stream(ctx, path, &mut body, decrypt, None)?;
-
+/// `path` accepts relative, absolute account, or address form. `body` and
+/// `metadata` are the server's copy, as [`get_stream`](super::get_stream)
+/// returns it. Writes a `<name>.remote-<iso>` sidecar carrying the server's
+/// copy (body plus metadata), and beside it a `<name>.base-<id>` sidecar
+/// carrying the newest version both sides descend from, where they share one,
+/// to merge against. Neither sidecar is sync-tracked itself, and they replace
+/// any an earlier conflict on `path` left. `decrypt` controls whether the base
+/// sidecar body is decrypted, and should match how `body` was fetched.
+/// [`resolve_conflict`] publishes the merge.
+pub fn write_conflict(ctx: &Context, path: &str, body: &[u8], metadata: &Metadata, decrypt: bool) -> io::Result<()> {
     let suffix = format!("{}{}", REMOTE_SIDECAR_PREFIX, timestamp::format_fs_safe(timestamp::now()));
     let mut written = vec![sidecar_path_for(path, &suffix)];
-    write_atomic_with_metadata(ctx, &written[0], &body, &metadata, None)?;
+    write_atomic_with_metadata(ctx, &written[0], body, metadata, None)?;
 
     if let Ok(existing_metadata) = read_metadata_attributes(ctx, path) {
-        if let Some((base_body, base_metadata)) = get_merge_base_version(ctx, path, &existing_metadata, &metadata, decrypt)? {
+        if let Some((base_body, base_metadata)) = get_merge_base_version(ctx, path, &existing_metadata, metadata, decrypt)? {
             let suffix = format!("{}{}", BASE_SIDECAR_PREFIX, to_version(&base_metadata));
             written.push(sidecar_path_for(path, &suffix));
             write_atomic_with_metadata(ctx, &written[1], &base_body, &base_metadata, None)?;
@@ -97,7 +95,22 @@ pub fn resolve_conflict(ctx: &Context, path: &str) -> io::Result<()> {
     remove_sidecars(ctx, path, &[])
 }
 
-fn remove_sidecars(ctx: &Context, path: &str, keep: &[String]) -> io::Result<()> {
+// Whether the body changed since it was last synced; `None` where untracked.
+pub fn is_modified(ctx: &Context, path: &str) -> io::Result<Option<bool>> {
+    let local_metadata = read_local_metadata_attributes(ctx, path)?;
+
+    if is_dir(ctx, path) {
+        return Ok(local_metadata.sync_author_date.map(|_| false));
+    }
+
+    match &local_metadata.sync_body_hash {
+        Some(h) => Ok(Some(h.value != sha256(&read(ctx, path)?))),
+        None => Ok(None),
+    }
+}
+
+// Remove the sidecars a conflict on `path` left, other than those in `keep`.
+pub fn remove_sidecars(ctx: &Context, path: &str, keep: &[String]) -> io::Result<()> {
     let parent = parent_path(path).unwrap_or("/");
     let remote_prefix = format!("{}.{}", file_name(path), REMOTE_SIDECAR_PREFIX);
     let base_prefix = format!("{}.{}", file_name(path), BASE_SIDECAR_PREFIX);
