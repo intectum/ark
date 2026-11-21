@@ -6,8 +6,8 @@ use crate::http::{error_response_code, write_text};
 use crate::metadata::read_metadata_attributes;
 use crate::storage::{exists, is_dir, is_symlink, read_dir, remove_dir_all, remove_file};
 use crate::types::{Context, Identity, Metadata, Permission};
-use crate::validate::validate_entry;
-use crate::versions::{is_versioned, remove_versions, write_version};
+use crate::validation::validate_entry;
+use crate::versions::{is_versioned, purge_stored_versions, write_version};
 
 pub fn serve_delete(
     server_ctx: &Context,
@@ -82,12 +82,12 @@ pub fn serve_delete(
     Ok(true)
 }
 
-pub fn serve_delete_versions(ctx: &Context, path: &str, stream: &mut dyn Write) -> io::Result<()> {
+pub fn serve_purge_versions(ctx: &Context, path: &str, stream: &mut dyn Write) -> io::Result<()> {
     if exists(ctx, path) {
-        return write_text(stream, 409, b"delete the path before its versions");
+        return write_text(stream, 409, b"delete the path before purging its versions");
     }
 
-    match remove_versions(ctx, path) {
+    match purge_stored_versions(ctx, path) {
         Ok(_) => write_text(stream, 204, &[]),
         Err(e) => write_text(stream, 500, e.to_string().as_bytes()),
     }
@@ -101,6 +101,7 @@ mod tests {
     use time::Duration;
 
     use crate::metadata::{read_metadata_attributes, sign_metadata};
+    use crate::paths::to_path_segment;
     use crate::testing::fs::{TEST_ADDRESS, account_context, create_delete_test_metadata, create_test_account, in_test_dir, write_plain_test_file};
     use crate::testing::http::*;
     use crate::testing::http::start_test_server;
@@ -123,28 +124,29 @@ mod tests {
             let (account_ctx, _) = account_context(&account_dir.join(".ark"));
             let versions = read_versions(&account_ctx, "/notes/a.txt").unwrap();
             assert_eq!(versions.len(), 1, "a path beneath a deleted directory keeps its versions too");
-            assert!(!versions[0].deleted, "only the path deleted keeps the delete");
+            assert!(!versions[0].metadata.deleted, "only the path deleted keeps the delete");
 
             let versions = read_versions(&account_ctx, "/notes").unwrap();
-            assert!(versions[0].deleted, "the delete is the newest version of the path");
+            assert!(versions[0].metadata.deleted, "the delete is the newest version of the path");
             assert_eq!(versions[0].id, to_version(&metadata));
         });
     }
 
     #[test]
-    fn the_account_drops_the_versions_of_a_deleted_path_and_those_beneath_it() {
+    fn the_account_purges_the_versions_of_a_deleted_path_and_those_beneath_it() {
         in_test_dir("ark_server_test", |temp_dir| {
             let (identity, secret_key, account_dir) = create_test_account(temp_dir, TEST_ADDRESS);
             seed_shared_dir(temp_dir, &identity, &secret_key, "ark/test/notes", vec![]);
             let port = start_test_server(temp_dir.to_path_buf());
             signed_put_with_default_metadata(port, &identity, &secret_key, "/ark/test/notes/a.txt", b"inside");
 
-            let (code, _, _) = signed_request(port, &identity, &secret_key, "DELETE", "/ark/test/notes?versions", &[]);
+            let history = format!("/ark/test/.ark/versions/{}", to_path_segment("/notes"));
+            let (code, _, _) = signed_request(port, &identity, &secret_key, "DELETE", &history, &[]);
             assert_eq!(code, 409, "versions go only once the path itself has");
 
             let metadata = create_delete_test_metadata(&account_dir.join("notes"), &identity, &secret_key);
             signed_delete_metadata(port, &identity, &secret_key, "/ark/test/notes", &metadata);
-            let (code, _, _) = signed_request(port, &identity, &secret_key, "DELETE", "/ark/test/notes?versions", &[]);
+            let (code, _, _) = signed_request(port, &identity, &secret_key, "DELETE", &history, &[]);
             assert_eq!(code, 204);
 
             let (account_ctx, _) = account_context(&account_dir.join(".ark"));
@@ -153,7 +155,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_account_drops_versions() {
+    fn only_the_account_purges_versions() {
         in_test_dir("ark_server_test", |temp_dir| {
             let (owner_identity, owner_key, owner_dir) = create_test_account(temp_dir, "owner@example.com");
             let (co_owner_identity, co_owner_key, _) = create_test_account(temp_dir, "coowner@example.com");
@@ -167,7 +169,7 @@ mod tests {
             let metadata = create_delete_test_metadata(&owner_dir.join("shared/a.txt"), &owner_identity, &owner_key);
             signed_delete_metadata(port, &owner_identity, &owner_key, "/ark/owner/shared/a.txt", &metadata);
 
-            let (code, _, _) = signed_request(port, &co_owner_identity, &co_owner_key, "DELETE", "/ark/owner/shared/a.txt?versions", &[]);
+            let (code, _, _) = signed_request(port, &co_owner_identity, &co_owner_key, "DELETE", &format!("/ark/owner/.ark/versions/{}", to_path_segment("/shared/a.txt")), &[]);
             assert_eq!(code, 403);
 
             let (account_ctx, _) = account_context(&owner_dir.join(".ark"));

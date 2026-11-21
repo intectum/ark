@@ -5,7 +5,6 @@ mod get;
 mod log;
 mod put;
 mod relay;
-mod versions;
 
 use std::env;
 #[cfg(test)]
@@ -20,21 +19,20 @@ use std::sync::Arc;
 use std::thread;
 
 use self::auth::{authenticate, authorize};
-use self::delete::{serve_delete, serve_delete_versions};
+use self::delete::{serve_delete, serve_purge_versions};
 use self::get::serve_get;
 use self::log::{LoggingStream, try_log_request};
 use self::put::{serve_put, serve_put_init};
 use self::relay::relay;
 use self::stream::serve_stream;
-use self::versions::serve_version_list;
 
 use crate::context::{create_server_context, create_target_context};
 use crate::http::{read_request, write_text};
 use crate::identity::resolve_identity;
 use crate::metadata::{read_inherited_metadata_attributes, read_metadata_attributes, read_metadata_headers};
-use crate::paths::parse_request_target;
-use crate::storage::{exists, is_file, is_symlink};
-use crate::versions::{read_versions, version_path_for};
+use crate::paths::{is_version_store_path, parse_request_target, path_for_version_dir};
+use crate::storage::{is_dir, is_file, is_symlink};
+use crate::versions::read_versions;
 use crate::types::{Context, Permission, RelayMode};
 
 pub const MAX_CLOCK_SKEW_MS: u64 = 300_000;
@@ -143,7 +141,7 @@ fn handle_parsed_inner(
     let server_root = server_ctx.root.parent().unwrap().parent().unwrap();
     let name = segments[1];
 
-    let url_path = match url.path().strip_prefix(&format!("/ark/{}", name)) {
+    let target_path = match url.path().strip_prefix(&format!("/ark/{}", name)) {
         Some("") => "/".to_string(),
         Some(rest) => rest.to_string(),
         None => return write_text(stream, 403, b"forbidden"),
@@ -152,12 +150,12 @@ fn handle_parsed_inner(
     let account_root = server_root.join("ark").join(name);
     let target_identity_path = account_root.join(".ark").join("identity.json");
 
-    if method == "PUT" && url_path == "/.ark/identity.json" && !target_identity_path.exists() {
+    if method == "PUT" && target_path == "/.ark/identity.json" && !target_identity_path.exists() {
         let metadata = match read_metadata_headers(headers) {
             Ok(m) => m,
             Err(e) => return write_text(stream, 400, e.to_string().as_bytes()),
         };
-        return serve_put_init(&account_root, &url_path, stream, body, &metadata);
+        return serve_put_init(&account_root, &target_path, stream, body, &metadata);
     }
 
     let target_ctx = match create_target_context(server_root, name) {
@@ -170,15 +168,11 @@ fn handle_parsed_inner(
     let mut metadata_only = false;
     let mut prefix: Option<String> = None;
     let mut relay_mode: Option<RelayMode> = None;
-    let mut version: Option<String> = None;
-    let mut versions = false;
     for (key, value) in url.query_pairs() {
         match key.as_ref() {
             "metadata" => metadata_only = true,
             "prefix" => prefix = Some(value.into_owned()),
             "relay" => relay_mode = RelayMode::parse(value.as_ref()),
-            "version" => version = Some(value.into_owned()),
-            "versions" => versions = true,
             _ => {}
         }
     }
@@ -186,29 +180,15 @@ fn handle_parsed_inner(
     let wants_stream = headers.iter().any(|(n, v)|
         n.eq_ignore_ascii_case("accept") && v.contains("text/event-stream"));
 
-    let target_path = match version.as_deref() {
-        Some(id) => {
-            if (method != "GET" && method != "HEAD") || wants_stream {
-                return write_text(stream, 405, b"a version can only be read");
-            }
-
-            if id.is_empty() || id.contains('/') || id.starts_with('.') {
-                return write_text(stream, 400, b"bad version id");
-            }
-
-            let version_path = match version_path_for(&target_ctx, &url_path, id) {
-                Ok(path) => path,
-                Err(e) => return write_text(stream, 400, e.to_string().as_bytes()),
-            };
-
-            if !exists(&target_ctx, &version_path) {
-                return write_text(stream, 404, b"no such version");
-            }
-
-            version_path
-        }
-        None => url_path.clone(),
+    let history_of = match path_for_version_dir(&target_path) {
+        Ok(path) => path,
+        Err(e) => return write_text(stream, 400, e.to_string().as_bytes()),
     };
+
+    let purges_history = method == "DELETE" && history_of.is_some();
+    if is_version_store_path(&target_path) && method != "GET" && method != "HEAD" && !purges_history {
+        return write_text(stream, 405, b"versions can only be read");
+    }
 
     if is_symlink(&target_ctx, &target_path) {
         return write_text(stream, 403, b"symlinks not allowed");
@@ -227,17 +207,10 @@ fn handle_parsed_inner(
         return write_text(stream, 500, b"file missing metadata");
     }
 
-    let reads_versions = versions && (method == "GET" || method == "HEAD");
-    let reads_history = reads_versions || (version.is_some() && method == "HEAD");
-
-    let members_path = if reads_history { &url_path } else { &target_path };
-    let members_metadata = if reads_history {
-        let newest_metadata = read_versions(&target_ctx, members_path).and_then(|versions| match versions.first() {
-            Some(newest) => read_metadata_attributes(&target_ctx, &version_path_for(&target_ctx, members_path, &newest.id)?).map(Some),
-            None => Ok(None),
-        });
-        match newest_metadata {
-            Ok(metadata) => metadata,
+    let members_path = history_of.as_deref().unwrap_or(&target_path);
+    let members_metadata = if history_of.is_some() {
+        match read_versions(&target_ctx, members_path) {
+            Ok(versions) => versions.into_iter().next().map(|newest| newest.metadata),
             Err(error) => return write_text(stream, 500, error.to_string().as_bytes()),
         }
     } else {
@@ -258,8 +231,17 @@ fn handle_parsed_inner(
         .as_deref()
         .and_then(|members| members.iter().find(|member| member.address == "*"));
 
-    if public_member.is_some() && (method == "GET" || method == "HEAD") && !reads_versions {
-        return serve_get(&target_ctx, &target_path, stream, method == "GET", prefix.as_deref());
+    if public_member.is_some() && (method == "GET" || method == "HEAD") {
+        let signed = headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("authorization"));
+        let requestor_identity = if signed && is_dir(&target_ctx, &target_path) {
+            match authenticate(server_ctx, &url, method, headers, body) {
+                Ok(identity) => Some(identity),
+                Err(e) => return write_text(stream, 401, e.to_string().as_bytes()),
+            }
+        } else {
+            None
+        };
+        return serve_get(server_ctx, &target_ctx, &target_path, stream, method == "GET", prefix.as_deref(), requestor_identity.as_ref(), history_of.is_some());
     }
 
     let requestor_identity = match authenticate(server_ctx, &url, method, headers, body) {
@@ -267,11 +249,7 @@ fn handle_parsed_inner(
         Err(e) => return write_text(stream, 401, e.to_string().as_bytes())
     };
 
-    if reads_versions {
-        return serve_version_list(server_ctx, &target_ctx, &target_path, stream, method == "GET", &requestor_identity, effective_members.as_deref());
-    }
-
-    let metadata = if method == "PUT" || (method == "DELETE" && !versions) {
+    let metadata = if method == "PUT" || (method == "DELETE" && !purges_history) {
         match read_metadata_headers(headers) {
             Ok(m) => Some(m),
             Err(e) => return write_text(stream, 400, e.to_string().as_bytes()),
@@ -307,19 +285,20 @@ fn handle_parsed_inner(
                 return serve_stream(&target_ctx, &target_path, stream, verbose);
             }
 
-            return serve_get(&target_ctx, &target_path, stream, method == "GET", prefix.as_deref());
+            return serve_get(server_ctx, &target_ctx, &target_path, stream, method == "GET", prefix.as_deref(), Some(&requestor_identity), history_of.is_some());
         },
         "PUT" => {
             let metadata = metadata.as_ref().expect("metadata presence checked above");
 
             serve_put(server_ctx, &target_ctx, &target_path, stream, body, metadata, metadata_only)?
         }
-        "DELETE" if versions => {
+        "DELETE" if purges_history => {
             if requestor_identity.address != target_ctx.identity.address {
-                return write_text(stream, 403, b"only the account can delete versions");
+                return write_text(stream, 403, b"only the account can purge versions");
             }
 
-            return serve_delete_versions(&target_ctx, &target_path, stream);
+            let history_of = history_of.as_deref().expect("history checked above");
+            return serve_purge_versions(&target_ctx, history_of, stream);
         },
         "DELETE" => {
             let metadata = metadata.as_ref().expect("metadata presence checked above");

@@ -7,7 +7,7 @@ use crate::metadata::write_metadata_attributes_atomic;
 use crate::paths::parent_path;
 use crate::storage::{create_dir_all, exists};
 use crate::types::{Context, Identity, Metadata};
-use crate::validate::validate_entry;
+use crate::validation::validate_entry;
 use crate::versions::{copy_versioned_with_metadata, create_dir_version, read_versions, write_versioned_with_metadata};
 
 pub fn serve_put_init(
@@ -58,7 +58,7 @@ pub fn serve_put(server_ctx: &Context, ctx: &Context, path: &str, stream: &mut d
 
     let mut current = Some(path);
     while let Some(current_path) = current {
-        if read_versions(ctx, current_path)?.iter().any(|version| version.deleted && metadata.author_date < version.author_date) {
+        if read_versions(ctx, current_path)?.iter().any(|version| version.metadata.deleted && metadata.author_date < version.metadata.author_date) {
             write_text(stream, 409, b"author_date is older than a delete of the path")?;
             return Ok(false);
         }
@@ -102,7 +102,8 @@ mod tests {
     use crate::storage::read;
     use crate::timestamp::now_ms;
     use crate::types::{Member, Permission};
-    use crate::versions::{read_versions, to_version, version_path_for};
+    use crate::paths::version_path_for;
+    use crate::versions::{read_versions, to_version};
 
     #[test]
     fn put_new_file_returns_201() {
@@ -534,7 +535,7 @@ mod tests {
             assert_eq!(versions[0].id, to_version(&new_meta), "what the path holds now is a version too");
             assert_eq!(versions[1].id, to_version(&old_meta));
 
-            let stored = version_path_for(&account_ctx, &account_path, &versions[1].id).unwrap();
+            let stored = version_path_for(&account_path, &versions[1].id);
             assert_eq!(read(&account_ctx, &stored).unwrap(), b"old");
         });
     }
@@ -561,7 +562,7 @@ mod tests {
             assert_eq!(versions.len(), 2);
             assert_eq!(versions[0].id, to_version(&new_meta));
 
-            let stored = version_path_for(&account_ctx, &account_path, &versions[1].id).unwrap();
+            let stored = version_path_for(&account_path, &versions[1].id);
             let stored_metadata = read_metadata_attributes(&account_ctx, &stored).unwrap();
             assert_eq!(stored_metadata.members.len(), 1, "the version carries the member list it was written with");
             assert_eq!(read(&account_ctx, &stored).unwrap(), b"body");

@@ -114,15 +114,18 @@ An Ark **server** is an authenticated file server rooted at `/ark/<account>/…`
 
 **File.** Response body is the file's bytes exactly as stored (ciphertext for encrypted files, raw bytes for unencrypted). Response headers include the full `X-Ark-Meta-*` set. Membership is enforced (§6); a `*` member allows unauthenticated GET.
 
-**Directory (default).** Response body is `[DirectoryEntry]` (Appendix A.5) as JSON — `{type, name}` per entry, `type` in `dir | file | symlink`. If the directory itself has metadata, its `X-Ark-Meta-*` are also returned. No recursion.
+**Directory (default).** Response body is `[DirectoryEntry]` (Appendix A.5) as JSON — `{type, name, metadata}` per entry, `type` in `dir | file`, in name order. If the directory itself has metadata, its `X-Ark-Meta-*` are also returned. No recursion.
+
+A listing holds only the entries the requester may read — as each one's own effective list (§6) authorizes them, or, for an unauthenticated request, where that list holds `*` — each with its own metadata. A signed request for a public directory is still checked, so its listing holds what the signer may read; a bad signature is `401`. A directory with no metadata of its own answers to the list of the one being listed, so is listed, without metadata. A symlink is never listed, nor an entry whose metadata cannot be read. A directory of versions is the exception (below).
 
 **Directory (`?prefix=`).** Lists only the entries whose name starts with the given string. A filter on the name alone, so what it can narrow is whatever the names encode — the request log (§10) leads its names with the method and status for this.
 
-**Optional query param: `versions`.** The response body is `[VersionEntry]` (Appendix A.10) as JSON — the history of the path, newest first, what it holds now included, or an empty array where it has none. The path's own metadata is not returned. The path need not exist: a deleted path keeps its history, the delete itself its newest entry (§4.6). Authentication is required. A requester the path's current effective list (§6) authorizes is shown every version, as it may read each one's metadata (below); for a deleted path, that list is the one its newest version carries. Anyone else is shown only the versions whose own member list authorizes them.
+**History.** The versions of a path are entries of the version store (§4.8), read like any other entry: `/.ark/versions/<key>/` is the path's history, and `/.ark/versions/<key>/<id>` one version of it, where `<key>` is the path's account path encoded as §4.8 sets out and `<id>` the version's id (Appendix A.10). Everything under `/.ark/versions/` is GET and HEAD only (`405` otherwise), save that a whole history can be deleted (§4.6). `400` where `<key>` names no path.
 
-**Optional query param: `version=<id>`.** The response is that version's body, with the `X-Ark-Meta-*` set its author signed. GET and HEAD only (`405` otherwise). `400` where the id contains `/` or begins with `.`, and `404` where it names no version the server stored. A version is authorized against the member list **its own metadata** carries (§6), as any other entry is against its own — so a `*` member on that version allows an unauthenticated read — and never against the path's current members or an ancestor's. The exception is a HEAD, which serves the version's metadata alone: that is authorized against the path's current effective list — for a deleted path, the list its newest version carries — so a member added later can check who made each earlier version and who could have (§6, *Clients*) without reading what it held. A delete's version has an empty body and its delete metadata.
+- **Listing the history.** A directory listing as above, one entry per version, named by its id, so in name order the oldest comes first; what the path holds now is included. The path need not exist: a deleted path keeps its history, the delete itself its newest entry (§4.6). The directory answers to the path it is the history of rather than to anything above it: it is authorized against that path's current effective list (§6) — for a deleted path, the list its newest version carries — and every entry carries its metadata. So a member added later can check who made each earlier version and who could have (§6, *Clients*) without reading what it held. `404` where the path has no history.
+- **Reading a version.** That version's body, with the `X-Ark-Meta-*` set its author signed. `404` where `<id>` names no version the server stored. A version is authorized against the member list **its own metadata** carries (§6), as any other entry is against its own — so a `*` member on that version allows an unauthenticated read — and never against the path's current members or an ancestor's. A delete's version has an empty body and its delete metadata.
 
-Note for clients: a `?version=` response is deliberately older than the copy the client holds, so of the comparison in §4.2 only the age half and the same-`id` half are waived — the history may hold a file the path held before a delete. It must still be a file where the copy is a file, and it must be the version asked for (`id` derived from the metadata served, Appendix A.10). A delete's version is checked by its signature alone: it keeps the `body_hash` of what it deleted, but no body. Every other GET applies §4.2 in full.
+Note for clients: a version is deliberately older than the copy the client holds, so of the comparison in §4.2 only the age half and the same-`id` half are waived — the history may hold a file the path held before a delete. It must still be a file where the copy is a file, and it must be the version asked for (`id` derived from the metadata served, Appendix A.10). A delete's version is checked by its signature alone: it keeps the `body_hash` of what it deleted, but no body. Every other GET applies §4.2 in full.
 
 **Directory (SSE upgrade).** If the request carries `Accept: text/event-stream`, the response is a `text/event-stream` connection that stays open. Each event describes a filesystem change under the target directory. Payload:
 
@@ -155,7 +158,7 @@ Creates or updates a file or directory. **Dir vs file is determined by whether t
 
 **Optional query param: `metadata`.** Metadata-only PUT. The request body is ignored and the file body on disk is left unchanged; only the `X-Ark-Meta-*` xattrs are rewritten. The new metadata's `body_hash` MUST equal the existing file's `body_hash`; otherwise `400`. The target file MUST already exist; otherwise `409`. Query params combine (e.g. `?relay=full&metadata`) — relay carries the flag forward.
 
-**Superseding, not destroying.** Every PUT is stored as a version of its path (§4.3), so what a path holds now is always its newest version, and what a PUT replaces stays in the history. A server MUST keep every version until the account drops them (§4.6); it does not drop old versions on its own, nor on a delete.
+**Superseding, not destroying.** Every PUT is stored as a version of its path (§4.3), so what a path holds now is always its newest version, and what a PUT replaces stays in the history. A server MUST keep every version until the account purges them (§4.6); it does not drop old versions on its own, nor on a delete.
 
 **Parent directories.** Missing intermediate directories on the path are created automatically. They are created without metadata, so they inherit member checks from the nearest metadata-bearing ancestor (§7.3).
 
@@ -177,7 +180,7 @@ Removes a file, or recursively removes a directory and its contents. **The versi
 
 **Optional query param: `relay`.** As for PUT (§4.5): fans the delete out to the members its metadata lists (§9).
 
-**Optional query param: `versions`.** Drops the versions of the path and of everything beneath it instead, which is what leaves nothing to recover. Takes no metadata. Only the account may: `403` for anyone else, whatever their permission. The path must already be deleted, so that what it holds now is never dropped from its own history: `409` while it exists. `204 No Content` on success, whether or not there were versions to drop.
+**Purging a history: `DELETE /ark/<account>/.ark/versions/<key>`.** Deleting a path's history (§4.3) purges the versions of the path and of everything beneath it, which is what leaves nothing to recover. Takes no metadata. Only the account may: `403` for anyone else, whatever their permission. The path must already be deleted, so that what it holds now is never purged from its own history: `409` while it exists. `204 No Content` on success, whether or not there were versions to purge.
 
 ### 4.7 Response codes
 
@@ -188,10 +191,10 @@ Removes a file, or recursively removes a directory and its contents. **The versi
 | 204 | PUT overwrote an existing path, or DELETE succeeded. |
 | 400 | Malformed request (bad metadata, dir-with-body, unparseable path). |
 | 401 | Missing / invalid `Authorization` (also: bad `Host`, stale timestamp, bad signature). |
-| 403 | Not a member with sufficient permission, member change without `owner`, versions dropped by anyone but the account, symlink target, path outside `/ark/`. |
+| 403 | Not a member with sufficient permission, member change without `owner`, versions purged by anyone but the account, symlink target, path outside `/ark/`. |
 | 404 | Target does not exist, or names no version the server stored. |
-| 405 | Method not allowed at this path (e.g. PUT on `/ark/<account>`). |
-| 409 | A write not made on the version the path holds, one older than a delete stored for the path, or versions dropped from a path that still exists. |
+| 405 | Method not allowed at this path (e.g. PUT on `/ark/<account>`, or anything but GET/HEAD under `/.ark/versions/`, bar a DELETE of a whole history). |
+| 409 | A write not made on the version the path holds, one older than a delete stored for the path, or versions purged from a path that still exists. |
 | 500 | Server-side error (I/O, corrupt metadata). |
 
 ### 4.8 Reserved `/ark/<account>/.ark/` namespace
@@ -202,11 +205,11 @@ Everything under `/.ark/` is protocol-defined. Applications must not write arbit
 |---|---|---|
 | `identity.json` | `Identity` (A.1) | Public. Self-signed. PUT unauthenticated only when creating the account. |
 | `identity.key` | Encrypted account private key, as a normal Ark file | Owner + recovery members with `reader`. Body is the base64url identity seed, encrypted under a per-file key like any other file (§8). |
-| `identities/<address>.json` | Cached peer `Identity` | **Client-local.** Not required or served by the server; documented so implementations agree on where clients keep their TOFU cache. `<address>` is percent-encoded per the rule below. A reader MUST check that the entry it finds answers for the address asked for, and ignore it otherwise. |
-| `versions/<path>/<id>` | What one write to a path left there | **Stored by servers and clients alike**, under the same ids. One directory per path, holding an ordinary ark entry per version — body bytes as stored (ciphertext for encrypted files) and the metadata its author signed. A directory's is an empty file carrying its metadata, and so is a delete's (§4.6). Reached through `?version=` / `?versions` on the path itself (§4.3), never as a path of its own. `<path>` is percent-encoded per the rule below. **On a server** a file's newest version is the very entry the path names (a hard link), written here first and then linked into place, so a write that stops part-way can leave a version the path never held, but never the reverse. A directory's version is likewise stored before the directory takes its metadata, and a delete's before the path is removed. Versions stay stored through deletes of the path. **On a client** the store holds copies: every version it made to upload, deletes included, stored before the upload so the bytes sent are the bytes stored, and every one it verified on the way in, as received. A version taken in with a path's history (§6, *Clients*) is stored as an empty file carrying its metadata until its body is wanted; one whose file is empty though its `body_hash` is not that of an empty body holds no body yet. Only verified versions enter a client's store. A client dropping a path's history (§4.6) drops these too, once the server has. Its working copy holds plaintext and is edited in place, so it is never linked. Neither stores versions of the store's own entries, nor of the request log (§10), whose entries a server writes itself without storing any. |
+| `identities/<address>.json` | Cached peer `Identity` | **Client-local.** Not required or served by the server; documented so implementations agree on where clients keep their TOFU cache. `<address>` is encoded per the rule below. A reader MUST check that the entry it finds answers for the address asked for, and ignore it otherwise. |
+| `versions/<path>/<id>` | What one write to a path left there | **Stored by servers and clients alike**, under the same ids. One directory per path, holding an ordinary ark entry per version — body bytes as stored (ciphertext for encrypted files) and the metadata its author signed. A directory's is an empty file carrying its metadata, and so is a delete's (§4.6). Read at these paths, and written only by the host storing them (§4.3). `<path>` is encoded per the rule below. **On a server** a file's newest version is the very entry the path names (a hard link), written here first and then linked into place, so a write that stops part-way can leave a version the path never held, but never the reverse. A directory's version is likewise stored before the directory takes its metadata, and a delete's before the path is removed. Versions stay stored through deletes of the path. **On a client** the store holds copies: every version it made to upload, deletes included, stored before the upload so the bytes sent are the bytes stored, and every one it verified on the way in, as received. A version taken in with a path's history (§6, *Clients*) is stored as an empty file carrying its metadata until its body is wanted; one whose file is empty though its `body_hash` is not that of an empty body holds no body yet. Only verified versions enter a client's store. A client purging a path's history (§4.6) purges these too, once the server has. Its working copy holds plaintext and is edited in place, so it is never linked. Neither stores versions of the store's own entries, nor of the request log (§10), whose entries a server writes itself without storing any. |
 | `versions/<path>/.previous` | The metadata a directory carried before a rewrite | **Server-local.** Empty file carrying the previous metadata in its own attributes, set aside so an interrupted rewrite can be put back. See §7.2. Not a version: an id never begins with `.`, and a listing skips it. |
-| `grants/<path>` | The version of `<path>` the account accepted from another account | **Kept on the account's server, read only by the account.** Body: that version's id. Written by the account on accepting a share proposal (§10), and signed by it, so its devices trust a path another account wrote (§6, *Clients*); one not signed by the account is no grant. Deleting it withdraws that trust. `<path>` is the account path, base64url-encoded (no padding) so the name travels in a URL unchanged. |
-| `sync/<path>` | The last request-log entry a sync of `<path>` took in | **Client-local.** Where its next sync of that path picks up the log (§10). `<path>` is percent-encoded per the rule below. Nothing under `/.ark/` is synced as account content: it is protocol state, much of it with a meaning of its own on each host. |
+| `grants/<path>` | The version of `<path>` the account accepted from another account | **Kept on the account's server, read only by the account.** Body: that version's id. Written by the account on accepting a share proposal (§10), and signed by it, so its devices trust a path another account wrote (§6, *Clients*); one not signed by the account is no grant. Deleting it withdraws that trust. `<path>` is encoded per the rule below. |
+| `sync/<path>` | The last request-log entry a sync of `<path>` took in | **Client-local.** Where its next sync of that path picks up the log (§10). `<path>` is encoded per the rule below. Nothing under `/.ark/` is synced as account content: it is protocol state, much of it with a meaning of its own on each host. |
 | `passwords/<name>.json` | `Identity` with `algorithm: argon2id-ed25519` | Publicly readable. GET/HEAD unauthenticated. See §11. |
 | `passkeys/<name>.json` | `Identity` with `algorithm: webauthn-prf-ed25519` | Publicly readable. **Status: not yet implemented.** |
 | `groups/<name>.json` | `Identity` with a `members` field | Publicly readable. Path is convention; any identity with `members` is a group (§2). |
@@ -223,7 +226,7 @@ Requests to `/ark/<account>/.ark/requests/` and its entries are **not** themselv
 - **Beside the entry**, as a sibling. For a file that has to land by a rename, since a rename across filesystems fails and only a sibling is guaranteed to share one — a temporary copy on the way to replacing an entry (§7.2), named so it is skipped by directory listings. And for a file the user is meant to find next to what it refers to, such as a remote copy from a sync.
 - **Under `/.ark/<kind>/`**, flat, for everything else — including state about a single path that outlives the operation that wrote it, such as the metadata a rewrite sets aside. A directory of its own can be swept in one pass, and a path with no parent inside the account (the account root) still has somewhere to live.
 
-An entry in a flat directory keyed by something that is itself a path or an address percent-encodes `/` and `%` in that key, leaving the rest readable. Both characters must be encoded: without `%`, two distinct keys could encode to one name, and the entry for one would be served under the other. Folding separators into an ordinary character (`/` to `_`, say) is not sufficient for the same reason.
+An entry in a flat directory keyed by something that is itself a path or an address is named by the base64url encoding (no padding) of that key's UTF-8 bytes. Distinct keys give distinct names, so the entry for one is never served under another, and the name travels in a URL unchanged. Folding separators into an ordinary character (`/` to `_`, say) is not sufficient, since two keys could then meet in one name; nor is percent-encoding them, since a `%2F` in a URL path is decoded or refused along the way by many HTTP stacks. An account path is keyed without a trailing `/`.
 
 ---
 
@@ -270,14 +273,14 @@ The server derives an **effective member list** for the target:
 - Directory exists and has metadata → its own member list.
 - Directory exists without metadata → walk up as above.
 
-A version (§4.3) is an entry of its own, and its effective list is the one its own metadata carries — never the live path's, nor an ancestor's. A member removed from a path therefore keeps reading the versions written while they were a member, as they could then, and a member added later reaches only the versions written since. Neither the path's current members nor an ancestor's reach a version whose own metadata leaves them out, which keeps a deleted or recreated path's history to those it was shared with.
+A version (§4.3) is an entry of its own, and its effective list is the one its own metadata carries — never the live path's, nor an ancestor's. A member removed from a path therefore keeps reading the versions written while they were a member, as they could then, and a member added later reaches only the versions written since. Neither the path's current members nor an ancestor's reach a version whose own metadata leaves them out, which keeps a deleted or recreated path's history to those it was shared with. The listing of a path's history is the exception: its effective list is the path's own, or for a deleted path its newest version's (§4.3), which shows a member every version's metadata but none of their bodies.
 
 **Permission decision.**
 
 1. If the request is unauthenticated and the effective list contains `*`, GET/HEAD succeed with `reader`; PUT/DELETE return `401`.
 2. Otherwise authenticate (§5), then compute the highest permission across:
    - a direct match on `requestor_identity.address`,
-   - a match on the metadata's `author` (for PUT — a change relayed on behalf of a member author; the author check below applies regardless),
+   - a match on the metadata's `author` (for PUT and DELETE — a change relayed on behalf of a member author; the author check below applies regardless),
    - a group match — for any member entry whose identity carries a `members` list, treat the requestor (or `author`) as matching if their address is in that list; the entry's permission is granted,
    - the `*` public member (read-only shortcut).
 3. If none match, `403`.
@@ -296,11 +299,11 @@ A version (§4.3) is an entry of its own, and its effective list is the one its 
 
 **Author check.** On a PUT or DELETE, the metadata's `author` must itself be allowed to make the change, whoever sends it: `writer` against the member list of the version it was made on (`parent_version`, §7), or for a first write the effective list it inherits, and `owner` where it would change the member list; otherwise `403`. An author who is the account itself always is, and so is a version the account granted on accepting a share proposal (§4.8, `grants/`). A server checks a change exactly as a client does (*Clients*, below), from what it holds: it has nowhere to fetch a version it lacks, so a change made on one is refused.
 
-**Clients.** A client applies the author check to everything it takes into its account: a download, a change it syncs, a delete. It checks each one against the version it was made against, which its `parent_version` (§7) names, as the client holds it: its own copy, or its version store (§4.8). Everything in either was checked on the way in, so the store is the client's trusted history. Where the client holds neither the version nor the one before it — as on its first download of a path written more than once — it first takes in the one before it: it fetches its metadata (`HEAD ?version=`, §4.3), checks it the same way, back to a version it holds or the first, and stores it without a body. A version needs no further check where:
+**Clients.** A client applies the author check to everything it takes into its account: a download, a change it syncs, a delete. It checks each one against the version it was made against, which its `parent_version` (§7) names, as the client holds it: its own copy, or its version store (§4.8). Everything in either was checked on the way in, so the store is the client's trusted history. Where the client holds neither the version nor the one before it — as on its first download of a path written more than once — it first takes in the one before it: it takes its metadata from the path's history (§4.3), checks it the same way, back to a version it holds or the first, and stores it without a body. A version needs no further check where:
 - the account signed it;
 - the account granted it on accepting it from another account (§4.8, `grants/`).
 
-A first version names no parent and answers to the nearest directory above it that carries metadata, as it stood when the file was written: the client lists the directory's history (`?versions`), takes the version that was newest at the file's `author_date`, in the same way, and checks against its members, whatever the directory holds now. A server judges a first version arriving now against the directory as it holds it now instead. A version whose author was not allowed, or whose history breaks, is refused, and so is a download meant to replace the client's copy that was not made on it (§9, *Conflict resolution*). Versions on no chain the client takes in are checked only when fetched. Bodies of past versions are fetched only when wanted, as for a restore or a merge (§9), and checked against the metadata already stored. The request log (§10) is the server's own record, written and signed by it, and is exempt; everything else under `/.ark/`, such as a grant, is checked like any other entry.
+A first version names no parent and answers to the nearest directory above it that carries metadata, as it stood when the file was written: the client lists the directory's history (§4.3), takes the version that was newest at the file's `author_date`, in the same way, and checks against its members, whatever the directory holds now. A server judges a first version arriving now against the directory as it holds it now instead. A version whose author was not allowed, or whose history breaks, is refused, and so is a download meant to replace the client's copy that was not made on it (§9, *Conflict resolution*). Versions on no chain the client takes in are checked only when fetched. Bodies of past versions are fetched only when wanted, as for a restore or a merge (§9), and checked against the metadata already stored. The request log (§10) is the server's own record, written and signed by it, and is exempt; everything else under `/.ark/`, such as a grant, is checked like any other entry.
 
 ---
 
@@ -351,7 +354,7 @@ Updates should be atomic: write body + xattrs to a temp file, then rename over t
 Directory metadata (§7.3) cannot be written that way. A rename only succeeds onto an empty directory, and a directory being updated holds the entries beneath it, so its attributes are replaced where they stand. Two things make that safe:
 
 - **A lock.** A writer holds an exclusive advisory lock on the directory for the whole replacement, and a reader holds a shared one. Concurrent readers therefore never observe a partial set. The lock is released by the host if the process holding it stops, so it cannot be left stranded. It is advisory and local to one host: an account root MUST live on a local filesystem, and MUST NOT be shared between hosts over a network filesystem.
-- **The previous metadata, set aside.** Before touching a directory's attributes, the writer creates an empty file at `/.ark/versions/<percent-encoded account path>/.previous` carrying what the directory carries in that file's own `user.ark.*` attributes — metadata at rest in the same shape as anywhere else, landed by a rename so what is set aside is never caught part-way itself. A file carrying no attributes records that the directory carried no metadata. The writer then puts each new attribute on before taking off those left over from the metadata it replaces, so the directory never carries no metadata at all part-way, and removes the file only once the new metadata is whole, so its presence marks a replacement as still under way.
+- **The previous metadata, set aside.** Before touching a directory's attributes, the writer creates an empty file at `/.ark/versions/<encoded account path>/.previous` (§4.8) carrying what the directory carries in that file's own `user.ark.*` attributes — metadata at rest in the same shape as anywhere else, landed by a rename so what is set aside is never caught part-way itself. A file carrying no attributes records that the directory carried no metadata. The writer then puts each new attribute on before taking off those left over from the metadata it replaces, so the directory never carries no metadata at all part-way, and removes the file only once the new metadata is whole, so its presence marks a replacement as still under way.
 
   A reader that holds a lock on the directory knows no writer holds the exclusive one, so previous metadata it can see is what a stopped writer left behind. It takes the exclusive lock, puts back what that file carries — the previous metadata, or no metadata at all where it carries none — removes it, and reads again.
 
@@ -359,7 +362,7 @@ Directory metadata (§7.3) cannot be written that way. A rename only succeeds on
 
   This is what makes the detection complete. An interrupted replacement is not always visible in the attributes: a write that stopped after four of six members leaves metadata that is contiguous from index 0, carries an owner and a signature, and parses whole with the wrong member list. Only the metadata set aside distinguishes it. An update interrupted part-way is therefore put back to the state before it, rather than serving a short member list or leaving the directory to inherit from its nearest metadata-bearing ancestor.
 
-The `.previous` entry sits beside the path's versions (§4.8) so that everything stored about one path lives in one place, and a `DELETE ?versions` that drops the history (§4.6) drops it too. It is not account content and not a version.
+The `.previous` entry sits beside the path's versions (§4.8) so that everything stored about one path lives in one place, and a purge of the history (§4.6) purges it too. It is not account content and not a version.
 
 An implementation MAY also sweep `/.ark/versions/*/.previous` at startup to put these back eagerly, rather than waiting for each directory to be read.
 
@@ -443,7 +446,7 @@ Ark makes federation a server responsibility. A client publishes once; the serve
 
 **Conflict resolution.** No forks: a PUT or DELETE to a path that holds an entry must be made on it, its `parent_version` naming the version the path holds, or it returns `409`. Of two writes made on one version, the first to arrive is applied and the second is refused; its writer syncs, merges (*Merging*, below) and puts again. A PUT older than a delete stored for the path or a directory above it (§4.6) also returns `409`, so a delete still wins over a write relayed after it. A server that missed a relayed write holds no version later ones were made on, and refuses them until the path is shared again; fetching what it missed from the sender is **Status: not yet implemented**.
 
-**Pulling (client).** A sync takes in the changes its account's request log (§10) records since it last looked, in the order they were made, and fetches each as the version it made (`?version=`), not as what the path holds now. Each is checked against the one before it (§6, *Clients*), so an owner adding a member and that member then editing both check out. A change the account itself made from another device is taken in like any other. One that does not check out is reported and passed over.
+**Pulling (client).** A sync takes in the changes its account's request log (§10) records since it last looked, in the order they were made, and fetches each as the version it made (§4.3), not as what the path holds now. Each is checked against the one before it (§6, *Clients*), so an owner adding a member and that member then editing both check out. A change the account itself made from another device is taken in like any other. One that does not check out is reported and passed over.
 
 **Merging (client).** Where a sync finds both the copy and the server changed, it keeps the copy and writes the server's version beside it as a remote copy. It then walks both histories back along `parent_version` through its own store, which holds the server's side once that side is checked (§6, *Clients*), to the newest version both share, and writes that beside it too, as the base to merge against. Publishing the merge puts it as a change to the server's version, so its `parent_version` names that version and the history records where the two lines met.
 
@@ -564,7 +567,7 @@ The client creates a **password identity** — a sub-identity whose keypair is d
 - The compromised server sees all metadata and ciphertext but no plaintext.
 - It cannot forge signatures for existing files (no identity key).
 - It can serve a **different** `identity.json` to a new peer, so first-contact peers who don't verify out of band could be MITM'd. Pinned peers are safe.
-- It can replay an **older** signed version of a file, or a signed file from another path, in place of the current one. A client holding its own copy catches both (§4.2); one fetching a path for the first time checks it back through its history (§6, *Clients*), which catches a file from another path but not an older version of the right one. `?version=` (§4.3) asks for an older version on purpose, so only the second of those still applies to it: a client MUST refuse metadata whose `id` differs from its own copy's, and MUST recompute the version id from the metadata it was served and refuse anything that is not the version it asked for. The id travels in the query, which the request signature does not cover (§5).
+- It can replay an **older** signed version of a file, or a signed file from another path, in place of the current one. A client holding its own copy catches both (§4.2); one fetching a path for the first time checks it back through its history (§6, *Clients*), which catches a file from another path but not an older version of the right one. Reading a version (§4.3) asks for an older one on purpose, so only the second of those still applies to it: a client MUST refuse metadata whose `id` differs from its own copy's, and MUST recompute the version id from the metadata it was served and refuse anything that is not the version it asked for. Nothing else binds what is served to the id asked for.
 - It cannot write into an account on its own: a client takes in only what the account, or someone the account let in, signed (§6, *Clients*). It can still **withhold**, serving an older history or leaving out newer versions, a member's removal among them; only another replica shows that.
 - If a password identity is configured, the server also holds `identity.key` encrypted under the password identity — see §12.2.
 
@@ -667,10 +670,12 @@ Algorithm ids are registered in Appendix B.1.
 ### A.5 DirectoryEntry
 
 ```json
-{ "type": "file", "name": "todo.md" }
+{ "type": "file", "name": "todo.md", "metadata": Metadata }
 ```
 
-`type` ∈ `dir | file | symlink`. Symlink entries are listed for inspection; the server rejects requests that actually traverse a symlink with `403`.
+`type` ∈ `dir | file`. Symlinks are not listed; the server rejects requests that traverse one with `403`.
+
+`metadata` is the entry's own [`Metadata`](#a2-metadata), in its JSON form; omitted for a directory with none of its own (§4.3). Omitted in an SSE event (§4.3). In a listing of a path's history, the entry's `name` is the version's id (A.10).
 
 ### A.6 Signature / Hash
 
@@ -708,32 +713,17 @@ A group is an [`Identity`](#a1-identity) whose `members` field is set. The ident
 
 A share proposal pre-accepted by the inviter. Redemption creates the target directory with the redeemer added as a member.
 
-### A.10 VersionEntry
+### A.10 Version id
 
-```json
-{
-  "id": "2026-07-24T09-12-33.418Z_p7Qk2-Xd",
-  "entry_id": "5f3f...",
-  "author": "alice@example.com",
-  "author_date": "2026-07-24T09:12:33.418Z",
-  "body_hash": Hash,
-  "size": 2048
-}
+```
+2026-07-24T09-12-33.418Z_p7Qk2-Xd
 ```
 
-One entry of the history returned by `GET <path>?versions` (§4.3), newest first.
+Names a version: its entry's name in the path's history (§4.3, §4.8), and what `parent_version` (§7) takes. Derived from what the metadata says: the `author_date` timestamp with `:` replaced by `-`, an underscore, then the first 8 base64url characters of the SHA-256 of the bytes its signature covers (§7 — the JCS-canonical metadata with `signature.algorithm` and `signature.value` cleared). Every host holding a version names it the same, so two histories that drifted apart through a dropped relay (§9) can still be compared. The signature itself plays no part, so the id does not depend on the signing algorithm, nor on a scheme that can sign the same metadata more than one way.
 
-| Field | Required | Notes |
-|---|---|---|
-| `id` | ✓ | Names the version, and is what `?version=` and `parent_version` (§7) take. Derived from what the metadata says: the `author_date` timestamp with `:` replaced by `-`, an underscore, then the first 8 base64url characters of the SHA-256 of the bytes its signature covers (§7 — the JCS-canonical metadata with `signature.algorithm` and `signature.value` cleared). Every host holding a version names it the same, so two histories that drifted apart through a dropped relay (§9) can still be compared. The signature itself plays no part, so the id does not depend on the signing algorithm, nor on a scheme that can sign the same metadata more than one way. |
-| `entry_id` | ✓ | The version's `Metadata.id`: the file or directory it is a version of, which keeps one id across all its writes. A history outlives deletes of its path (§4.6), so entries of one listing may differ here — each run of one value is one entry the path held. |
-| `author` | ✓ | The version's `Metadata.author`. |
-| `author_date` | ✓ | The version's `Metadata.author_date`. **Derived, not independent:** it is the same timestamp `id` opens with, sent in its ordinary form so a client need not take an id apart to learn when a version was written. A client that does parse it out of `id` must split on the *first* `_`, since base64url includes `_` and the hash characters may contain one. |
-| `body_hash` | for a file | The version's `Metadata.body_hash`. Absent for a directory. Two entries sharing one `body_hash` differ only in their metadata — a `?metadata` PUT (§4.5) that moved the member list and left the body alone — which is what lets a client tell those apart in a listing without fetching either. |
-| `size` | ✓ | Bytes the version's body holds as stored. `0` for a directory and for a delete. |
-| `deleted` | for a delete | `true` where the version is a delete of the path (§4.6), omitted otherwise. Its `body_hash` is that of the file it deleted. |
+A client that parses the timestamp out of an id must split on the *first* `_`, since base64url includes `_` and the hash characters may contain one. It need not: the metadata listed beside each version carries `author_date` too.
 
-`id` and `author_date` carry the same timestamp, so an implementation that changes the id grammar must keep them in step.
+A history outlives deletes of its path (§4.6), so the versions listed in one may differ in `Metadata.id` — each run of one value is one entry the path held. Two versions sharing one `body_hash` differ only in their metadata — a `?metadata` PUT (§4.5) that moved the member list and left the body alone. A delete's version has `deleted` set, and the `body_hash` of the file it deleted.
 
 ---
 

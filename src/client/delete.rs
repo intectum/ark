@@ -7,7 +7,7 @@ use crate::paths::to_url;
 use crate::storage::exists;
 use crate::timestamp;
 use crate::types::Context;
-use crate::versions::{read_versions, to_version, version_path_for, write_version};
+use crate::versions::{read_versions, to_version, write_version};
 
 /// Delete a file or directory (recursive) at `path`. Requires the account to
 /// have `writer` or `owner` permission on the target, and on everything
@@ -24,8 +24,8 @@ use crate::versions::{read_versions, to_version, version_path_for, write_version
 pub fn delete(ctx: &Context, path: &str) -> io::Result<()> {
     let mut metadata = if exists(ctx, path) && has_metadata_attributes(ctx, path)? {
         read_metadata_attributes(ctx, path)?
-    } else if let Some(version) = read_versions(ctx, path)?.iter().find(|version| !version.deleted) {
-        read_metadata_attributes(ctx, &version_path_for(ctx, path, &version.id)?)?
+    } else if let Some(version) = read_versions(ctx, path)?.into_iter().find(|version| !version.metadata.deleted) {
+        version.metadata
     } else {
         return Err(io::Error::new(io::ErrorKind::NotFound, format!("no metadata of {} to delete against", path)));
     };
@@ -98,7 +98,7 @@ mod tests {
 
             let stored = read_versions(&ctx, "x.txt").unwrap();
             assert_eq!(stored.len(), 2);
-            assert!(stored[0].deleted);
+            assert!(stored[0].metadata.deleted);
             let (server_ctx, server_path) = account_context(&temp_dir.join("ark/gyan/x.txt"));
             assert_eq!(read_versions(&server_ctx, &server_path).unwrap()[0].id, stored[0].id, "both name the delete the same");
 
@@ -106,7 +106,7 @@ mod tests {
             fs::remove_file(temp_dir.join("x.txt")).unwrap();
             let err = delete(&ctx, "x.txt").unwrap_err();
             assert_eq!(err.kind(), io::ErrorKind::NotFound, "the server holds nothing to delete");
-            let delete_metadata = read_metadata_attributes(&ctx, &version_path_for(&ctx, "x.txt", &read_versions(&ctx, "x.txt").unwrap()[0].id).unwrap()).unwrap();
+            let delete_metadata = &read_versions(&ctx, "x.txt").unwrap()[0].metadata;
             assert_eq!(delete_metadata.parent_version, Some(written_version));
         });
     }

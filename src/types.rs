@@ -19,11 +19,13 @@ pub struct Context {
     pub identity_key: Option<Key>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct DirEntry {
     #[serde(rename = "type")]
     pub kind: DirEntryKind,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Metadata>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -31,7 +33,6 @@ pub struct DirEntry {
 pub enum DirEntryKind {
     Dir,
     File,
-    Symlink,
 }
 
 #[derive(Clone)]
@@ -269,20 +270,12 @@ pub struct StreamEvent {
 }
 
 
-/// One entry of a path's version history. See `spec.md` §4.3.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct VersionEntry {
+/// One entry of a path's version history: the id naming it and the metadata
+/// its author signed. See `spec.md` §4.3.
+#[derive(Clone)]
+pub struct Version {
     pub id: String,
-    #[serde(with = "hyphenated_uuid")]
-    pub entry_id: Uuid,
-    pub author: String,
-    #[serde(with = "timestamp")]
-    pub author_date: OffsetDateTime,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub body_hash: Option<Hash>,
-    pub size: u64,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub deleted: bool,
+    pub metadata: Metadata,
 }
 
 mod base64url {
@@ -340,6 +333,7 @@ mod tests {
         let e = DirEntry {
             kind: DirEntryKind::File,
             name: "a.txt".to_string(),
+            metadata: None,
         };
         let s = serde_json::to_string(&e).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
@@ -351,19 +345,19 @@ mod tests {
     fn directory_entry_kind_serializes_as_snake_case_strings() {
         assert_eq!(serde_json::to_string(&DirEntryKind::Dir).unwrap(), "\"dir\"");
         assert_eq!(serde_json::to_string(&DirEntryKind::File).unwrap(), "\"file\"");
-        assert_eq!(serde_json::to_string(&DirEntryKind::Symlink).unwrap(), "\"symlink\"");
     }
 
     #[test]
     fn directory_entry_round_trip() {
         let original = DirEntry {
-            kind: DirEntryKind::Symlink,
-            name: "link".to_string(),
+            kind: DirEntryKind::Dir,
+            name: "sub".to_string(),
+            metadata: None,
         };
         let s = serde_json::to_string(&original).unwrap();
         let back: DirEntry = serde_json::from_str(&s).unwrap();
-        assert!(matches!(back.kind, DirEntryKind::Symlink));
-        assert_eq!(back.name, "link");
+        assert!(matches!(back.kind, DirEntryKind::Dir));
+        assert_eq!(back.name, "sub");
     }
 
     #[test]

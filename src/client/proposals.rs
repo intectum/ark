@@ -147,7 +147,7 @@ pub fn accept_proposal(ctx: &Context, index_or_id: &str, force: bool) -> io::Res
         format!("/{}", relative_path)
     };
 
-    let grant_path = grant_path_for(&path);
+    let grant_path = grant_path_for(&to_account_path(ctx, &path)?);
     let existing_grant_metadata = match head(ctx, &grant_path) {
         Ok((_, grant_metadata)) => Some(grant_metadata),
         Err(e) if e.kind() == io::ErrorKind::NotFound => None,
@@ -406,6 +406,45 @@ mod tests {
             fs::remove_dir_all(temp_dir.join("alice_client/.ark/versions")).unwrap();
             get(&alice_ctx, "/apps/notes/foo.md", false, false).unwrap();
             assert_eq!(fs::read(temp_dir.join("alice_client/apps/notes/foo.md")).unwrap(), b"hello alice");
+        });
+    }
+
+    #[test]
+    fn accept_proposal_of_a_dir_grants_the_dir() {
+        in_test_dir("ark_proposals_test", |temp_dir| {
+            let port = start_test_server(temp_dir.to_path_buf());
+            let (_alice_ctx, bob_ctx) = setup(temp_dir, port);
+
+            set_current_dir(temp_dir.join("bob_client")).unwrap();
+            fs::create_dir_all(temp_dir.join("bob_client/apps/notes")).unwrap();
+            put(&bob_ctx, "apps/notes/", &Permissions::default(), None, false).unwrap();
+
+            let alice_addr = format!("alice@127.0.0.1:{}", port);
+            put(&bob_ctx, "apps/notes/", &reader(alice_addr.clone()), None, false).unwrap();
+
+            set_current_dir(temp_dir.join("alice_client")).unwrap();
+            let alice_ctx = create_client_context().unwrap();
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let proposals = loop {
+                let p = list_proposals(&alice_ctx).unwrap();
+                if !p.is_empty() || Instant::now() >= deadline { break p; }
+                sleep(Duration::from_millis(20));
+            };
+            assert_eq!(proposals.len(), 1, "expected one proposal");
+
+            accept_proposal(&alice_ctx, &proposals[0].id, false).unwrap();
+
+            assert!(temp_dir.join("ark/alice/apps/notes").is_dir(), "dir should exist on alice's server");
+            let grant_file = temp_dir.join("ark/alice").join(grant_path_for("/apps/notes").trim_start_matches('/'));
+            assert!(grant_file.exists(), "the grant is kept under the dir's account path");
+            assert_eq!(list_proposals(&alice_ctx).unwrap().len(), 0, "log entry should be deleted");
+
+            // Bob wrote it, but the account's grant vouches for it on a device
+            // holding nothing of it yet.
+            fs::remove_dir_all(temp_dir.join("alice_client/.ark/versions")).unwrap();
+            get(&alice_ctx, "/apps/notes/", false, false).unwrap();
+            assert!(temp_dir.join("alice_client/apps/notes").is_dir());
         });
     }
 

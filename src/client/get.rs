@@ -6,11 +6,11 @@ use super::{decrypt_stream, is_modified, remove_sidecars, request, write_conflic
 use crate::crypto::DEFAULT_HASH_ALGORITHM;
 use crate::http::check_response_code;
 use crate::metadata::{has_metadata_headers, read_local_metadata_attributes, read_metadata_attributes, read_metadata_headers, write_metadata_attributes_atomic};
-use crate::paths::{parent_path, to_url};
+use crate::paths::{parent_path, to_url, to_version_url};
 use crate::storage::{create_dir_all, exists, write_atomic_with_metadata};
 use crate::types::{Context, Hash, LocalMetadata, Metadata};
 use crate::util::sha256;
-use crate::validate::validate_entry;
+use crate::validation::validate_entry;
 use crate::versions::{is_versioned, write_version};
 
 /// Download the body of a file at `path` (decrypting when encrypted).
@@ -116,10 +116,10 @@ pub fn get_stream(
     decrypt: bool,
     version: Option<&str>,
 ) -> io::Result<(Metadata, LocalMetadata)> {
-    let mut url = to_url(ctx, path)?;
-    if let Some(id) = version {
-        url.query_pairs_mut().append_pair("version", id);
-    }
+    let url = match version {
+        Some(id) => to_version_url(ctx, path, Some(id))?,
+        None => to_url(ctx, path)?,
+    };
 
     let (code, headers, body) = request(Some(ctx), "GET", &url, &[], &[])?;
     check_response_code(code, &body)?;

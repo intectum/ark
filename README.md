@@ -119,7 +119,7 @@ Every command takes `-h` for details. Paths accept three forms:
 | `ark head <PATH>` | Fetch response headers only. |
 | `ark list <PATH>` | List entries of a directory. |
 | `ark delete <PATH>` | Delete a file or directory (recursive). |
-| `ark versions <PATH>` | List everything PATH has held, newest first, what it holds now included. History outlives a delete. `--purge` drops the history of a deleted PATH instead, on the server and in this device's own store. |
+| `ark versions <PATH>` | List everything PATH has held, newest first, what it holds now included. History outlives a delete. `--purge` purges the history of a deleted PATH instead, on the server and in this device's own store. |
 | `ark restore <PATH> <ID>` | Put a version's body back into the local copy of PATH. `ark put` publishes it, as for any local change. |
 | `ark sync [PATH]` | Reconcile local and remote state under PATH — the working directory by default — in one pass. `-w` watches continuously. Prints one line per reconciled entry. Removes what co-members deleted, unless it changed locally. Where both sides changed, writes `<name>.remote-<time>` (the server's copy) and `<name>.base-<ID>` (what both started from) beside the file. |
 | `ark resolve <PATH>` | Publish the local copy of PATH as the merge of a conflict `ark sync` or `ark get` reported, and remove its sidecars. The history records the merge. |

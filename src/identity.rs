@@ -473,9 +473,8 @@ mod tests {
             init_local(temp_dir, "alice@example.com").unwrap();
             let ctx = create_client_context().unwrap();
 
-            let cache_dir = temp_dir.join(".ark/identities");
-            fs::create_dir_all(&cache_dir).unwrap();
-            fs::write(cache_dir.join("bob@example.com.json"), b"not json").unwrap();
+            fs::create_dir_all(temp_dir.join(".ark/identities")).unwrap();
+            fs::write(temp_dir.join(identity_cache_path("bob@example.com").trim_start_matches('/')), b"not json").unwrap();
 
             let err = resolve_identity(&ctx, "bob@example.com").unwrap_err();
             assert!(err.to_string().contains("identity.json parse"), "msg was {}", err);

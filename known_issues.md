@@ -31,7 +31,7 @@ design; a client's is a cache, and could drop anything the server also has.
 
 ## A purge leaves other devices' version stores
 
-`ark versions --purge` drops the server's history of a path and the store of
+`ark versions --purge` purges the server's history of a path and the store of
 the device that ran it. Every other device of the account keeps the copies
 in its own store, so the history is recoverable from any of them until each
 drops it.
@@ -95,11 +95,11 @@ both hold.
 
 ## Taking in a history costs a request per version
 
-A client taking in a path's history, as on its first download of it, makes a
-`HEAD ?version=` per version it lacks, one after another back along the
+A client taking in a path's history, as on its first download of it, lists
+that history once per version it lacks, one after another back along the
 chain. A path with a long history, or a tree of many, makes that many
-requests. A listing that returned each version's signed metadata would take
-one.
+requests. Every listing already carries each version's signed metadata, so
+taking the chain in from one would take one.
 
 ## A download in address form is checked against the account's own directories
 

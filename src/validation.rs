@@ -2,14 +2,13 @@ use std::io;
 
 use time::OffsetDateTime;
 
-use crate::client::{get_stream, list_versions, request};
-use crate::http::check_response_code;
+use crate::client::{get_stream, list_versions};
 use crate::identity::resolve_identity;
-use crate::metadata::{members_changed, read_inherited_metadata_attributes, read_metadata_attributes, read_metadata_headers, resolve_member_permission, verify_metadata, verify_metadata_signature};
-use crate::paths::{grant_path_for, is_request_log_path, parent_path, to_account_path, to_address, to_url};
+use crate::metadata::{members_changed, read_inherited_metadata_attributes, read_metadata_attributes, resolve_member_permission, verify_metadata, verify_metadata_signature};
+use crate::paths::{grant_path_for, is_request_log_path, parent_path, to_account_path, to_address, version_path_for};
 use crate::storage::{exists, read};
 use crate::types::{Context, Member, Metadata, Permission};
-use crate::versions::{get_version_chain, read_version_metadata_attributes, to_version, version_path_for, write_version};
+use crate::versions::{get_version_chain, read_version_metadata_attributes, to_version, write_version};
 
 /// Checks that `metadata`, with `body` where it arrived with one, can be
 /// trusted as an entry of `path` by the account `ctx` belongs to.
@@ -85,17 +84,18 @@ pub fn validate_entry(ctx: &Context, path: &str, metadata: &Metadata, body: Opti
         }
     }
 
-    if is_request_log_path(&to_account_path(ctx, path)?) {
+    let account_path = to_account_path(ctx, path)?;
+    if is_request_log_path(&account_path) {
         return Ok(());
     }
 
     let address = to_address(ctx, path)?;
     let account_address = address.split_once('/').map_or(address.as_str(), |(account, _)| account);
-    let is_trusted_version = exists(ctx, &version_path_for(ctx, &address, &to_version(metadata))?);
+    let is_trusted_version = exists(ctx, &version_path_for(&account_path, &to_version(metadata)));
 
     if !is_trusted_version && server_ctx.is_none() {
         if let Some(parent_id) = &metadata.parent_version {
-            if !exists(ctx, &version_path_for(ctx, &address, parent_id)?) {
+            if !exists(ctx, &version_path_for(&account_path, parent_id)) {
                 match fetch_version(ctx, &address, parent_id) {
                     Ok(_) => {}
                     // Not on the server, so only a grant vouches for what
@@ -207,16 +207,16 @@ fn validate_author(
     Ok(())
 }
 
-// The metadata of the version of `path` that `id` names, fetched from the
-// account's server, checked as `validate_entry` checks it, and stored in the
-// version store without its body.
+// The metadata of the version of `path` that `id` names, taken from the
+// history the account's server lists, checked as `validate_entry` checks it,
+// and stored in the version store without its body.
 fn fetch_version(ctx: &Context, path: &str, id: &str) -> io::Result<Metadata> {
-    let mut url = to_url(ctx, path)?;
-    url.query_pairs_mut().append_pair("version", id);
-
-    let (code, headers, body) = request(Some(ctx), "HEAD", &url, &[], &[])?;
-    check_response_code(code, &body)?;
-    let metadata = read_metadata_headers(&headers)?;
+    // TODO: walking a chain lists the whole history once per version it lacks;
+    // one listing could serve every version of the chain (known_issues.md).
+    let metadata = list_versions(ctx, path)?.into_iter()
+        .find(|version| version.id == id)
+        .map(|version| version.metadata)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("{} holds no version {}", path, id)))?;
 
     validate_entry(ctx, path, &metadata, None, Some(id), None)?;
     write_version(ctx, path, &[], &metadata)?;
@@ -239,7 +239,7 @@ fn members_at(ctx: &Context, path: &str, date: OffsetDateTime, server_ctx: Optio
         let versions = list_versions(ctx, dir)?;
         if !versions.is_empty() {
             let version = versions.iter()
-                .find(|version| !version.deleted && version.author_date <= date)
+                .find(|version| !version.metadata.deleted && version.metadata.author_date <= date)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, format!("{} held nothing then", dir)))?;
             let metadata = match read_version_metadata_attributes(ctx, dir, &version.id)? {
                 Some(metadata) => metadata,

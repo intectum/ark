@@ -4,11 +4,11 @@ use super::{decrypt_stream, get_stream, request};
 
 use crate::http::check_response_code;
 use crate::metadata::{read_local_metadata_attributes, read_metadata_attributes};
-use crate::paths::to_url;
+use crate::paths::{to_account_path, to_version_url, version_path_for};
 use crate::storage::{read, write_atomic_with_metadata};
-use crate::types::{Context, LocalMetadata, Metadata, VersionEntry};
+use crate::types::{Context, DirEntry, LocalMetadata, Metadata, Version};
 use crate::util::sha256;
-use crate::versions::{get_version_chain, remove_versions, version_path_for};
+use crate::versions::{get_version_chain, purge_stored_versions};
 
 /// The version history of the file or directory at `path`, newest first, what
 /// it holds now included.
@@ -17,21 +17,27 @@ use crate::versions::{get_version_chain, remove_versions, version_path_for};
 /// history, or none the server stored, gives an empty list.
 ///
 /// History outlives a delete of `path`, so it may span more than one file —
-/// told apart by `entry_id`. Every version is listed where `path` admits the
-/// account — or for a removed path, its newest version did — and otherwise
-/// only those whose own member list admits it.
-pub fn list_versions(ctx: &Context, path: &str) -> io::Result<Vec<VersionEntry>> {
-    let mut url = to_url(ctx, path)?;
-    url.query_pairs_mut().append_key_only("versions");
-
-    let (code, _, body) = request(Some(ctx), "GET", &url, &[], &[])?;
+/// told apart by their metadata's `id`. Listed where `path` admits the
+/// account — or for a removed path, its newest version did. The metadata is
+/// as the server sent it, not yet checked.
+pub fn list_versions(ctx: &Context, path: &str) -> io::Result<Vec<Version>> {
+    let (code, _, body) = request(Some(ctx), "GET", &to_version_url(ctx, path, None)?, &[], &[])?;
     if code == 404 {
         return Ok(Vec::new());
     }
     check_response_code(code, &body)?;
 
-    serde_json::from_slice(&body)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("version listing: {}", e)))
+    let entries: Vec<DirEntry> = serde_json::from_slice(&body)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("version listing: {}", e)))?;
+
+    let mut versions = Vec::new();
+    for entry in entries.into_iter().rev() {
+        let metadata = entry.metadata
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("version listing: no metadata for {}", entry.name)))?;
+        versions.push(Version { id: entry.name, metadata });
+    }
+
+    Ok(versions)
 }
 
 /// The body and signed metadata of the version of `path` that `id` names.
@@ -47,7 +53,7 @@ pub fn list_versions(ctx: &Context, path: &str) -> io::Result<Vec<VersionEntry>>
 /// `existing_metadata`: the metadata of the account's own copy of `path`, when
 /// it has one. The version must then be a file where the copy is a file.
 pub fn get_version(ctx: &Context, path: &str, id: &str, decrypt: bool, existing_metadata: Option<&Metadata>) -> io::Result<(Vec<u8>, Metadata)> {
-    let version_path = version_path_for(ctx, path, id)?;
+    let version_path = version_path_for(&to_account_path(ctx, path)?, id);
     let is_stored = match read_metadata_attributes(ctx, &version_path) {
         Ok(metadata) => !read(ctx, &version_path)?.is_empty() || metadata.body_hash.is_none_or(|hash| hash.value == sha256(&[])),
         Err(error) if error.kind() == io::ErrorKind::NotFound => false,
@@ -129,21 +135,20 @@ pub fn restore_version(ctx: &Context, path: &str, id: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Drop the version history of `path` and of everything beneath it, which a
+/// Purge the version history of `path` and of everything beneath it, which a
 /// delete keeps. Only the account can, and only once `path` itself is deleted
 /// on the server.
 ///
-/// `path` accepts relative, absolute account, or address form. Drops the
+/// `path` accepts relative, absolute account, or address form. Purges the
 /// server's history, then the account's own store of it. The local copy is
 /// left alone. Other devices keep the versions in their own stores.
 pub fn purge_versions(ctx: &Context, path: &str) -> io::Result<()> {
-    let mut url = to_url(ctx, path)?;
-    url.query_pairs_mut().append_key_only("versions");
+    let url = to_version_url(ctx, path, None)?;
 
     let (code, _, body) = request(Some(ctx), "DELETE", &url, &[], &[])?;
     check_response_code(code, &body)?;
 
-    remove_versions(ctx, path)
+    purge_stored_versions(ctx, path)
 }
 
 #[cfg(test)]
@@ -163,7 +168,8 @@ mod tests {
     use crate::testing::http::start_test_server;
     use crate::types::Permissions;
     use crate::util::sha256;
-    use crate::versions::{read_versions, to_version, version_dir_for, version_path_for};
+    use crate::paths::version_dir_for;
+    use crate::versions::{read_versions, to_version};
 
     fn client(temp_dir: &Path) -> Context {
         let port = start_test_server(temp_dir.to_path_buf());
@@ -194,7 +200,7 @@ mod tests {
 
             let listed = list_versions(&ctx,"notes.txt").unwrap();
             assert_eq!(listed.len(), 2);
-            assert_eq!(listed[1].author, ctx.identity.address);
+            assert_eq!(listed[1].metadata.author, ctx.identity.address);
         });
     }
 
@@ -209,13 +215,13 @@ mod tests {
             put(&ctx, "notes.txt", &Permissions::default(), Some("none"), false).unwrap();
 
             let id = list_versions(&ctx,"notes.txt").unwrap()[1].id.clone();
-            remove_dir_all(&ctx, &version_dir_for(&ctx, "notes.txt").unwrap()).unwrap();
+            remove_dir_all(&ctx, &version_dir_for("/notes.txt")).unwrap();
 
             let (body, metadata) = get_version(&ctx, "notes.txt", &id, true, None).unwrap();
 
             assert_eq!(body, b"one");
             assert_eq!(to_version(&metadata), id);
-            assert!(exists(&ctx, &version_path_for(&ctx, "notes.txt", &id).unwrap()), "the fetched version is stored");
+            assert!(exists(&ctx, &version_path_for("/notes.txt", &id)), "the fetched version is stored");
             assert_eq!(fs::read(temp_dir.join("notes.txt")).unwrap(), b"two", "the copy it belongs to is left alone");
         });
     }
@@ -232,14 +238,14 @@ mod tests {
 
             // As a device that holds nothing of it yet.
             fs::remove_file(temp_dir.join("notes.txt")).unwrap();
-            remove_dir_all(&ctx, &version_dir_for(&ctx, "notes.txt").unwrap()).unwrap();
+            remove_dir_all(&ctx, &version_dir_for("/notes.txt")).unwrap();
 
             get(&ctx, "notes.txt", false, false).unwrap();
 
             let stored = read_versions(&ctx, "notes.txt").unwrap();
             assert_eq!(stored.len(), 3);
             let bodies: Vec<Vec<u8>> = stored.iter()
-                .map(|version| read(&ctx, &version_path_for(&ctx, "notes.txt", &version.id).unwrap()).unwrap())
+                .map(|version| read(&ctx, &version_path_for("/notes.txt", &version.id)).unwrap())
                 .collect();
             assert_eq!(bodies, vec![b"tri".to_vec(), Vec::new(), Vec::new()]);
         });
@@ -256,14 +262,14 @@ mod tests {
             put(&ctx, "notes.txt", &Permissions::default(), Some("none"), false).unwrap();
 
             fs::remove_file(temp_dir.join("notes.txt")).unwrap();
-            remove_dir_all(&ctx, &version_dir_for(&ctx, "notes.txt").unwrap()).unwrap();
+            remove_dir_all(&ctx, &version_dir_for("/notes.txt")).unwrap();
             get(&ctx, "notes.txt", false, false).unwrap();
 
             let id = list_versions(&ctx, "notes.txt").unwrap()[1].id.clone();
             assert_eq!(get_version(&ctx, "notes.txt", &id, false, None).unwrap().0, b"one");
 
             let server_ctx = server(&ctx, temp_dir);
-            fs::remove_file(server_ctx.root.join(version_path_for(&server_ctx, "/notes.txt", &id).unwrap().trim_start_matches('/'))).unwrap();
+            fs::remove_file(server_ctx.root.join(version_path_for("/notes.txt", &id).trim_start_matches('/'))).unwrap();
             assert_eq!(get_version(&ctx, "notes.txt", &id, false, None).unwrap().0, b"one", "read back without the server");
         });
     }
@@ -308,16 +314,16 @@ mod tests {
 
             let listed = list_versions(&ctx, "notes.txt").unwrap();
             assert_eq!(listed.len(), 3);
-            assert!(listed[1].deleted, "the delete is stored between the two files");
-            assert_eq!(listed[1].entry_id, listed[2].entry_id);
-            assert_ne!(listed[0].entry_id, listed[2].entry_id);
+            assert!(listed[1].metadata.deleted, "the delete is stored between the two files");
+            assert_eq!(listed[1].metadata.id, listed[2].metadata.id);
+            assert_ne!(listed[0].metadata.id, listed[2].metadata.id);
 
             let (body, _) = get_version(&ctx, "notes.txt", &listed[2].id, true, None).unwrap();
             assert_eq!(body, b"removed");
 
             // Fetched from the server, the delete verifies though it has no
             // body.
-            remove_dir_all(&ctx, &version_dir_for(&ctx, "notes.txt").unwrap()).unwrap();
+            remove_dir_all(&ctx, &version_dir_for("/notes.txt")).unwrap();
             let (body, metadata) = get_version(&ctx, "notes.txt", &listed[1].id, true, None).unwrap();
             assert!(body.is_empty() && metadata.deleted);
             let err = restore_version(&ctx, "notes.txt", &listed[1].id).unwrap_err();
@@ -325,7 +331,7 @@ mod tests {
 
             restore_version(&ctx, "notes.txt", &listed[2].id).unwrap();
             assert_eq!(fs::read(temp_dir.join("notes.txt")).unwrap(), b"removed");
-            assert_eq!(read_metadata_attributes(&ctx, "notes.txt").unwrap().id, listed[0].entry_id,
+            assert_eq!(read_metadata_attributes(&ctx, "notes.txt").unwrap().id, listed[0].metadata.id,
                 "the copy stays the file the path holds now");
         });
     }
@@ -358,11 +364,11 @@ mod tests {
             put(&ctx, "notes.txt", &Permissions::default(), Some("none"), false).unwrap();
             delete(&ctx, "notes.txt").unwrap();
             assert_eq!(list_versions(&ctx, "notes.txt").unwrap().len(), 2);
-            assert!(exists(&ctx, &version_dir_for(&ctx, "notes.txt").unwrap()), "the account keeps its own store of the history");
+            assert!(exists(&ctx, &version_dir_for("/notes.txt")), "the account keeps its own store of the history");
 
             purge_versions(&ctx, "notes.txt").unwrap();
             assert!(list_versions(&ctx, "notes.txt").unwrap().is_empty());
-            assert!(!exists(&ctx, &version_dir_for(&ctx, "notes.txt").unwrap()), "the account's own store of the history is dropped too");
+            assert!(!exists(&ctx, &version_dir_for("/notes.txt")), "the account's own store of the history is purged too");
         });
     }
 
@@ -382,7 +388,7 @@ mod tests {
             // server is free to answer with something else. Swapping the
             // stored body for the current one is that answer.
             let server_ctx = server(&ctx, temp_dir);
-            let version_path = version_path_for(&server_ctx, "/notes.txt", &id).unwrap();
+            let version_path = version_path_for("/notes.txt", &id);
             let current = read(&server_ctx, "/notes.txt").unwrap();
             let current_metadata = read_metadata_attributes(&server_ctx, "/notes.txt").unwrap();
             write_atomic_with_metadata(&server_ctx, &version_path, &current, &current_metadata, None).unwrap();

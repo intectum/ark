@@ -251,7 +251,7 @@ enum Cmd {
     /// History outlives a delete, so a path written again after one lists the
     /// versions of the file it held before too, under a file ID of their own.
     Versions {
-        /// Drop the history of a deleted path, and of everything beneath it,
+        /// Purge the history of a deleted path, and of everything beneath it,
         /// instead of listing it.
         #[arg(long)]
         purge: bool,
@@ -391,7 +391,6 @@ fn list_cli(ctx: &Context, path: &str, prefix: Option<&str>) -> io::Result<()> {
         let kind = match entry.kind {
             DirEntryKind::Dir => "dir",
             DirEntryKind::File => "file",
-            DirEntryKind::Symlink => "symlink",
         };
         writeln!(stdout, "{}  {}", kind, entry.name)?;
     }
@@ -425,8 +424,9 @@ fn list_versions_cli(ctx: &Context, path: &str) -> io::Result<()> {
 
     let mut stdout = io::stdout().lock();
     for entry in &entries {
-        let size = if entry.deleted { "deleted".to_string() } else { entry.size.to_string() };
-        writeln!(stdout, "{}  {:>10}  {}  {}  ({})", format_timestamp(entry.author_date), size, entry.author, entry.entry_id, entry.id)?;
+        let metadata = &entry.metadata;
+        let kind = if metadata.deleted { "deleted" } else if metadata.body_hash.is_some() { "file" } else { "dir" };
+        writeln!(stdout, "{}  {:>7}  {}  {}  ({})", format_timestamp(metadata.author_date), kind, metadata.author, metadata.id, entry.id)?;
     }
 
     Ok(())
@@ -436,7 +436,6 @@ fn print_event(event: EntryEvent) -> bool {
     let kind = match event.kind {
         Some(DirEntryKind::Dir) => "dir",
         Some(DirEntryKind::File) => "file",
-        Some(DirEntryKind::Symlink) => "symlink",
         None => "?",
     };
     let suffix = if event.conflict { " (conflict)" } else { "" };

@@ -7,13 +7,12 @@ use crate::crypto::{DEFAULT_HASH_ALGORITHM, decrypt_bytes, encrypt_bytes, sign_b
 use crate::identity::{identity_key_path, parse_address, read_identity_key, resolve_identity};
 use crate::permissions::cli_address_to_wire;
 use crate::lock::{Lock, lock_exclusive, lock_shared};
-use crate::paths::parent_path;
+use crate::paths::{parent_path, to_account_path, version_dir_for, version_path_for};
 use crate::storage::{copy_atomic_with_metadata, create_dir_all, exists, is_dir, list_attributes, read, read_attribute, remove_attribute, remove_file, write_atomic_with_metadata, write_atomic_without_metadata, write_attribute};
 use crate::timestamp;
 use crate::types::{Hash, Key, LocalMetadata, Member, Metadata, Permission, Permissions, Signature};
 use crate::types::Context;
 use crate::util::{decode_base64url, encode_base64url, parse_uuid, sha256};
-use crate::versions::{version_dir_for, version_path_for};
 
 const PREVIOUS_VERSION: &str = ".previous";
 
@@ -182,7 +181,7 @@ pub fn write_metadata_attributes_atomic(ctx: &Context, path: &str, metadata: &Me
 
     write_metadata_attributes(ctx, path, metadata, local_metadata)?;
 
-    remove_file(ctx, &version_path_for(ctx, path, PREVIOUS_VERSION)?)
+    remove_file(ctx, &version_path_for(&to_account_path(ctx, path)?, PREVIOUS_VERSION))
 }
 
 /// Replace the metadata `path` carries with `metadata`, and the local metadata
@@ -676,9 +675,10 @@ fn lock_directory_shared(ctx: &Context, path: &str) -> io::Result<Option<Lock>> 
 }
 
 fn save_previous_metadata(ctx: &Context, path: &str, metadata: Option<&Metadata>, local: &LocalMetadata) -> io::Result<()> {
-    create_dir_all(ctx, &version_dir_for(ctx, path)?)?;
+    let account_path = to_account_path(ctx, path)?;
+    create_dir_all(ctx, &version_dir_for(&account_path))?;
 
-    let previous_path = version_path_for(ctx, path, PREVIOUS_VERSION)?;
+    let previous_path = version_path_for(&account_path, PREVIOUS_VERSION);
 
     match metadata {
         Some(metadata) => write_atomic_with_metadata(ctx, &previous_path, &[], metadata, Some(local)),
@@ -687,7 +687,7 @@ fn save_previous_metadata(ctx: &Context, path: &str, metadata: Option<&Metadata>
 }
 
 fn recover_directory(ctx: &Context, path: &str, lock: Option<Lock>) -> io::Result<Option<Lock>> {
-    if lock.is_none() || !exists(ctx, &version_path_for(ctx, path, PREVIOUS_VERSION)?) {
+    if lock.is_none() || !exists(ctx, &version_path_for(&to_account_path(ctx, path)?, PREVIOUS_VERSION)) {
         return Ok(lock);
     }
 
@@ -699,7 +699,7 @@ fn recover_directory(ctx: &Context, path: &str, lock: Option<Lock>) -> io::Resul
 }
 
 fn restore_previous_metadata_unlocked(ctx: &Context, path: &str) -> io::Result<()> {
-    let previous_path = version_path_for(ctx, path, PREVIOUS_VERSION)?;
+    let previous_path = version_path_for(&to_account_path(ctx, path)?, PREVIOUS_VERSION);
     if !exists(ctx, &previous_path) {
         return Ok(());
     }
@@ -947,7 +947,7 @@ mod tests {
             assert_eq!(read_back.id, original.id);
             assert_eq!(read_back.members.len(), 1);
             assert_eq!(read_back.members[0].address, identity.address);
-            assert!(!exists(&context, &version_path_for(&context, "/dir", PREVIOUS_VERSION).unwrap()), "the previous metadata outlived being put back");
+            assert!(!exists(&context, &version_path_for("/dir", PREVIOUS_VERSION)), "the previous metadata outlived being put back");
         });
     }
 
@@ -989,7 +989,7 @@ mod tests {
 
             let read_back = read_metadata_attributes(&context, "/dir").unwrap();
             assert_eq!(read_back.signature.value, original.signature.value, "torn metadata that parses was served instead of being rolled back");
-            assert!(!exists(&context, &version_path_for(&context, "/dir", PREVIOUS_VERSION).unwrap()));
+            assert!(!exists(&context, &version_path_for("/dir", PREVIOUS_VERSION)));
         });
     }
 
@@ -1011,7 +1011,7 @@ mod tests {
                 Ok(_) => panic!("expected the roll back to leave no metadata"),
                 Err(error) => assert_eq!(error.kind(), io::ErrorKind::NotFound),
             }
-            assert!(!exists(&context, &version_path_for(&context, "/dir", PREVIOUS_VERSION).unwrap()));
+            assert!(!exists(&context, &version_path_for("/dir", PREVIOUS_VERSION)));
         });
     }
 
@@ -1039,7 +1039,7 @@ mod tests {
 
             let read_back = read_local_metadata_attributes(&context, "/dir").unwrap();
             assert_eq!(read_back.sync_author_date, Some(original.author_date), "the directory came back untracked");
-            assert!(!exists(&context, &version_path_for(&context, "/dir", PREVIOUS_VERSION).unwrap()));
+            assert!(!exists(&context, &version_path_for("/dir", PREVIOUS_VERSION)));
         });
     }
 
@@ -1054,7 +1054,7 @@ mod tests {
             sign_metadata(&secret_key, &mut metadata, None).unwrap();
             write_metadata_attributes_atomic(&context, "/dir", &metadata, None).unwrap();
 
-            assert!(!exists(&context, &version_path_for(&context, "/dir", PREVIOUS_VERSION).unwrap()));
+            assert!(!exists(&context, &version_path_for("/dir", PREVIOUS_VERSION)));
         });
     }
 

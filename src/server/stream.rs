@@ -58,6 +58,7 @@ fn write_event(ctx: &Context, stream: &mut dyn Write, account_root: &str, path: 
     let entry = DirEntry {
         kind,
         name: relative_path,
+        metadata: None,
     };
 
     let json = serde_json::to_string(&entry).map_err(|e| io::Error::other(e.to_string()))?;

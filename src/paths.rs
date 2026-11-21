@@ -14,21 +14,16 @@ use std::env::current_dir;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
-use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use url::Url;
 use uuid::Uuid;
 
 use crate::identity::parse_address;
 use crate::types::Context;
-use crate::util::{encode_base64url, is_loopback_host, parse_uuid};
+use crate::util::{decode_base64url, encode_base64url, is_loopback_host, parse_uuid};
+
+pub const VERSIONS_DIR: &str = "/.ark/versions";
 
 const TEMP_INFIX: &str = ".tmp-";
-
-// The separator must not survive into a name that stands as one entry, and the
-// escape character has to be escaped alongside it — otherwise two names that
-// differ could meet in the same entry, and one would be read under the other's
-// key. Everything else is left readable.
-const SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS.add(b'%').add(b'/');
 
 /// The account-absolute form of a path argument, which every filesystem
 /// function resolves its argument to first.
@@ -130,28 +125,25 @@ pub fn file_name(path: &str) -> &str {
 /// is itself a path or an address.
 ///
 /// Distinct names always give distinct entries, so nothing keyed this way can
-/// be reached under another key's name.
+/// be reached under another key's name. The entry name travels in a URL as it
+/// is.
 pub fn to_path_segment(name: &str) -> String {
-    utf8_percent_encode(name, SEGMENT_ENCODE_SET).to_string()
+    encode_base64url(name.as_bytes())
+}
+
+/// The name [`to_path_segment`] gave `segment`.
+///
+/// Errors where `segment` is not one it gives.
+pub fn from_path_segment(segment: &str) -> io::Result<String> {
+    decode_base64url(segment).ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "not a path segment"))
 }
 
 /// Where the account keeps the grant it signs on accepting the account path
 /// `path` from another account.
 pub fn grant_path_for(path: &str) -> String {
-    // Named so it travels in a URL as it is.
-    join_path("/.ark/grants", &encode_base64url(path.trim_end_matches('/').as_bytes()))
-}
-
-/// A unique sibling name for a temporary version of `path`.
-///
-/// Named `.<name>.tmp-<uuid>`. The leading dot marks it internal.
-pub fn temp_path_for(path: &str) -> String {
-    let name = format!(".{}{}{}", file_name(path), TEMP_INFIX, Uuid::new_v4().hyphenated());
-
-    match parent_path(path) {
-        Some(parent) => join_path(parent, &name),
-        None => name,
-    }
+    join_path("/.ark/grants", &to_path_segment(path))
 }
 
 /// A sibling name for a copy of `path` the user is meant to find beside what
@@ -166,6 +158,39 @@ pub fn sidecar_path_for(path: &str, suffix: &str) -> String {
         Some(parent) => join_path(parent, &name),
         None => name,
     }
+}
+
+/// A unique sibling name for a temporary version of `path`.
+///
+/// Named `.<name>.tmp-<uuid>`. The leading dot marks it internal.
+pub fn temp_path_for(path: &str) -> String {
+    let name = format!(".{}{}{}", file_name(path), TEMP_INFIX, Uuid::new_v4().hyphenated());
+
+    match parent_path(path) {
+        Some(parent) => join_path(parent, &name),
+        None => name,
+    }
+}
+
+/// Where the versions of the account path `path` are stored.
+pub fn version_dir_for(path: &str) -> String {
+    join_path(VERSIONS_DIR, &to_path_segment(path))
+}
+
+/// Where the version of the account path `path` that `id` names is stored.
+pub fn version_path_for(path: &str, id: &str) -> String {
+    join_path(&version_dir_for(path), id)
+}
+
+/// The account path whose versions the directory `path` stores, where `path`
+/// is one [`version_dir_for`] gives, and `None` where it is not.
+///
+/// Errors where `path` sits where one would but its name names no path.
+pub fn path_for_version_dir(path: &str) -> io::Result<Option<String>> {
+    let Some(segment) = path.trim_end_matches('/').strip_prefix(&format!("{}/", VERSIONS_DIR)) else { return Ok(None); };
+    if segment.contains('/') { return Ok(None); }
+
+    from_path_segment(segment).map(Some)
 }
 
 /// Whether the account path `path`, with or without its leading `/`, lies
@@ -196,6 +221,15 @@ pub fn is_temp_path(path: &str) -> bool {
         Some(infix) => parse_uuid(&stem[infix + TEMP_INFIX.len()..]).is_ok(),
         None => false,
     }
+}
+
+/// Whether the account path `path`, with or without its leading `/`, lies
+/// under `/.ark/versions/`, the version store, whose entries only the host
+/// storing them writes.
+pub fn is_version_store_path(path: &str) -> bool {
+    let path = path.trim_start_matches('/');
+
+    path == ".ark/versions" || path.starts_with(".ark/versions/")
 }
 
 /// Expand a CLI/library path argument into a fully-qualified address string
@@ -255,6 +289,22 @@ pub fn to_url_raw(root: &Path, path: &str, address: &str) -> io::Result<Url> {
     reject_path_traversal(&url)?;
 
     Ok(url)
+}
+
+/// The URL of the directory holding the versions of `path` on the server
+/// holding `path`, or of the version `id` names within it.
+///
+/// Accepts the same forms as [`to_url`].
+pub fn to_version_url(ctx: &Context, path: &str, id: Option<&str>) -> io::Result<Url> {
+    let address = to_address(ctx, path)?;
+    let account_address = address.split_once('/').map_or(address.as_str(), |(account, _)| account);
+    let account_path = to_account_path(ctx, path)?;
+    let version_path = match id {
+        Some(id) => version_path_for(&account_path, id),
+        None => version_dir_for(&account_path),
+    };
+
+    to_url(ctx, &format!("{}{}", account_address, version_path))
 }
 
 /// The target of an inbound request — path and query — as a [`Url`], for

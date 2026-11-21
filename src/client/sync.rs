@@ -12,7 +12,7 @@ use crate::paths::{is_protocol_path, join_path, parent_path, to_account_path, to
 use crate::storage::{create_dir_all, exists, is_dir, is_file, is_symlink, read_dir, read_to_string, remove_dir, remove_file, write_atomic_with_metadata, write_atomic_without_metadata};
 use crate::types::{Context, DirEntryKind, EntryAction, EntryEvent, Hash, LocalMetadata, Metadata};
 use crate::util::{parse_request_entry, sha256};
-use crate::validate::{validate_entry, validate_made_on_copy};
+use crate::validation::{validate_entry, validate_made_on_copy};
 use crate::versions::to_version;
 
 /// Reconcile local and remote state under the directory `path` in a single
@@ -438,7 +438,7 @@ fn parse_log_entry(entry_bytes: &[u8], account_prefix: &str) -> io::Result<Optio
         ("PUT", 201 | 204) | ("DELETE", 204) => {}
         _ => return Ok(None),
     }
-    // A delete of a path's versions carries no metadata.
+    // A purge of a path's versions carries no metadata.
     if !has_metadata_headers(&entry.request_headers) { return Ok(None); }
 
     let target = entry.target.split_once('?').map(|(p, _)| p).unwrap_or(&entry.target);

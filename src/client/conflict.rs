@@ -95,7 +95,7 @@ pub fn resolve_conflict(ctx: &Context, path: &str) -> io::Result<()> {
     remove_sidecars(ctx, path, &[])
 }
 
-// Whether the body changed since it was last synced; `None` where untracked.
+/// Whether the body changed since it was last synced; `None` where untracked.
 pub fn is_modified(ctx: &Context, path: &str) -> io::Result<Option<bool>> {
     let local_metadata = read_local_metadata_attributes(ctx, path)?;
 
@@ -109,7 +109,7 @@ pub fn is_modified(ctx: &Context, path: &str) -> io::Result<Option<bool>> {
     }
 }
 
-// Remove the sidecars a conflict on `path` left, other than those in `keep`.
+/// Remove the sidecars a conflict on `path` left, other than those in `keep`.
 pub fn remove_sidecars(ctx: &Context, path: &str, keep: &[String]) -> io::Result<()> {
     let parent = parent_path(path).unwrap_or("/");
     let remote_prefix = format!("{}.{}", file_name(path), REMOTE_SIDECAR_PREFIX);

@@ -266,7 +266,7 @@ mod tests {
     use crate::testing::fs::{account_context, in_test_dir, init_with_server, write_plain_test_file};
     use crate::testing::http::start_test_server;
     use crate::types::{Context, Identity, Key, Permission};
-    use crate::versions::version_path_for;
+    use crate::paths::version_path_for;
 
     fn cache_identity(ctx: &Context, identity: &Identity) {
         create_dir_all(ctx, "/.ark/identities").unwrap();
@@ -814,8 +814,8 @@ mod tests {
 
             let id = to_version(&read_metadata_attributes(&ctx, "notes.txt").unwrap());
             let server_ctx = server(&ctx, temp_dir);
-            let stored_body = read(&ctx, &version_path_for(&ctx, "notes.txt", &id).unwrap()).unwrap();
-            let server_body = read(&server_ctx, &version_path_for(&server_ctx, "/notes.txt", &id).unwrap()).unwrap();
+            let stored_body = read(&ctx, &version_path_for("/notes.txt", &id)).unwrap();
+            let server_body = read(&server_ctx, &version_path_for("/notes.txt", &id)).unwrap();
             assert_eq!(stored_body, server_body, "the same ciphertext under the same id");
             assert_ne!(stored_body, b"secret", "stored as it was sent, not as the copy holds it");
         });
@@ -834,8 +834,8 @@ mod tests {
             put_permissions(&ctx, "notes.txt", &reader(other.address.clone())).unwrap();
 
             let after = read_metadata_attributes(&ctx, "notes.txt").unwrap();
-            let before_body = read(&ctx, &version_path_for(&ctx, "notes.txt", &to_version(&before)).unwrap()).unwrap();
-            let after_body = read(&ctx, &version_path_for(&ctx, "notes.txt", &to_version(&after)).unwrap()).unwrap();
+            let before_body = read(&ctx, &version_path_for("/notes.txt", &to_version(&before))).unwrap();
+            let after_body = read(&ctx, &version_path_for("/notes.txt", &to_version(&after))).unwrap();
             assert_eq!(after_body, before_body);
             verify_metadata(&ctx.identity.public_key, &after, Some(&after_body)).unwrap();
         });
