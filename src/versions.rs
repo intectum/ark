@@ -15,7 +15,7 @@
 use std::io;
 
 use crate::metadata::{read_metadata_attributes, to_canonical_metadata_bytes};
-use crate::paths::{VERSIONS_DIR, file_name, from_path_segment, is_request_log_path, is_version_store_path, join_path, to_account_path, version_dir_for, version_path_for};
+use crate::paths::{VERSIONS_DIR, file_name, from_path_segment, is_request_log_entry_path, is_version_store_path, join_path, to_account_path, version_dir_for, version_path_for};
 use crate::storage::{copy_atomic_with_metadata, create_dir_all, exists, link_atomic, read_dir, remove_dir_all, write_atomic_with_metadata};
 use crate::timestamp;
 use crate::types::{Context, Metadata, Version};
@@ -119,12 +119,12 @@ pub fn create_dir_version(ctx: &Context, path: &str, metadata: &Metadata) -> io:
 
 /// Whether writes to `path` are stored as versions of it.
 ///
-/// They are everywhere but in the version store itself, and the request log,
-/// whose entries a server writes once and never replaces.
+/// They are everywhere but in the version store itself, and the entries of the
+/// request log, which a server writes once and never replaces.
 pub fn is_versioned(ctx: &Context, path: &str) -> io::Result<bool> {
     let account_path = to_account_path(ctx, path)?;
 
-    Ok(!is_version_store_path(&account_path) && !is_request_log_path(&account_path))
+    Ok(!is_version_store_path(&account_path) && !is_request_log_entry_path(&account_path))
 }
 
 /// The versions of `path`, newest first, what it holds now included. Empty

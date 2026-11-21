@@ -203,11 +203,9 @@ pub fn is_protocol_path(path: &str) -> bool {
 
 /// Whether the account path `path`, with or without its leading `/`, lies
 /// under `/.ark/requests/`, the request log, whose entries the server writes
-/// and signs itself.
-pub fn is_request_log_path(path: &str) -> bool {
-    let path = path.trim_start_matches('/');
-
-    path == ".ark/requests" || path.starts_with(".ark/requests/")
+/// and signs itself. The log directory itself is not one.
+pub fn is_request_log_entry_path(path: &str) -> bool {
+    path.trim_start_matches('/').starts_with(".ark/requests/")
 }
 
 /// Whether `path` names a temporary version of a file.

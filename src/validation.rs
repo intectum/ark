@@ -5,7 +5,7 @@ use time::OffsetDateTime;
 use crate::client::{get_stream, list_versions};
 use crate::identity::resolve_identity;
 use crate::metadata::{members_changed, read_inherited_metadata_attributes, read_metadata_attributes, resolve_member_permission, verify_metadata, verify_metadata_signature};
-use crate::paths::{grant_path_for, is_request_log_path, parent_path, to_account_path, to_address, version_path_for};
+use crate::paths::{grant_path_for, parent_path, to_account_path, to_address, version_path_for};
 use crate::storage::{exists, read};
 use crate::types::{Context, Member, Metadata, Permission};
 use crate::versions::{get_version_chain, read_version_metadata_attributes, to_version, write_version};
@@ -17,9 +17,7 @@ use crate::versions::{get_version_chain, read_version_metadata_attributes, to_ve
 /// the account signed it, or granted it on accepting `path` from another
 /// account, or its author was allowed to make it by the version it was made
 /// against, which the account must trust in turn. A first version answers to
-/// the directory above it, as that directory's history held it then. An entry
-/// of the request log is the server's own record, and only its signature is
-/// checked.
+/// the directory above it, as that directory's history held it then.
 ///
 /// `path` accepts relative, absolute account, or address form. `body` is
 /// `None` on a directory or a delete, which have none, and on a file whose
@@ -85,10 +83,6 @@ pub fn validate_entry(ctx: &Context, path: &str, metadata: &Metadata, body: Opti
     }
 
     let account_path = to_account_path(ctx, path)?;
-    if is_request_log_path(&account_path) {
-        return Ok(());
-    }
-
     let address = to_address(ctx, path)?;
     let account_address = address.split_once('/').map_or(address.as_str(), |(account, _)| account);
     let is_trusted_version = exists(ctx, &version_path_for(&account_path, &to_version(metadata)));
